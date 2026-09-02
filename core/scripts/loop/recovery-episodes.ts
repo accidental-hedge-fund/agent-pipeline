@@ -9,8 +9,9 @@
 import * as crypto from "node:crypto";
 import {
   LoopError,
-  RECOVERY_RECIPES,
+  isDurableBlockerClass,
   isRecoveryRecipe,
+  type DurableBlockerClass,
   type LoopCoolingRecord,
   type LoopLedger,
   type LoopRecoveryAttempt,
@@ -94,9 +95,141 @@ function isNonEmptyText(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+/**
+ * Default configured recipe order and per-strategy bound per blocker class.
+ * Must stay equal to {@link DEFAULT_RECOVERY_POLICY} recipes / retry_budget
+ * (drift-guarded in recovery-episodes.test.ts). Used when validating a
+ * ledger without the contract's compiled policy.
+ */
+const CLASS_RECOVERY_SEQUENCE: Record<DurableBlockerClass, { recipes: readonly RecoveryRecipe[]; bound: number }> = {
+  "transient-rate-limit": { recipes: ["wait_and_retry"], bound: 5 },
+  "workflow-state": { recipes: ["resync_workflow_state", "repair_pipeline_item"], bound: 3 },
+  "implementation-ci": { recipes: ["verify_head_goal", "rerun_ci", "repair_pipeline_item"], bound: 3 },
+  "review-findings": { recipes: ["unlink_engine_scratch", "repair_pipeline_item"], bound: 3 },
+  "environment-auth": { recipes: ["verify_authentication"], bound: 2 },
+  "specification-decision": { recipes: [], bound: 0 },
+  "missing-authority": { recipes: [], bound: 0 },
+  "upstream-dependency": { recipes: ["retry_upstream_check"], bound: 3 },
+  "workflow-engine-defect": {
+    recipes: [
+      "unlink_engine_scratch",
+      "checkpoint_owned_harness_dirt",
+      "publish_unpublished_stage_commit",
+      "restart_workflow_engine",
+      "repair_pipeline_item",
+    ],
+    bound: 2,
+  },
+};
+
+/** Configured recipe sequence and per-strategy bound for a blocker class. */
+export function configuredRecoverySequence(
+  blockerClass: unknown,
+): { recipes: readonly RecoveryRecipe[]; bound: number } | undefined {
+  if (!isDurableBlockerClass(blockerClass)) return undefined;
+  return CLASS_RECOVERY_SEQUENCE[blockerClass];
+}
+
+function collectSkippedRecipes(
+  value: Record<string, unknown>,
+  history: readonly Record<string, unknown>[],
+): Set<string> | null {
+  const skipped = new Set<string>();
+  if (value.skipped_strategies !== undefined) {
+    if (!Array.isArray(value.skipped_strategies)) return null;
+    if (!value.skipped_strategies.every((recipe) => isRecoveryRecipe(recipe))) return null;
+    if (
+      typeof value.strategy_cursor === "number" &&
+      value.skipped_strategies.length > value.strategy_cursor
+    ) {
+      return null;
+    }
+    for (const recipe of value.skipped_strategies) skipped.add(recipe);
+  }
+  const rows = history.length > 0 ? history : [value];
+  for (const row of rows) {
+    if (row.outcome === "skipped" && isRecoveryRecipe(row.action)) skipped.add(row.action);
+  }
+  return skipped;
+}
+
+function derivedAttemptCounts(
+  episodeId: unknown,
+  history: readonly Record<string, unknown>[],
+): Record<string, number> {
+  const derived: Record<string, number> = {};
+  for (const sibling of history) {
+    if (sibling.episode_id !== episodeId) continue;
+    if (!isRecoveryRecipe(sibling.action)) continue;
+    if (sibling.outcome === "skipped" || sibling.outcome === "superseded") continue;
+    derived[sibling.action] = (derived[sibling.action] ?? 0) + 1;
+  }
+  return derived;
+}
+
+function countsMatchPersisted(
+  persisted: Record<string, unknown>,
+  derived: Record<string, number>,
+): boolean {
+  const keys = new Set([...Object.keys(persisted), ...Object.keys(derived)]);
+  for (const recipe of keys) {
+    const claimed = persisted[recipe];
+    const actual = derived[recipe] ?? 0;
+    if ((typeof claimed === "number" ? claimed : 0) !== actual) return false;
+  }
+  return true;
+}
+
+function numericCounts(persisted: Record<string, unknown>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const [recipe, count] of Object.entries(persisted)) {
+    if (typeof count === "number") counts[recipe] = count;
+  }
+  return counts;
+}
+
+/** High-water cursor justified by skipped / exhausted / in-progress recipes. */
+function justifiedStrategyCursor(
+  recipes: readonly RecoveryRecipe[],
+  bound: number,
+  counts: Record<string, number>,
+  skipped: Set<string>,
+): number {
+  let justified = 0;
+  for (let i = 0; i < recipes.length; i++) {
+    const recipe = recipes[i]!;
+    const spent = counts[recipe] ?? 0;
+    if (skipped.has(recipe)) {
+      justified = Math.max(justified, i + 1);
+    } else if (bound > 0 && spent >= bound) {
+      justified = Math.max(justified, i + 1);
+    } else if (spent > 0) {
+      justified = Math.max(justified, i);
+    }
+  }
+  return justified;
+}
+
+function sequenceFullyAccounted(
+  recipes: readonly RecoveryRecipe[],
+  bound: number,
+  counts: Record<string, number>,
+  skipped: Set<string>,
+): boolean {
+  for (const recipe of recipes) {
+    if (skipped.has(recipe)) continue;
+    const spent = counts[recipe] ?? 0;
+    if (bound > 0 && spent >= bound) continue;
+    return false;
+  }
+  return true;
+}
+
 /** Relational Recovery Episode checks used before a ledger is live authority.
  *  Primitive field presence is not enough: forged `episode_id`, cursor, or
- *  `attempts_per_strategy` counts must not be accepted. */
+ *  `attempts_per_strategy` counts must not be accepted. A cursor must be
+ *  justified by the class-configured recipe sequence — every predecessor
+ *  exhausted or skipped, never a terminal cursor with empty counters. */
 export function isAuthoritativeEpisodeState(
   value: Record<string, unknown>,
   siblings: readonly Record<string, unknown>[] = [],
@@ -116,12 +249,11 @@ export function isAuthoritativeEpisodeState(
   if (typeof value.strategy_cursor !== "number" || !Number.isInteger(value.strategy_cursor) || value.strategy_cursor < 0) {
     return false;
   }
-  if (value.strategy_cursor > RECOVERY_RECIPES.length) return false;
-  if (value.skipped_strategies !== undefined) {
-    if (!Array.isArray(value.skipped_strategies)) return false;
-    if (!value.skipped_strategies.every((recipe) => isRecoveryRecipe(recipe))) return false;
-    if (value.skipped_strategies.length > value.strategy_cursor) return false;
-  }
+  const sequence = configuredRecoverySequence(value.class) ?? configuredRecoverySequence(value.invariant);
+  if (!sequence) return false;
+  if (value.strategy_cursor > sequence.recipes.length) return false;
+  const skipped = collectSkippedRecipes(value, siblings);
+  if (skipped === null) return false;
   if (typeof value.attempts_per_strategy !== "object" || value.attempts_per_strategy === null || Array.isArray(value.attempts_per_strategy)) {
     return false;
   }
@@ -130,20 +262,22 @@ export function isAuthoritativeEpisodeState(
     if (!isRecoveryRecipe(recipe)) return false;
     if (typeof count !== "number" || !Number.isInteger(count) || count < 0) return false;
   }
-  if (siblings.length === 0) return true;
-  if (Object.keys(persisted).length === 0) return true;
-  const derived: Record<string, number> = {};
-  for (const sibling of siblings) {
-    if (sibling.episode_id !== value.episode_id) continue;
-    if (!isRecoveryRecipe(sibling.action)) continue;
-    if (sibling.outcome === "skipped" || sibling.outcome === "superseded") continue;
-    derived[sibling.action] = (derived[sibling.action] ?? 0) + 1;
+  let counts = numericCounts(persisted);
+  // Derived counts skip superseded rows. A superseded latest is a frozen closed
+  // claim — matching those derived counts against this snapshot would reject it.
+  if (siblings.length > 0 && value.outcome !== "superseded") {
+    const derived = derivedAttemptCounts(value.episode_id, siblings);
+    if (!countsMatchPersisted(persisted, derived)) return false;
+    counts = derived;
   }
-  const keys = new Set([...Object.keys(persisted), ...Object.keys(derived)]);
-  for (const recipe of keys) {
-    const claimed = persisted[recipe];
-    const actual = derived[recipe] ?? 0;
-    if ((typeof claimed === "number" ? claimed : 0) !== actual) return false;
+  if (value.strategy_cursor > justifiedStrategyCursor(sequence.recipes, sequence.bound, counts, skipped)) {
+    return false;
+  }
+  if (
+    value.strategy_cursor === sequence.recipes.length &&
+    !sequenceFullyAccounted(sequence.recipes, sequence.bound, counts, skipped)
+  ) {
+    return false;
   }
   return true;
 }

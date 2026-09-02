@@ -23,10 +23,13 @@ import {
   coolingRecordForItem,
   assertCursorDoesNotRegress,
   competingPrivateEpisodePath,
+  configuredRecoverySequence,
   DURABLE_GENERATION_QUARANTINE_THEME,
   emptyEpisode,
+  isAuthoritativeEpisodeState,
   isTempWriteBasename,
   lastValidPathFor,
+  ledgerEpisodesAreAuthoritative,
   normalizeEvidenceIdentity,
   perStrategyBound,
   reconcileUncertainClaim,
@@ -46,9 +49,11 @@ import {
   type LoopStoreDeps,
 } from "../scripts/loop/store.ts";
 import {
+  DURABLE_BLOCKER_CLASSES,
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
   LoopError,
+  RECOVERY_RECIPES,
   type LoopContract,
   type LoopLedger,
   type LoopRecoveryAttempt,
@@ -873,6 +878,215 @@ test("forged episode cursor and attempt counts are quarantined (#1325 99629b67)"
   files.delete(lastValidPathFor(published));
   files.set(published, JSON.stringify(mismatchedCounts));
   await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+});
+
+test("configured recovery sequences match DEFAULT_RECOVERY_POLICY", () => {
+  for (const cls of DURABLE_BLOCKER_CLASSES) {
+    const sequence = configuredRecoverySequence(cls);
+    assert.ok(sequence, cls);
+    assert.deepEqual([...sequence.recipes], DEFAULT_RECOVERY_POLICY[cls].recipes);
+    assert.equal(sequence.bound, perStrategyBound(DEFAULT_RECOVERY_POLICY[cls]));
+  }
+});
+
+test("honest cursor 0 and fully accounted terminal cursor remain authoritative", () => {
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-1",
+    evidence_identity: "evidence-1",
+  };
+  const episodeId = recoveryEpisodeId(key);
+  const fresh = {
+    ...key,
+    episode_id: episodeId,
+    class: "workflow-state",
+    action: "resync_workflow_state",
+    outcome: "started",
+    attempts_per_strategy: { resync_workflow_state: 1 },
+    strategy_cursor: 0,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  assert.equal(isAuthoritativeEpisodeState(fresh), true);
+  const skipped = {
+    ...key,
+    episode_id: episodeId,
+    class: "workflow-state",
+    action: "resync_workflow_state",
+    outcome: "skipped",
+    attempts_per_strategy: {},
+    strategy_cursor: 1,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  assert.equal(isAuthoritativeEpisodeState(skipped), true);
+  const exhausted = {
+    ...key,
+    episode_id: episodeId,
+    class: "workflow-state",
+    action: "repair_pipeline_item",
+    outcome: "exhausted",
+    attempts_per_strategy: { resync_workflow_state: 3, repair_pipeline_item: 3 },
+    strategy_cursor: 2,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  assert.equal(isAuthoritativeEpisodeState(exhausted), true);
+  const history = [
+    { ...exhausted, action: "resync_workflow_state", outcome: "failed", attempts_per_strategy: { resync_workflow_state: 1 }, strategy_cursor: 0 },
+    { ...exhausted, action: "resync_workflow_state", outcome: "failed", attempts_per_strategy: { resync_workflow_state: 2 }, strategy_cursor: 0 },
+    { ...exhausted, action: "resync_workflow_state", outcome: "failed", attempts_per_strategy: { resync_workflow_state: 3 }, strategy_cursor: 1 },
+    { ...exhausted, action: "repair_pipeline_item", outcome: "failed", attempts_per_strategy: { resync_workflow_state: 3, repair_pipeline_item: 1 }, strategy_cursor: 1 },
+    { ...exhausted, action: "repair_pipeline_item", outcome: "failed", attempts_per_strategy: { resync_workflow_state: 3, repair_pipeline_item: 2 }, strategy_cursor: 1 },
+    exhausted,
+  ];
+  assert.equal(isAuthoritativeEpisodeState(exhausted, history), true);
+  assert.equal(ledgerEpisodesAreAuthoritative(history), true);
+});
+
+test("superseded latest snapshot is not rejected for frozen attempt counts", () => {
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-1",
+    evidence_identity: "evidence-1",
+  };
+  const superseded = {
+    ...key,
+    episode_id: recoveryEpisodeId(key),
+    class: "workflow-state",
+    action: "resync_workflow_state",
+    outcome: "superseded",
+    attempts_per_strategy: { resync_workflow_state: 1 },
+    strategy_cursor: 0,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  assert.equal(isAuthoritativeEpisodeState(superseded, [superseded]), true);
+  assert.equal(ledgerEpisodesAreAuthoritative([superseded]), true);
+});
+
+test("forged terminal cursor with empty counters is not authoritative (#1325 510698c2)", () => {
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-1",
+    evidence_identity: "evidence-1",
+  };
+  const forged = {
+    ...key,
+    episode_id: recoveryEpisodeId(key),
+    class: "workflow-state",
+    action: "repair_pipeline_item",
+    outcome: "started",
+    attempts_per_strategy: {},
+    strategy_cursor: RECOVERY_RECIPES.length,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  assert.equal(isAuthoritativeEpisodeState(forged), false);
+  assert.equal(isAuthoritativeEpisodeState(forged, [forged]), false);
+  assert.equal(ledgerEpisodesAreAuthoritative([forged]), false);
+});
+
+test("forged terminal cursor with incomplete predecessor history is not authoritative (#1325 510698c2)", () => {
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-1",
+    evidence_identity: "evidence-1",
+  };
+  const sequence = configuredRecoverySequence("workflow-state")!;
+  const forged = {
+    ...key,
+    episode_id: recoveryEpisodeId(key),
+    class: "workflow-state",
+    action: "resync_workflow_state",
+    outcome: "started",
+    attempts_per_strategy: { resync_workflow_state: 1 },
+    strategy_cursor: sequence.recipes.length,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  assert.equal(isAuthoritativeEpisodeState(forged), false);
+  assert.equal(isAuthoritativeEpisodeState(forged, [forged]), false);
+  assert.equal(ledgerEpisodesAreAuthoritative([forged]), false);
+});
+
+test("forged terminal cursor with empty counters is quarantined (#1325 510698c2)", async () => {
+  const { deps, files, token } = await setup();
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-1",
+    evidence_identity: "evidence-1",
+  };
+  const base = await readLedger(deps, "run-1", token);
+  const forged = {
+    ...base,
+    recovery_attempts: [
+      {
+        item_id: "100",
+        seq: 0,
+        time: "2026-09-02T00:00:00.000Z",
+        class: "workflow-state",
+        action: "repair_pipeline_item",
+        outcome: "started",
+        episode_id: recoveryEpisodeId(key),
+        operation: key.operation,
+        invariant: key.invariant,
+        candidate_epoch: key.candidate_epoch,
+        evidence_identity: key.evidence_identity,
+        attempts_per_strategy: {},
+        strategy_cursor: RECOVERY_RECIPES.length,
+        next_eligible_at: "2026-09-02T00:00:00.000Z",
+      },
+    ],
+  };
+  files.set(published, JSON.stringify(forged));
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+  const owned = await readLedger(deps, "run-1", token);
+  assert.equal(owned.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  const resumed = resumeEpisodeFromAttempts(owned.recovery_attempts, key);
+  assert.equal(resumed, null);
+});
+
+test("forged terminal cursor with incomplete predecessor history is quarantined (#1325 510698c2)", async () => {
+  const { deps, files, token } = await setup();
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-1",
+    evidence_identity: "evidence-1",
+  };
+  const sequence = configuredRecoverySequence("workflow-state")!;
+  const base = await readLedger(deps, "run-1", token);
+  const forged = {
+    ...base,
+    recovery_attempts: [
+      {
+        item_id: "100",
+        seq: 0,
+        time: "2026-09-02T00:00:00.000Z",
+        class: "workflow-state",
+        action: "resync_workflow_state",
+        outcome: "started",
+        episode_id: recoveryEpisodeId(key),
+        operation: key.operation,
+        invariant: key.invariant,
+        candidate_epoch: key.candidate_epoch,
+        evidence_identity: key.evidence_identity,
+        attempts_per_strategy: { resync_workflow_state: 1 },
+        strategy_cursor: sequence.recipes.length,
+        next_eligible_at: "2026-09-02T00:00:00.000Z",
+      },
+    ],
+  };
+  files.set(published, JSON.stringify(forged));
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+  const owned = await readLedger(deps, "run-1", token);
+  assert.equal(owned.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  const resumed = resumeEpisodeFromAttempts(owned.recovery_attempts, key);
+  assert.equal(resumed, null);
 });
 
 test("5.8 unauthenticated read does not overwrite a corrupt ledger that still carries a started claim", async () => {
