@@ -26,9 +26,22 @@ import {
   type LoopContract,
   type LoopLedger,
   type LoopEngineName,
+  type LoopCoolingRecord,
 } from "./types.ts";
 import { initRun, readLedger, writeLedger, appendEvent, type LoopStoreDeps } from "./store.ts";
 import { mapLegacyThemeToBlockerClass } from "./import.ts";
+import {
+  applyClaimToEpisode,
+  assertRecoveryEpisodeFields,
+  attachEpisodeFields,
+  buildCoolingRecord,
+  emptyEpisode,
+  normalizeEvidenceIdentity,
+  perStrategyBound,
+  resumeEpisodeFromAttempts,
+  stampEpisodeNextEligibleAt,
+  type RecoveryEpisodeKey,
+} from "./recovery-episodes.ts";
 
 // ---------------------------------------------------------------------------
 // Recovery policy compilation — fail closed.
@@ -110,7 +123,7 @@ function compileEntry(cls: DurableBlockerClass, entry: Record<string, unknown>):
       `recovery policy for "${cls}" must route to a terminal human-authority outcome with no automated recipe`,
     );
   }
-  return {
+  const compiled: RecoveryPolicyEntry = {
     recipes: recipes as RecoveryRecipe[],
     retry_budget: entry.retry_budget,
     backoff: { initial_seconds: backoff.initial_seconds, multiplier: backoff.multiplier, max_seconds: backoff.max_seconds },
@@ -118,6 +131,10 @@ function compileEntry(cls: DurableBlockerClass, entry: Record<string, unknown>):
     run_fatal: entry.run_fatal,
     repeated_evidence_limit: entry.repeated_evidence_limit,
   };
+  if (typeof entry.per_strategy_bound === "number" && Number.isFinite(entry.per_strategy_bound) && entry.per_strategy_bound >= 0) {
+    compiled.per_strategy_bound = entry.per_strategy_bound;
+  }
+  return compiled;
 }
 
 /** A reasonable default policy covering every class — used by `pipeline:loop`
@@ -457,16 +474,11 @@ export function classifyBlocker(candidates: readonly string[]): DurableBlockerCl
 
 /** Pure function producing a stable fingerprint over normalized evidence —
  *  structurally identical failures fingerprint identically regardless of
- *  incidental formatting (whitespace, case, embedded shas/numbers that vary
- *  run to run), while materially different evidence fingerprints distinctly. */
+ *  incidental formatting (whitespace, case, hashes, timestamps, request IDs),
+ *  while materially different evidence (including HTTP status and error codes)
+ *  fingerprints distinctly. */
 export function fingerprintEvidence(evidence: string): string {
-  const normalized = evidence
-    .toLowerCase()
-    .replace(/\b[0-9a-f]{7,40}\b/g, "<hash>")
-    .replace(/\d+/g, "<n>")
-    .replace(/\s+/g, " ")
-    .trim();
-  return crypto.createHash("sha256").update(normalized).digest("hex");
+  return normalizeEvidenceIdentity(evidence);
 }
 
 /** Stable recovery-action idempotency key. Candidate identity distinguishes
@@ -533,7 +545,7 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
   const blockerClass = input.blockerClass;
   const contract = upgradeContractForRecovery(contractInput);
 
-  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
   if (ledger.stop && !input.allowAlreadyStopped) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
@@ -627,7 +639,16 @@ interface RecoveryActionInput {
   candidateIdentity?: string;
 }
 
-export interface StartRecoveryAttemptInput extends RecoveryActionInput {}
+export interface StartRecoveryAttemptInput extends RecoveryActionInput {
+  /** Operation name for the Recovery Episode key. Defaults to loop_recovery. */
+  operation?: string;
+  /** Declared invariant identity. Defaults to the blocker class. */
+  invariant?: string;
+  /** Candidate epoch. Defaults to candidate identity without an attempt ordinal. */
+  candidateEpoch?: string;
+  /** When true, persist an inapplicable skip without charging the strategy bound. */
+  skipInapplicable?: boolean;
+}
 
 export interface CompleteRecoveryAttemptInput {
   runId: string;
@@ -678,17 +699,34 @@ export function isReviewFindingsPrepUnlink(
   return blockerClass === "review-findings" && action === "unlink_engine_scratch";
 }
 
+function recoveryEpisodeKeyFor(input: {
+  operation?: string;
+  invariant: string;
+  candidateEpoch: string;
+  evidenceIdentity: string;
+}): RecoveryEpisodeKey {
+  return {
+    operation: input.operation ?? "loop_recovery",
+    invariant: input.invariant,
+    candidate_epoch: input.candidateEpoch,
+    evidence_identity: input.evidenceIdentity,
+  };
+}
+
 /** Durably claims exactly one recovery action before its external side effect.
- *  The claim consumes one class-budget unit whether the later action succeeds,
- *  fails, or the process dies. Replaying the same deterministic identity after
- *  restart returns the existing attempt without another charge. */
+ *  The claim consumes one per-strategy bound unit whether the later action succeeds,
+ *  fails, or the process dies. Class-wide `retry_budget` is a compatibility
+ *  projection only — a remaining class budget of 0 does not hide a later
+ *  applicable recipe that has not spent its own bound. Replaying the same
+ *  deterministic identity after restart returns the existing attempt without
+ *  another charge. */
 export async function startRecoveryAttempt(
   deps: LoopStoreDeps,
   contractInput: LoopContract,
   input: StartRecoveryAttemptInput,
 ): Promise<RecoverItemResult> {
   const contract = upgradeContractForRecovery(contractInput);
-  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
   if (ledger.stop) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
@@ -713,6 +751,14 @@ export async function startRecoveryAttempt(
     evidenceFingerprint,
     item.repeated_evidence_count ?? 0,
   );
+  const candidateEpoch = (input.candidateEpoch ?? candidateIdentity.replace(/\|attempt=\d+$/i, "")).trim() || candidateIdentity;
+  const episodeKey = recoveryEpisodeKeyFor({
+    operation: input.operation,
+    invariant: input.invariant ?? blockerClass,
+    candidateEpoch,
+    evidenceIdentity: evidenceFingerprint,
+  });
+  let episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, episodeKey) ?? emptyEpisode(episodeKey, time);
   const attemptId = recoveryAttemptId({
     itemId: input.itemId,
     candidateIdentity,
@@ -720,61 +766,101 @@ export async function startRecoveryAttempt(
     action: input.action,
   });
   const existing = ledger.recovery_attempts.find((attempt) => attempt.attempt_id === attemptId);
-  if (existing) return { ledger, attempt: existing };
+  if (existing) {
+    if (existing.invariant) assertRecoveryEpisodeFields(existing);
+    return { ledger, attempt: existing };
+  }
 
   const remaining = item.recovery_budgets_remaining[blockerClass] ?? policyEntry.retry_budget;
-  // #1060: preparatory unlink under review-findings is free of the class retry
-  // budget so three implementer repair attempts remain after scratch prep.
   const findingsPrep = isReviewFindingsPrepUnlink(blockerClass, input.action);
-  const outcome: RecoveryAttemptOutcome = remaining <= 0 && !findingsPrep ? "exhausted" : "started";
-  const budgetRemaining = findingsPrep
-    ? remaining
-    : Math.max(0, remaining - (outcome === "started" ? 1 : 0));
-  // Free prep must not advance backoff for subsequent substantive recipes, or a
-  // same-sequence repair would inherit an extra backoff step from the prep claim.
+  const skipInapplicable = input.skipInapplicable === true;
+  const strategyBound = perStrategyBound(policyEntry, input.action);
+  const strategySpent = episode.attempts_per_strategy[input.action] ?? 0;
+  const strategyExhausted = !skipInapplicable && !findingsPrep && strategySpent >= strategyBound;
+  const outcome: RecoveryAttemptOutcome = skipInapplicable
+    ? "skipped"
+    : strategyExhausted
+      ? "exhausted"
+      : "started";
+  const chargeClassProjection = outcome === "started" && !findingsPrep && !skipInapplicable;
+  const budgetRemaining = chargeClassProjection ? Math.max(0, remaining - 1) : remaining;
   const priorClassAttempts = ledger.recovery_attempts.filter(
     (attempt) =>
       attempt.item_id === input.itemId &&
       attempt.class === blockerClass &&
       attempt.evidence_fingerprint === evidenceFingerprint &&
+      attempt.outcome !== "skipped" &&
       !isReviewFindingsPrepUnlink(attempt.class, attempt.action),
   ).length;
-  // Prep unlink runs immediately (no backoff) so same-sequence repair can follow.
-  const backoffSeconds = findingsPrep
+  const backoffSeconds = findingsPrep || skipInapplicable
     ? 0
     : Math.min(
         policyEntry.backoff.max_seconds,
         policyEntry.backoff.initial_seconds * Math.pow(policyEntry.backoff.multiplier, priorClassAttempts),
       );
   const notBefore = new Date(Date.parse(time) + backoffSeconds * 1000).toISOString();
+  const recipeIndex = policyEntry.recipes.indexOf(input.action);
+  if (recipeIndex >= 0 && recipeIndex > episode.strategy_cursor) {
+    const implicitSkips = policyEntry.recipes
+      .slice(episode.strategy_cursor, recipeIndex)
+      .filter((recipe) => !episode.skipped_strategies.includes(recipe));
+    episode = {
+      ...episode,
+      strategy_cursor: recipeIndex,
+      skipped_strategies: [...episode.skipped_strategies, ...implicitSkips],
+    };
+  }
+  if (skipInapplicable) {
+    episode = {
+      ...episode,
+      strategy_cursor: Math.max(episode.strategy_cursor, recipeIndex + 1),
+      skipped_strategies: [...episode.skipped_strategies, input.action],
+      next_eligible_at: time,
+    };
+  } else if (outcome === "started") {
+    episode = applyClaimToEpisode(episode, input.action, backoffSeconds > 0 ? notBefore : time);
+  } else {
+    episode = { ...episode, next_eligible_at: time };
+  }
 
-  const attempt: LoopRecoveryAttempt = {
-    attempt_id: attemptId,
-    idempotency_key: attemptId,
-    seq: ledger.recovery_attempts.length,
-    time,
-    ...(outcome === "started" && backoffSeconds > 0
-      ? { not_before: notBefore, next_attempt_at: notBefore }
-      : {}),
-    item_id: input.itemId,
-    class: blockerClass,
-    candidate_identity: candidateIdentity,
-    action: input.action,
-    actions: [input.action],
-    evidence_fingerprint: evidenceFingerprint,
-    outcome,
-    status: outcome,
-    budget_remaining: budgetRemaining,
-    ...(outcome === "exhausted"
-      ? {
-          error: `recovery budget exhausted before action "${input.action}" could start`,
-          last_error: `recovery budget exhausted before action "${input.action}" could start`,
-          terminal_outcome: "failed" as const,
-        }
-      : {}),
-  };
+  const attempt: LoopRecoveryAttempt = attachEpisodeFields(
+    {
+      attempt_id: attemptId,
+      idempotency_key: attemptId,
+      seq: ledger.recovery_attempts.length,
+      time,
+      ...(outcome === "started" && backoffSeconds > 0
+        ? { not_before: notBefore, next_attempt_at: notBefore }
+        : {}),
+      item_id: input.itemId,
+      class: blockerClass,
+      candidate_identity: candidateIdentity,
+      action: input.action,
+      actions: [input.action],
+      evidence_fingerprint: evidenceFingerprint,
+      outcome,
+      status: outcome,
+      budget_remaining: budgetRemaining,
+      side_effect_certainty: outcome === "started" ? "uncertain" : undefined,
+      ...(outcome === "exhausted"
+        ? {
+            error: `recovery budget exhausted before action "${input.action}" could start`,
+            last_error: `recovery budget exhausted before action "${input.action}" could start`,
+            terminal_outcome: "failed" as const,
+          }
+        : {}),
+      ...(outcome === "skipped"
+        ? {
+            error: `recipe "${input.action}" is inapplicable and was skipped without charging repair budget`,
+            last_error: `recipe "${input.action}" is inapplicable and was skipped without charging repair budget`,
+          }
+        : {}),
+    },
+    episode,
+    input.token,
+  );
   ledger.recovery_attempts.push(attempt);
-  if (outcome === "started" && !findingsPrep) {
+  if (chargeClassProjection) {
     item.recovery_budgets_remaining[blockerClass] = budgetRemaining;
   }
 
@@ -800,7 +886,7 @@ export async function completeRecoveryAttempt(
   input: CompleteRecoveryAttemptInput,
 ): Promise<RecoverItemResult> {
   upgradeContractForRecovery(contractInput);
-  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
   const attempt = ledger.recovery_attempts.find((candidate) => candidate.attempt_id === input.attemptId);
   if (!attempt || attempt.item_id !== input.itemId) {
     throw new LoopError("validation", `recovery attempt "${input.attemptId}" was not started for item "${input.itemId}"`);
@@ -883,7 +969,7 @@ export async function recoverItem(
   contractInput: LoopContract,
   input: RecoverItemInput,
 ): Promise<RecoverItemResult> {
-  const current = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
+  const current = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
   if (current.stop) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${current.stop.reason}`);
   }
@@ -912,6 +998,44 @@ export async function recoverItem(
     error: input.error,
   });
 }
+
+/** Persist owned Cooling. Never writes a mechanical lifecycle stop. */
+export async function persistOwnedCooling(
+  deps: LoopStoreDeps,
+  input: {
+    runId: string;
+    token: string;
+    cooling: LoopCoolingRecord;
+  },
+): Promise<LoopLedger> {
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
+  const itemCooling = { ...(ledger.item_cooling ?? {}) };
+  if (input.cooling.item_id) {
+    itemCooling[input.cooling.item_id] = input.cooling;
+  }
+  const attempts =
+    input.cooling.item_id && input.cooling.next_eligible_at
+      ? stampEpisodeNextEligibleAt(ledger.recovery_attempts, input.cooling.item_id, input.cooling.next_eligible_at)
+      : ledger.recovery_attempts;
+  const next: LoopLedger = {
+    ...ledger,
+    cooling: input.cooling,
+    ...(Object.keys(itemCooling).length > 0 ? { item_cooling: itemCooling } : {}),
+    recovery_attempts: attempts,
+    stop: ledger.stop,
+  };
+  await writeLedger(deps, next, input.token);
+  await appendEvent(deps, input.runId, input.token, "loop_item_cooling", {
+    item_id: input.cooling.item_id,
+    theme: input.cooling.theme,
+    reason: input.cooling.reason,
+    next_eligible_at: input.cooling.next_eligible_at,
+    historical_evidence: input.cooling.historical_evidence,
+  });
+  return next;
+}
+
+export { buildCoolingRecord };
 
 // ---------------------------------------------------------------------------
 // Independent-item continuation — gated by the blocking class's run_fatal flag.

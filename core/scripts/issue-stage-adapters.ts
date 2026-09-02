@@ -17,6 +17,7 @@ import {
   mintObservationIdentity,
   ownedAdmissionObservation,
   persistOperationObservation,
+  loadOwnedOperationClaim,
   reportMechanicalFault,
   reportOwnedOperation,
   treatmentForSideEffectCertainty,
@@ -25,6 +26,17 @@ import {
   type ReportOperationObservation,
   type SideEffectCertainty,
 } from "./operation-observation.ts";
+import {
+  assertCompleteRecoveryEpisodeKey,
+  assertCursorDoesNotRegress,
+  assertRecoveryEpisodeFields,
+  emptyEpisode,
+  normalizeEvidenceIdentity,
+  recoveryEpisodeId,
+  resumeEpisodeFromAttempts,
+  type RecoveryEpisodeKey,
+} from "./loop/recovery-episodes.ts";
+import type { LoopRecoveryAttempt } from "./loop/types.ts";
 import {
   claimStageAttempt,
   persistStageAttemptLedger,
@@ -705,6 +717,42 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
 
 export const RECOVERY_EPISODE_CLAIM_OPERATION = "recovery_episode" as const;
 
+/** Production order for stage-adapter recovery treatments. */
+export const STAGE_RECOVERY_RECIPE_ORDER = ["worktree_rematerialize", "no_run_recovery"] as const;
+
+/** One Recovery Episode key for both the write-ahead claim and treatment history. */
+export function stageRecoveryEpisodeKey(input: {
+  issue: number | string;
+  candidateEpoch: string;
+  evidence: string;
+}): RecoveryEpisodeKey {
+  return {
+    operation: RECOVERY_EPISODE_CLAIM_OPERATION,
+    invariant: `issue:${input.issue}`,
+    candidate_epoch: input.candidateEpoch,
+    evidence_identity: normalizeEvidenceIdentity(input.evidence),
+  };
+}
+
+function nextMonotonicStageCursor(
+  recipes: readonly string[],
+  previous: number,
+  action: string,
+  attempts: Record<string, number>,
+  bound: number,
+): number {
+  const actionIndex = recipes.indexOf(action);
+  let cursor = previous;
+  if (actionIndex >= 0 && actionIndex > cursor) cursor = actionIndex;
+  if (actionIndex >= 0 && (attempts[action] ?? 0) >= bound) {
+    cursor = Math.max(cursor, actionIndex + 1);
+  }
+  while (cursor < recipes.length && (attempts[recipes[cursor]!] ?? 0) >= bound) {
+    cursor += 1;
+  }
+  return assertCursorDoesNotRegress(previous, cursor);
+}
+
 export function claimOrResumeRecoveryEpisode(input: {
   domain: string;
   logical_operation_id?: string | null;
@@ -714,20 +762,54 @@ export function claimOrResumeRecoveryEpisode(input: {
   message: string;
   reportObservation?: ReportOperationObservation;
   persistDir?: string;
+  episodeKey: RecoveryEpisodeKey;
 }): OperationObservation {
-  const obs = ownedAdmissionObservation({
-    operation: RECOVERY_EPISODE_CLAIM_OPERATION,
-    form_id: "recovery-supervisor",
-    message: input.message,
+  const key = assertCompleteRecoveryEpisodeKey(input.episodeKey, "claimOrResumeRecoveryEpisode");
+  const identity = mintObservationIdentity({
     domain: input.domain,
     logical_operation_id: input.logical_operation_id,
     repository: input.repository,
     issue: input.issue,
     run_id: input.run_id,
   });
-  reportOwnedOperation(input.reportObservation, obs);
-  if (input.persistDir) persistOperationObservation(obs, input.persistDir);
-  return obs;
+  const episode = emptyEpisode(key, new Date().toISOString());
+  if (input.persistDir && identity.logical_operation_id) {
+    const existing = loadOwnedOperationClaim(identity.domain, identity.logical_operation_id, input.persistDir);
+    if (
+      existing &&
+      existing.episode_id === episode.episode_id &&
+      existing.invariant === episode.invariant &&
+      existing.candidate_epoch === episode.candidate_epoch &&
+      existing.evidence_identity === episode.evidence_identity
+    ) {
+      reportOwnedOperation(input.reportObservation, existing);
+      return existing;
+    }
+  }
+  const obs = ownedAdmissionObservation({
+    operation: RECOVERY_EPISODE_CLAIM_OPERATION,
+    form_id: "recovery-supervisor",
+    message: input.message,
+    domain: input.domain,
+    logical_operation_id: identity.logical_operation_id,
+    repository: input.repository,
+    issue: input.issue,
+    run_id: input.run_id,
+  });
+  const claimed: OperationObservation = {
+    ...obs,
+    episode_id: episode.episode_id,
+    invariant: episode.invariant,
+    candidate_epoch: episode.candidate_epoch,
+    evidence_identity: episode.evidence_identity,
+    attempts_per_strategy: episode.attempts_per_strategy,
+    strategy_cursor: episode.strategy_cursor,
+    next_eligible_at: episode.next_eligible_at,
+  };
+  assertRecoveryEpisodeFields(claimed);
+  reportOwnedOperation(input.reportObservation, claimed);
+  if (input.persistDir) persistOperationObservation(claimed, input.persistDir);
+  return claimed;
 }
 
 export function recordRecoveryEpisodeTreatment(input: {
@@ -738,7 +820,33 @@ export function recordRecoveryEpisodeTreatment(input: {
   evidenceFingerprint?: string;
   typedReason?: string;
   runDir?: string;
+  episodeKey: RecoveryEpisodeKey;
+  recipes?: readonly string[];
+  strategyBound?: number;
 }): StageAttemptLedger {
+  const key = assertCompleteRecoveryEpisodeKey(input.episodeKey, "recordRecoveryEpisodeTreatment");
+  const nowIso = new Date().toISOString();
+  const recipes = input.recipes ?? STAGE_RECOVERY_RECIPE_ORDER;
+  const bound = input.strategyBound ?? 1;
+  const projected = resumeEpisodeFromAttempts(
+    input.ledger.attempts as unknown as LoopRecoveryAttempt[],
+    key,
+  ) ?? emptyEpisode(key, nowIso);
+  const attemptsPerStrategy = { ...projected.attempts_per_strategy };
+  attemptsPerStrategy[input.action] = (attemptsPerStrategy[input.action] ?? 0) + 1;
+  const strategyCursor = nextMonotonicStageCursor(
+    recipes,
+    projected.strategy_cursor,
+    input.action,
+    attemptsPerStrategy,
+    bound,
+  );
+  const episode = {
+    ...projected,
+    attempts_per_strategy: attemptsPerStrategy,
+    strategy_cursor: strategyCursor,
+    next_eligible_at: nowIso,
+  };
   const claimed = claimStageAttempt(input.ledger, {
     headSha: input.headSha,
     action: input.action,
@@ -746,6 +854,13 @@ export function recordRecoveryEpisodeTreatment(input: {
     evidenceFingerprint: input.evidenceFingerprint,
     typedReason: input.typedReason,
     budgetBefore: 1,
+    invariant: episode.invariant,
+    candidateEpoch: episode.candidate_epoch,
+    evidenceIdentity: episode.evidence_identity,
+    attemptsPerStrategy: episode.attempts_per_strategy,
+    strategyCursor: episode.strategy_cursor,
+    nextEligibleAt: episode.next_eligible_at,
+    episodeId: recoveryEpisodeId(key),
   });
   if (input.runDir) persistStageAttemptLedger(input.runDir, claimed.ledger);
   return claimed.ledger;

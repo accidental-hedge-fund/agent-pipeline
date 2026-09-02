@@ -543,19 +543,19 @@ test("recoverItem: an empty action list is refused for a retry-capable class —
   assert.equal(ledger.recovery_attempts.length, 0, "no attempt is recorded for a refused call");
 });
 
-test("recoverItem: exhausted class budget remains blocked for supervisor scheduling", async () => {
+test("recoverItem: class-wide remaining 0 still claims an unspent per-strategy recipe (#1325)", async () => {
   const { deps, contract, token } = await setup();
   const ledgerFile = "run-1";
-  // Drain the class budget to zero directly (simulating prior exhausted attempts).
   const ledger = await readLedger(deps, ledgerFile);
   ledger.items["100"].recovery_budgets_remaining["implementation-ci"] = 0;
   await import("../scripts/loop/store.ts").then((m) => m.writeLedger(deps, ledger, token));
 
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed again" });
   const result = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] , succeeded: true });
-  assert.equal(result.attempt.outcome, "exhausted");
+  assert.equal(result.attempt.outcome, "recovered");
   assert.equal(result.ledger.stop, null);
-  assert.equal(result.ledger.items["100"].state, "blocked", "item does not resume when its budget is exhausted");
+  assert.equal(result.ledger.items["100"].state, "in_progress");
+  assert.equal(result.attempt.attempts_per_strategy?.["rerun_ci"], 1);
 
   await assert.rejects(() => recoverItem(deps, contract, { runId: "run-1", token, itemId: "200", engine: "claude", actions: [] , succeeded: true }));
 });

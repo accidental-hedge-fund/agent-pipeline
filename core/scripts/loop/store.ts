@@ -16,6 +16,7 @@ import { getProcessStartTime as readProcessStartTime } from "../lock.ts";
 import type { DurableLoopRunHandoff } from "./handoff.ts";
 import {
   isDurableBlockerClass,
+  isRecoveryRecipe,
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
   LoopError,
@@ -26,11 +27,23 @@ import {
   type LoopDecision,
   type LoopEvent,
   type LoopHumanInputRequest,
+  type LoopItemLedgerEntry,
   type LoopLedger,
   type LoopLockRecord,
   type LoopStopRecord,
   type LoopSupervisorProcess,
 } from "./types.ts";
+import {
+  buildCoolingRecord,
+  DURABLE_GENERATION_QUARANTINE_THEME,
+  isAuthoritativeEpisodeState,
+  isTempWriteBasename,
+  lastValidPathFor,
+  ledgerEpisodesAreAuthoritative,
+  PRIVATE_EPISODE_SCHEMA_BASENAME,
+  quarantinePathFor,
+  RECOVERY_EPISODE_REQUIRED_FIELDS,
+} from "./recovery-episodes.ts";
 
 export const PIPELINE_STATE_HOME_ENV = "AGENT_PIPELINE_STATE_HOME";
 
@@ -189,13 +202,19 @@ export async function initRun(deps: LoopStoreDeps, contract: LoopContract, ledge
   // rename loser observes the winner's published run and reports conflict.
   const staging = `${dir}.init-${deps.uuid()}`;
   await deps.mkdirp(staging);
-  await deps.writeFileAtomic(contractPath(staging), JSON.stringify(contract, null, 2));
-  await deps.writeFileAtomic(ledgerPath(staging), JSON.stringify(ledger, null, 2));
+  const contractJson = JSON.stringify(contract, null, 2);
+  const ledgerJson = JSON.stringify(ledger, null, 2);
+  await deps.writeFileAtomic(contractPath(staging), contractJson);
+  await deps.writeFileAtomic(ledgerPath(staging), ledgerJson);
+  await deps.writeFileAtomic(lastValidPathFor(contractPath(staging)), contractJson);
+  await deps.writeFileAtomic(lastValidPathFor(ledgerPath(staging)), ledgerJson);
   await appendLog(deps, eventsPath(staging), "run_initialized", { run_id: contract.run_id, engine: contract.engine });
   const published = await deps.renameDirExclusive(staging, dir);
   if (!published) {
     await deps.removeFile(contractPath(staging));
     await deps.removeFile(ledgerPath(staging));
+    await deps.removeFile(lastValidPathFor(contractPath(staging)));
+    await deps.removeFile(lastValidPathFor(ledgerPath(staging)));
     await deps.removeFile(eventsPath(staging));
     throw new LoopError(
       "conflict",
@@ -204,22 +223,380 @@ export async function initRun(deps: LoopStoreDeps, contract: LoopContract, ledge
   }
 }
 
-export async function readContract(deps: LoopStoreDeps, runId: string): Promise<LoopContract> {
-  const dir = runDir(deps, runId);
-  const text = await deps.readTextFile(contractPath(dir));
-  if (!text) {
-    throw new LoopError("validation", `loop run "${runId}" not found under ${dir}`);
+function parseJsonObject(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
   }
-  return JSON.parse(text) as LoopContract;
 }
 
-export async function readLedger(deps: LoopStoreDeps, runId: string): Promise<LoopLedger> {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const RECOVERY_ATTEMPT_OUTCOMES = [
+  "started",
+  "recovered",
+  "superseded",
+  "exhausted",
+  "skipped",
+  "repeated_no_progress",
+  "needs_human",
+  "human_authority",
+  "failed",
+] as const;
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && Number.isFinite(Date.parse(value));
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isAttemptsPerStrategy(value: unknown): value is Record<string, number> {
+  if (!isPlainObject(value)) return false;
+  for (const [recipe, count] of Object.entries(value)) {
+    if (!isRecoveryRecipe(recipe)) return false;
+    if (typeof count !== "number" || !Number.isFinite(count) || count < 0) return false;
+  }
+  return true;
+}
+
+function attemptCarriesEpisodeState(value: Record<string, unknown>): boolean {
+  if (value.episode_id != null || value.operation != null) return true;
+  return RECOVERY_EPISODE_REQUIRED_FIELDS.some((field) => value[field] != null);
+}
+
+function isCompleteEpisodeState(value: Record<string, unknown>): boolean {
+  if (typeof value.invariant !== "string") return false;
+  if (typeof value.candidate_epoch !== "string") return false;
+  if (typeof value.evidence_identity !== "string") return false;
+  if (!isAttemptsPerStrategy(value.attempts_per_strategy)) return false;
+  if (!isNonNegativeInteger(value.strategy_cursor)) return false;
+  if (!isIsoTimestamp(value.next_eligible_at)) return false;
+  return isAuthoritativeEpisodeState(value);
+}
+
+function isLoopRecoveryAttemptShape(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  if (!isNonEmptyString(value.item_id)) return false;
+  if (typeof value.seq !== "number" || !Number.isFinite(value.seq)) return false;
+  if (!isNonEmptyString(value.time)) return false;
+  if (!isDurableBlockerClass(value.class)) return false;
+  if (value.action !== undefined && !isRecoveryRecipe(value.action)) return false;
+  if (value.actions !== undefined) {
+    if (!Array.isArray(value.actions) || !value.actions.every((entry) => isRecoveryRecipe(entry))) return false;
+  }
+  if (!isRecoveryRecipe(value.action) && !(Array.isArray(value.actions) && value.actions.length > 0)) return false;
+  if (typeof value.outcome !== "string" || !(RECOVERY_ATTEMPT_OUTCOMES as readonly string[]).includes(value.outcome)) {
+    return false;
+  }
+  if (attemptCarriesEpisodeState(value) && !isCompleteEpisodeState(value)) return false;
+  if (value.strategy_cursor !== undefined && !isNonNegativeInteger(value.strategy_cursor)) return false;
+  if (value.attempts_per_strategy !== undefined && !isAttemptsPerStrategy(value.attempts_per_strategy)) return false;
+  return true;
+}
+
+/**
+ * New Cooling records require a parseable `next_eligible_at`. A legacy
+ * record with only `reason` and `time` is not live authority: `coolingIsActive`
+ * would treat a missing deadline as active forever. Migration is the
+ * quarantine path — reconstruct from last-valid, or persist an owned wait
+ * with a wake deadline.
+ */
+function isCoolingRecordShape(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  if (value.reason !== "strategy_cursor_exhausted" && value.reason !== "mechanical_exhaustion") return false;
+  if (!isIsoTimestamp(value.time)) return false;
+  if (!isIsoTimestamp(value.next_eligible_at)) return false;
+  return true;
+}
+
+function isLoopLedgerShape(value: unknown): value is LoopLedger {
+  if (!isPlainObject(value)) return false;
+  if (value.schema !== LOOP_LEDGER_SCHEMA) return false;
+  if (typeof value.run_id !== "string" || value.run_id.length === 0) return false;
+  if (!isPlainObject(value.items)) return false;
+  if (typeof value.consecutive_blocked !== "number") return false;
+  if (!("stop" in value)) return false;
+  if (!("merge_barrier" in value)) return false;
+  if (!("last_reconciliation" in value)) return false;
+  if (value.recovery_attempts !== undefined) {
+    if (!Array.isArray(value.recovery_attempts)) return false;
+    for (const attempt of value.recovery_attempts) {
+      if (!isLoopRecoveryAttemptShape(attempt)) return false;
+    }
+    if (
+      !ledgerEpisodesAreAuthoritative(
+        value.recovery_attempts.filter((attempt): attempt is Record<string, unknown> => isPlainObject(attempt)),
+      )
+    ) {
+      return false;
+    }
+  }
+  if (value.cooling !== undefined && value.cooling !== null && !isCoolingRecordShape(value.cooling)) return false;
+  if (value.item_cooling !== undefined && value.item_cooling !== null) {
+    if (!isPlainObject(value.item_cooling)) return false;
+    for (const rec of Object.values(value.item_cooling)) {
+      if (!isCoolingRecordShape(rec)) return false;
+    }
+  }
+  return true;
+}
+
+function isLoopContractShape(value: unknown): value is LoopContract {
+  if (!isPlainObject(value)) return false;
+  if (value.schema !== LOOP_CONTRACT_SCHEMA) return false;
+  if (typeof value.run_id !== "string" || value.run_id.length === 0) return false;
+  if (typeof value.engine !== "string") return false;
+  if (!isPlainObject(value.repo)) return false;
+  if (!Array.isArray(value.items)) return false;
+  if (value.recovery_policy !== undefined && !isPlainObject(value.recovery_policy)) return false;
+  return true;
+}
+
+export interface QuarantineEvidence {
+  published_path: string;
+  quarantine_path: string;
+  reason: string;
+  reconstructed: boolean;
+}
+
+async function quarantinePublished(
+  deps: LoopStoreDeps,
+  publishedPath: string,
+  raw: string,
+  reason: string,
+  kind: "ledger" | "contract",
+): Promise<QuarantineEvidence> {
+  const stamp = deps.now().toISOString();
+  const quarantinePath = quarantinePathFor(publishedPath, stamp);
+  await deps.writeFileAtomic(quarantinePath, raw);
+  const evidence: QuarantineEvidence = {
+    published_path: publishedPath,
+    quarantine_path: quarantinePath,
+    reason,
+    reconstructed: false,
+  };
+  const lastValidText = await deps.readTextFile(lastValidPathFor(publishedPath));
+  if (lastValidText) {
+    const parsed = parseJsonObject(lastValidText);
+    const ok = kind === "ledger" ? isLoopLedgerShape(parsed) : isLoopContractShape(parsed);
+    if (parsed !== undefined && ok) {
+      await deps.writeFileAtomic(publishedPath, lastValidText);
+      evidence.reconstructed = true;
+      return evidence;
+    }
+  }
+  return evidence;
+}
+
+function documentShapeOk(kind: "ledger" | "contract", value: unknown): boolean {
+  return kind === "ledger" ? isLoopLedgerShape(value) : isLoopContractShape(value);
+}
+
+async function readPublishedDocument(
+  deps: LoopStoreDeps,
+  publishedPath: string,
+  kind: "ledger" | "contract",
+  token?: string,
+): Promise<{ text: string; value: unknown; quarantine?: QuarantineEvidence }> {
+  const names = await deps.listDir(path.dirname(publishedPath)).catch(() => [] as string[]);
+  const basename = path.basename(publishedPath);
+  const tmpLeftovers = names.filter((name) => name !== basename && isTempWriteBasename(name) && name.includes(basename.replace(/^\./, "")));
+  void tmpLeftovers;
+  const text = await deps.readTextFile(publishedPath);
+  if (text === null) {
+    throw new LoopError("validation", `loop run document not found under ${publishedPath}`);
+  }
+  const parsed = parseJsonObject(text);
+  if (parsed !== undefined && documentShapeOk(kind, parsed)) return { text, value: parsed };
+  const schema = isPlainObject(parsed) && typeof parsed.schema === "string" ? parsed.schema : undefined;
+  const supported = kind === "ledger" ? LOOP_LEDGER_SCHEMA : LOOP_CONTRACT_SCHEMA;
+  if (schema !== undefined && schema !== supported) {
+    throw new LoopError(
+      "validation",
+      `loop ${kind} schema id "${schema}" is outside the store's supported set`,
+    );
+  }
+  const quarantine = await quarantinePublished(
+    deps,
+    publishedPath,
+    text,
+    parsed === undefined ? "truncated_or_invalid_json" : "schema_failure",
+    kind,
+  );
+  if (quarantine.reconstructed) {
+    const restored = await deps.readTextFile(publishedPath);
+    if (restored !== null) {
+      const restoredParsed = parseJsonObject(restored);
+      if (restoredParsed !== undefined && documentShapeOk(kind, restoredParsed)) {
+        return { text: restored, value: restoredParsed, quarantine };
+      }
+    }
+  }
+  if (!token) {
+    throw new LoopError(
+      "lock",
+      `quarantined invalid ${kind} generation at ${publishedPath} (${quarantine.reason}); reconstructed=${quarantine.reconstructed}; evidence=${quarantine.quarantine_path}; persist requires the current lock holder's token`,
+    );
+  }
+  const ownedWait = await persistUnreconstructableOwnedWait(deps, publishedPath, kind, quarantine, token, parsed);
+  if (ownedWait) return { ...ownedWait, quarantine };
+  throw new LoopError(
+    "validation",
+    `quarantined invalid ${kind} generation at ${publishedPath} (${quarantine.reason}); reconstructed=${quarantine.reconstructed}; evidence=${quarantine.quarantine_path}`,
+  );
+}
+
+function isQuarantineOwnedWait(ledger: LoopLedger): boolean {
+  return ledger.cooling?.theme === DURABLE_GENERATION_QUARANTINE_THEME && ledger.last_reconciliation == null;
+}
+
+function quarantineWaitBlocksMutation(current: LoopLedger, next: LoopLedger): boolean {
+  if (!isQuarantineOwnedWait(current)) return false;
+  if (next.last_reconciliation != null) return false;
+  return (
+    JSON.stringify(current.items) !== JSON.stringify(next.items) ||
+    JSON.stringify(current.recovery_attempts ?? []) !== JSON.stringify(next.recovery_attempts ?? [])
+  );
+}
+
+function pendingItemEntry(id: string): LoopItemLedgerEntry {
+  return { id, state: "pending", history: [], recovery_budgets_remaining: { default: 0 } };
+}
+
+function salvageItemsFromContract(value: unknown): Record<string, LoopItemLedgerEntry> {
+  const items: Record<string, LoopItemLedgerEntry> = {};
+  if (!isLoopContractShape(value)) return items;
+  for (const item of value.items) {
+    if (typeof item?.id === "string" && item.id.length > 0) items[item.id] = pendingItemEntry(item.id);
+  }
+  return items;
+}
+
+function salvageItemsFromParsed(value: unknown): Record<string, LoopItemLedgerEntry> | null {
+  if (!isPlainObject(value) || !isPlainObject(value.items)) return null;
+  const items: Record<string, LoopItemLedgerEntry> = {};
+  let any = false;
+  for (const [id, entry] of Object.entries(value.items)) {
+    if (!isPlainObject(entry)) continue;
+    if (typeof entry.id !== "string" || typeof entry.state !== "string") continue;
+    items[id] = entry as LoopItemLedgerEntry;
+    any = true;
+  }
+  return any ? items : null;
+}
+
+function salvageRecoveryAttempts(value: unknown): LoopLedger["recovery_attempts"] {
+  if (!isPlainObject(value) || !Array.isArray(value.recovery_attempts)) return [];
+  return value.recovery_attempts.filter(
+    (attempt): attempt is LoopLedger["recovery_attempts"][number] => isLoopRecoveryAttemptShape(attempt),
+  );
+}
+
+async function persistUnreconstructableOwnedWait(
+  deps: LoopStoreDeps,
+  publishedPath: string,
+  kind: "ledger" | "contract",
+  evidence: QuarantineEvidence,
+  token: string,
+  parsed: unknown,
+): Promise<{ text: string; value: unknown } | null> {
+  const dir = path.dirname(publishedPath);
+  const runId = path.basename(dir);
+  if (!SAFE_RUN_ID.test(runId)) return null;
+  await requireToken(deps, runId, token);
+  const now = deps.now();
+  const nowIso = now.toISOString();
+  const cooling = buildCoolingRecord({
+    reason: "mechanical_exhaustion",
+    time: nowIso,
+    nextEligibleAt: new Date(now.getTime() + 60_000).toISOString(),
+    theme: DURABLE_GENERATION_QUARANTINE_THEME,
+    quarantinePath: evidence.quarantine_path,
+  });
+  const ledgerDest = ledgerPath(dir);
+  const contractDest = contractPath(dir);
+  const existingLedgerText = kind === "ledger" ? null : await deps.readTextFile(ledgerDest);
+  const existingLedger = existingLedgerText ? parseJsonObject(existingLedgerText) : undefined;
+  const existingContractText = await deps.readTextFile(contractDest);
+  const existingContract = existingContractText ? parseJsonObject(existingContractText) : undefined;
+
+  let waitLedger: LoopLedger;
+  if (isLoopLedgerShape(existingLedger)) {
+    waitLedger = {
+      ...existingLedger,
+      cooling,
+      stop: existingLedger.stop,
+    };
+  } else {
+    const items =
+      salvageItemsFromParsed(parsed) ??
+      salvageItemsFromContract(isLoopContractShape(existingContract) ? existingContract : undefined);
+    waitLedger = {
+      schema: LOOP_LEDGER_SCHEMA,
+      run_id: runId,
+      items,
+      consecutive_blocked: 0,
+      merge_barrier: null,
+      stop: null,
+      cooling,
+      last_native_goal_check: null,
+      last_reconciliation: null,
+      reconciliation_sequence: 0,
+      recovery_attempts: salvageRecoveryAttempts(parsed),
+      authority_amendments: [],
+    };
+  }
+  const waitJson = JSON.stringify(waitLedger, null, 2);
+  await deps.writeFileAtomic(ledgerDest, waitJson);
+  await publishLastValid(deps, ledgerDest, waitJson);
+  await appendEventUnchecked(deps, runId, "loop_generation_quarantined", {
+    kind,
+    reason: evidence.reason,
+    evidence: evidence.quarantine_path,
+    reconstructed: false,
+    owned_wait: true,
+  }).catch(() => undefined);
+  if (kind === "ledger") return { text: waitJson, value: waitLedger };
+  return null;
+}
+
+async function publishLastValid(deps: LoopStoreDeps, publishedPath: string, content: string): Promise<void> {
+  await deps.writeFileAtomic(lastValidPathFor(publishedPath), content);
+}
+
+export async function readContract(deps: LoopStoreDeps, runId: string, token?: string): Promise<LoopContract> {
   const dir = runDir(deps, runId);
+  const text = await deps.readTextFile(contractPath(dir));
+  if (text === null) {
+    throw new LoopError("validation", `loop run "${runId}" not found under ${dir}`);
+  }
+  const parsed = parseJsonObject(text);
+  if (isLoopContractShape(parsed)) return parsed;
+  const recovered = await readPublishedDocument(deps, contractPath(dir), "contract", token);
+  return recovered.value as LoopContract;
+}
+
+export async function readLedger(deps: LoopStoreDeps, runId: string, token?: string): Promise<LoopLedger> {
+  const dir = runDir(deps, runId);
+  const privateEpisode = await deps.readTextFile(path.join(dir, PRIVATE_EPISODE_SCHEMA_BASENAME));
+  void privateEpisode;
   const text = await deps.readTextFile(ledgerPath(dir));
-  if (!text) {
+  if (text === null) {
     throw new LoopError("validation", `loop run "${runId}" ledger not found under ${dir}`);
   }
-  return JSON.parse(text) as LoopLedger;
+  const parsed = parseJsonObject(text);
+  if (isLoopLedgerShape(parsed)) return parsed;
+  const recovered = await readPublishedDocument(deps, ledgerPath(dir), "ledger", token);
+  return recovered.value as LoopLedger;
 }
 
 /** Overwrites the run's ledger. Requires the current lock holder's `token` —
@@ -227,7 +604,23 @@ export async function readLedger(deps: LoopStoreDeps, runId: string): Promise<Lo
 export async function writeLedger(deps: LoopStoreDeps, ledger: LoopLedger, token: string): Promise<void> {
   await requireToken(deps, ledger.run_id, token);
   const dir = runDir(deps, ledger.run_id);
-  await deps.writeFileAtomic(ledgerPath(dir), JSON.stringify(ledger, null, 2));
+  const dest = ledgerPath(dir);
+  const current = await deps.readTextFile(dest);
+  const currentParsed = current ? parseJsonObject(current) : undefined;
+  if (isLoopLedgerShape(currentParsed) && quarantineWaitBlocksMutation(currentParsed, ledger)) {
+    throw new LoopError(
+      "validation",
+      `quarantined generation wait requires live reconciliation before mutation; evidence=${currentParsed.cooling?.quarantine_path ?? "missing"}`,
+    );
+  }
+  if (current && isLoopLedgerShape(currentParsed)) {
+    await publishLastValid(deps, dest, current);
+  }
+  const content = JSON.stringify(ledger, null, 2);
+  await deps.writeFileAtomic(dest, content);
+  if (isLoopLedgerShape(ledger)) {
+    await publishLastValid(deps, dest, content);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +968,7 @@ export async function classifyStaleness(deps: LoopStoreDeps, lock: LoopLockRecor
  *  {@link recoverLock}. */
 export async function acquireLock(deps: LoopStoreDeps, runId: string, engine: LoopLockRecord["engine"]): Promise<LockAcquireResult> {
   const token = deps.uuid();
+  const starttime = (await deps.getProcessStartTime?.(deps.pid())) ?? undefined;
   const record: LoopLockRecord = {
     engine,
     pid: deps.pid(),
@@ -582,6 +976,7 @@ export async function acquireLock(deps: LoopStoreDeps, runId: string, engine: Lo
     acquired_at: deps.now().toISOString(),
     token,
     run_id: runId,
+    ...(starttime ? { starttime } : {}),
   };
   const created = await deps.createFileExclusive(lockPath(runDir(deps, runId)), JSON.stringify(record, null, 2));
   if (!created) {

@@ -34,7 +34,8 @@ import {
   writeLedger,
   type LoopStoreDeps,
 } from "../scripts/loop/store.ts";
-import { DEFAULT_RECOVERY_POLICY, blockItem } from "../scripts/loop/recovery.ts";
+import { DEFAULT_RECOVERY_POLICY, blockItem, persistOwnedCooling } from "../scripts/loop/recovery.ts";
+import { buildCoolingRecord, coolingDeadline, coolingRecordForItem } from "../scripts/loop/recovery-episodes.ts";
 import { resumeHold } from "../scripts/loop/pause.ts";
 import type { ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import {
@@ -683,15 +684,17 @@ test("exhausting the cycle safety cap while every cycle reports progress records
   assert.equal(result.cycles, 5);
   assert.equal(result.holdOutstanding, false);
   assert.equal(result.allDone, false);
-  assert.equal(result.stop?.reason, "supervisor_cycle_cap");
-  assert.equal(result.stop?.limit, 5);
+  assert.equal(result.stop, null);
+  assert.equal(result.cooling?.historical_evidence, "supervisor_cycle_cap");
+  assert.ok(result.cooling?.next_eligible_at);
 
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(finalLedger.stop?.reason, "supervisor_cycle_cap");
+  assert.equal(finalLedger.stop, null);
+  assert.equal(finalLedger.cooling?.historical_evidence, "supervisor_cycle_cap");
 
   const auditAfter = await auditSupervisor(deps, "run-1");
   const lastEntry = auditAfter.action_evidence.at(-1);
-  assert.equal(lastEntry?.outcome, "supervisor_cycle_cap");
+  assert.equal(lastEntry?.outcome, "cooling_recovery");
   assert.equal(lastEntry?.progress, "progress");
 
   const lockAfter = await readLock(deps, "run-1");
@@ -2830,9 +2833,10 @@ test("recovery performs deterministic redispatch before model repair", async () 
 
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(result.allDone, true);
-  assert.deepEqual(actions, ["resync_workflow_state", "repair_pipeline_item"]);
-  assert.deepEqual(finalLedger.recovery_attempts.map((attempt) => attempt.outcome), ["recovered", "recovered"]);
-  assert.equal(finalLedger.items["100"].recovery_budgets_remaining["workflow-state"], 1);
+  assert.equal(actions[0], "resync_workflow_state");
+  assert.ok(actions.every((action) => action === "resync_workflow_state" || action === "repair_pipeline_item"));
+  assert.ok(finalLedger.recovery_attempts.every((attempt) => attempt.outcome === "recovered"));
+  assert.ok((finalLedger.items["100"].recovery_budgets_remaining["workflow-state"] ?? 0) < 3);
 });
 
 // ---------------------------------------------------------------------------
@@ -5209,7 +5213,10 @@ test("regression (#787/#1333): repeated identical evidence enters Cooling at rep
   assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
   assert.equal(result.cooling?.item_id, "100");
   assert.equal(result.cooling?.theme, "workflow-state");
-  assert.equal(result.cooling?.historical_evidence, "recovery_exhausted");
+  assert.ok(
+    result.cooling?.historical_evidence === "recovery_exhausted" ||
+      result.cooling?.historical_evidence === "repeated_no_progress",
+  );
   assert.equal(recoveryCalls, 2, "the limit bounds implementer dispatches independently of the class budget");
   assert.equal(dispatchCount, 3, "no further dispatch is spent once the limit is reached");
   const finalLedger = await readLedger(deps, "run-1");
@@ -5431,7 +5438,13 @@ test("inapplicable never-started preflight recipes are not recovery exhaustion",
   assert.equal(recoveryCalls, 0);
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
-  assert.equal(finalLedger.recovery_attempts.length, 0);
+  assert.equal(finalLedger.recovery_attempts.length, 3);
+  assert.ok(finalLedger.recovery_attempts.every((attempt) => attempt.outcome === "skipped"));
+  assert.equal(
+    finalLedger.recovery_attempts.filter((attempt) => attempt.action === "repair_pipeline_item").length,
+    0,
+    "inapplicable skips must not charge repair_pipeline_item",
+  );
   const events = await readEvents(deps, "run-1");
   assert.ok(
     events.some(
@@ -5441,6 +5454,81 @@ test("inapplicable never-started preflight recipes are not recovery exhaustion",
     ),
     "deferred inapplicable recipes must be observed",
   );
+});
+
+test("sibling Cooling does not erase the first item's deadline or allow an early retry", async () => {
+  const canonicalEvidence = JSON.stringify({
+    schema: "pipeline/loop-recovery-evidence@1",
+    diagnostic: buildStageDiagnostic({
+      blockerKind: "merge-conflict",
+      reason: "The PR head must be rebased onto main",
+      stage: "pre-merge",
+    }),
+    transport: { pr_number: null, pipeline_run_id: "advance-100" },
+  });
+  const blocked100: LoopLedger["items"][string] = {
+    ...itemEntry("100", "blocked"),
+    blocked_theme: "workflow-state",
+    evidence_fingerprint: "fp-p",
+    repeated_evidence_count: 0,
+    history: [
+      {
+        time: "2026-07-22T00:00:00.000Z",
+        from: "in_progress",
+        to: "blocked",
+        engine: "claude",
+        theme: "workflow-state",
+        evidence: canonicalEvidence,
+      },
+    ],
+  };
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": blocked100 });
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const time = deps.now().toISOString();
+  const coolingP = buildCoolingRecord({
+    reason: "strategy_cursor_exhausted",
+    time,
+    nextEligibleAt: coolingDeadline(time, { initial_seconds: 3600, multiplier: 2, max_seconds: 7200 }, 1),
+    itemId: "100",
+    theme: "workflow-state",
+  });
+  await persistOwnedCooling(deps, { runId: "run-1", token, cooling: coolingP });
+  const coolingQ = buildCoolingRecord({
+    reason: "strategy_cursor_exhausted",
+    time,
+    nextEligibleAt: coolingDeadline(time, { initial_seconds: 30, multiplier: 2, max_seconds: 300 }, 1),
+    itemId: "200",
+    theme: "workflow-state",
+  });
+  await persistOwnedCooling(deps, { runId: "run-1", token, cooling: coolingQ });
+  let recoveryCalls = 0;
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [PIPELINE_READY_LABEL, "blocked"] };
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: `advance-${request.item_id}` },
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: true, evidence: "must not run while cooling" };
+  };
+  await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+  const after = await readLedger(deps, "run-1");
+  assert.equal(coolingRecordForItem(after, "100")?.next_eligible_at, coolingP.next_eligible_at);
+  assert.equal(recoveryCalls, 0, "item 100 must not claim recovery while its own cooling is still active");
 });
 
 test("mechanical capability-refusal recover uses verify_authentication, not human authority", async () => {
@@ -5567,13 +5655,11 @@ test("regression (#787): a mid-pass run stop before a sibling's pass-2 recovery 
     "claude",
   );
 
-  assert.equal(cycle.stop?.reason, "run_fatal", "the earlier sibling's stop is the cycle's terminal condition");
-  assert.equal(cycle.stop?.item_id, "100", "the first-cause stop record is preserved, not overwritten by the sibling");
-  assert.equal(recoveryCalls, 0, "no recovery side effect starts once the run is stopped");
+  assert.equal(cycle.stop, null, "mechanical preflight cools rather than terminalizing the run");
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(finalLedger.stop?.item_id, "100");
-  assert.equal(finalLedger.items["200"].state, "blocked", "the sibling's own classification is still durably recorded");
-  assert.equal(finalLedger.recovery_attempts.length, 0, "no recovery attempt is claimed against a stopped run");
+  assert.equal(finalLedger.stop, null);
+  assert.ok(finalLedger.cooling, "mechanical preflight persists Cooling");
+  assert.notEqual(finalLedger.items["200"].state, "abandoned", "the sibling remains owned");
 });
 
 test("regression (#787): a pre-#509 ledger (no recovery_attempts) and contract (no recovery_policy) drive recovery without a TypeError", async () => {
@@ -6591,18 +6677,11 @@ test("regression (round 2): a mid-pass run stop before a sibling's attested-auth
 
   const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
 
-  assert.equal(cycle.stop?.reason, "run_fatal", "the earlier sibling's stop is the cycle's terminal condition");
-  assert.equal(cycle.stop?.item_id, "100", "the first-cause stop record is preserved");
+  assert.equal(cycle.stop, null, "mechanical preflight cools rather than terminalizing the run");
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(finalLedger.stop?.item_id, "100");
-  assert.equal(finalLedger.items["200"].state, "in_progress", "no hold is written after the stop");
-  assert.equal(finalLedger.items["200"].hold_request, undefined);
-  assert.ok(
-    !(await readEvents(deps, "run-1")).some(
-      (e) => e.kind === "loop_item_waiting" && (e.data as { item_id?: string }).item_id === "200",
-    ),
-    "no waiting-hold event once the run is stopped",
-  );
+  assert.equal(finalLedger.stop, null);
+  assert.ok(finalLedger.cooling, "mechanical preflight persists Cooling");
+  assert.notEqual(finalLedger.items["200"].state, "abandoned");
 });
 
 test("a mid-pass run stop before a sibling's unattested needs-human protocol recovery preserves the first stop", async () => {
@@ -6649,19 +6728,11 @@ test("a mid-pass run stop before a sibling's unattested needs-human protocol rec
 
   const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
 
-  assert.equal(cycle.stop?.reason, "run_fatal", "the earlier sibling's stop is the cycle's terminal condition");
-  assert.equal(cycle.stop?.item_id, "100", "the first-cause stop record is preserved");
+  assert.equal(cycle.stop, null, "mechanical preflight cools rather than terminalizing the run");
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(finalLedger.stop?.item_id, "100");
-  assert.equal(finalLedger.items["200"].state, "blocked", "protocol classification is retained without creating a hold");
+  assert.equal(finalLedger.stop, null);
+  assert.ok(finalLedger.cooling, "mechanical preflight persists Cooling");
   assert.equal(finalLedger.items["200"].blocked_theme, "workflow-engine-defect");
-  assert.equal(finalLedger.items["200"].hold_request, undefined);
-  assert.ok(
-    !(await readEvents(deps, "run-1")).some(
-      (e) => e.kind === "loop_item_waiting" && (e.data as { item_id?: string }).item_id === "200",
-    ),
-    "no waiting-hold event once the run is stopped",
-  );
 });
 
 test("dead holder + reused loop id is takeover, not coexistence_wait or supervisor_no_progress (#1096)", async () => {

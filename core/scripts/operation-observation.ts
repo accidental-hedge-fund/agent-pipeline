@@ -148,6 +148,14 @@ export interface OperationObservation extends OperationIdentity {
   fault: string | null;
   message: string;
   capability_request: CapabilityRequestObservation | null;
+  /** Recovery Episode fields on the shared claim family (#1325). */
+  invariant?: string;
+  candidate_epoch?: string;
+  evidence_identity?: string;
+  attempts_per_strategy?: Record<string, number>;
+  strategy_cursor?: number;
+  next_eligible_at?: string;
+  episode_id?: string;
 }
 
 export type ReportOperationObservation = (obs: OperationObservation) => void;

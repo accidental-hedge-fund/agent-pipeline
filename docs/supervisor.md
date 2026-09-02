@@ -12,7 +12,11 @@ request, cancellation, or a terminal mechanical outcome. `setBlocked` is a
 **lifecycle projector** (labels and comments), not lifecycle policy.
 `pipeline recover-parked` and internal `auto_recover` are compatibility
 entrypoints on the same Recovery Episode. There is no `pipeline supervise-advance`
-verb.
+verb and no `pipeline supervise-recovery` verb. RecoverySupervisor persists a
+candidate-scoped Recovery Episode (strategy cursor, per-strategy bounds,
+`next_eligible_at`) on the shared recovery-attempt family. Mechanical exhaustion
+enters owned Cooling or an external-condition wait. It does not end lifecycle
+ownership. Independent siblings stay schedulable while one item cools.
 
 Related:
 

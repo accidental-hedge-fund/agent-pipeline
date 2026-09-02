@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change release-blocked-worktrees-on-hold. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Pure worktree capacity SHALL be an ops admission disposition, not product needs-human
 
 When the sole reason an issue cannot start or obtain a worktree is that `otherActive` managed worktrees already meet `cfg.max_concurrent_worktrees`, the pipeline SHALL treat that outcome as an **ops/capacity admission** failure — not as a product-judgment needs-human decision that requests a human answer, override, or product disposition. The outcome SHALL be machine-distinguishable from product `needs-human` (a dedicated capacity kind, error identity, or equivalent typed field locked by tests). Operator-facing text SHALL state that capacity is full, that the operator should wait for active work to complete or for safe park-release to free slots, and SHALL NOT use product-override / “answer the findings” recipe language for that pure-capacity case.
@@ -20,7 +22,7 @@ When the sole reason an issue cannot start or obtain a worktree is that `otherAc
 
 ### Requirement: Durable loop SHALL NOT cascade per-item capacity human blocks
 
-When a durable multi-item loop would schedule further pending items and the only barrier to starting them is worktree capacity, the supervisor SHALL NOT mark each remaining pending item as a product `blocked` / needs-human hold in sequence solely for capacity. After park-release has freed safe parked slots, new starts MAY proceed within the cap. If residual capacity is still full because true-active (non-parked) worktrees occupy every slot, the run SHALL stop admitting new starts with a clear capacity / `worktree_capacity` (or equivalent) run-level or admission reason and SHALL preserve already-ready and already-held sibling state without inventing product human answer requests for pure capacity.
+When a durable multi-item loop would schedule further pending items and the only barrier to starting them is worktree capacity, the supervisor SHALL NOT mark each remaining pending item as a product `blocked` / needs-human hold in sequence solely for capacity. After park-release has freed safe parked slots, new starts MAY proceed within the cap. If residual capacity is still full because true-active (non-parked) worktrees occupy every slot, RecoverySupervisor SHALL persist owned Cooling or an external-condition wait with a clear capacity reason and a future `next_eligible_at`. It SHALL preserve already-ready and already-held sibling state without inventing product human answer requests for pure capacity. Residual capacity SHALL NOT persist `worktree_capacity` as a lifecycle terminal stop.
 
 #### Scenario: Park-release frees a slot for the next pending item
 
@@ -34,8 +36,10 @@ When a durable multi-item loop would schedule further pending items and the only
 
 - **WHEN** every capacity slot is held by non-parked active worktrees
 - **AND** one or more pending items remain schedulable by dependency rules alone
-- **THEN** the durable loop SHALL stop or hold admission with a capacity reason
+- **THEN** RecoverySupervisor SHALL persist Cooling or an external-condition wait with a capacity reason
 - **AND** it SHALL NOT sequentially label each remaining pending item product-blocked for capacity alone
+- **AND** it SHALL NOT persist `worktree_capacity` as a lifecycle terminal stop
+- **AND** already-active siblings SHALL remain owned
 
 #### Scenario: Product needs-human holds are unchanged
 

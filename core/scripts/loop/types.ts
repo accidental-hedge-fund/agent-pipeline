@@ -225,6 +225,12 @@ export interface RecoveryPolicyEntry {
   /** Consecutive identical-evidence-fingerprint repeats permitted on the same
    *  item before the run stops terminally for repeated no-progress. */
   repeated_evidence_limit: number;
+  /**
+   * Per-strategy attempt bound. Absent on pre-#1325 policies; runtime uses
+   * {@link retry_budget} per applicable recipe as the production bound.
+   * Class-wide `retry_budget` remains a compatibility projection only.
+   */
+  per_strategy_bound?: number;
 }
 
 /** A machine-readable, validated recovery policy covering every
@@ -241,6 +247,7 @@ export type RecoveryAttemptOutcome =
   | "recovered"
   | "superseded"
   | "exhausted"
+  | "skipped"
   | "repeated_no_progress"
   | "needs_human"
   | "human_authority"
@@ -301,6 +308,24 @@ export interface LoopRecoveryAttempt {
   idempotency_key?: string;
   /** PR head SHA when the attempt is stage-bound to a head (#759). */
   head_sha?: string;
+  /**
+   * Recovery Episode fields (#1325). Required after a claimed treatment on
+   * the shared recovery-attempt family. Optional on pre-#1325 ledgers.
+   */
+  invariant?: string;
+  candidate_epoch?: string;
+  evidence_identity?: string;
+  attempts_per_strategy?: Record<string, number>;
+  strategy_cursor?: number;
+  skipped_strategies?: RecoveryRecipe[];
+  next_eligible_at?: string;
+  /** Current fenced lease token that authorized this claim. */
+  fence_token?: string;
+  /** Side-effect certainty for takeover reconciliation. Default uncertain while `started`. */
+  side_effect_certainty?: "known_complete" | "known_absent" | "uncertain";
+  /** Stable episode identity over operation + invariant + epoch + evidence. */
+  episode_id?: string;
+  operation?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -718,8 +743,18 @@ export interface LoopCoolingRecord {
   time: string;
   item_id?: string;
   theme?: string;
+  /** Earliest wake time. Required on live Cooling writes (#1325). */
+  next_eligible_at?: string;
   /** Historical evidence token only — not a lifecycle STOP. */
-  historical_evidence?: "recovery_exhausted";
+  historical_evidence?:
+    | "recovery_exhausted"
+    | "run_fatal"
+    | "repeated_no_progress"
+    | "supervisor_no_progress"
+    | "supervisor_cycle_cap"
+    | "worktree_capacity";
+  /** Quarantine evidence path when Cooling was entered for unreconstructable durable generation. */
+  quarantine_path?: string;
 }
 
 export interface LoopStopRecord {
@@ -931,10 +966,17 @@ export interface LoopLedger {
   merge_barrier: LoopMergeBarrier | null;
   stop: LoopStopRecord | null;
   /**
-   * Owned Cooling when strategy-cursor exhaustion is current. Absent on
+   * Latest Cooling projection for run-level consumers. Absent on
    * pre-#1333 ledgers. Does not replace a true non-exhaustion `stop`.
+   * Per-item authority is {@link item_cooling}; this field is the most
+   * recently persisted Cooling record and MUST NOT erase sibling deadlines.
    */
   cooling?: LoopCoolingRecord | null;
+  /**
+   * Candidate-scoped Cooling keyed by item id. Survives a later sibling
+   * Cooling write that updates the run-level {@link cooling} projection.
+   */
+  item_cooling?: Record<string, LoopCoolingRecord>;
   last_native_goal_check: LoopNativeGoalCheck | null;
   last_reconciliation: LoopReconciliation | null;
   reconciliation_sequence: number;
@@ -960,6 +1002,8 @@ export interface LoopLockRecord {
   acquired_at: string;
   token: string;
   run_id: string;
+  /** Host process starttime token. Distinguishes PID reuse from the original holder. */
+  starttime?: string;
 }
 
 export interface LoopEvent {

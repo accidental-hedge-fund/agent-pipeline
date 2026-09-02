@@ -24,6 +24,7 @@ import {
   type LoopCoolingRecord,
   type LoopStopRecord,
   type LoopSupervisorProcess,
+  type LoopRecoveryAttempt,
   type RecoveryRecipe,
 } from "./types.ts";
 import {
@@ -63,7 +64,19 @@ import {
   transitionItem,
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
-import { blockItem, completeRecoveryAttempt, fingerprintEvidence, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
+import { blockItem, completeRecoveryAttempt, fingerprintEvidence, persistOwnedCooling, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
+import {
+  buildCoolingRecord,
+  coolingDeadline,
+  coolingIsActive,
+  coolingRecordForItem,
+  emptyEpisode,
+  perStrategyBound,
+  reconcileUncertainClaim,
+  resumeEpisodeFromAttempts,
+  selectNextApplicableStrategy,
+  type SideEffectObserverResult,
+} from "./recovery-episodes.ts";
 import { waitItem, type WaitRequestInput } from "./pause.ts";
 import {
   classifyHumanAsk,
@@ -279,6 +292,14 @@ export interface SupervisorDeps {
   ): unknown;
   /** Clears the handle returned by {@link setHeartbeatInterval}. */
   clearHeartbeatInterval?(handle: unknown): void;
+  /**
+   * Authoritative observer for a started Recovery Episode claim whose
+   * side-effect certainty is uncertain. Takeover must query this before any
+   * new mutation. Default is fail-closed `uncertain` (owned wait).
+   */
+  observeRecoverySideEffect?(
+    attempt: LoopRecoveryAttempt,
+  ): Promise<SideEffectObserverResult> | SideEffectObserverResult;
   /** Best-effort hook invoked once `driveSupervisor` reaches a terminal stop
    *  or full completion — never on an outstanding pause/hold, since the run
    *  is not yet done there (capability `durable-run-blocker-auto-file`, #538).
@@ -333,7 +354,7 @@ async function startItem(
   store: LoopStoreDeps,
   input: { runId: string; token: string; itemId: string; engine: LoopEngineName },
 ): Promise<LoopLedger> {
-  const ledger = await readLedger(store, input.runId);
+  const ledger = await readLedger(store, input.runId, input.token);
   const item = ledger.items[input.itemId];
   if (!item || item.state !== "pending") {
     throw new LoopError(
@@ -360,7 +381,7 @@ async function abandonInProgressItem(
   itemId: string,
   engine: LoopEngineName,
 ): Promise<LoopLedger> {
-  const ledger = await readLedger(store, runId);
+  const ledger = await readLedger(store, runId, token);
   let item = ledger.items[itemId];
   if (!item || item.state !== "in_progress") {
     throw new LoopError(
@@ -390,7 +411,7 @@ async function excludeInProgressItem(
   store: LoopStoreDeps,
   input: { runId: string; token: string; itemId: string; engine: LoopEngineName; exclusion: LoopPreconditionExclusion },
 ): Promise<LoopLedger> {
-  const ledger = await readLedger(store, input.runId);
+  const ledger = await readLedger(store, input.runId, input.token);
   const item = ledger.items[input.itemId];
   if (!item || item.state !== "in_progress") {
     throw new LoopError(
@@ -430,7 +451,7 @@ async function revertInProgressToPending(
   note: string,
   eventName: "loop_item_capacity_wait" | "loop_item_typed_request_auto_settled",
 ): Promise<LoopLedger> {
-  const ledger = await readLedger(store, input.runId);
+  const ledger = await readLedger(store, input.runId, input.token);
   const item = ledger.items[input.itemId];
   if (!item || item.state !== "in_progress") {
     throw new LoopError(
@@ -569,7 +590,7 @@ async function takeoverDeadHolderItem(
     crashFingerprint: string;
   },
 ): Promise<LoopLedger> {
-  const ledger = await readLedger(store, input.runId);
+  const ledger = await readLedger(store, input.runId, input.token);
   const item = ledger.items[input.itemId];
   if (!item) return ledger;
   if (item.state !== "in_progress" && item.state !== "blocked") return ledger;
@@ -732,24 +753,25 @@ async function stopForRecoveryPreflight(
   itemId: string,
   detail: string,
 ): Promise<LoopLedger> {
-  const ledger = await readLedger(deps.store, runId);
+  const ledger = await readLedger(deps.store, runId, token);
   if (ledger.stop) return ledger;
   const time = deps.store.now().toISOString();
-  const stop: LoopStopRecord = {
-    reason: "run_fatal",
+  const policy = contract.recovery_policy["workflow-engine-defect"];
+  const cooling = buildCoolingRecord({
+    reason: "mechanical_exhaustion",
     time,
+    nextEligibleAt: coolingDeadline(time, policy?.backoff ?? { initial_seconds: 30, multiplier: 2, max_seconds: 300 }, 0),
+    itemId,
+    theme: "workflow-engine-defect",
+    historicalEvidence: "run_fatal",
+  });
+  const next = await persistOwnedCooling(deps.store, { runId, token, cooling });
+  await appendEvent(deps.store, runId, token, "loop_item_cooling", {
     item_id: itemId,
     theme: "workflow-engine-defect",
-    outstanding_ready: outstandingReadyItemIds(ledger),
-  };
-  const next = { ...ledger, stop };
-  await writeLedger(deps.store, next, token);
-  await appendEvent(deps.store, runId, token, "loop_run_stopped", {
-    reason: stop.reason,
-    item_id: itemId,
-    theme: stop.theme,
     detail,
     repo: contract.repo.name,
+    historical_evidence: "run_fatal",
   });
   return next;
 }
@@ -773,7 +795,7 @@ async function supersedeStartedRecoveryAttempts(
   itemId: string,
   reason: string,
 ): Promise<LoopLedger> {
-  const ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId));
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId, token));
   const time = deps.store.now().toISOString();
   const superseded = ledger.recovery_attempts
     .filter((attempt) => attempt.item_id === itemId && attempt.outcome === "started")
@@ -826,7 +848,7 @@ async function executeBlockedRecovery(
   // A pre-#509 contract/ledger carries no recovery_policy/recovery_attempts
   // field — route both through the pure upgraders before any recovery access.
   const contract = upgradeContractForRecovery(contractInput);
-  let ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId));
+  let ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId, token));
   // A sibling processed earlier in this same concurrent pass may already have
   // recorded a terminal stop. Once `ledger.stop` is set no recovery side
   // effect may start: skip gracefully, preserving the first-cause stop record
@@ -861,7 +883,7 @@ async function executeBlockedRecovery(
   try {
     const identity = await observeExternalIdentity(deps.observe, itemId);
     observedIdentity = identity;
-    const currentLedger = upgradeLedgerForRecovery(await readLedger(deps.store, runId));
+    const currentLedger = upgradeLedgerForRecovery(await readLedger(deps.store, runId, token));
     const currentItem = currentLedger.items[itemId];
     if (!currentItem || currentItem.state !== "blocked") {
       return { ledger: currentLedger, attempted: false };
@@ -970,14 +992,29 @@ async function executeBlockedRecovery(
   let claimedNow = false;
   if (!attempt) {
     const policy = contract.recovery_policy[item.blocked_theme];
+    const ownedCooling = coolingRecordForItem(ledger, itemId);
+    if (coolingIsActive(ownedCooling, deps.store.now().toISOString())) {
+      await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+        item_id: itemId,
+        reason: "cooling_next_eligible_at",
+        next_eligible_at: ownedCooling?.next_eligible_at,
+      }).catch(() => {});
+      return { ledger, attempted: false };
+    }
     // Repeated byte-identical evidence is bounded independently of the class
-    // retry budget: at `repeated_evidence_limit` no further attempt is claimed
-    // here — the idle-promotion branch in runSupervisorCycle records Cooling
-    // once the scheduler proves no independent sibling is schedulable.
+    // retry budget: at `repeated_evidence_limit` advance the cursor or Cool
+    // rather than tight-looping the same strategy.
     if ((item.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit) {
-      // Durable trace for the per-cycle skip (mirrors the coexistence
-      // deferrals' events): without it the at-limit refusal leaves no run-trail
-      // record until the idle promotion records Cooling.
+      const time = deps.store.now().toISOString();
+      const cooling = buildCoolingRecord({
+        reason: "strategy_cursor_exhausted",
+        time,
+        nextEligibleAt: coolingDeadline(time, policy.backoff, item.repeated_evidence_count ?? 1),
+        itemId,
+        theme: item.blocked_theme,
+        historicalEvidence: "repeated_no_progress",
+      });
+      ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
       await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
         item_id: itemId,
         reason: "repeated_evidence_limit",
@@ -995,30 +1032,62 @@ async function executeBlockedRecovery(
     const neverStartedFiltered = preflightNeverStarted
       ? filterRecipesForNeverStartedPreflight(reasonFiltered)
       : reasonFiltered;
-    const executableRecipes = hasCandidateHead
-      ? neverStartedFiltered
-      : neverStartedFiltered.filter((recipe) => recipe !== "repair_pipeline_item");
-    // #1060: same-sequence continuation forces repair after findings prep unlink.
-    // Also prefer repair when the last matching attempt was already findings prep
-    // unlink (avoids modulo re-picking free unlink after scratch is gone).
+    const candidateIdentity = recoveryCandidateIdentity(
+      contract,
+      item,
+      persisted.transport,
+      matchingAttempts.length,
+    );
+    const candidateEpoch = candidateIdentity.replace(/\|attempt=\d+$/i, "");
+    const episodeKey = {
+      operation: "loop_recovery",
+      invariant: item.blocked_theme,
+      candidate_epoch: candidateEpoch,
+      evidence_identity: item.evidence_fingerprint ?? "",
+    };
+    let episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, episodeKey) ?? emptyEpisode(episodeKey, deps.store.now().toISOString());
+    const isApplicable = (recipe: RecoveryRecipe): boolean => {
+      if (!neverStartedFiltered.includes(recipe)) return false;
+      if (recipe === "verify_head_goal" && !hasCandidateHead) return false;
+      if (recipe === "repair_pipeline_item" && !hasCandidateHead) return false;
+      return true;
+    };
     const lastMatching = matchingAttempts[matchingAttempts.length - 1];
     const preferRepairAfterFindingsPrep =
       item.blocked_theme === "review-findings" &&
       lastMatching?.action === "unlink_engine_scratch" &&
       hasCandidateHead &&
-      executableRecipes.includes("repair_pipeline_item");
+      policy.recipes.includes("repair_pipeline_item");
     const forced =
-      options?.forceNextAction && executableRecipes.includes(options.forceNextAction)
+      options?.forceNextAction && isApplicable(options.forceNextAction)
         ? options.forceNextAction
-        : undefined;
-    const action = forced
-      ? forced
-      : preferRepairAfterFindingsPrep
-        ? "repair_pipeline_item"
-        : executableRecipes.length > 0
-          ? executableRecipes[matchingAttempts.length % executableRecipes.length]
+        : preferRepairAfterFindingsPrep
+          ? ("repair_pipeline_item" as const)
           : undefined;
-    if (!action) {
+    const selected = forced
+      ? { kind: "claim" as const, action: forced, cursor: Math.max(episode.strategy_cursor, policy.recipes.indexOf(forced)), skipped: [] as RecoveryRecipe[] }
+      : selectNextApplicableStrategy({
+          recipes: policy.recipes,
+          cursor: episode.strategy_cursor,
+          attemptsPerStrategy: episode.attempts_per_strategy,
+          strategyBound: (recipe) => perStrategyBound(policy, recipe),
+          isApplicable,
+        });
+    for (const skipped of selected.skipped) {
+      const skipResult = await startRecoveryAttempt(deps.store, contract, {
+        runId,
+        token,
+        itemId,
+        engine,
+        action: skipped,
+        candidateIdentity,
+        candidateEpoch,
+        invariant: item.blocked_theme,
+        skipInapplicable: true,
+      });
+      ledger = skipResult.ledger;
+    }
+    if (selected.kind === "exhausted") {
       if (preflightNeverStarted && neverStartedFiltered.length === 0) {
         await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
           item_id: itemId,
@@ -1029,29 +1098,38 @@ async function executeBlockedRecovery(
         }).catch(() => {});
         return { ledger, attempted: false };
       }
-      ledger = await stopForRecoveryPreflight(
-        deps,
-        contract,
-        runId,
-        token,
+      if (!hasCandidateHead && policy.recipes.every((recipe) => !isApplicable(recipe))) {
+        ledger = await stopForRecoveryPreflight(
+          deps,
+          contract,
+          runId,
+          token,
+          itemId,
+          `recovery policy for "${item.blocked_theme}" has no action that is safe without a current candidate head`,
+        );
+        return { ledger, attempted: false };
+      }
+      const time = deps.store.now().toISOString();
+      const cooling = buildCoolingRecord({
+        reason: "strategy_cursor_exhausted",
+        time,
+        nextEligibleAt: coolingDeadline(time, policy.backoff, 1),
         itemId,
-        `recovery policy for "${item.blocked_theme}" has no action that is safe without a current candidate head`,
-      );
+        theme: item.blocked_theme,
+        historicalEvidence: "recovery_exhausted",
+      });
+      ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
       return { ledger, attempted: false };
     }
-    const candidateIdentity = recoveryCandidateIdentity(
-      contract,
-      item,
-      persisted.transport,
-      matchingAttempts.length,
-    );
     const started = await startRecoveryAttempt(deps.store, contract, {
       runId,
       token,
       itemId,
       engine,
-      action,
+      action: selected.action,
       candidateIdentity,
+      candidateEpoch,
+      invariant: item.blocked_theme,
     });
     ledger = started.ledger;
     attempt = started.attempt;
@@ -1103,7 +1181,7 @@ async function executeBlockedRecovery(
       not_before: attempt.not_before,
     });
     return {
-      ledger: upgradeLedgerForRecovery(await readLedger(deps.store, runId)),
+      ledger: upgradeLedgerForRecovery(await readLedger(deps.store, runId, token)),
       attempted: claimedNow,
       deferredUntil: attempt.not_before,
     };
@@ -1159,7 +1237,7 @@ async function executeBlockedRecovery(
       item_id: itemId,
       reason: err instanceof Error ? err.message : String(err),
     });
-    return { ledger: upgradeLedgerForRecovery(await readLedger(deps.store, runId)), attempted: true };
+    return { ledger: upgradeLedgerForRecovery(await readLedger(deps.store, runId, token)), attempted: true };
   }
   const claimedHead = /(?:^|\|)head=([0-9a-f]{6,64})(?:\||$)/i.exec(attempt.candidate_identity)?.[1] ?? "";
   if (execution.succeeded && attempt.action === "repair_pipeline_item") {
@@ -1221,7 +1299,7 @@ async function executeBlockedRecovery(
     postcondition: execution.succeeded ? "verified" : "failed",
   });
 
-  const beforeCompletion = await readLedger(deps.store, runId);
+  const beforeCompletion = await readLedger(deps.store, runId, token);
   const beforeCompletionItem = beforeCompletion.items[itemId];
   if (beforeCompletionItem?.state === "blocked") {
     await writeLedger(deps.store, {
@@ -1290,7 +1368,7 @@ async function blockAndExecuteRecovery(
     allowAlreadyStopped?: boolean;
   },
 ): Promise<RecoveryExecutionResult> {
-  const current = await readLedger(deps.store, input.runId);
+  const current = await readLedger(deps.store, input.runId, input.token);
   const currentState = current.items[input.itemId]?.state;
   if (currentState === "blocked") {
     return executeBlockedRecovery(
@@ -1328,7 +1406,7 @@ async function blockAndExecuteRecovery(
         token: input.token,
         engine: input.engine,
       });
-      const reconciled = await readLedger(deps.store, input.runId);
+      const reconciled = await readLedger(deps.store, input.runId, input.token);
       await appendEvent(deps.store, input.runId, input.token, "loop_recovery_superseded", {
         item_id: input.itemId,
         state: reconciled.items[input.itemId]?.state ?? null,
@@ -1731,8 +1809,8 @@ export async function runSupervisorCycle(
 ): Promise<SupervisorCycleResult> {
   // A pre-#509 contract carries no recovery_policy — the pure upgrader installs
   // the default so the recovery/idle-promotion reads below never fault.
-  const contract = upgradeContractForRecovery(await readContract(deps.store, runId));
-  let ledger = await readLedger(deps.store, runId);
+  const contract = upgradeContractForRecovery(await readContract(deps.store, runId, token));
+  let ledger = await readLedger(deps.store, runId, token);
 
   if (ledger.stop) {
     await appendActionEvidence(deps.store, runId, token, {
@@ -1745,22 +1823,14 @@ export async function runSupervisorCycle(
     return { progress: false, stop: ledger.stop, holdOutstanding: false, allDone: false, heldItemIds: heldItemIdsFromLedger(ledger) };
   }
 
-  if (ledger.cooling) {
-    await appendActionEvidence(deps.store, runId, token, {
-      item_id: ledger.cooling.item_id ?? null,
-      action: "noop",
-      outcome: "cooling_recovery",
-      next_action: null,
-      progress: "no_progress",
-    });
-    return {
-      progress: false,
-      stop: null,
-      cooling: ledger.cooling,
-      holdOutstanding: false,
-      allDone: false,
-      heldItemIds: heldItemIdsFromLedger(ledger),
-    };
+  const nowIso = deps.store.now().toISOString();
+  if (ledger.cooling && coolingIsActive(ledger.cooling, nowIso)) {
+    // Item-local Cooling must not whole-stop the run. Fall through so a
+    // proven-independent sibling can still be scheduled. Recovery for the
+    // cooling item is refused until next_eligible_at.
+  } else if (ledger.cooling && !coolingIsActive(ledger.cooling, nowIso)) {
+    ledger = { ...ledger, cooling: null };
+    await writeLedger(deps.store, ledger, token);
   }
 
   let drifted = false;
@@ -1769,7 +1839,7 @@ export async function runSupervisorCycle(
     drifted = reconciliation.drift.length > 0;
   } catch (err) {
     if (err instanceof LoopError && err.loopFailureClass === "stop") {
-      ledger = await readLedger(deps.store, runId);
+      ledger = await readLedger(deps.store, runId, token);
       await appendActionEvidence(deps.store, runId, token, {
         item_id: null,
         action: "stop",
@@ -1784,7 +1854,7 @@ export async function runSupervisorCycle(
 
   // Upgraded read (pre-#509 ledgers have no recovery_attempts): this ledger
   // feeds the started-claim scan and the idle-promotion branch below.
-  ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId));
+  ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId, token));
   if (ledger.stop) {
     await appendActionEvidence(deps.store, runId, token, {
       item_id: null,
@@ -2017,6 +2087,24 @@ export async function runSupervisorCycle(
       };
     }
 
+    if (ledger.cooling) {
+      await appendActionEvidence(deps.store, runId, token, {
+        item_id: ledger.cooling.item_id ?? null,
+        action: "noop",
+        outcome: "cooling_recovery",
+        next_action: null,
+        progress: recoveryProgress ? "progress" : "no_progress",
+      });
+      return {
+        progress: recoveryProgress,
+        stop: null,
+        cooling: ledger.cooling,
+        holdOutstanding: false,
+        allDone: false,
+        heldItemIds: heldItemIdsFromLedger(ledger),
+      };
+    }
+
     // Engine-owned strategy-cursor exhaustion stays item-local Cooling (or an
     // external wait). Repeated evidence and run_fatal policy must not
     // terminalize this branch — those flags describe independent non-exhaustion
@@ -2034,25 +2122,34 @@ export async function runSupervisorCycle(
       ) return false;
       const policy = contract.recovery_policy[candidate.blocked_theme as DurableBlockerClass];
       if (!policy || policy.terminal_outcome === "human_authority") return false;
+      const episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, {
+        operation: "loop_recovery",
+        invariant: candidate.blocked_theme,
+        candidate_epoch: candidate.last_verified_identity?.head_sha.trim() || candidate.evidence_fingerprint || candidate.id,
+        evidence_identity: candidate.evidence_fingerprint ?? "",
+      });
+      const repeated = (candidate.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit;
+      if (episode) {
+        const allStrategiesSpent = policy.recipes.every(
+          (recipe) => (episode.attempts_per_strategy[recipe] ?? 0) >= perStrategyBound(policy, recipe),
+        );
+        return allStrategiesSpent || repeated;
+      }
       const remaining = candidate.recovery_budgets_remaining[candidate.blocked_theme] ?? policy.retry_budget;
-      return remaining <= 0 || (candidate.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit;
+      return remaining <= 0 || repeated;
     });
     if (exhausted?.blocked_theme) {
       const time = deps.store.now().toISOString();
-      const cooling: LoopCoolingRecord = {
+      const policy = contract.recovery_policy[exhausted.blocked_theme as DurableBlockerClass];
+      const cooling: LoopCoolingRecord = buildCoolingRecord({
         reason: "strategy_cursor_exhausted",
         time,
-        item_id: exhausted.id,
+        nextEligibleAt: coolingDeadline(time, policy?.backoff ?? { initial_seconds: 30, multiplier: 2, max_seconds: 300 }, 1),
+        itemId: exhausted.id,
         theme: exhausted.blocked_theme,
-        historical_evidence: "recovery_exhausted",
-      };
-      ledger = { ...ledger, cooling };
-      await writeLedger(deps.store, ledger, token);
-      await appendEvent(deps.store, runId, token, "loop_item_cooling", {
-        item_id: exhausted.id,
-        theme: exhausted.blocked_theme,
-        historical_evidence: "recovery_exhausted",
+        historicalEvidence: "recovery_exhausted",
       });
+      ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
       return {
         progress: recoveryProgress,
         stop: null,
@@ -2728,7 +2825,13 @@ export async function runSupervisorCycle(
         response?.diagnostic &&
         isCurrentHumanAuthorityDiagnostic(response.diagnostic, authorityIdentity.head_sha)
       ) {
-        const preHoldLedger = await readLedger(deps.store, runId);
+        // A sibling processed earlier in this same concurrent pass may already
+        // have recorded a terminal stop; entering a hold would throw
+        // LoopError("stop") out of the drive (pause.ts enterHold) and strand
+        // this in_progress item. Re-check the durable stop and skip the hold
+        // gracefully — no ledger write, no waitItem — preserving the
+        // first-cause stop record (mirrors executeBlockedRecovery's guard).
+        const preHoldLedger = await readLedger(deps.store, runId, token);
         if (preHoldLedger.stop) {
           ledger = preHoldLedger;
         } else {
@@ -2755,7 +2858,7 @@ export async function runSupervisorCycle(
           });
         }
       } else if (classified.kind === "CapabilityRequest") {
-        const preHoldLedger = await readLedger(deps.store, runId);
+        const preHoldLedger = await readLedger(deps.store, runId, token);
         if (preHoldLedger.stop) {
           ledger = preHoldLedger;
         } else {
@@ -2949,7 +3052,7 @@ export async function runSupervisorCycle(
         const reason = dispatchError
           ? `pipeline/loop-execution@1 dispatch rejected for item ${itemId}: ${dispatchError}`
           : `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, normalized to failed`;
-        const latest = await readLedger(deps.store, runId);
+        const latest = await readLedger(deps.store, runId, token);
         const alreadyBlocked = latest.items[itemId]?.state === "blocked";
         // A legacy/in-process child may have durably recorded its own block
         // immediately before its dispatch transport died. Never try to block
@@ -3001,7 +3104,7 @@ export async function runSupervisorCycle(
     } catch (err) {
       if (!(err instanceof LoopError && err.loopFailureClass === "stop")) throw err;
     }
-    ledger = await readLedger(deps.store, runId);
+    ledger = await readLedger(deps.store, runId, token);
     if (ledger.stop) {
       return {
         progress: true,
@@ -3025,28 +3128,25 @@ export async function runSupervisorCycle(
   // N sequential capacity human-blocks on every remaining pending item.
   if (!ledger.stop && capacityWaitItemIds.length > 0) {
     const time = deps.store.now().toISOString();
-    const stop: LoopStopRecord = {
-      reason: "worktree_capacity",
+    const cooling = buildCoolingRecord({
+      reason: "mechanical_exhaustion",
       time,
-      item_id: capacityWaitItemIds[0],
-      outstanding_ready: outstandingReadyItemIds(ledger),
-    };
-    ledger = { ...ledger, stop };
-    await writeLedger(deps.store, ledger, token);
-    await appendEvent(deps.store, runId, token, "loop_run_stopped", {
-      reason: "worktree_capacity",
-      capacity_wait_item_ids: capacityWaitItemIds,
+      nextEligibleAt: coolingDeadline(time, { initial_seconds: 30, multiplier: 2, max_seconds: 300 }, 0),
+      itemId: capacityWaitItemIds[0],
+      historicalEvidence: "worktree_capacity",
     });
+    ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
     await appendActionEvidence(deps.store, runId, token, {
       item_id: null,
-      action: "stop",
-      outcome: "worktree_capacity",
+      action: "noop",
+      outcome: "cooling_recovery",
       next_action: null,
       progress: "progress",
     });
     return {
       progress: true,
-      stop,
+      stop: null,
+      cooling,
       holdOutstanding: false,
       allDone: false,
       heldItemIds: heldItemIdsFromLedger(ledger),
@@ -3096,6 +3196,39 @@ export async function runSupervisorCycle(
   return { progress: true, stop: ledger.stop, holdOutstanding: terminalHold, allDone: false, heldItemIds: finalHeldItemIds };
 }
 
+async function reconcileUncertainStartedClaims(
+  deps: SupervisorDeps,
+  runId: string,
+  token: string,
+  engine: LoopEngineName,
+): Promise<"ok" | "wait"> {
+  const contract = upgradeContractForRecovery(await readContract(deps.store, runId, token));
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId, token));
+  const started = ledger.recovery_attempts.filter(
+    (attempt) => attempt.outcome === "started" && (attempt.side_effect_certainty ?? "uncertain") === "uncertain",
+  );
+  if (started.length === 0) return "ok";
+  for (const attempt of started) {
+    const observed: SideEffectObserverResult = deps.observeRecoverySideEffect
+      ? await deps.observeRecoverySideEffect(attempt)
+      : "uncertain";
+    const decision = reconcileUncertainClaim(observed);
+    if (decision === "wait") return "wait";
+    if (decision === "reconcile_forward") {
+      await completeRecoveryAttempt(deps.store, contract, {
+        runId,
+        token,
+        itemId: attempt.item_id,
+        engine,
+        attemptId: attempt.attempt_id,
+        succeeded: true,
+      });
+    }
+    // proven-absent: leave started so replay uses the same attempt_id.
+  }
+  return "ok";
+}
+
 // ---------------------------------------------------------------------------
 // Attach — acquire, or recover-and-acquire on a provably dead holder.
 // ---------------------------------------------------------------------------
@@ -3137,9 +3270,25 @@ export async function attachSupervisor(deps: SupervisorDeps, input: SupervisorAt
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
   }
-  const contract = await readContract(deps.store, runId);
-  const ledger = await readLedger(deps.store, runId);
-  if (contract.schema !== LOOP_CONTRACT_SCHEMA || ledger.schema !== LOOP_LEDGER_SCHEMA) {
+  let contract: LoopContract | null = null;
+  let ledger: LoopLedger | null = null;
+  try {
+    contract = await readContract(deps.store, runId);
+    ledger = await readLedger(deps.store, runId);
+  } catch (err) {
+    if (
+      !(err instanceof LoopError) ||
+      err.loopFailureClass !== "lock" ||
+      !/persist requires the current lock holder's token/.test(err.message)
+    ) {
+      throw err;
+    }
+  }
+  if (
+    contract &&
+    ledger &&
+    (contract.schema !== LOOP_CONTRACT_SCHEMA || ledger.schema !== LOOP_LEDGER_SCHEMA)
+  ) {
     throw new LoopError(
       "validation",
       `loop run "${runId}" carries schema ${contract.schema}/${ledger.schema}, outside the store's supported set — refusing takeover`,
@@ -3169,6 +3318,22 @@ export async function attachSupervisor(deps: SupervisorDeps, input: SupervisorAt
   }
 
   const acquired = await acquireLock(deps.store, runId, engine);
+  if (!contract || !ledger) {
+    try {
+      contract = await readContract(deps.store, runId, acquired.token);
+      ledger = await readLedger(deps.store, runId, acquired.token);
+    } catch (err) {
+      await releaseLock(deps.store, runId, acquired.token).catch(() => undefined);
+      throw err;
+    }
+  }
+  if (contract.schema !== LOOP_CONTRACT_SCHEMA || ledger.schema !== LOOP_LEDGER_SCHEMA) {
+    await releaseLock(deps.store, runId, acquired.token).catch(() => undefined);
+    throw new LoopError(
+      "validation",
+      `loop run "${runId}" carries schema ${contract.schema}/${ledger.schema}, outside the store's supported set — refusing takeover`,
+    );
+  }
   const now = deps.store.now().toISOString();
   const starttime = (await deps.store.getProcessStartTime?.(deps.store.pid())) ?? undefined;
   const record: LoopSupervisorProcess = {
@@ -3290,7 +3455,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
   });
   const token = attach.token;
   let record = attach.record;
-  const contract = await readContract(deps.store, input.runId);
+  const contract = await readContract(deps.store, input.runId, token);
   const limit = input.consecutiveNoProgressLimit ?? contract.consecutive_no_progress_limit ?? DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT;
   const cyclesSafetyCap = input.maxCyclesSafety ?? MAX_CYCLES_SAFETY;
   const heartbeatMs = packLoopHeartbeatCadenceMs();
@@ -3305,8 +3470,21 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
   let heartbeatTimer: unknown;
 
   try {
+    if (attach.resumed) {
+      const claimReconcile = await reconcileUncertainStartedClaims(deps, input.runId, token, input.engine);
+      if (claimReconcile === "wait") {
+        const time = deps.store.now().toISOString();
+        const waitCooling = buildCoolingRecord({
+          reason: "mechanical_exhaustion",
+          time,
+          nextEligibleAt: coolingDeadline(time, { initial_seconds: 15, multiplier: 2, max_seconds: 300 }, 0),
+        });
+        await persistOwnedCooling(deps.store, { runId: input.runId, token, cooling: waitCooling });
+      }
+    }
+
     if (input.resume) {
-      const attachedLedger = await readLedger(deps.store, input.runId);
+      const attachedLedger = await readLedger(deps.store, input.runId, token);
       if (attachedLedger.stop?.reason === "run_fatal") {
         const decision = await evaluateRunFatalResumeEligibility(deps.store, deps.observe, input.runId);
         if (!decision.eligible) {
@@ -3476,7 +3654,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
         // "nothing left to do" terminal. Heal should have restored such items
         // to in_progress; do not record supervisor_no_progress solely from
         // empty pending selection while advance remains advertised.
-        const ledger = await readLedger(deps.store, input.runId);
+        const ledger = await readLedger(deps.store, input.runId, token);
         const nextActions = ledger.last_reconciliation?.next_actions ?? {};
         const observed = ledger.last_reconciliation?.observed ?? {};
         const hasAdvanceStillNeeded = contract.items.some((item) => {
@@ -3493,48 +3671,49 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
           continue;
         }
         const time = deps.store.now().toISOString();
-        const newLedger: LoopLedger = {
-          ...ledger,
-          stop: { reason: "supervisor_no_progress", time, outstanding_ready: outstandingReadyItemIds(ledger) },
-        };
-        await writeLedger(deps.store, newLedger, token);
-        await appendEvent(deps.store, input.runId, token, "loop_run_stopped", { reason: "supervisor_no_progress" });
+        const coolingRecord = buildCoolingRecord({
+          reason: "mechanical_exhaustion",
+          time,
+          nextEligibleAt: coolingDeadline(time, { initial_seconds: 30, multiplier: 2, max_seconds: 900 }, record.consecutive_no_progress),
+          historicalEvidence: "supervisor_no_progress",
+        });
+        await persistOwnedCooling(deps.store, { runId: input.runId, token, cooling: coolingRecord });
         await appendActionEvidence(deps.store, input.runId, token, {
           item_id: null,
-          action: "stop",
-          outcome: "supervisor_no_progress",
+          action: "noop",
+          outcome: "cooling_recovery",
           next_action: null,
           progress: "no_progress",
         });
-        stop = newLedger.stop;
+        cooling = coolingRecord;
         break;
       }
     }
 
-    if (!stop && !holdOutstanding && !resolved && cycles >= cyclesSafetyCap) {
+    if (!stop && !cooling && !holdOutstanding && !resolved && cycles >= cyclesSafetyCap) {
       const time = deps.store.now().toISOString();
-      const ledger = await readLedger(deps.store, input.runId);
-      const newLedger: LoopLedger = {
-        ...ledger,
-        stop: { reason: "supervisor_cycle_cap", time, limit: cyclesSafetyCap, outstanding_ready: outstandingReadyItemIds(ledger) },
-      };
-      await writeLedger(deps.store, newLedger, token);
-      await appendEvent(deps.store, input.runId, token, "loop_run_stopped", { reason: "supervisor_cycle_cap" });
+      const coolingRecord = buildCoolingRecord({
+        reason: "mechanical_exhaustion",
+        time,
+        nextEligibleAt: coolingDeadline(time, { initial_seconds: 60, multiplier: 2, max_seconds: 900 }, cycles),
+        historicalEvidence: "supervisor_cycle_cap",
+      });
+      await persistOwnedCooling(deps.store, { runId: input.runId, token, cooling: coolingRecord });
       await appendActionEvidence(deps.store, input.runId, token, {
         item_id: null,
-        action: "stop",
-        outcome: "supervisor_cycle_cap",
+        action: "noop",
+        outcome: "cooling_recovery",
         next_action: null,
         progress: "progress",
       });
-      stop = newLedger.stop;
+      cooling = coolingRecord;
     }
 
     // Accounting derived from the final ledger, not an in-process counter, so a resumed run
     // reports the whole run's dispatch/exclusion picture (#614, design.md decision 2) — including
     // for a stop or an outstanding hold, whose summary stays as informative as before (design.md
     // edge cases).
-    const finalLedger = await readLedger(deps.store, input.runId);
+    const finalLedger = await readLedger(deps.store, input.runId, token);
     const finalExclusions = classifyPreconditionExclusions(contract, finalLedger);
     const excludedItemIds = finalExclusions.map((e) => e.item_id).sort();
     const exclusionReason = dominantExclusionReason(finalExclusions);

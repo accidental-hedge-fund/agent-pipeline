@@ -39,8 +39,11 @@ import {
   scanDeliveryStageAdapterContracts,
   claimOrResumeRecoveryEpisode,
   recordRecoveryEpisodeTreatment,
+  stageRecoveryEpisodeKey,
 } from "../scripts/issue-stage-adapters.ts";
 import { emptyStageAttemptLedger } from "../scripts/stage-attempt-ledger.ts";
+import { resumeEpisodeFromAttempts } from "../scripts/loop/recovery-episodes.ts";
+import type { LoopRecoveryAttempt } from "../scripts/loop/types.ts";
 import { STAGES, type Outcome, type PipelineConfig } from "../scripts/types.ts";
 import {
   ensureManagedWorktree,
@@ -663,6 +666,11 @@ test("5.1 comment-counted auto-recovery cap cannot post a terminal that ends own
     issue: 1328,
     message: "auto_recover cap reached — Cooling, not terminal",
     reportObservation: sink.reportObservation,
+    episodeKey: stageRecoveryEpisodeKey({
+      issue: 1328,
+      candidateEpoch: "unresolved",
+      evidence: "auto_recover:#1328",
+    }),
   });
   assert.equal(obs.owned, true);
   assert.equal(obs.complete, false);
@@ -672,12 +680,18 @@ test("5.1 comment-counted auto-recovery cap cannot post a terminal that ends own
 
 test("5.4 auto-recovery comments are not the sole authority — ledger + claim are", () => {
   const dir = mkdtempSync(join(tmpdir(), "ap-1328-claim-"));
+  const episodeKey = stageRecoveryEpisodeKey({
+    issue: 1328,
+    candidateEpoch: "a".repeat(40),
+    evidence: "resume episode",
+  });
   const obs = claimOrResumeRecoveryEpisode({
     domain: "test",
     logical_operation_id: "lop-ledger",
     issue: 1328,
     message: "resume episode",
     persistDir: dir,
+    episodeKey,
   });
   persistOperationObservation(obs, dir);
   const ledger = recordRecoveryEpisodeTreatment({
@@ -686,11 +700,84 @@ test("5.4 auto-recovery comments are not the sole authority — ledger + claim a
     action: "no_run_recovery",
     itemId: "1328",
     typedReason: "auto-recover-treatment",
+    episodeKey,
   });
   assert.ok(ledger.attempts.length >= 1);
   assert.equal(ledger.attempts[0]!.action, "no_run_recovery");
   assert.equal(countRecoveryEpisodeTreatments(ledger, "1328"), 1);
+  assert.equal(ledger.attempts[0]!.episode_id, obs.episode_id);
+  const resumed = claimOrResumeRecoveryEpisode({
+    domain: "test",
+    logical_operation_id: "lop-ledger",
+    issue: 1328,
+    message: "resume episode after restart",
+    persistDir: dir,
+    episodeKey,
+  });
+  assert.equal(resumed.episode_id, obs.episode_id);
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("5.5 stage treatments for the same candidate share one Recovery Episode", () => {
+  const headSha = "a".repeat(40);
+  const episodeKey = stageRecoveryEpisodeKey({
+    issue: 1325,
+    candidateEpoch: headSha,
+    evidence: "same-evidence",
+  });
+  const first = recordRecoveryEpisodeTreatment({
+    ledger: emptyStageAttemptLedger(),
+    headSha,
+    action: "worktree_rematerialize",
+    itemId: "1325",
+    evidenceFingerprint: "same-evidence",
+    episodeKey,
+  });
+  const second = recordRecoveryEpisodeTreatment({
+    ledger: first,
+    headSha,
+    action: "no_run_recovery",
+    itemId: "1325",
+    evidenceFingerprint: "same-evidence",
+    episodeKey,
+  });
+  assert.equal(second.attempts.length, 2);
+  assert.equal(second.attempts[0]!.episode_id, second.attempts[1]!.episode_id);
+  assert.equal(second.attempts[0]!.invariant, "issue:1325");
+  assert.equal(second.attempts[1]!.invariant, "issue:1325");
+  assert.equal(second.attempts[1]!.attempts_per_strategy?.["worktree_rematerialize"], 1);
+  assert.equal(second.attempts[1]!.attempts_per_strategy?.["no_run_recovery"], 1);
+  assert.equal(first.attempts[0]!.strategy_cursor, 1);
+  assert.equal(second.attempts[1]!.strategy_cursor, 2);
+  assert.ok((second.attempts[1]!.strategy_cursor ?? 0) >= (first.attempts[0]!.strategy_cursor ?? 0));
+  const restarted = resumeEpisodeFromAttempts(second.attempts as unknown as LoopRecoveryAttempt[], episodeKey);
+  assert.ok(restarted);
+  assert.equal(restarted!.strategy_cursor, 2);
+  assert.notEqual(restarted!.strategy_cursor, 0);
+  assert.notEqual(second.attempts[0]!.episode_id, `${"1325"}:${headSha}:worktree_rematerialize`);
+});
+
+test("5.6 omitted episode key is rejected rather than defaulting apart", () => {
+  assert.throws(
+    () =>
+      claimOrResumeRecoveryEpisode({
+        domain: "test",
+        issue: 1325,
+        message: "missing key",
+        episodeKey: undefined as never,
+      }),
+    /complete RecoveryEpisodeKey/,
+  );
+  assert.throws(
+    () =>
+      recordRecoveryEpisodeTreatment({
+        ledger: emptyStageAttemptLedger(),
+        headSha: "a".repeat(40),
+        action: "no_run_recovery",
+        episodeKey: { operation: "", invariant: "", candidate_epoch: "", evidence_identity: "" },
+      }),
+    /complete RecoveryEpisodeKey/,
+  );
 });
 
 test("6.1 harness crash, malformed output, unsatisfied no-op, and non-convergence stay owned", () => {
