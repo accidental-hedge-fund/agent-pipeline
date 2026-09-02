@@ -783,6 +783,113 @@ test("5.8 unauthenticated read does not overwrite a corrupt ledger that still ca
   assert.equal(ledger.items["100"]?.state, "blocked");
 });
 
+test("5.9 crash after truncated recovery-attempt write reconstructs last-valid episode", async () => {
+  const { deps, files, contract, token } = await setup();
+  await blockCi(deps, contract, token);
+  const { attempt } = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "rerun_ci",
+    candidateIdentity: "head-partial",
+  });
+  assert.ok(attempt.invariant);
+  assert.equal(typeof attempt.strategy_cursor, "number");
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  const lastValid = lastValidPathFor(published);
+  assert.ok(files.has(lastValid));
+  const partial = JSON.parse(files.get(published)!);
+  partial.recovery_attempts = [{ attempt_id: attempt.attempt_id, item_id: "100" }];
+  files.set(published, JSON.stringify(partial, null, 2));
+  const restored = await readLedger(deps, "run-1");
+  assert.equal(restored.recovery_attempts.length, 1);
+  assert.equal(restored.recovery_attempts[0]!.attempt_id, attempt.attempt_id);
+  assert.equal(restored.recovery_attempts[0]!.strategy_cursor, attempt.strategy_cursor);
+  assert.equal(restored.recovery_attempts[0]!.invariant, attempt.invariant);
+  assert.equal(restored.recovery_attempts[0]!.attempts_per_strategy?.rerun_ci, attempt.attempts_per_strategy?.rerun_ci);
+  assert.notEqual(restored.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+});
+
+test("5.10 unreconstructable truncated recovery-attempt is not live episode authority", async () => {
+  const { deps, files, contract, token } = await setup();
+  await blockCi(deps, contract, token);
+  const { attempt } = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "rerun_ci",
+    candidateIdentity: "head-partial",
+  });
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  const partial = JSON.parse(files.get(published)!);
+  partial.recovery_attempts = [
+    {
+      attempt_id: attempt.attempt_id,
+      item_id: "100",
+      strategy_cursor: 0,
+    },
+  ];
+  files.set(published, JSON.stringify(partial, null, 2));
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+  const ledger = await readLedger(deps, "run-1", token);
+  assert.equal(ledger.stop, null);
+  assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  assert.ok(ledger.cooling?.next_eligible_at);
+  assert.equal(ledger.recovery_attempts.length, 0);
+  const resumed = resumeEpisodeFromAttempts(ledger.recovery_attempts, {
+    operation: attempt.operation ?? "loop_recovery",
+    invariant: attempt.invariant!,
+    candidate_epoch: attempt.candidate_epoch!,
+    evidence_identity: attempt.evidence_identity!,
+  });
+  assert.equal(resumed, null);
+  const quarantined = [...files.keys()].filter((k) => k.includes("quarantine"));
+  assert.ok(quarantined.length >= 1);
+});
+
+test("5.11 crash after Cooling write missing next_eligible_at reconstructs last-valid deadline", async () => {
+  const { deps, files, token } = await setup();
+  const cooling = buildCoolingRecord({
+    reason: "strategy_cursor_exhausted",
+    time: deps.now().toISOString(),
+    nextEligibleAt: "2026-09-03T00:00:00.000Z",
+    itemId: "100",
+  });
+  await persistOwnedCooling(deps, { runId: "run-1", token, cooling });
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  assert.ok(files.has(lastValidPathFor(published)));
+  const partial = JSON.parse(files.get(published)!);
+  delete partial.cooling.next_eligible_at;
+  if (partial.item_cooling?.["100"]) delete partial.item_cooling["100"].next_eligible_at;
+  files.set(published, JSON.stringify(partial, null, 2));
+  const restored = await readLedger(deps, "run-1");
+  assert.equal(restored.cooling?.next_eligible_at, "2026-09-03T00:00:00.000Z");
+  assert.notEqual(restored.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  assert.equal(coolingIsActive(restored.cooling, "2026-09-02T00:00:00.000Z"), true);
+  assert.equal(coolingIsActive(restored.cooling, "2026-09-03T00:00:01.000Z"), false);
+});
+
+test("5.12 unreconstructable Cooling missing next_eligible_at stays owned with a wake deadline", async () => {
+  const { deps, files, token } = await setup();
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  const partial = JSON.parse(files.get(published)!);
+  partial.cooling = { reason: "mechanical_exhaustion", time: "2026-09-02T00:00:00.000Z" };
+  files.set(published, JSON.stringify(partial, null, 2));
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+  const ledger = await readLedger(deps, "run-1", token);
+  assert.equal(ledger.stop, null);
+  assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  assert.ok(ledger.cooling?.next_eligible_at);
+  assert.notEqual(ledger.cooling?.next_eligible_at, undefined);
+  assert.equal(coolingIsActive(ledger.cooling, ledger.cooling.next_eligible_at), false);
+  const quarantined = [...files.keys()].filter((k) => k.includes("quarantine"));
+  assert.ok(quarantined.length >= 1);
+});
+
 // ---------------------------------------------------------------------------
 // 6. Crash boundaries
 // ---------------------------------------------------------------------------

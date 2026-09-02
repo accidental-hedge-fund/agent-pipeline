@@ -16,6 +16,7 @@ import { getProcessStartTime as readProcessStartTime } from "../lock.ts";
 import type { DurableLoopRunHandoff } from "./handoff.ts";
 import {
   isDurableBlockerClass,
+  isRecoveryRecipe,
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
   LoopError,
@@ -39,6 +40,7 @@ import {
   lastValidPathFor,
   PRIVATE_EPISODE_SCHEMA_BASENAME,
   quarantinePathFor,
+  RECOVERY_EPISODE_REQUIRED_FIELDS,
 } from "./recovery-episodes.ts";
 
 export const PIPELINE_STATE_HOME_ENV = "AGENT_PIPELINE_STATE_HOME";
@@ -231,12 +233,87 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const RECOVERY_ATTEMPT_OUTCOMES = [
+  "started",
+  "recovered",
+  "superseded",
+  "exhausted",
+  "skipped",
+  "repeated_no_progress",
+  "needs_human",
+  "human_authority",
+  "failed",
+] as const;
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && Number.isFinite(Date.parse(value));
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isAttemptsPerStrategy(value: unknown): value is Record<string, number> {
+  if (!isPlainObject(value)) return false;
+  for (const [recipe, count] of Object.entries(value)) {
+    if (!isRecoveryRecipe(recipe)) return false;
+    if (typeof count !== "number" || !Number.isFinite(count) || count < 0) return false;
+  }
+  return true;
+}
+
+function attemptCarriesEpisodeState(value: Record<string, unknown>): boolean {
+  if (value.episode_id != null || value.operation != null) return true;
+  return RECOVERY_EPISODE_REQUIRED_FIELDS.some((field) => value[field] != null);
+}
+
+function isCompleteEpisodeState(value: Record<string, unknown>): boolean {
+  if (typeof value.invariant !== "string") return false;
+  if (typeof value.candidate_epoch !== "string") return false;
+  if (typeof value.evidence_identity !== "string") return false;
+  if (!isAttemptsPerStrategy(value.attempts_per_strategy)) return false;
+  if (!isNonNegativeInteger(value.strategy_cursor)) return false;
+  if (!isIsoTimestamp(value.next_eligible_at)) return false;
+  return true;
+}
+
+function isLoopRecoveryAttemptShape(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  if (!isNonEmptyString(value.item_id)) return false;
+  if (typeof value.seq !== "number" || !Number.isFinite(value.seq)) return false;
+  if (!isNonEmptyString(value.time)) return false;
+  if (!isDurableBlockerClass(value.class)) return false;
+  if (value.action !== undefined && !isRecoveryRecipe(value.action)) return false;
+  if (value.actions !== undefined) {
+    if (!Array.isArray(value.actions) || !value.actions.every((entry) => isRecoveryRecipe(entry))) return false;
+  }
+  if (!isRecoveryRecipe(value.action) && !(Array.isArray(value.actions) && value.actions.length > 0)) return false;
+  if (typeof value.outcome !== "string" || !(RECOVERY_ATTEMPT_OUTCOMES as readonly string[]).includes(value.outcome)) {
+    return false;
+  }
+  if (attemptCarriesEpisodeState(value) && !isCompleteEpisodeState(value)) return false;
+  if (value.strategy_cursor !== undefined && !isNonNegativeInteger(value.strategy_cursor)) return false;
+  if (value.attempts_per_strategy !== undefined && !isAttemptsPerStrategy(value.attempts_per_strategy)) return false;
+  return true;
+}
+
+/**
+ * New Cooling records require a parseable `next_eligible_at`. A legacy
+ * record with only `reason` and `time` is not live authority: `coolingIsActive`
+ * would treat a missing deadline as active forever. Migration is the
+ * quarantine path — reconstruct from last-valid, or persist an owned wait
+ * with a wake deadline.
+ */
 function isCoolingRecordShape(value: unknown): boolean {
   if (!isPlainObject(value)) return false;
-  return (
-    (value.reason === "strategy_cursor_exhausted" || value.reason === "mechanical_exhaustion") &&
-    typeof value.time === "string"
-  );
+  if (value.reason !== "strategy_cursor_exhausted" && value.reason !== "mechanical_exhaustion") return false;
+  if (!isIsoTimestamp(value.time)) return false;
+  if (!isIsoTimestamp(value.next_eligible_at)) return false;
+  return true;
 }
 
 function isLoopLedgerShape(value: unknown): value is LoopLedger {
@@ -248,7 +325,12 @@ function isLoopLedgerShape(value: unknown): value is LoopLedger {
   if (!("stop" in value)) return false;
   if (!("merge_barrier" in value)) return false;
   if (!("last_reconciliation" in value)) return false;
-  if (value.recovery_attempts !== undefined && !Array.isArray(value.recovery_attempts)) return false;
+  if (value.recovery_attempts !== undefined) {
+    if (!Array.isArray(value.recovery_attempts)) return false;
+    for (const attempt of value.recovery_attempts) {
+      if (!isLoopRecoveryAttemptShape(attempt)) return false;
+    }
+  }
   if (value.cooling !== undefined && value.cooling !== null && !isCoolingRecordShape(value.cooling)) return false;
   if (value.item_cooling !== undefined && value.item_cooling !== null) {
     if (!isPlainObject(value.item_cooling)) return false;
@@ -406,8 +488,7 @@ function salvageItemsFromParsed(value: unknown): Record<string, LoopItemLedgerEn
 function salvageRecoveryAttempts(value: unknown): LoopLedger["recovery_attempts"] {
   if (!isPlainObject(value) || !Array.isArray(value.recovery_attempts)) return [];
   return value.recovery_attempts.filter(
-    (attempt): attempt is LoopLedger["recovery_attempts"][number] =>
-      isPlainObject(attempt) && typeof attempt.attempt_id === "string" && attempt.attempt_id.length > 0,
+    (attempt): attempt is LoopLedger["recovery_attempts"][number] => isLoopRecoveryAttemptShape(attempt),
   );
 }
 
@@ -528,7 +609,9 @@ export async function writeLedger(deps: LoopStoreDeps, ledger: LoopLedger, token
   }
   const content = JSON.stringify(ledger, null, 2);
   await deps.writeFileAtomic(dest, content);
-  await publishLastValid(deps, dest, content);
+  if (isLoopLedgerShape(ledger)) {
+    await publishLastValid(deps, dest, content);
+  }
 }
 
 // ---------------------------------------------------------------------------
