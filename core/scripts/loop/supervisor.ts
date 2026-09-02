@@ -64,7 +64,7 @@ import {
   transitionItem,
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
-import { blockItem, completeRecoveryAttempt, fingerprintEvidence, persistOwnedCooling, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
+import { blockItem, completeRecoveryAttempt, eligibleIndependentItems, fingerprintEvidence, persistOwnedCooling, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
 import {
   buildCoolingRecord,
   coolingDeadline,
@@ -77,6 +77,11 @@ import {
   selectNextApplicableStrategy,
   type SideEffectObserverResult,
 } from "./recovery-episodes.ts";
+import {
+  compatibilityStopRefusesItem,
+  coolingRecordFromCompatibilityStop,
+  supervisorCycleDispositionForStop,
+} from "../recovery-lifecycle-ownership.ts";
 import { waitItem, type WaitRequestInput } from "./pause.ts";
 import {
   classifyHumanAsk,
@@ -855,7 +860,9 @@ async function executeBlockedRecovery(
   // (mirrors blockItem's allowAlreadyStopped design), instead of letting
   // startRecoveryAttempt/completeRecoveryAttempt throw LoopError("stop") out
   // of the drive.
-  if (ledger.stop) return { ledger, attempted: false };
+  if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, itemId)) {
+    return { ledger, attempted: false };
+  }
   let item = ledger.items[itemId];
   if (!item || item.state !== "blocked" || !item.blocked_theme) {
     return { ledger, attempted: false };
@@ -1796,6 +1803,75 @@ export interface SupervisorCycleResult {
   heldItemIds: string[];
 }
 
+async function persistCoolingFromCompatibilityStop(
+  deps: SupervisorDeps,
+  runId: string,
+  token: string,
+  ledger: LoopLedger,
+  stop: LoopStopRecord,
+): Promise<{ ledger: LoopLedger; cooling: LoopCoolingRecord }> {
+  const cooling = ledger.cooling ?? coolingRecordFromCompatibilityStop(stop);
+  if (ledger.cooling) return { ledger, cooling: ledger.cooling };
+  const next = { ...ledger, cooling };
+  await writeLedger(deps.store, next, token);
+  await appendEvent(deps.store, runId, token, "loop_item_cooling", {
+    item_id: cooling.item_id ?? null,
+    theme: cooling.theme ?? null,
+    historical_evidence: cooling.historical_evidence ?? stop.reason,
+  });
+  return { ledger: next, cooling };
+}
+
+async function cycleResultForCompatibilityStop(
+  deps: SupervisorDeps,
+  runId: string,
+  token: string,
+  contract: LoopContract,
+  ledger: LoopLedger,
+  progress: boolean,
+): Promise<SupervisorCycleResult | null> {
+  const stop = ledger.stop;
+  if (!stop) return null;
+  const siblings = eligibleIndependentItems(contract, ledger);
+  const disposition = supervisorCycleDispositionForStop({
+    stop,
+    hasSchedulableSibling: siblings.length > 0,
+  });
+  if (disposition.continueSiblings) return null;
+  if (disposition.cooling) {
+    const persisted = await persistCoolingFromCompatibilityStop(deps, runId, token, ledger, stop);
+    await appendActionEvidence(deps.store, runId, token, {
+      item_id: persisted.cooling.item_id ?? null,
+      action: "noop",
+      outcome: "cooling_recovery",
+      next_action: null,
+      progress: "no_progress",
+    });
+    return {
+      progress,
+      stop: null,
+      cooling: persisted.cooling,
+      holdOutstanding: false,
+      allDone: false,
+      heldItemIds: heldItemIdsFromLedger(persisted.ledger),
+    };
+  }
+  await appendActionEvidence(deps.store, runId, token, {
+    item_id: null,
+    action: "stop",
+    outcome: stop.reason,
+    next_action: null,
+    progress: "no_progress",
+  });
+  return {
+    progress,
+    stop,
+    holdOutstanding: false,
+    allDone: false,
+    heldItemIds: heldItemIdsFromLedger(ledger),
+  };
+}
+
 /** Runs exactly one supervisor cycle: reconcile -> select at most one
  *  dependency-ready active item (respecting `max_active_items: 1`) ->
  *  dispatch via `pipeline/loop-execution@1` -> record the outcome through the
@@ -1813,14 +1889,8 @@ export async function runSupervisorCycle(
   let ledger = await readLedger(deps.store, runId, token);
 
   if (ledger.stop) {
-    await appendActionEvidence(deps.store, runId, token, {
-      item_id: null,
-      action: "stop",
-      outcome: ledger.stop.reason,
-      next_action: null,
-      progress: "no_progress",
-    });
-    return { progress: false, stop: ledger.stop, holdOutstanding: false, allDone: false, heldItemIds: heldItemIdsFromLedger(ledger) };
+    const projected = await cycleResultForCompatibilityStop(deps, runId, token, contract, ledger, false);
+    if (projected) return projected;
   }
 
   const nowIso = deps.store.now().toISOString();
@@ -1840,6 +1910,8 @@ export async function runSupervisorCycle(
   } catch (err) {
     if (err instanceof LoopError && err.loopFailureClass === "stop") {
       ledger = await readLedger(deps.store, runId, token);
+      const projected = await cycleResultForCompatibilityStop(deps, runId, token, contract, ledger, false);
+      if (projected) return projected;
       await appendActionEvidence(deps.store, runId, token, {
         item_id: null,
         action: "stop",
@@ -1856,14 +1928,8 @@ export async function runSupervisorCycle(
   // feeds the started-claim scan and the idle-promotion branch below.
   ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId, token));
   if (ledger.stop) {
-    await appendActionEvidence(deps.store, runId, token, {
-      item_id: null,
-      action: "stop",
-      outcome: ledger.stop.reason,
-      next_action: null,
-      progress: "progress",
-    });
-    return { progress: true, stop: ledger.stop, holdOutstanding: false, allDone: false, heldItemIds: heldItemIdsFromLedger(ledger) };
+    const projected = await cycleResultForCompatibilityStop(deps, runId, token, contract, ledger, true);
+    if (projected) return projected;
   }
 
   // Reconciliation may have repaired a formerly blocked item directly to a
@@ -2011,20 +2077,15 @@ export async function runSupervisorCycle(
       recoveryDeferredUntil = recovery.deferredUntil;
     }
     if (ledger.stop) {
-      await appendActionEvidence(deps.store, runId, token, {
-        item_id: item.id,
-        action: "stop",
-        outcome: ledger.stop.reason,
-        next_action: null,
-        progress: recovery.attempted ? "progress" : "no_progress",
-      });
-      return {
-        progress: recovery.attempted,
-        stop: ledger.stop,
-        holdOutstanding: false,
-        allDone: false,
-        heldItemIds: heldItemIdsFromLedger(ledger),
-      };
+      const projected = await cycleResultForCompatibilityStop(
+        deps,
+        runId,
+        token,
+        contract,
+        ledger,
+        recovery.attempted,
+      );
+      if (projected) return projected;
     }
   }
 
@@ -3106,13 +3167,8 @@ export async function runSupervisorCycle(
     }
     ledger = await readLedger(deps.store, runId, token);
     if (ledger.stop) {
-      return {
-        progress: true,
-        stop: ledger.stop,
-        holdOutstanding: false,
-        allDone: false,
-        heldItemIds: heldItemIdsFromLedger(ledger),
-      };
+      const projected = await cycleResultForCompatibilityStop(deps, runId, token, contract, ledger, true);
+      if (projected) return projected;
     }
     ledger = await invalidateStaleAuthorityHolds(deps, runId, token, engine, ledger);
   ledger = await reclassifyInFlightHumanHolds(deps, runId, token, engine, ledger);
@@ -3192,6 +3248,10 @@ export async function runSupervisorCycle(
       next_action: "hold-for-human",
       progress: "progress",
     });
+  }
+  if (ledger.stop) {
+    const projected = await cycleResultForCompatibilityStop(deps, runId, token, contract, ledger, true);
+    if (projected) return { ...projected, holdOutstanding: terminalHold };
   }
   return { progress: true, stop: ledger.stop, holdOutstanding: terminalHold, allDone: false, heldItemIds: finalHeldItemIds };
 }

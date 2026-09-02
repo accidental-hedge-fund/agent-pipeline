@@ -5655,11 +5655,15 @@ test("regression (#787): a mid-pass run stop before a sibling's pass-2 recovery 
     "claude",
   );
 
-  assert.equal(cycle.stop, null, "mechanical preflight cools rather than terminalizing the run");
+  assert.equal(cycle.stop, null, "live run_fatal is Cooling, not a lifecycle terminal");
+  assert.equal(cycle.cooling?.reason, "mechanical_exhaustion");
+  assert.equal(cycle.cooling?.historical_evidence, "run_fatal");
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(finalLedger.stop, null);
-  assert.ok(finalLedger.cooling, "mechanical preflight persists Cooling");
+  assert.equal(finalLedger.stop?.reason, "run_fatal", "historical stop remains as a compatibility projection");
+  assert.equal(finalLedger.stop?.item_id, "100", "the first-cause stop record is preserved, not overwritten by the sibling");
   assert.notEqual(finalLedger.items["200"].state, "abandoned", "the sibling remains owned");
+  assert.ok(finalLedger.cooling, "mechanical preflight persists Cooling");
+  assert.equal(finalLedger.cooling?.historical_evidence, "run_fatal");
 });
 
 test("regression (#787): a pre-#509 ledger (no recovery_attempts) and contract (no recovery_policy) drive recovery without a TypeError", async () => {
@@ -6677,9 +6681,10 @@ test("regression (round 2): a mid-pass run stop before a sibling's attested-auth
 
   const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
 
-  assert.equal(cycle.stop, null, "mechanical preflight cools rather than terminalizing the run");
+  assert.equal(cycle.stop, null, "live run_fatal is Cooling, not a lifecycle terminal");
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(finalLedger.stop, null);
+  assert.equal(finalLedger.stop?.reason, "run_fatal");
+  assert.equal(finalLedger.stop?.item_id, "100", "the first-cause stop record is preserved");
   assert.ok(finalLedger.cooling, "mechanical preflight persists Cooling");
   assert.notEqual(finalLedger.items["200"].state, "abandoned");
 });
@@ -6728,11 +6733,14 @@ test("a mid-pass run stop before a sibling's unattested needs-human protocol rec
 
   const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
 
-  assert.equal(cycle.stop, null, "mechanical preflight cools rather than terminalizing the run");
+  assert.equal(cycle.stop, null, "live run_fatal is Cooling, not a lifecycle terminal");
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(finalLedger.stop, null);
+  assert.equal(finalLedger.stop?.reason, "run_fatal");
+  assert.equal(finalLedger.stop?.item_id, "100", "the first-cause stop record is preserved");
   assert.ok(finalLedger.cooling, "mechanical preflight persists Cooling");
+  assert.equal(finalLedger.items["200"].state, "blocked", "protocol classification is retained without creating a hold");
   assert.equal(finalLedger.items["200"].blocked_theme, "workflow-engine-defect");
+  assert.equal(finalLedger.items["200"].hold_request, undefined);
 });
 
 test("dead holder + reused loop id is takeover, not coexistence_wait or supervisor_no_progress (#1096)", async () => {

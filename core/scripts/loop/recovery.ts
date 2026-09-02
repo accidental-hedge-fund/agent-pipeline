@@ -42,6 +42,7 @@ import {
   stampEpisodeNextEligibleAt,
   type RecoveryEpisodeKey,
 } from "./recovery-episodes.ts";
+import { compatibilityStopRefusesItem, isMechanicalCompatibilityStopReason } from "../recovery-lifecycle-ownership.ts";
 
 // ---------------------------------------------------------------------------
 // Recovery policy compilation — fail closed.
@@ -546,7 +547,7 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
   const contract = upgradeContractForRecovery(contractInput);
 
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
-  if (ledger.stop && !input.allowAlreadyStopped) {
+  if (ledger.stop && !input.allowAlreadyStopped && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
   const item = ledger.items[input.itemId];
@@ -727,7 +728,7 @@ export async function startRecoveryAttempt(
 ): Promise<RecoverItemResult> {
   const contract = upgradeContractForRecovery(contractInput);
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
-  if (ledger.stop) {
+  if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
   const item = ledger.items[input.itemId];
@@ -892,7 +893,7 @@ export async function completeRecoveryAttempt(
     throw new LoopError("validation", `recovery attempt "${input.attemptId}" was not started for item "${input.itemId}"`);
   }
   if (attempt.outcome !== "started") return { ledger, attempt };
-  if (ledger.stop) {
+  if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
 
@@ -1063,8 +1064,10 @@ export const DONE_STATES = new Set(["ready", "merged", "released", "deployed"]);
  *  dependencies are all done, and whose external dependencies (capability
  *  `durable-run-dependency-integrity`) are all `satisfied` — eligible to start while another item
  *  is blocked, subject to the existing single-active-item invariant (never returns items when one
- *  is already `in_progress`). A configured `run_fatal` class does not suppress independent work
- *  until exhaustion has produced a durable `ledger.stop`. `externalStatuses` defaults to `{}` (no
+ *  is already `in_progress`). Mechanical compatibility stops (`run_fatal`,
+ *  `recovery_exhausted`, `repeated_no_progress`, cycle caps, capacity) do not
+ *  suppress independent siblings. Non-mechanical stops still empty this list.
+ *  `externalStatuses` defaults to `{}` (no
  *  external dependencies) so existing callers with no external gating are unaffected. Preserves
  *  the merge-barrier invariant by never bypassing it — it is enforced elsewhere, unaffected by
  *  this selection. */
@@ -1075,17 +1078,22 @@ export function eligibleIndependentItems(
 ): string[] {
   const contract = upgradeContractForRecovery(contractInput);
   const ledger = upgradeLedgerForRecovery(ledgerInput);
-  if (ledger.stop) return [];
+  if (ledger.stop && !isMechanicalCompatibilityStopReason(ledger.stop.reason)) return [];
   if (Object.values(ledger.items).some((item) => item.state === "in_progress")) return [];
 
   const blockedIds = new Set(Object.values(ledger.items).filter((item) => item.state === "blocked").map((item) => item.id));
   const dependsOn = new Map(contract.items.map((i) => [i.id, i.depends_on]));
   const externalDependsOn = new Map(contract.items.map((i) => [i.id, i.external_depends_on ?? []]));
 
+  const exhaustedItemId = isMechanicalCompatibilityStopReason(ledger.stop?.reason)
+    ? ledger.stop?.item_id
+    : undefined;
+
   return contract.items
     .filter((i) => {
       const entry = ledger.items[i.id];
       if (!entry || entry.state !== "pending") return false;
+      if (exhaustedItemId && i.id === exhaustedItemId) return false;
       const deps = dependsOn.get(i.id) ?? [];
       if (deps.some((d) => blockedIds.has(d))) return false;
       const inSnapshotDone = deps.every((d) => {

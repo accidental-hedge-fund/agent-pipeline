@@ -840,6 +840,26 @@ test("eligibleIndependentItems: a non-run-fatal block lets an independent pendin
   assert.deepEqual(eligible, ["200"]);
 });
 
+test("eligibleIndependentItems: a live run_fatal compatibility stop does not strand an independent sibling", async () => {
+  const { contract } = await setup();
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-1",
+    items: {
+      "100": { id: "100", state: "blocked", history: [], recovery_budgets_remaining: { default: 3 } },
+      "200": { id: "200", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: { reason: "run_fatal", time: "2026-09-02T00:00:00.000Z", item_id: "100", theme: "workflow-engine-defect" },
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+  } as LoopLedger;
+  assert.deepEqual(eligibleIndependentItems(contract, ledger), ["200"]);
+});
+
 test("eligibleIndependentItems: a recoverable run-fatal block does not strand an independent sibling", async () => {
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "environment-auth", evidence: "token expired" });

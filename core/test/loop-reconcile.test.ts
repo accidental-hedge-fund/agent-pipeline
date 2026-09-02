@@ -876,9 +876,21 @@ test("reconcile: the merge barrier stays set when the base branch does not yet c
   assert.deepEqual(after.merge_barrier, { item_id: "100", merged_sha: "mergesha", set_at: "2026-07-22T00:00:00.000Z" });
 });
 
-test("reconcile: refuses to run against an already-stopped run", async () => {
+test("reconcile: mechanical compatibility stop does not refuse observation (#1322)", async () => {
   const { deps, token } = await setup("pr_opened", {}, {
     stop: { reason: "recovery_exhausted", time: "2026-07-23T00:00:00.000Z" },
+  });
+
+  const { deps: observeDeps } = fakeObserveDeps();
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  assert.ok(result);
+  const after = await readLedger(deps, "run-1");
+  assert.equal(after.stop?.reason, "recovery_exhausted");
+});
+
+test("reconcile: refuses to run against a non-mechanical already-stopped run", async () => {
+  const { deps, token } = await setup("pr_opened", {}, {
+    stop: { reason: "human_authority", time: "2026-07-23T00:00:00.000Z" },
   });
 
   const { deps: observeDeps } = fakeObserveDeps();

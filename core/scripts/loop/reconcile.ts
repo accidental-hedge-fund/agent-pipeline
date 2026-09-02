@@ -57,6 +57,7 @@ import {
 } from "./types.ts";
 import { appendEvent, readLedger, writeLedger, type LoopStoreDeps } from "./store.ts";
 import { authorizeGatedTransition, NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS } from "./pause.ts";
+import { isMechanicalCompatibilityStopReason } from "../recovery-lifecycle-ownership.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -582,7 +583,7 @@ export async function reconcile(
   input: ReconcileInput,
 ): Promise<LoopReconciliation> {
   const ledger = await readLedger(deps, input.runId);
-  if (ledger.stop) {
+  if (ledger.stop && !isMechanicalCompatibilityStopReason(ledger.stop.reason)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
 
@@ -872,7 +873,12 @@ export async function transitionItem(
 ): Promise<LoopLedger> {
   const ledger = await readLedger(deps, input.runId);
   if (ledger.stop) {
-    throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
+    const mechanical = isMechanicalCompatibilityStopReason(ledger.stop.reason);
+    const sibling = ledger.stop.item_id !== input.itemId;
+    const observerCatchUp = REMOTE_PROVING_STATES.has(input.to);
+    if (!mechanical || (!sibling && !observerCatchUp)) {
+      throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
+    }
   }
   const item = ledger.items[input.itemId];
   if (!item) {

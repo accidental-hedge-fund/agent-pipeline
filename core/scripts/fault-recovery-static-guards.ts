@@ -126,6 +126,29 @@ export function collectHumanAskWithoutClassifier(source: string, file = "fixture
   return [{ file, reason: "production human-ask park without shared classifier import" }];
 }
 
+const NEEDS_HUMAN_STAGE_PARK_RE =
+  /transition(?:Fn)?\s*\(\s*[^,]+,\s*[^,]+,\s*["'][^"']+["']\s*,\s*["']needs-human["']|to:\s*["']needs-human["']|addLabels?\s*\([^;]{0,400}["']pipeline:needs-human["']/;
+
+/**
+ * Production sites must not park `pipeline:needs-human` as human ownership
+ * without the shared typed-request classifier. design_gate.ts is bound by
+ * recovery-lifecycle-ownership class law (change D6) rather than rewritten here.
+ */
+export function collectNeedsHumanParkWithoutClassifier(source: string, file = "fixture.ts"): StaticGuardHit[] {
+  if (
+    file.endsWith("stage-diagnostic.ts") ||
+    file.endsWith("loop/recovery.ts") ||
+    file.endsWith("recovery.ts") ||
+    file.endsWith("design_gate.ts") ||
+    file.endsWith("types.ts")
+  ) {
+    return [];
+  }
+  if (!NEEDS_HUMAN_STAGE_PARK_RE.test(source)) return [];
+  if (CLASSIFIER_IMPORT_RE.test(source)) return [];
+  return [{ file, reason: "production needs-human park without shared classifier import" }];
+}
+
 export function collectProviderIncidentDispatch(source: string, file = "fixture.ts"): StaticGuardHit[] {
   const hits: StaticGuardHit[] = [];
   for (const key of PROVIDER_OR_INCIDENT_DISPATCH_KEYS) {
@@ -148,6 +171,7 @@ export function scanProductionRecoveryGuards(coreRoot?: string): StaticGuardHit[
     const source = readFileSync(abs, "utf8");
     hits.push(...collectRetiredControllerImports(source, rel));
     hits.push(...collectHumanAskWithoutClassifier(source, rel));
+    hits.push(...collectNeedsHumanParkWithoutClassifier(source, rel));
     const supervisedRel = SUPERVISED_COMMAND_MODULES.filter((m) => m !== "scripts/pipeline.ts");
     if (rel.startsWith(COMMAND_MODULE_DIR) || supervisedRel.includes(rel as (typeof supervisedRel)[number])) {
       hits.push(...collectCommandLocalLifecycleExits(source, rel));

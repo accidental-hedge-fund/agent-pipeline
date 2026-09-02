@@ -25,6 +25,7 @@ import {
   type LoopNativeGoalCheck,
   type LoopPipelinePreflightEvidence,
 } from "./types.ts";
+import { compatibilityStopRefusesItem } from "../recovery-lifecycle-ownership.ts";
 import {
   pauseKindToTypedRequest,
   validateAuthorityRequest,
@@ -74,7 +75,7 @@ async function enterHold(
     );
   }
   const ledger = upgradeLedgerForPauseAuthority(await readLedger(deps, input.runId));
-  if (ledger.stop) {
+  if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
   const item = ledger.items[input.itemId];
@@ -333,7 +334,7 @@ export async function abandonHold(deps: LoopStoreDeps, input: AbandonHoldInput):
     );
   }
   const ledger = upgradeLedgerForPauseAuthority(await readLedger(deps, input.runId));
-  if (ledger.stop) {
+  if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
   const item = ledger.items[input.itemId];
@@ -465,7 +466,7 @@ export async function resumeHold(deps: LoopStoreDeps, input: ResumeHoldInput): P
     );
   }
   const ledger = upgradeLedgerForPauseAuthority(await readLedger(deps, input.runId));
-  if (ledger.stop) {
+  if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
   const item = ledger.items[input.itemId];

@@ -1,6 +1,6 @@
 # agent-pipeline
 
-**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 18-stage state machine — backlog → needs-spec → ready → planning → plan-review → pre-code-attestation → implementing → design-gate → review-1 → fix-1 → review-2 → fix-2 → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with `needs-human` as the terminal park off-ramp. The ordinary advance path does **not** merge. An operator must authorize a separate merge command.
+**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 18-stage state machine — backlog → needs-spec → ready → planning → plan-review → pre-code-attestation → implementing → design-gate → review-1 → fix-1 → review-2 → fix-2 → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with `needs-human` as the compatibility park off-ramp for a current typed-input wait. Mechanical exhaustion stays RecoverySupervisor-owned Cooling. The ordinary advance path does **not** merge. An operator must authorize a separate merge command.
 
 The product is the `pipeline` CLI. Hosts are argv wrappers that exec it. A runnable repository declares an **implementer/reviewer pair** in `.github/pipeline.yml`. `pipeline init` writes a starter pair from the active profile; after that write, those values are repository policy. The invoking host profile does not select live workers. An existing file that omits those keys can be migrated with `pipeline config sync`. Core prerequisites: Node ≥ 24, `git`, `gh`, and the configured harness CLIs authenticated. Packaging contract: [docs/packaging.md](docs/packaging.md).
 
@@ -8,7 +8,7 @@ The product is the `pipeline` CLI. Hosts are argv wrappers that exec it. A runna
 
 ![agent-pipeline state machine — ready → deploy-ready, no human writes the code](docs/assets/state-machine.png)
 
-`ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`; exhausted or ambiguous paths park at `needs-human`. The advance path never guesses past uncertainty and never invokes a merge command.
+`ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`. `needs-human` projects a current typed request (`DecisionRequest`, `CapabilityRequest`, or `AuthorityRequest`). Retry exhaustion and unknown failure stay Cooling, not human-owned cancellation. The advance path never guesses past uncertainty and never invokes a merge command.
 
 | Band | What happens |
 | --- | --- |
@@ -17,7 +17,7 @@ The product is the `pipeline` CLI. Hosts are argv wrappers that exec it. A runna
 | Bounded convergence | Review/fix rounds are capped by policy and guarded against recurring findings. If the run cannot converge cleanly, it stops with evidence instead of looping indefinitely. |
 | Surgical fixes | `fix-1` and `fix-2` are scoped to reviewer findings. No opportunistic refactors, no scope creep, no destructive cleanup. |
 | Gated stop | `pre-merge` checks CI, conflicts, mergeability, and spec archive. `visual-gate` can run a repo-defined E2E/visual suite (e.g. Playwright) and captures its artifacts as PR-visible evidence. `eval-gate` can run a repo-defined eval/scoring suite. `shipcheck-gate` lets the reviewer apply an acceptance rubric. |
-| Operator-authorized merge | `ready-to-deploy` is the happy-path terminal for the autonomous loop; `needs-human` is the park terminal when review ceilings or similar paths exhaust. A direct operator can use `pipeline merge` or dry-run-first `merge-queue --apply`. |
+| Operator-authorized merge | `ready-to-deploy` is the happy-path label terminal for the autonomous loop. `needs-human` is a compatibility projection of a current typed-input wait, not lifecycle cancellation. Mechanical exhaustion is Cooling. A direct operator can use `pipeline merge` or dry-run-first `merge-queue --apply`. |
 
 | Naive AI loop | agent-pipeline lifecycle |
 | --- | --- |

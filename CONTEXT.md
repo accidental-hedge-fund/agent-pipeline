@@ -149,6 +149,14 @@ _Avoid_: command retry loop, class-wide retry counter
 The monotonic position within a Recovery Episode's applicable treatments. Exhausting one treatment advances the cursor rather than ending lifecycle ownership.
 _Avoid_: global retry budget
 
+**Lifecycle state**:
+Exactly one of `active`, `cooling`, `external-condition-wait`, `typed-input-wait`, `succeeded`, or `cancelled` on an admitted Logical Operation. Compatibility labels, comments, events, process exits, and `ledger.stop.reason` project from this state. They are not lifecycle truth.
+_Avoid_: pipeline:needs-human as lifecycle, exit code as success
+
+**Typed-input wait**:
+An owned wait with a current DecisionRequest, CapabilityRequest, or AuthorityRequest. RecoverySupervisor retains ownership. `pipeline:needs-human` may project this wait. The label alone is not authority.
+_Avoid_: raw failure as a typed request, mechanical exhaustion as needs-human
+
 **Cooling**:
 An owned state in which a supervised operation waits until its next eligible observation or wake event. It is not cancellation, human ownership, or terminal failure.
 _Avoid_: recovery exhausted, stopped, abandoned

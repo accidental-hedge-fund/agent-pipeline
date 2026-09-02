@@ -650,11 +650,12 @@ test("resume of recovery_exhausted does not clear that stop or dispatch", async 
   );
   assert.equal(result.resumed, true);
   assert.equal(result.dispatched, 0);
-  assert.equal(result.stop?.reason, "recovery_exhausted");
-  assert.equal(result.stop?.time, ORIGINAL_STOP_TIME);
+  assert.equal(result.stop, null, "live recovery_exhausted is Cooling, not a lifecycle terminal");
+  assert.equal(result.cooling?.historical_evidence, "recovery_exhausted");
   assert.equal(calls.length, 0);
   const finalLedger = await readLedger(deps, RUN_ID);
   assert.equal(finalLedger.stop?.reason, "recovery_exhausted");
+  assert.equal(finalLedger.stop?.time, ORIGINAL_STOP_TIME);
   const { token } = await acquireLock(deps, RUN_ID, "claude");
   await assert.rejects(
     () =>
@@ -780,8 +781,7 @@ test("resume of recovery_exhausted repair-forwards GitHub-ready blocked item (#1
     { runId: RUN_ID, engine: "claude", resume: true },
   );
   assert.equal(result.resumed, true);
-  assert.equal(result.stop?.reason, "recovery_exhausted");
-  assert.equal(result.stop?.time, ORIGINAL_STOP_TIME);
+  assert.equal(result.stop, null, "catch-up keeps historical stop as a projection, not a lifecycle terminal");
   assert.equal(calls.length, 0);
   const finalLedger = await readLedger(deps, RUN_ID);
   assert.equal(finalLedger.items["1290"].state, "ready");
@@ -1007,7 +1007,7 @@ test("live drive without --resume does not run recovery_exhausted terminal catch
   assert.equal(calls.length, 0);
 });
 
-test("default reconcile still throws stop when ledger.stop is recovery_exhausted (#1297)", async () => {
+test("default reconcile proceeds on recovery_exhausted compatibility stop (#1322)", async () => {
   const contract = testContract({ items: [{ id: "1290", depends_on: [], external_depends_on: [] }] });
   const stop: LoopStopRecord = {
     reason: "recovery_exhausted",
@@ -1023,17 +1023,10 @@ test("default reconcile still throws stop when ledger.stop is recovery_exhausted
   const { deps } = await seedStoppedRun(contract, ledger);
   const observe = observeWithIdentities({ "1290": READY_1290 });
   const { token } = await acquireLock(deps, RUN_ID, "claude");
-  await assert.rejects(
-    () => reconcile(deps, observe, { runId: RUN_ID, token, engine: "claude" }),
-    (err: unknown) => {
-      assert.ok(err instanceof LoopError);
-      assert.equal(err.loopFailureClass, "stop");
-      assert.match(err.message, /recovery_exhausted/);
-      return true;
-    },
-  );
+  const reconciliation = await reconcile(deps, observe, { runId: RUN_ID, token, engine: "claude" });
+  assert.ok(reconciliation);
   const after = await readLedger(deps, RUN_ID);
-  assert.equal(after.items["1290"].state, "blocked");
+  assert.equal(after.stop?.reason, "recovery_exhausted");
   await releaseLock(deps, RUN_ID, token);
 });
 
