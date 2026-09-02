@@ -4,9 +4,8 @@
 // does not add another scheduler, retry model, merge implementation, or FRG
 // evidence producer. Each converge operation first observes external truth.
 
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,16 +16,16 @@ import {
 } from "../ship-end-identity.ts";
 import {
   assertShipEndLeafArgv,
+  defaultResolveAndPrepareDeps,
   hmacVerifyChildEnv,
   pinShaDiffersFromCandidate,
-  resolveCandidateEngine,
   shipEndCliPrefix,
   shipEndLeafArgv,
   uncredentialedPrepareEnv,
+  resolveAndPrepareCandidateEngine,
   type CandidateEngine,
   type CandidateEngineResult,
   type PresentFrgAttestorCredentialDeps,
-  type ResolveCandidateEngineDeps,
 } from "../ship-end-candidate.ts";
 import {
   observeReleaseEligibleFrgEvidence,
@@ -1260,6 +1259,13 @@ function candidateIdentityError(detail: string): Error {
   return new Error(`ship candidate-engine identity defect: ${detail}`);
 }
 
+function candidateReadinessError(kind: "readiness" | "lock", detail: string): Error {
+  return new Error(
+    `ship candidate-engine ${kind} defect: ${detail} ` +
+      "[supervised lifecycle: bounded treatment, Cooling, or External-condition wait]",
+  );
+}
+
 async function spawnLeaf(
   ctx: CandidateShipEndContext,
   engine: CandidateEngine,
@@ -1958,7 +1964,12 @@ export function bindCandidateShipEndOperations(
 ): ShipAdapterOperations {
   const requireCandidate = async (sha: string): Promise<CandidateEngine> => {
     const resolved = await ctx.resolveCandidate(sha);
-    if (!resolved.ok) throw candidateIdentityError(resolved.error);
+    if (!resolved.ok) {
+      if (resolved.kind === "readiness" || resolved.kind === "lock") {
+        throw candidateReadinessError(resolved.kind, resolved.error);
+      }
+      throw candidateIdentityError(resolved.error);
+    }
     if (resolved.engine.commitSha !== parseExactGitSha(sha)) {
       throw candidateIdentityError(
         `resolved commit_sha ${resolved.engine.commitSha} does not equal candidate ${sha}`,
@@ -2156,71 +2167,6 @@ export function bindCandidateShipEndOperations(
   };
 }
 
-function defaultResolveCandidateDeps(): ResolveCandidateEngineDeps {
-  return {
-    isDirectory: (p) => {
-      try {
-        return statSync(p).isDirectory();
-      } catch {
-        return false;
-      }
-    },
-    fileExists: (p) => {
-      try {
-        return statSync(p).isFile();
-      } catch {
-        return false;
-      }
-    },
-    revParseHead: (cwd) => {
-      try {
-        const out = execFileSync("git", ["-C", cwd, "rev-parse", "--verify", "HEAD"], {
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "ignore"],
-          timeout: 5_000,
-        });
-        return parseExactGitSha(String(out).trim());
-      } catch {
-        return null;
-      }
-    },
-    porcelain: (cwd) => {
-      try {
-        const out = execFileSync("git", ["-C", cwd, "status", "--porcelain"], {
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "ignore"],
-          timeout: 5_000,
-        });
-        return String(out);
-      } catch {
-        return null;
-      }
-    },
-    fetchSha: (dir, sha) => {
-      try {
-        execFileSync("git", ["-C", dir, "fetch", "--quiet", "origin", sha], {
-          stdio: "ignore",
-          timeout: 120_000,
-        });
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    worktreeAdd: (dir, dest, sha) => {
-      try {
-        execFileSync("git", ["-C", dir, "worktree", "add", "--detach", dest, sha], {
-          stdio: "ignore",
-          timeout: 120_000,
-        });
-        return true;
-      } catch {
-        return false;
-      }
-    },
-  };
-}
-
 function runningProcessPinSha(): string | null {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const engineRoot = path.resolve(here, "../..");
@@ -2357,13 +2303,13 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
   const resolve =
     opts.resolveCandidateEngine ??
     (async (sha: string) =>
-      resolveCandidateEngine(
+      resolveAndPrepareCandidateEngine(
         {
           repoDir: opts.repoDir,
           candidateSha: sha,
           candidateEngineRootEnv: env.PIPELINE_CANDIDATE_ENGINE_ROOT,
         },
-        defaultResolveCandidateDeps(),
+        defaultResolveAndPrepareDeps(),
       ));
   const spawn =
     opts.spawnShipEnd ??

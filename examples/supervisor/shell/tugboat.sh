@@ -42,6 +42,8 @@
 #                          core/scripts/pipeline.ts + scripts/pipeline-launcher.mjs
 #                          present). Else Tugboat uses a clean REPO_DIR HEAD
 #                          or $REPO_DIR/.worktrees/ship-candidate-<sha>.
+#                          Every accepted root is made runnable before spawn
+#                          (SHA plus nested core lockfile digest).
 #   SHIP_END_NODE          node binary for the candidate launcher. When unset
 #                          or major < 24, Tugboat walks PATH then /usr/bin/node.
 #                          systemd export is not required (#1162).
@@ -1073,46 +1075,94 @@ maybe_reexec_candidate_composer() {
   exec bash "$cand" "${TUGBOAT_INVOKE_ARGV[@]}"
 }
 
-# After train-complete: bind SHIP_END_CLI to the candidate engine. Fail closed
-# (no production-pin fallback) when identity cannot be resolved (#1151).
+# Pin-side engine root that hosts the resolve-and-prepare TypeScript seam.
+# Not a new pipeline CLI verb (#1344).
+pin_engine_root() {
+  local pipeline_path parent
+  pipeline_path=$PIPELINE
+  if [[ "$pipeline_path" != /* ]]; then
+    pipeline_path=$(command -v "$PIPELINE" 2>/dev/null || true)
+  fi
+  if [[ -z "$pipeline_path" || ! -e "$pipeline_path" ]]; then
+    echo "FAIL: cannot locate pin-side PIPELINE=$PIPELINE for resolve-and-prepare" >&2
+    return 1
+  fi
+  pipeline_path=$(cd "$(dirname "$pipeline_path")" && pwd)/$(basename "$pipeline_path")
+  parent=$(dirname "$pipeline_path")
+  if [[ -f "$parent/core/scripts/ship-end-candidate.ts" ]]; then
+    printf '%s\n' "$parent"
+    return 0
+  fi
+  if [[ "$(basename "$pipeline_path")" == "pipeline-launcher.mjs" \
+    && -f "$parent/../core/scripts/ship-end-candidate.ts" ]]; then
+    (cd "$parent/.." && pwd)
+    return 0
+  fi
+  if [[ -f "$parent/../core/scripts/ship-end-candidate.ts" ]]; then
+    (cd "$parent/.." && pwd)
+    return 0
+  fi
+  echo "FAIL: cannot locate pin-side resolve-and-prepare module from PIPELINE=$PIPELINE" >&2
+  return 1
+}
+
+# Invoke pin-side Node on resolveAndPrepareCandidateEngine. Do not install in shell.
+invoke_resolve_and_prepare() {
+  local sha=$1
+  local pin_root module out
+  pin_root=$(pin_engine_root) || return 1
+  module="$pin_root/core/scripts/ship-end-candidate.ts"
+  if [[ ! -f "$module" ]]; then
+    echo "FAIL: pin engine missing resolve-and-prepare module at $module" >&2
+    return 1
+  fi
+  if ! out=$("$SHIP_END_NODE" --experimental-strip-types "$module" \
+    --resolve-and-prepare --repo-dir "$REPO_DIR" --sha "$sha" --json); then
+    python3 -c 'import json,sys
+raw=sys.argv[1]
+try:
+    d=json.loads(raw)
+except Exception:
+    sys.stderr.write(raw + "\n")
+    raise SystemExit(1)
+sys.stderr.write("FAIL: " + str(d.get("error") or "resolve-and-prepare failed") + "\n")
+' "$out" >&2 || echo "FAIL: resolve-and-prepare failed for candidate $sha" >&2
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+# After train-complete: bind SHIP_END_CLI to a prepared candidate engine.
+# Identity-only resolution does not authorize spawn (#1151 / #1344).
 resolve_ship_end_cli() {
   local req=$1
-  local sha root launcher worktree explicit
+  local sha json root launcher commit
   resolve_ship_end_node || return 1
   sha=$(read_candidate_sha_from_request "$req") || return 1
   is_exact_git_sha "$sha" || return 1
-  worktree="$REPO_DIR/.worktrees/ship-candidate-$sha"
-  explicit="${PIPELINE_CANDIDATE_ENGINE_ROOT:-}"
-  root=""
-  if engine_root_ok "$REPO_DIR" "$sha"; then
-    root="$REPO_DIR"
-  elif engine_root_ok "$worktree" "$sha"; then
-    root="$worktree"
-  elif [[ -n "$explicit" ]]; then
-    case "$explicit" in
-      /*) ;;
-      *)
-        echo "FAIL: PIPELINE_CANDIDATE_ENGINE_ROOT must be an absolute directory" >&2
-        return 1
-        ;;
-    esac
-    if engine_root_ok "$explicit" "$sha"; then
-      root="$explicit"
-    fi
-  fi
-  if [[ -z "$root" ]]; then
-    mkdir -p "$REPO_DIR/.worktrees" 2>/dev/null || true
-    if git -C "$REPO_DIR" fetch --quiet origin "$sha" 2>/dev/null \
-      && git -C "$REPO_DIR" worktree add --detach "$worktree" "$sha" 2>/dev/null \
-      && engine_root_ok "$worktree" "$sha"; then
-      root="$worktree"
-    fi
-  fi
-  if [[ -z "$root" ]]; then
-    echo "FAIL: cannot resolve candidate engine at $sha (clean REPO_DIR HEAD, $worktree, or PIPELINE_CANDIDATE_ENGINE_ROOT)" >&2
+  json=$(invoke_resolve_and_prepare "$sha") || return 1
+  root=$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read());
+print(d["engine"]["engineRoot"] if d.get("ok") else "")' <<<"$json") || true
+  launcher=$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read());
+print(d["engine"]["launcherPath"] if d.get("ok") else "")' <<<"$json") || true
+  commit=$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read());
+print(d["engine"]["commitSha"] if d.get("ok") else "")' <<<"$json") || true
+  if [[ -z "$root" || -z "$launcher" || "$commit" != "$sha" ]]; then
+    python3 -c 'import json,sys
+raw=sys.stdin.read()
+try:
+    d=json.loads(raw)
+except Exception:
+    sys.stderr.write("FAIL: resolve-and-prepare returned non-JSON\n")
+    raise SystemExit(1)
+if not d.get("ok"):
+    sys.stderr.write("FAIL: "+str(d.get("error") or "resolve-and-prepare failed")+"\n")
+    raise SystemExit(1)
+sys.stderr.write("FAIL: resolve-and-prepare returned an unusable candidate engine\n")
+' <<<"$json" || true
+    echo "FAIL: cannot resolve candidate engine at $sha" >&2
     return 1
   fi
-  launcher="$root/scripts/pipeline-launcher.mjs"
   SHIP_END_ENGINE_ROOT="$root"
   SHIP_END_CANDIDATE_SHA="$sha"
   SHIP_END_CLI=("$SHIP_END_NODE" "$launcher")

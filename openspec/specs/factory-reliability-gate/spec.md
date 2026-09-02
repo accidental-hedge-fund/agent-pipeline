@@ -2134,7 +2134,7 @@ Hybrid-v2 collect for `pipeline factory-gate --from-run` (and the in-process equ
 
 ### Requirement: Layer A probe records SHALL use the same packed-candidate OID as pack provenance
 
-Every Layer A probe record produced by from-run hybrid-v2 collect SHALL set `candidate_git_sha` to the same packed-candidate OID as `pack_provenance.candidate_git_sha`. Layer A probes for that score SHALL execute against candidate engine sources for that OID. Collect SHALL resolve those sources with the existing candidate-engine resolver at packed candidate `C` and SHALL pass the resolved engine root as the probe working directory. They SHALL NOT treat factory control checkout HEAD as the candidate identity when it differs. Collect SHALL fail closed when it cannot resolve a clean checkout whose HEAD is `C`. Collect SHALL fail closed rather than bind TAP output from pin sources to the packed candidate.
+Every Layer A probe record produced by from-run hybrid-v2 collect SHALL set `candidate_git_sha` to the same packed-candidate OID as `pack_provenance.candidate_git_sha`. Layer A probes for that score SHALL execute against candidate engine sources for that OID. Collect SHALL resolve and prepare those sources with the shared resolve-and-prepare seam at packed candidate `C` and SHALL pass the prepared engine root as the probe working directory. Identity-only resolution SHALL NOT authorize TAP. They SHALL NOT treat factory control checkout HEAD as the candidate identity when it differs. Collect SHALL fail closed when it cannot resolve a clean checkout whose HEAD is `C`. Collect SHALL fail closed when resolve-and-prepare cannot prove candidate readiness. Collect SHALL fail closed rather than bind TAP output from pin sources to the packed candidate.
 
 #### Scenario: Probe records match pack provenance
 
@@ -2158,6 +2158,15 @@ Every Layer A probe record produced by from-run hybrid-v2 collect SHALL set `can
 - **AND** collect cannot resolve a clean candidate engine checkout whose HEAD is `C`
 - **THEN** collect SHALL fail closed before Layer A TAP
 - **AND** it SHALL NOT write provenance that binds pin-source TAP to `C`
+
+#### Scenario: Unready candidate engine for C fails closed before TAP
+
+- **WHEN** packed candidate is `C`
+- **AND** collect resolves a clean candidate engine checkout whose HEAD is `C`
+- **AND** resolve-and-prepare cannot prove candidate readiness
+- **THEN** collect SHALL fail closed before Layer A TAP
+- **AND** it SHALL NOT write provenance that binds pin-source TAP to `C`
+- **AND** no Layer A probe SHALL have executed
 
 ### Requirement: FRG from-run throughput SHALL count GitHub ready-to-deploy as clean-ready over a stale blocked ledger
 

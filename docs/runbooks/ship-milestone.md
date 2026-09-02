@@ -192,6 +192,12 @@ engine-promote use the production-pin CLI** (`$PIPELINE`). **After
 train-complete, FRG pack, `pipeline release`, `release finish`, and
 `release ensure-tag` use the candidate engine** at the FRG-bound SHA
 (`SHIP_END_CLI` = `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"`).
+Every accepted candidate root is made runnable before spawn: resolve-and-prepare
+proves candidate readiness as SHA plus nested `core/package-lock.json` digest.
+Fail-closed recovery is candidate-local (`npm ci` in that candidate `core/`).
+It is not a global package reinstall. Identity-only resolution does not
+authorize ship-end spawn. Tugboat and in-engine `pipeline ship` share that
+gate; Tugboat does not `npm ci` in bash.
 Tugboat does not invoke `git tag` or `gh release create`. Tag create is
 candidate `pipeline release ensure-tag` from on-disk HMAC `latest.json`.
 `.agent-pipeline/frg/` is gitignored, so auto-tag must not stall the ship for
@@ -221,9 +227,12 @@ pack-fail: prepare returns `awaiting_frg_attestation` and Tugboat runs
 `factory-gate --from-run` in a separate child. Real ineligible scoreboards
 stay pack-fail. A failed or missing pack that is not omitted-HMAC-only
 stops the ship **before** `pipeline release`.
-If the candidate engine cannot be resolved, Tugboat fails closed and does **not**
-fall back to the production-pin `$PIPELINE` for those verbs. Tugboat does not
-write the key body into `state.json`.
+If the candidate engine cannot be resolved or cannot be made ready, Tugboat
+fails closed and does **not** fall back to the production-pin `$PIPELINE` for
+those verbs. Setup, lock, and abandoned-ownership failures stay supervised
+lifecycle states (bounded treatment, Cooling, or External-condition wait).
+They are not generic blocked, needs-human, or a new recover recipe.
+Tugboat does not write the key body into `state.json`.
 
 `--skip-frg` / `TUGBOAT_SKIP_FRG=1` is an operator escape only. It requires a
 non-empty `--skip-frg-reason` / `TUGBOAT_SKIP_FRG_REASON`. Missing reason fails

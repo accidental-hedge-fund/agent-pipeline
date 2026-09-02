@@ -212,12 +212,12 @@ The exact-SHA engine checkout selected for candidate work such as ship or factor
 _Avoid_: installed PATH engine, control checkout
 
 **Candidate readiness**:
-Engine-owned proof that a Candidate-engine root is runnable from its own nested lockfile at the selected SHA. A dependency directory alone is not proof.
-_Avoid_: node_modules exists, global reinstall
+Engine-owned proof that a Candidate-engine root is runnable. The proof is a success record keyed by candidate SHA plus the nested `core/package-lock.json` digest, stored outside tracked files. A dependency directory alone is not proof.
+_Avoid_: node_modules exists, global reinstall, operator attestation
 
 **Resolve-and-prepare**:
 The shared gate that selects a Candidate-engine root, proves Candidate readiness, revalidates identity and cleanliness, and only then permits candidate commands to spawn.
-_Avoid_: leaf-command install, ship-only bootstrap
+_Avoid_: leaf-command install, ship-only bootstrap, identity-only spawn
 
 **Integration candidate**:
 The exact repository, base, pull request, and head tuple eligible for one authorized merge claim.

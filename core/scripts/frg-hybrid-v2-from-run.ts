@@ -18,8 +18,8 @@ import {
 import type { LoopContract, LoopLedger } from "./loop/types.ts";
 import { defaultLoopStoreDeps, runDir } from "./loop/store.ts";
 import {
-  defaultResolveCandidateEngineDeps,
-  resolveCandidateEngine,
+  defaultResolveAndPrepareDeps,
+  resolveAndPrepareCandidateEngine,
   type CandidateEngineResult,
 } from "./ship-end-candidate.ts";
 import { parseExactGitSha } from "./ship-end-identity.ts";
@@ -325,14 +325,14 @@ async function defaultReadLoopBinding(loopRunId: string): Promise<LoopBindingPre
 function defaultResolveCandidateEngineForCollect(opts: {
   repoDir: string;
   candidateSha: string;
-}): CandidateEngineResult {
-  return resolveCandidateEngine(
+}): Promise<CandidateEngineResult> {
+  return resolveAndPrepareCandidateEngine(
     {
       repoDir: opts.repoDir,
       candidateSha: opts.candidateSha,
       candidateEngineRootEnv: process.env.PIPELINE_CANDIDATE_ENGINE_ROOT,
     },
-    defaultResolveCandidateEngineDeps(),
+    defaultResolveAndPrepareDeps(),
   );
 }
 

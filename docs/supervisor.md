@@ -318,7 +318,10 @@ repo example content),
 `supervisor:ship-composer-skip-frg` (installed Tugboat/playbook must not
 hard-code default `--skip-frg`),
 and `supervisor:ship-end-candidate-engine` (ship-end uses the candidate engine;
-selected stale playbook fails). Train and promote stay on the production pin.
+selected stale playbook fails). After train-complete, ship-end composers obtain
+that engine from resolve-and-prepare: every accepted root is made runnable
+before spawn, readiness is SHA plus nested lockfile digest, and fail-closed
+recovery is candidate-local. Train and promote stay on the production pin.
 
 **Notify policy:** observational only; notification failures must not alter ship
 phase decisions. Prefer shared `ship-notify.sh` / `ship-stage-watch.sh` siblings
