@@ -17,6 +17,7 @@ import {
   mintObservationIdentity,
   ownedAdmissionObservation,
   persistOperationObservation,
+  loadOwnedOperationClaim,
   reportMechanicalFault,
   reportOwnedOperation,
   treatmentForSideEffectCertainty,
@@ -25,6 +26,12 @@ import {
   type ReportOperationObservation,
   type SideEffectCertainty,
 } from "./operation-observation.ts";
+import {
+  assertRecoveryEpisodeFields,
+  emptyEpisode,
+  normalizeEvidenceIdentity,
+  type RecoveryEpisodeKey,
+} from "./loop/recovery-episodes.ts";
 import {
   claimStageAttempt,
   persistStageAttemptLedger,
@@ -714,20 +721,61 @@ export function claimOrResumeRecoveryEpisode(input: {
   message: string;
   reportObservation?: ReportOperationObservation;
   persistDir?: string;
+  invariant?: string;
+  candidateEpoch?: string;
+  evidence?: string;
 }): OperationObservation {
-  const obs = ownedAdmissionObservation({
-    operation: RECOVERY_EPISODE_CLAIM_OPERATION,
-    form_id: "recovery-supervisor",
-    message: input.message,
+  const identity = mintObservationIdentity({
     domain: input.domain,
     logical_operation_id: input.logical_operation_id,
     repository: input.repository,
     issue: input.issue,
     run_id: input.run_id,
   });
-  reportOwnedOperation(input.reportObservation, obs);
-  if (input.persistDir) persistOperationObservation(obs, input.persistDir);
-  return obs;
+  const key: RecoveryEpisodeKey = {
+    operation: RECOVERY_EPISODE_CLAIM_OPERATION,
+    invariant: input.invariant ?? `issue:${input.issue ?? identity.logical_operation_id}`,
+    candidate_epoch: input.candidateEpoch ?? identity.run_id ?? "none",
+    evidence_identity: normalizeEvidenceIdentity(input.evidence ?? input.message),
+  };
+  const episode = emptyEpisode(key, new Date().toISOString());
+  if (input.persistDir && identity.logical_operation_id) {
+    const existing = loadOwnedOperationClaim(identity.domain, identity.logical_operation_id, input.persistDir);
+    if (
+      existing &&
+      existing.episode_id === episode.episode_id &&
+      existing.invariant === episode.invariant &&
+      existing.candidate_epoch === episode.candidate_epoch &&
+      existing.evidence_identity === episode.evidence_identity
+    ) {
+      reportOwnedOperation(input.reportObservation, existing);
+      return existing;
+    }
+  }
+  const obs = ownedAdmissionObservation({
+    operation: RECOVERY_EPISODE_CLAIM_OPERATION,
+    form_id: "recovery-supervisor",
+    message: input.message,
+    domain: input.domain,
+    logical_operation_id: identity.logical_operation_id,
+    repository: input.repository,
+    issue: input.issue,
+    run_id: input.run_id,
+  });
+  const claimed: OperationObservation = {
+    ...obs,
+    episode_id: episode.episode_id,
+    invariant: episode.invariant,
+    candidate_epoch: episode.candidate_epoch,
+    evidence_identity: episode.evidence_identity,
+    attempts_per_strategy: episode.attempts_per_strategy,
+    strategy_cursor: episode.strategy_cursor,
+    next_eligible_at: episode.next_eligible_at,
+  };
+  assertRecoveryEpisodeFields(claimed);
+  reportOwnedOperation(input.reportObservation, claimed);
+  if (input.persistDir) persistOperationObservation(claimed, input.persistDir);
+  return claimed;
 }
 
 export function recordRecoveryEpisodeTreatment(input: {
@@ -738,7 +786,10 @@ export function recordRecoveryEpisodeTreatment(input: {
   evidenceFingerprint?: string;
   typedReason?: string;
   runDir?: string;
+  invariant?: string;
+  candidateEpoch?: string;
 }): StageAttemptLedger {
+  const evidenceIdentity = input.evidenceFingerprint ?? input.headSha;
   const claimed = claimStageAttempt(input.ledger, {
     headSha: input.headSha,
     action: input.action,
@@ -746,6 +797,13 @@ export function recordRecoveryEpisodeTreatment(input: {
     evidenceFingerprint: input.evidenceFingerprint,
     typedReason: input.typedReason,
     budgetBefore: 1,
+    invariant: input.invariant ?? `stage:${input.action}`,
+    candidateEpoch: input.candidateEpoch ?? input.headSha,
+    evidenceIdentity,
+    attemptsPerStrategy: { [input.action]: 1 },
+    strategyCursor: 0,
+    nextEligibleAt: new Date().toISOString(),
+    episodeId: `${input.itemId ?? "stage"}:${input.headSha}:${input.action}`,
   });
   if (input.runDir) persistStageAttemptLedger(input.runDir, claimed.ledger);
   return claimed.ledger;

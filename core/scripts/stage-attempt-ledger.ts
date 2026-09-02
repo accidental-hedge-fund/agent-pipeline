@@ -97,6 +97,13 @@ export interface StageAttemptRecord {
   /** Bounded non-sensitive last error (recovery-family `error`). */
   error?: string;
   last_error?: string;
+  invariant?: string;
+  candidate_epoch?: string;
+  evidence_identity?: string;
+  attempts_per_strategy?: Record<string, number>;
+  strategy_cursor?: number;
+  next_eligible_at?: string;
+  episode_id?: string;
 }
 
 export const STAGE_ATTEMPT_LEDGER_SCHEMA = 1 as const;
@@ -617,6 +624,13 @@ export interface ClaimStageAttemptInput {
   budgetBefore?: number;
   notBefore?: string;
   nextAttemptAt?: string;
+  invariant?: string;
+  candidateEpoch?: string;
+  evidenceIdentity?: string;
+  attemptsPerStrategy?: Record<string, number>;
+  strategyCursor?: number;
+  nextEligibleAt?: string;
+  episodeId?: string;
 }
 
 export type ClaimStageAttemptResult =
@@ -683,6 +697,13 @@ export function claimStageAttempt(
           terminal_outcome: "failed" as const,
         }
       : {}),
+    ...(input.invariant ? { invariant: input.invariant } : {}),
+    ...(input.candidateEpoch ? { candidate_epoch: input.candidateEpoch } : {}),
+    ...(input.evidenceIdentity ? { evidence_identity: input.evidenceIdentity } : {}),
+    ...(input.attemptsPerStrategy ? { attempts_per_strategy: input.attemptsPerStrategy } : {}),
+    ...(input.strategyCursor !== undefined ? { strategy_cursor: input.strategyCursor } : {}),
+    ...(input.nextEligibleAt ? { next_eligible_at: input.nextEligibleAt } : {}),
+    ...(input.episodeId ? { episode_id: input.episodeId } : {}),
   };
   ledger.attempts.push(attempt);
   return { ok: true, ledger, attempt, created: true };

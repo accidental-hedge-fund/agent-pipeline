@@ -187,14 +187,7 @@ budget, while sibling items continue to be scheduled and recovered unaffected.
 
 ### Requirement: Every terminal driver exit SHALL emit one durable terminal event
 
-Before the supervisor process exits with a verified-complete or authenticated-cancellation run
-result, it SHALL persist exactly one
-terminal event kind for that exit. Existing stop transitions for genuine human-authority holds SHALL continue to append
-`loop_run_stopped` or `loop_run_complete` with their final item accounting. Mechanical exhaustion,
-process death, no-progress, capacity, and cycle-cap SHALL persist Cooling or wait evidence. They
-SHALL NOT emit a terminal stop event that ends ownership. A process interruption while recovery
-remains possible SHALL NOT emit a terminal event. Re-entry SHALL not duplicate an already persisted
-terminal event for the same terminal revision.
+The supervisor SHALL persist exactly one terminal event kind before it exits with a verified-complete or authenticated-cancellation run result. Existing stop transitions for genuine human-authority holds SHALL continue to append `loop_run_stopped` or `loop_run_complete` with their final item accounting. Mechanical exhaustion, process death, no-progress, capacity, and cycle-cap SHALL persist Cooling or wait evidence. They SHALL NOT emit a terminal stop event that ends ownership. A process interruption while recovery remains possible SHALL NOT emit a terminal event. Re-entry SHALL not duplicate an already persisted terminal event for the same terminal revision.
 
 #### Scenario: Completed run emits completion event
 

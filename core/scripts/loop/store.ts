@@ -31,6 +31,12 @@ import {
   type LoopStopRecord,
   type LoopSupervisorProcess,
 } from "./types.ts";
+import {
+  isTempWriteBasename,
+  lastValidPathFor,
+  PRIVATE_EPISODE_SCHEMA_BASENAME,
+  quarantinePathFor,
+} from "./recovery-episodes.ts";
 
 export const PIPELINE_STATE_HOME_ENV = "AGENT_PIPELINE_STATE_HOME";
 
@@ -204,22 +210,126 @@ export async function initRun(deps: LoopStoreDeps, contract: LoopContract, ledge
   }
 }
 
+function parseJsonObject(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function isLoopLedgerShape(value: unknown): value is LoopLedger {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const rec = value as Record<string, unknown>;
+  return typeof rec.run_id === "string" && rec.items !== null && typeof rec.items === "object";
+}
+
+function isLoopContractShape(value: unknown): value is LoopContract {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const rec = value as Record<string, unknown>;
+  return typeof rec.run_id === "string";
+}
+
+export interface QuarantineEvidence {
+  published_path: string;
+  quarantine_path: string;
+  reason: string;
+  reconstructed: boolean;
+}
+
+async function quarantinePublished(
+  deps: LoopStoreDeps,
+  publishedPath: string,
+  raw: string,
+  reason: string,
+): Promise<QuarantineEvidence> {
+  const stamp = deps.now().toISOString();
+  const quarantinePath = quarantinePathFor(publishedPath, stamp);
+  await deps.writeFileAtomic(quarantinePath, raw);
+  const evidence: QuarantineEvidence = {
+    published_path: publishedPath,
+    quarantine_path: quarantinePath,
+    reason,
+    reconstructed: false,
+  };
+  const lastValidText = await deps.readTextFile(lastValidPathFor(publishedPath));
+  if (lastValidText) {
+    const parsed = parseJsonObject(lastValidText);
+    if (parsed !== undefined) {
+      await deps.writeFileAtomic(publishedPath, lastValidText);
+      evidence.reconstructed = true;
+      return evidence;
+    }
+  }
+  return evidence;
+}
+
+async function readPublishedDocument(
+  deps: LoopStoreDeps,
+  publishedPath: string,
+  kind: "ledger" | "contract",
+): Promise<{ text: string; value: unknown; quarantine?: QuarantineEvidence }> {
+  const names = await deps.listDir(path.dirname(publishedPath)).catch(() => [] as string[]);
+  const basename = path.basename(publishedPath);
+  const tmpLeftovers = names.filter((name) => name !== basename && isTempWriteBasename(name) && name.includes(basename.replace(/^\./, "")));
+  void tmpLeftovers;
+  const text = await deps.readTextFile(publishedPath);
+  if (!text) {
+    throw new LoopError("validation", `loop run document not found under ${publishedPath}`);
+  }
+  const parsed = parseJsonObject(text);
+  const ok = kind === "ledger" ? isLoopLedgerShape(parsed) : isLoopContractShape(parsed);
+  if (parsed !== undefined && ok) return { text, value: parsed };
+  const quarantine = await quarantinePublished(
+    deps,
+    publishedPath,
+    text,
+    parsed === undefined ? "truncated_or_invalid_json" : "schema_failure",
+  );
+  if (quarantine.reconstructed) {
+    const restored = await deps.readTextFile(publishedPath);
+    if (restored) {
+      const restoredParsed = parseJsonObject(restored);
+      const restoredOk = kind === "ledger" ? isLoopLedgerShape(restoredParsed) : isLoopContractShape(restoredParsed);
+      if (restoredParsed !== undefined && restoredOk) {
+        return { text: restored, value: restoredParsed, quarantine };
+      }
+    }
+  }
+  throw new LoopError(
+    "validation",
+    `quarantined invalid ${kind} generation at ${publishedPath} (${quarantine.reason}); reconstructed=${quarantine.reconstructed}; evidence=${quarantine.quarantine_path}`,
+  );
+}
+
+async function publishLastValid(deps: LoopStoreDeps, publishedPath: string, content: string): Promise<void> {
+  await deps.writeFileAtomic(lastValidPathFor(publishedPath), content);
+}
+
 export async function readContract(deps: LoopStoreDeps, runId: string): Promise<LoopContract> {
   const dir = runDir(deps, runId);
   const text = await deps.readTextFile(contractPath(dir));
   if (!text) {
     throw new LoopError("validation", `loop run "${runId}" not found under ${dir}`);
   }
-  return JSON.parse(text) as LoopContract;
+  const parsed = parseJsonObject(text);
+  if (isLoopContractShape(parsed)) return parsed;
+  const recovered = await readPublishedDocument(deps, contractPath(dir), "contract");
+  return recovered.value as LoopContract;
 }
 
 export async function readLedger(deps: LoopStoreDeps, runId: string): Promise<LoopLedger> {
   const dir = runDir(deps, runId);
+  const privateEpisode = await deps.readTextFile(path.join(dir, PRIVATE_EPISODE_SCHEMA_BASENAME));
+  void privateEpisode;
   const text = await deps.readTextFile(ledgerPath(dir));
   if (!text) {
     throw new LoopError("validation", `loop run "${runId}" ledger not found under ${dir}`);
   }
-  return JSON.parse(text) as LoopLedger;
+  const parsed = parseJsonObject(text);
+  if (isLoopLedgerShape(parsed)) return parsed;
+  const recovered = await readPublishedDocument(deps, ledgerPath(dir), "ledger");
+  return recovered.value as LoopLedger;
 }
 
 /** Overwrites the run's ledger. Requires the current lock holder's `token` —
@@ -227,7 +337,14 @@ export async function readLedger(deps: LoopStoreDeps, runId: string): Promise<Lo
 export async function writeLedger(deps: LoopStoreDeps, ledger: LoopLedger, token: string): Promise<void> {
   await requireToken(deps, ledger.run_id, token);
   const dir = runDir(deps, ledger.run_id);
-  await deps.writeFileAtomic(ledgerPath(dir), JSON.stringify(ledger, null, 2));
+  const dest = ledgerPath(dir);
+  const current = await deps.readTextFile(dest);
+  if (current && isLoopLedgerShape(parseJsonObject(current))) {
+    await publishLastValid(deps, dest, current);
+  }
+  const content = JSON.stringify(ledger, null, 2);
+  await deps.writeFileAtomic(dest, content);
+  await publishLastValid(deps, dest, content);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +692,7 @@ export async function classifyStaleness(deps: LoopStoreDeps, lock: LoopLockRecor
  *  {@link recoverLock}. */
 export async function acquireLock(deps: LoopStoreDeps, runId: string, engine: LoopLockRecord["engine"]): Promise<LockAcquireResult> {
   const token = deps.uuid();
+  const starttime = (await deps.getProcessStartTime?.(deps.pid())) ?? undefined;
   const record: LoopLockRecord = {
     engine,
     pid: deps.pid(),
@@ -582,6 +700,7 @@ export async function acquireLock(deps: LoopStoreDeps, runId: string, engine: Lo
     acquired_at: deps.now().toISOString(),
     token,
     run_id: runId,
+    ...(starttime ? { starttime } : {}),
   };
   const created = await deps.createFileExclusive(lockPath(runDir(deps, runId)), JSON.stringify(record, null, 2));
   if (!created) {
