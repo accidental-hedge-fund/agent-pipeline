@@ -2861,6 +2861,7 @@ export async function runSupervisorCycle(
               token,
               itemId,
               engine,
+              logicalOperationId: logicalOperationIdFor(contract, ledger),
               request: waitRequestFromClassifier(
                 classified,
                 response.diagnostic.detail.reason,
@@ -3039,6 +3040,7 @@ export async function runSupervisorCycle(
             token,
             itemId,
             engine,
+            logicalOperationId: logicalOperationIdFor(contract, ledger),
             request: waitRequestFromClassifier(classified, response.diagnostic.detail.reason, {
               authority_evidence_key: response.diagnostic.evidence_key,
               authority_candidate_head: authorityIdentity.head_sha,
@@ -3057,6 +3059,7 @@ export async function runSupervisorCycle(
             token,
             itemId,
             engine,
+            logicalOperationId: logicalOperationIdFor(contract, ledger),
             request: waitRequestFromClassifier(
               classified,
               response?.diagnostic?.detail.reason ?? classified.record.missing,

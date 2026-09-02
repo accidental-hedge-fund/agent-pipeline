@@ -30,6 +30,7 @@ import {
 } from "./types.ts";
 import { initRun, readLedger, writeLedger, appendEvent, type LoopStoreDeps } from "./store.ts";
 import { mapLegacyThemeToBlockerClass } from "./import.ts";
+import { resolveLogicalOperationId } from "../logical-operation.ts";
 import {
   applyClaimToEpisode,
   assertRecoveryEpisodeFields,
@@ -43,8 +44,10 @@ import {
   type RecoveryEpisodeKey,
 } from "./recovery-episodes.ts";
 import {
+  bindLifecycleRecord,
   compatibilityStopRefusesItem,
   consultLifecycleRecord,
+  deriveLifecycleState,
   isMechanicalCompatibilityStopReason,
   lifecycleAllowsRecoveryRecipe,
 } from "../recovery-lifecycle-ownership.ts";
@@ -510,6 +513,27 @@ export function recoveryAttemptId(input: {
 // Blocking transition — classification + fingerprint + repeat bounding.
 // ---------------------------------------------------------------------------
 
+/** Admit a missing RecoverySupervisor record before a recovery mutation writes. */
+function admitRecoveryLifecycle(
+  contract: LoopContract,
+  ledger: LoopLedger,
+  updatedAt: string,
+): LoopLedger {
+  const logicalOperationId = resolveLogicalOperationId({
+    written: ledger.lifecycle?.logical_operation_id,
+    loopStore: contract.logical_operation_id,
+  });
+  const facts = {
+    cooling: Boolean(ledger.cooling),
+    stopReason: ledger.stop?.reason ?? null,
+    activeAttempt: true as const,
+  };
+  const ownership = ledger.lifecycle
+    ? consultLifecycleRecord(ledger.lifecycle, facts)
+    : deriveLifecycleState(facts);
+  return bindLifecycleRecord(ledger, logicalOperationId, ownership, updatedAt);
+}
+
 export interface BlockItemInput {
   runId: string;
   token: string;
@@ -591,21 +615,22 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
     }
   }
 
-  await writeLedger(deps, ledger, input.token);
+  const next = admitRecoveryLifecycle(contract, ledger, time);
+  await writeLedger(deps, next, input.token);
   await appendEvent(deps, input.runId, input.token, "loop_item_blocked", {
     item_id: input.itemId,
     class: blockerClass,
     evidence_fingerprint: fingerprint,
     repeated_evidence_count: repeatedCount,
   });
-  if (ledger.stop && !stopAlreadyRecorded) {
+  if (next.stop && !stopAlreadyRecorded) {
     await appendEvent(deps, input.runId, input.token, "loop_run_stopped", {
-      reason: ledger.stop.reason,
+      reason: next.stop.reason,
       item_id: input.itemId,
       fingerprint,
     });
   }
-  return ledger;
+  return next;
 }
 
 /** Composes {@link classifyBlocker} and {@link blockItem}. Unknown or
@@ -780,7 +805,10 @@ export async function startRecoveryAttempt(
   const existing = ledger.recovery_attempts.find((attempt) => attempt.attempt_id === attemptId);
   if (existing) {
     if (existing.invariant) assertRecoveryEpisodeFields(existing);
-    return { ledger, attempt: existing };
+    const admitted = admitRecoveryLifecycle(contract, ledger, deps.now().toISOString());
+    if (admitted === ledger) return { ledger, attempt: existing };
+    await writeLedger(deps, admitted, input.token);
+    return { ledger: admitted, attempt: existing };
   }
 
   const remaining = item.recovery_budgets_remaining[blockerClass] ?? policyEntry.retry_budget;
@@ -876,7 +904,8 @@ export async function startRecoveryAttempt(
     item.recovery_budgets_remaining[blockerClass] = budgetRemaining;
   }
 
-  await writeLedger(deps, ledger, input.token);
+  const next = admitRecoveryLifecycle(contract, ledger, time);
+  await writeLedger(deps, next, input.token);
   await appendEvent(
     deps,
     input.runId,
@@ -884,7 +913,7 @@ export async function startRecoveryAttempt(
     outcome === "started" ? "loop_recovery_attempt_started" : "loop_recovery_attempt",
     { ...attempt },
   );
-  return { ledger, attempt };
+  return { ledger: next, attempt };
 }
 
 /** Completes a previously persisted recovery claim. Completion is idempotent:
@@ -897,7 +926,7 @@ export async function completeRecoveryAttempt(
   contractInput: LoopContract,
   input: CompleteRecoveryAttemptInput,
 ): Promise<RecoverItemResult> {
-  upgradeContractForRecovery(contractInput);
+  const contract = upgradeContractForRecovery(contractInput);
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
   if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle)) {
     throw new LoopError("stop", `logical operation lifecycle is ${consultLifecycleRecord(ledger.lifecycle).state}`);
@@ -906,7 +935,12 @@ export async function completeRecoveryAttempt(
   if (!attempt || attempt.item_id !== input.itemId) {
     throw new LoopError("validation", `recovery attempt "${input.attemptId}" was not started for item "${input.itemId}"`);
   }
-  if (attempt.outcome !== "started") return { ledger, attempt };
+  if (attempt.outcome !== "started") {
+    const admitted = admitRecoveryLifecycle(contract, ledger, deps.now().toISOString());
+    if (admitted === ledger) return { ledger, attempt };
+    await writeLedger(deps, admitted, input.token);
+    return { ledger: admitted, attempt };
+  }
   if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
@@ -971,9 +1005,10 @@ export async function completeRecoveryAttempt(
     }
   }
 
-  await writeLedger(deps, ledger, input.token);
+  const next = admitRecoveryLifecycle(contract, ledger, time);
+  await writeLedger(deps, next, input.token);
   await appendEvent(deps, input.runId, input.token, "loop_recovery_attempt", { ...attempt });
-  return { ledger, attempt };
+  return { ledger: next, attempt };
 }
 
 /** Compatibility wrapper for callers that already have an action result. New

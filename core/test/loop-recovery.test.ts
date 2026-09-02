@@ -668,6 +668,64 @@ test("startRecoveryAttempt: claim persists before execution and restart replay d
   assert.equal(replayedCompletion.ledger.recovery_attempts.length, 1);
 });
 
+test("recovery mutations admit a lifecycle record on a pre-#1322 ledger before the first write", async () => {
+  const { deps, contract, token } = await setup({ logical_operation_id: "lop-legacy-recovery-1322" });
+  const before = await readLedger(deps, "run-1");
+  assert.equal(before.lifecycle, undefined);
+
+  const blocked = await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "implementation-ci", evidence: "ci failed on current head",
+  });
+  assert.equal(blocked.lifecycle?.logical_operation_id, "lop-legacy-recovery-1322");
+  assert.equal(blocked.lifecycle?.state, "active");
+  assert.equal(blocked.items["100"].state, "blocked");
+
+  const afterBlock = await readLedger(deps, "run-1");
+  assert.equal(afterBlock.lifecycle?.logical_operation_id, "lop-legacy-recovery-1322");
+
+  const { lifecycle: _dropped, ...legacyAfterBlock } = afterBlock;
+  await writeLedger(deps, legacyAfterBlock as typeof afterBlock, token);
+  assert.equal((await readLedger(deps, "run-1")).lifecycle, undefined);
+
+  const started = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    action: "repair_pipeline_item", candidateIdentity: "head-abc:base-def",
+  });
+  assert.equal(started.ledger.lifecycle?.logical_operation_id, "lop-legacy-recovery-1322");
+  assert.equal(started.attempt.outcome, "started");
+
+  const afterStart = await readLedger(deps, "run-1");
+  const { lifecycle: _droppedStart, ...legacyAfterStart } = afterStart;
+  await writeLedger(deps, legacyAfterStart as typeof afterStart, token);
+
+  const completed = await completeRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    attemptId: started.attempt.attempt_id, succeeded: false, error: "repair failed",
+  });
+  assert.equal(completed.ledger.lifecycle?.logical_operation_id, "lop-legacy-recovery-1322");
+  assert.equal((await readLedger(deps, "run-1")).lifecycle?.logical_operation_id, "lop-legacy-recovery-1322");
+});
+
+test("recoverItem admits a lifecycle record on a pre-#1322 ledger", async () => {
+  const { deps, contract, token } = await setup({ logical_operation_id: "lop-legacy-recover-item-1322" });
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "implementation-ci", evidence: "ci failed",
+  });
+  const current = await readLedger(deps, "run-1");
+  const { lifecycle: _dropped, ...legacy } = current;
+  await writeLedger(deps, legacy as typeof current, token);
+
+  const recovered = await recoverItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    actions: ["rerun_ci"], candidateIdentity: "ci-1", succeeded: true,
+  });
+  assert.equal(recovered.ledger.lifecycle?.logical_operation_id, "lop-legacy-recover-item-1322");
+  assert.equal(recovered.attempt.outcome, "recovered");
+  assert.equal((await readLedger(deps, "run-1")).lifecycle?.logical_operation_id, "lop-legacy-recover-item-1322");
+});
+
 test("startRecoveryAttempt consults the durable lifecycle record and refuses cancelled/succeeded", async () => {
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, {

@@ -48,6 +48,13 @@ A supervised operation SHALL remain owned until verified success, durable Coolin
 - **THEN** a later RecoverySupervisor SHALL resume the same Logical Operation as `cooling` or `active`
 - **AND** SHALL NOT treat the death as `cancelled` or `succeeded`
 
+#### Scenario: Direct recovery or hold mutation admits ownership
+
+- **WHEN** a recovery or hold mutation runs against a ledger with no durable lifecycle record
+- **THEN** the mutating entry point SHALL admit and bind a lifecycle record for the Logical Operation before the first ledger write
+- **AND** SHALL use the contract logical-operation id when one is supplied
+- **AND** SHALL NOT depend on a later supervisor cycle to create ownership
+
 ---
 
 ### Requirement: Failure SHALL NOT grant human authority

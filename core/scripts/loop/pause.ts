@@ -25,6 +25,7 @@ import {
   type LoopNativeGoalCheck,
   type LoopPipelinePreflightEvidence,
 } from "./types.ts";
+import { resolveLogicalOperationId } from "../logical-operation.ts";
 import {
   bindLifecycleRecord,
   compatibilityStopRefusesItem,
@@ -53,9 +54,15 @@ export function upgradeLedgerForPauseAuthority(ledger: LoopLedger): LoopLedger {
   return { ...ledger, authority_amendments: [] };
 }
 
-function bindHoldLifecycle(ledger: LoopLedger, time: string): LoopLedger {
-  const logicalOperationId = ledger.lifecycle?.logical_operation_id;
-  if (!logicalOperationId) return ledger;
+function bindHoldLifecycle(
+  ledger: LoopLedger,
+  time: string,
+  logicalOperationId?: string | null,
+): LoopLedger {
+  const id = resolveLogicalOperationId({
+    written: ledger.lifecycle?.logical_operation_id,
+    parent: logicalOperationId,
+  });
   let typedRequest: "DecisionRequest" | "CapabilityRequest" | "AuthorityRequest" | null = null;
   for (const item of Object.values(ledger.items)) {
     const typed = item.hold_request?.typed_request;
@@ -66,7 +73,7 @@ function bindHoldLifecycle(ledger: LoopLedger, time: string): LoopLedger {
   }
   return bindLifecycleRecord(
     ledger,
-    logicalOperationId,
+    id,
     deriveLifecycleState({
       typedRequest,
       cooling: Boolean(ledger.cooling),
@@ -87,6 +94,8 @@ export interface EnterHoldInput {
   itemId: string;
   engine: LoopEngineName;
   note?: string;
+  /** Contract logical-operation id used to admit a pre-#1322 ledger. */
+  logicalOperationId?: string | null;
 }
 
 async function enterHold(
@@ -123,7 +132,7 @@ async function enterHold(
   item.hold_request = request;
   item.history.push({ time, from: fromState, to, engine: input.engine, note: input.note });
 
-  const next = bindHoldLifecycle(ledger, time);
+  const next = bindHoldLifecycle(ledger, time, input.logicalOperationId);
   await writeLedger(deps, next, input.token);
   await appendEvent(deps, input.runId, input.token, to === "paused" ? "loop_item_paused" : "loop_item_waiting", {
     item_id: input.itemId,
@@ -286,6 +295,7 @@ export async function invalidateIncompleteHoldForReclassify(
     engine: LoopEngineName;
     actor?: string;
     requestId?: string;
+    logicalOperationId?: string | null;
   },
 ): Promise<LoopLedger> {
   await requireToken(deps, input.runId, input.token);
@@ -325,6 +335,7 @@ export async function invalidateIncompleteHoldForReclassify(
   const next: LoopLedger = bindHoldLifecycle(
     { ...ledger, items: { ...ledger.items, [input.itemId]: updated } },
     time,
+    input.logicalOperationId,
   );
   await writeLedger(deps, next, input.token);
   await appendEvent(deps, input.runId, input.token, "loop_item_hold_invalidated", {
@@ -477,6 +488,8 @@ export interface ResumeHoldInput {
   pipeline_preflight: LoopPipelinePreflightEvidence | null | undefined;
   native_goal: LoopNativeGoalCheck | null | undefined;
   note?: string;
+  /** Contract logical-operation id used to admit a pre-#1322 ledger. */
+  logicalOperationId?: string | null;
 }
 
 /** Resumes a `paused`/`waiting` item to `in_progress` through an audited, fail-closed resume.
@@ -533,6 +546,7 @@ export async function resumeHold(deps: LoopStoreDeps, input: ResumeHoldInput): P
         engine: input.engine,
         actor: input.actor,
         requestId: outstanding.request_id,
+        logicalOperationId: input.logicalOperationId,
       });
     }
     if (outstanding.permitted_responses && !outstanding.permitted_responses.includes(input.response.value)) {
@@ -566,7 +580,7 @@ export async function resumeHold(deps: LoopStoreDeps, input: ResumeHoldInput): P
   item.history.push({ time, from: fromState, to: "in_progress", engine: input.engine, note: input.note });
   ledger.last_native_goal_check = input.native_goal as LoopNativeGoalCheck;
 
-  const next = bindHoldLifecycle(ledger, time);
+  const next = bindHoldLifecycle(ledger, time, input.logicalOperationId);
   await writeLedger(deps, next, input.token);
   await appendEvent(deps, input.runId, input.token, "loop_item_resumed", { item_id: input.itemId, from: fromState });
   return next;
