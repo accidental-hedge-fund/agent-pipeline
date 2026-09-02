@@ -26,12 +26,17 @@ import {
   LEGACY_TERMINAL_MIGRATION,
   MECHANICAL_FAULT_CLASSES,
   RECOVERY_LIFECYCLE_STATES,
+  admitLifecycleRecord,
+  applyLifecycleTransition,
   assertRecoveryLifecycleState,
+  bindLifecycleRecord,
   compatibilityStopAllowsIndependentSiblings,
+  consultLifecycleRecord,
   deriveLifecycleState,
   executionDispositionForForm,
   isRecoveryLifecycleState,
   lifecycleAfterProcessExit,
+  lifecycleAllowsRecoveryRecipe,
   lifecycleForMechanicalFault,
   mutatingSurfaceVerbsMissingInventory,
   observerCatalogHas,
@@ -350,4 +355,94 @@ test("authenticated cancel is the only cancelled exit; exhaustion is Cooling", (
   const exhaust = deriveLifecycleState({ faultClass: "retry-exhaustion" });
   assert.equal(exhaust.state, "cooling");
   assert.equal(exhaust.cancelled, false);
+});
+
+test("admission writes a durable one-of-six lifecycle record keyed by Logical Operation", () => {
+  const admitted = admitLifecycleRecord({
+    logical_operation_id: "lop-admitted-1322",
+    updated_at: "2026-09-02T00:00:00.000Z",
+  });
+  assert.equal(admitted.logical_operation_id, "lop-admitted-1322");
+  assert.equal(admitted.state, "active");
+  assert.equal(admitted.owned, true);
+  assert.equal(admitted.ownerless, false);
+  assert.equal(admitted.human_owned, false);
+  assert.equal(admitted.revision, 1);
+  assert.equal(isRecoveryLifecycleState(admitted.state), true);
+});
+
+test("durable lifecycle record is consulted after process death; labels are not truth", () => {
+  const admitted = admitLifecycleRecord({
+    logical_operation_id: "lop-wake-1322",
+    updated_at: "2026-09-02T00:00:00.000Z",
+  });
+  const cooling = applyLifecycleTransition(
+    admitted,
+    deriveLifecycleState({ faultClass: "retry-exhaustion" }),
+    "2026-09-02T00:01:00.000Z",
+    "lop-wake-1322",
+  );
+  assert.equal(cooling.state, "cooling");
+  assert.equal(cooling.revision, 2);
+  const wake = consultLifecycleRecord(cooling, {
+    labels: ["pipeline:needs-human", "blocked"],
+    processExitCode: 1,
+    stopReason: "run_fatal",
+  });
+  assert.equal(wake.state, "cooling");
+  assert.equal(wake.owned, true);
+  assert.notEqual(wake.state, "typed-input-wait");
+  assert.notEqual(wake.state, "cancelled");
+  assert.notEqual(wake.state, "succeeded");
+});
+
+test("applyLifecycleTransition refuses leaving cancelled or succeeded", () => {
+  const cancelled = applyLifecycleTransition(
+    null,
+    deriveLifecycleState({ cancelledByAuthenticatedCaller: true }),
+    "2026-09-02T00:00:00.000Z",
+    "lop-term-1322",
+  );
+  const after = applyLifecycleTransition(
+    cancelled,
+    deriveLifecycleState({ cooling: true }),
+    "2026-09-02T00:01:00.000Z",
+    "lop-term-1322",
+  );
+  assert.equal(after.state, "cancelled");
+  assert.equal(after.revision, 1);
+  assert.equal(lifecycleAllowsRecoveryRecipe(cancelled), false);
+  const succeeded = applyLifecycleTransition(
+    null,
+    deriveLifecycleState({ observerProvedPostcondition: true }),
+    "2026-09-02T00:00:00.000Z",
+    "lop-term-1322",
+  );
+  assert.equal(lifecycleAllowsRecoveryRecipe(succeeded), false);
+  const cooling = applyLifecycleTransition(
+    null,
+    deriveLifecycleState({ cooling: true }),
+    "2026-09-02T00:00:00.000Z",
+    "lop-cool-1322",
+  );
+  assert.equal(lifecycleAllowsRecoveryRecipe(cooling), true);
+});
+
+test("bindLifecycleRecord persists the closed state on a ledger-shaped document", () => {
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-1",
+    lifecycle: null as null,
+  };
+  const bound = bindLifecycleRecord(
+    ledger,
+    "lop-bind-1322",
+    deriveLifecycleState({ cooling: true, stopReason: "run_fatal" }),
+    "2026-09-02T00:00:00.000Z",
+  );
+  assert.equal(bound.lifecycle?.logical_operation_id, "lop-bind-1322");
+  assert.equal(bound.lifecycle?.state, "cooling");
+  assert.equal(bound.lifecycle?.revision, 1);
+  const consulted = consultLifecycleRecord(bound.lifecycle, { labels: ["pipeline:needs-human"] });
+  assert.equal(consulted.state, "cooling");
 });

@@ -91,6 +91,13 @@ export interface LifecycleOwnership {
   typed_request: PublicTypedRequest | null;
 }
 
+/** Durable RecoverySupervisor record for one admitted Logical Operation. */
+export interface DurableLifecycleRecord extends LifecycleOwnership {
+  logical_operation_id: string;
+  updated_at: string;
+  revision: number;
+}
+
 export interface LifecycleDerivationInput {
   labels?: readonly string[];
   typedRequest?: PublicTypedRequest | null;
@@ -141,6 +148,126 @@ function owned(state: RecoveryLifecycleState, extra?: Partial<LifecycleOwnership
     human_authority: extra?.human_authority === true,
     typed_request: extra?.typed_request ?? null,
   };
+}
+
+const TERMINAL_LIFECYCLE_STATES: ReadonlySet<RecoveryLifecycleState> = new Set(["succeeded", "cancelled"]);
+
+function ownershipFromRecord(record: DurableLifecycleRecord): LifecycleOwnership {
+  return {
+    state: record.state,
+    owned: true,
+    ownerless: false,
+    human_owned: false,
+    cancelled: record.cancelled,
+    human_authority: record.human_authority,
+    typed_request: record.typed_request,
+  };
+}
+
+function sameOwnership(record: DurableLifecycleRecord, next: LifecycleOwnership): boolean {
+  return (
+    record.state === next.state &&
+    record.cancelled === next.cancelled &&
+    record.human_authority === next.human_authority &&
+    record.typed_request === next.typed_request
+  );
+}
+
+/** Admit a Logical Operation into RecoverySupervisor ownership as `active`. */
+export function admitLifecycleRecord(input: {
+  logical_operation_id: string;
+  updated_at: string;
+}): DurableLifecycleRecord {
+  const logical_operation_id = input.logical_operation_id.trim();
+  if (!logical_operation_id) {
+    throw new Error("lifecycle record: logical_operation_id is required");
+  }
+  return {
+    logical_operation_id,
+    ...owned("active"),
+    updated_at: input.updated_at,
+    revision: 1,
+  };
+}
+
+/**
+ * Apply a lawful lifecycle transition. `succeeded` and `cancelled` are sticky.
+ * Admission (no current record) writes revision 1.
+ */
+export function applyLifecycleTransition(
+  current: DurableLifecycleRecord | null | undefined,
+  next: LifecycleOwnership,
+  updated_at: string,
+  logical_operation_id: string,
+): DurableLifecycleRecord {
+  const id = (current?.logical_operation_id ?? logical_operation_id).trim();
+  if (!current) {
+    return {
+      logical_operation_id: id,
+      ...next,
+      updated_at,
+      revision: 1,
+    };
+  }
+  if (TERMINAL_LIFECYCLE_STATES.has(current.state) && next.state !== current.state) {
+    return current;
+  }
+  if (sameOwnership(current, next)) return current;
+  return {
+    logical_operation_id: current.logical_operation_id,
+    ...next,
+    updated_at,
+    revision: current.revision + 1,
+  };
+}
+
+/**
+ * Consult the durable ownership record plus current typed-request evidence.
+ * Compatibility labels and process exits are not lifecycle truth.
+ */
+export function consultLifecycleRecord(
+  record: DurableLifecycleRecord | null | undefined,
+  evidence: LifecycleDerivationInput = {},
+): LifecycleOwnership {
+  if (evidence.cancelledByAuthenticatedCaller === true || evidence.cancelledByOriginalAuthorizedCaller === true) {
+    return owned("cancelled");
+  }
+  if (evidence.observerProvedPostcondition === true) {
+    return owned("succeeded");
+  }
+  if (isPublicTypedRequest(evidence.typedRequest)) {
+    return owned("typed-input-wait", {
+      human_authority: evidence.typedRequest === "AuthorityRequest",
+      typed_request: evidence.typedRequest,
+    });
+  }
+  if (!record) {
+    return deriveLifecycleState(evidence);
+  }
+  if (record.state === "typed-input-wait") {
+    return deriveLifecycleState({ ...evidence, typedRequest: null });
+  }
+  return ownershipFromRecord(record);
+}
+
+/** Bind the closed lifecycle record onto a ledger-shaped document. */
+export function bindLifecycleRecord<T extends { lifecycle?: DurableLifecycleRecord | null }>(
+  ledger: T,
+  logicalOperationId: string,
+  ownership: LifecycleOwnership,
+  updated_at: string,
+): T {
+  const lifecycle = applyLifecycleTransition(ledger.lifecycle, ownership, updated_at, logicalOperationId);
+  if (ledger.lifecycle === lifecycle) return ledger;
+  return { ...ledger, lifecycle };
+}
+
+/** Recovery recipes are refused only after a lawful lifecycle exit. */
+export function lifecycleAllowsRecoveryRecipe(
+  record: DurableLifecycleRecord | null | undefined,
+): boolean {
+  const life = consultLifecycleRecord(record);
+  return life.state !== "cancelled" && life.state !== "succeeded";
 }
 
 function hasNeedsHumanLabel(labels: readonly string[] | undefined): boolean {

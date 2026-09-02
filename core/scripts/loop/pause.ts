@@ -25,7 +25,11 @@ import {
   type LoopNativeGoalCheck,
   type LoopPipelinePreflightEvidence,
 } from "./types.ts";
-import { compatibilityStopRefusesItem } from "../recovery-lifecycle-ownership.ts";
+import {
+  bindLifecycleRecord,
+  compatibilityStopRefusesItem,
+  deriveLifecycleState,
+} from "../recovery-lifecycle-ownership.ts";
 import {
   pauseKindToTypedRequest,
   validateAuthorityRequest,
@@ -47,6 +51,30 @@ import { appendDecision, appendEvent, readLedger, releaseLock, requireToken, wri
 export function upgradeLedgerForPauseAuthority(ledger: LoopLedger): LoopLedger {
   if (ledger.authority_amendments) return ledger;
   return { ...ledger, authority_amendments: [] };
+}
+
+function bindHoldLifecycle(ledger: LoopLedger, time: string): LoopLedger {
+  const logicalOperationId = ledger.lifecycle?.logical_operation_id;
+  if (!logicalOperationId) return ledger;
+  let typedRequest: "DecisionRequest" | "CapabilityRequest" | "AuthorityRequest" | null = null;
+  for (const item of Object.values(ledger.items)) {
+    const typed = item.hold_request?.typed_request;
+    if (typed === "DecisionRequest" || typed === "CapabilityRequest" || typed === "AuthorityRequest") {
+      typedRequest = typed;
+      break;
+    }
+  }
+  return bindLifecycleRecord(
+    ledger,
+    logicalOperationId,
+    deriveLifecycleState({
+      typedRequest,
+      cooling: Boolean(ledger.cooling),
+      stopReason: ledger.stop?.reason,
+      activeAttempt: true,
+    }),
+    time,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -95,12 +123,13 @@ async function enterHold(
   item.hold_request = request;
   item.history.push({ time, from: fromState, to, engine: input.engine, note: input.note });
 
-  await writeLedger(deps, ledger, input.token);
+  const next = bindHoldLifecycle(ledger, time);
+  await writeLedger(deps, next, input.token);
   await appendEvent(deps, input.runId, input.token, to === "paused" ? "loop_item_paused" : "loop_item_waiting", {
     item_id: input.itemId,
     ...(request ? { request_id: request.request_id, kind: request.kind } : {}),
   });
-  return ledger;
+  return next;
 }
 
 /** Transitions an in_progress item to `paused` — a bare operator hold with no outstanding
@@ -293,7 +322,10 @@ export async function invalidateIncompleteHoldForReclassify(
       },
     ],
   };
-  const next: LoopLedger = { ...ledger, items: { ...ledger.items, [input.itemId]: updated } };
+  const next: LoopLedger = bindHoldLifecycle(
+    { ...ledger, items: { ...ledger.items, [input.itemId]: updated } },
+    time,
+  );
   await writeLedger(deps, next, input.token);
   await appendEvent(deps, input.runId, input.token, "loop_item_hold_invalidated", {
     item_id: input.itemId,
@@ -534,9 +566,10 @@ export async function resumeHold(deps: LoopStoreDeps, input: ResumeHoldInput): P
   item.history.push({ time, from: fromState, to: "in_progress", engine: input.engine, note: input.note });
   ledger.last_native_goal_check = input.native_goal as LoopNativeGoalCheck;
 
-  await writeLedger(deps, ledger, input.token);
+  const next = bindHoldLifecycle(ledger, time);
+  await writeLedger(deps, next, input.token);
   await appendEvent(deps, input.runId, input.token, "loop_item_resumed", { item_id: input.itemId, from: fromState });
-  return ledger;
+  return next;
 }
 
 // ---------------------------------------------------------------------------

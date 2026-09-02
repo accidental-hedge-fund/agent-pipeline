@@ -24,6 +24,7 @@ import {
   upgradeLedgerForRecovery,
 } from "../scripts/loop/recovery.ts";
 import { mapLegacyThemeToBlockerClass } from "../scripts/loop/import.ts";
+import { admitLifecycleRecord, applyLifecycleTransition, deriveLifecycleState } from "../scripts/recovery-lifecycle-ownership.ts";
 import { initRun, readContract, readLedger, writeLedger, acquireLock, type LoopStoreDeps } from "../scripts/loop/store.ts";
 import {
   DURABLE_BLOCKER_CLASSES,
@@ -665,6 +666,29 @@ test("startRecoveryAttempt: claim persists before execution and restart replay d
   });
   assert.equal(replayedCompletion.attempt.error, "semantic repair failed", "completion replay preserves the first durable result");
   assert.equal(replayedCompletion.ledger.recovery_attempts.length, 1);
+});
+
+test("startRecoveryAttempt consults the durable lifecycle record and refuses cancelled/succeeded", async () => {
+  const { deps, contract, token } = await setup();
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "implementation-ci", evidence: "ci failed on current head",
+  });
+  const current = await readLedger(deps, "run-1");
+  const cancelled = applyLifecycleTransition(
+    admitLifecycleRecord({ logical_operation_id: "lop-recovery-1322", updated_at: "2026-09-02T00:00:00.000Z" }),
+    deriveLifecycleState({ cancelledByAuthenticatedCaller: true }),
+    "2026-09-02T00:01:00.000Z",
+    "lop-recovery-1322",
+  );
+  await writeLedger(deps, { ...current, lifecycle: cancelled }, token);
+  await assert.rejects(
+    () => startRecoveryAttempt(deps, contract, {
+      runId: "run-1", token, itemId: "100", engine: "claude",
+      action: "repair_pipeline_item", candidateIdentity: "head-abc:base-def",
+    }),
+    (err: unknown) => err instanceof LoopError && err.loopFailureClass === "stop" && /cancelled/.test(err.message),
+  );
 });
 
 test("recoveryAttemptId is deterministic and changes with candidate, evidence, or action", () => {

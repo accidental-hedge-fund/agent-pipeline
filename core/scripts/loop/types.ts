@@ -6,6 +6,8 @@
 // closely (snake_case, same concepts) so the import module (goal-loop-run
 // import) can translate without lossy remapping — see loop/import.ts.
 
+import type { DurableLifecycleRecord } from "../recovery-lifecycle-ownership.ts";
+
 export const LOOP_CONTRACT_SCHEMA = "pipeline/loop-contract@1";
 export const LOOP_LEDGER_SCHEMA = "pipeline/loop-ledger@1";
 
@@ -977,6 +979,12 @@ export interface LoopLedger {
    * Cooling write that updates the run-level {@link cooling} projection.
    */
   item_cooling?: Record<string, LoopCoolingRecord>;
+  /**
+   * Closed RecoverySupervisor lifecycle for the admitted Logical Operation (#1322).
+   * Absent on pre-#1322 ledgers. Compatibility labels and `ledger.stop` are not
+   * this record.
+   */
+  lifecycle?: DurableLifecycleRecord | null;
   last_native_goal_check: LoopNativeGoalCheck | null;
   last_reconciliation: LoopReconciliation | null;
   reconciliation_sequence: number;

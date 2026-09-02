@@ -42,7 +42,12 @@ import {
   stampEpisodeNextEligibleAt,
   type RecoveryEpisodeKey,
 } from "./recovery-episodes.ts";
-import { compatibilityStopRefusesItem, isMechanicalCompatibilityStopReason } from "../recovery-lifecycle-ownership.ts";
+import {
+  compatibilityStopRefusesItem,
+  consultLifecycleRecord,
+  isMechanicalCompatibilityStopReason,
+  lifecycleAllowsRecoveryRecipe,
+} from "../recovery-lifecycle-ownership.ts";
 
 // ---------------------------------------------------------------------------
 // Recovery policy compilation — fail closed.
@@ -547,6 +552,9 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
   const contract = upgradeContractForRecovery(contractInput);
 
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
+  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle)) {
+    throw new LoopError("stop", `logical operation lifecycle is ${consultLifecycleRecord(ledger.lifecycle).state}`);
+  }
   if (ledger.stop && !input.allowAlreadyStopped && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
@@ -728,6 +736,9 @@ export async function startRecoveryAttempt(
 ): Promise<RecoverItemResult> {
   const contract = upgradeContractForRecovery(contractInput);
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
+  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle)) {
+    throw new LoopError("stop", `logical operation lifecycle is ${consultLifecycleRecord(ledger.lifecycle).state}`);
+  }
   if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
@@ -888,6 +899,9 @@ export async function completeRecoveryAttempt(
 ): Promise<RecoverItemResult> {
   upgradeContractForRecovery(contractInput);
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
+  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle)) {
+    throw new LoopError("stop", `logical operation lifecycle is ${consultLifecycleRecord(ledger.lifecycle).state}`);
+  }
   const attempt = ledger.recovery_attempts.find((candidate) => candidate.attempt_id === input.attemptId);
   if (!attempt || attempt.item_id !== input.itemId) {
     throw new LoopError("validation", `recovery attempt "${input.attemptId}" was not started for item "${input.itemId}"`);
@@ -971,6 +985,9 @@ export async function recoverItem(
   input: RecoverItemInput,
 ): Promise<RecoverItemResult> {
   const current = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
+  if (!lifecycleAllowsRecoveryRecipe(current.lifecycle)) {
+    throw new LoopError("stop", `logical operation lifecycle is ${consultLifecycleRecord(current.lifecycle).state}`);
+  }
   if (current.stop) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${current.stop.reason}`);
   }

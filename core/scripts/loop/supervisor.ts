@@ -77,9 +77,14 @@ import {
   selectNextApplicableStrategy,
   type SideEffectObserverResult,
 } from "./recovery-episodes.ts";
+import { resolveLogicalOperationId } from "../logical-operation.ts";
 import {
+  bindLifecycleRecord,
   compatibilityStopRefusesItem,
+  consultLifecycleRecord,
   coolingRecordFromCompatibilityStop,
+  deriveLifecycleState,
+  lifecycleAllowsRecoveryRecipe,
   supervisorCycleDispositionForStop,
 } from "../recovery-lifecycle-ownership.ts";
 import { waitItem, type WaitRequestInput } from "./pause.ts";
@@ -863,6 +868,9 @@ async function executeBlockedRecovery(
   if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, itemId)) {
     return { ledger, attempted: false };
   }
+  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle)) {
+    return { ledger, attempted: false };
+  }
   let item = ledger.items[itemId];
   if (!item || item.state !== "blocked" || !item.blocked_theme) {
     return { ledger, attempted: false };
@@ -1558,7 +1566,21 @@ async function reopenClearedBlockedHolds(
         },
       ],
     };
-    ledger = { ...ledger, items: { ...ledger.items, [item.id]: updated } };
+    const nextItems = { ...ledger.items, [item.id]: updated };
+    const nextLedger: LoopLedger = { ...ledger, items: nextItems };
+    ledger = ledger.lifecycle
+      ? bindLifecycleRecord(
+          nextLedger,
+          ledger.lifecycle.logical_operation_id,
+          consultLifecycleRecord(ledger.lifecycle, {
+            typedRequest: typedRequestFromItems(nextItems),
+            cooling: Boolean(ledger.cooling),
+            stopReason: ledger.stop?.reason,
+            activeAttempt: true,
+          }),
+          time,
+        )
+      : nextLedger;
     await writeLedger(deps.store, ledger, token);
     await appendEvent(deps.store, runId, token, "loop_item_hold_cleared", { item_id: item.id });
   }
@@ -1803,22 +1825,83 @@ export interface SupervisorCycleResult {
   heldItemIds: string[];
 }
 
+function typedRequestFromItems(
+  items: LoopLedger["items"],
+): "DecisionRequest" | "CapabilityRequest" | "AuthorityRequest" | null {
+  for (const item of Object.values(items)) {
+    const typed = item.hold_request?.typed_request;
+    if (typed === "DecisionRequest" || typed === "CapabilityRequest" || typed === "AuthorityRequest") {
+      return typed;
+    }
+  }
+  return null;
+}
+
+function logicalOperationIdFor(contract: LoopContract, ledger: LoopLedger): string {
+  return resolveLogicalOperationId({
+    loopStore: contract.logical_operation_id,
+    written: ledger.lifecycle?.logical_operation_id,
+  });
+}
+
+function bindLifecycle(
+  contract: LoopContract,
+  ledger: LoopLedger,
+  ownership: ReturnType<typeof deriveLifecycleState>,
+  updatedAt: string,
+): LoopLedger {
+  return bindLifecycleRecord(ledger, logicalOperationIdFor(contract, ledger), ownership, updatedAt);
+}
+
+async function admitOrRefreshLifecycle(
+  deps: SupervisorDeps,
+  contract: LoopContract,
+  ledger: LoopLedger,
+  token: string,
+  extra?: { observerProvedPostcondition?: boolean },
+): Promise<LoopLedger> {
+  const facts = {
+    typedRequest: typedRequestFromItems(ledger.items),
+    cooling: Boolean(ledger.cooling),
+    stopReason: ledger.stop?.reason ?? null,
+    observerProvedPostcondition: extra?.observerProvedPostcondition,
+    activeAttempt: true,
+  };
+  const ownership = ledger.lifecycle
+    ? consultLifecycleRecord(ledger.lifecycle, facts)
+    : deriveLifecycleState(facts);
+  const next = bindLifecycle(contract, ledger, ownership, deps.store.now().toISOString());
+  if (next === ledger) return ledger;
+  await writeLedger(deps.store, next, token);
+  return next;
+}
+
 async function persistCoolingFromCompatibilityStop(
   deps: SupervisorDeps,
   runId: string,
   token: string,
+  contract: LoopContract,
   ledger: LoopLedger,
   stop: LoopStopRecord,
 ): Promise<{ ledger: LoopLedger; cooling: LoopCoolingRecord }> {
   const cooling = ledger.cooling ?? coolingRecordFromCompatibilityStop(stop);
-  if (ledger.cooling) return { ledger, cooling: ledger.cooling };
-  const next = { ...ledger, cooling };
+  const withCooling: LoopLedger = ledger.cooling ? ledger : { ...ledger, cooling };
+  const next = bindLifecycle(
+    contract,
+    withCooling,
+    deriveLifecycleState({ cooling: true, stopReason: stop.reason }),
+    cooling.time,
+  );
+  const coolingAlreadyPersisted = Boolean(ledger.cooling);
+  if (next === ledger) return { ledger, cooling };
   await writeLedger(deps.store, next, token);
-  await appendEvent(deps.store, runId, token, "loop_item_cooling", {
-    item_id: cooling.item_id ?? null,
-    theme: cooling.theme ?? null,
-    historical_evidence: cooling.historical_evidence ?? stop.reason,
-  });
+  if (!coolingAlreadyPersisted) {
+    await appendEvent(deps.store, runId, token, "loop_item_cooling", {
+      item_id: cooling.item_id ?? null,
+      theme: cooling.theme ?? null,
+      historical_evidence: cooling.historical_evidence ?? stop.reason,
+    });
+  }
   return { ledger: next, cooling };
 }
 
@@ -1839,7 +1922,7 @@ async function cycleResultForCompatibilityStop(
   });
   if (disposition.continueSiblings) return null;
   if (disposition.cooling) {
-    const persisted = await persistCoolingFromCompatibilityStop(deps, runId, token, ledger, stop);
+    const persisted = await persistCoolingFromCompatibilityStop(deps, runId, token, contract, ledger, stop);
     await appendActionEvidence(deps.store, runId, token, {
       item_id: persisted.cooling.item_id ?? null,
       action: "noop",
@@ -1886,7 +1969,38 @@ export async function runSupervisorCycle(
   // A pre-#509 contract carries no recovery_policy — the pure upgrader installs
   // the default so the recovery/idle-promotion reads below never fault.
   const contract = upgradeContractForRecovery(await readContract(deps.store, runId, token));
-  let ledger = await readLedger(deps.store, runId, token);
+  let ledger = await admitOrRefreshLifecycle(
+    deps,
+    contract,
+    await readLedger(deps.store, runId, token),
+    token,
+  );
+
+  const admitted = consultLifecycleRecord(ledger.lifecycle, {
+    typedRequest: typedRequestFromItems(ledger.items),
+    cooling: Boolean(ledger.cooling),
+    stopReason: ledger.stop?.reason,
+  });
+  if (admitted.state === "succeeded") {
+    return {
+      progress: false,
+      stop: null,
+      cooling: ledger.cooling ?? null,
+      holdOutstanding: false,
+      allDone: true,
+      heldItemIds: heldItemIdsFromLedger(ledger),
+    };
+  }
+  if (admitted.state === "cancelled") {
+    return {
+      progress: false,
+      stop: ledger.stop,
+      cooling: ledger.cooling ?? null,
+      holdOutstanding: false,
+      allDone: false,
+      heldItemIds: heldItemIdsFromLedger(ledger),
+    };
+  }
 
   if (ledger.stop) {
     const projected = await cycleResultForCompatibilityStop(deps, runId, token, contract, ledger, false);
@@ -2097,6 +2211,15 @@ export async function runSupervisorCycle(
     return DONE_OR_ABANDONED.has(state) || preconditionExcludedIds.has(i.id);
   });
   if (allDone) {
+    const allSucceeded = contract.items.every((i) => {
+      const state = ledger.items[i.id]?.state ?? "";
+      return state === "ready" || state === "merged" || state === "released" || state === "deployed";
+    });
+    if (allSucceeded) {
+      ledger = await admitOrRefreshLifecycle(deps, contract, ledger, token, {
+        observerProvedPostcondition: true,
+      });
+    }
     await appendActionEvidence(deps.store, runId, token, {
       item_id: null,
       action: "noop",
@@ -2210,6 +2333,12 @@ export async function runSupervisorCycle(
         theme: exhausted.blocked_theme,
         historicalEvidence: "recovery_exhausted",
       });
+      ledger = bindLifecycle(
+        contract,
+        { ...ledger, cooling },
+        deriveLifecycleState({ cooling: true, stopReason: "recovery_exhausted", faultClass: "retry-exhaustion" }),
+        time,
+      );
       ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
       return {
         progress: recoveryProgress,
@@ -3192,6 +3321,13 @@ export async function runSupervisorCycle(
       historicalEvidence: "worktree_capacity",
     });
     ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
+    ledger = bindLifecycle(
+      contract,
+      ledger,
+      deriveLifecycleState({ stopReason: "worktree_capacity", faultClass: "capacity", cooling: true }),
+      time,
+    );
+    await writeLedger(deps.store, ledger, token);
     await appendActionEvidence(deps.store, runId, token, {
       item_id: null,
       action: "noop",
@@ -3737,7 +3873,17 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
           nextEligibleAt: coolingDeadline(time, { initial_seconds: 30, multiplier: 2, max_seconds: 900 }, record.consecutive_no_progress),
           historicalEvidence: "supervisor_no_progress",
         });
-        await persistOwnedCooling(deps.store, { runId: input.runId, token, cooling: coolingRecord });
+        let newLedger = await persistOwnedCooling(deps.store, { runId: input.runId, token, cooling: coolingRecord });
+        newLedger = bindLifecycle(
+          contract,
+          {
+            ...newLedger,
+            stop: { reason: "supervisor_no_progress", time, outstanding_ready: outstandingReadyItemIds(newLedger) },
+          },
+          deriveLifecycleState({ stopReason: "supervisor_no_progress", cooling: true }),
+          time,
+        );
+        await writeLedger(deps.store, newLedger, token);
         await appendActionEvidence(deps.store, input.runId, token, {
           item_id: null,
           action: "noop",
@@ -3758,7 +3904,17 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
         nextEligibleAt: coolingDeadline(time, { initial_seconds: 60, multiplier: 2, max_seconds: 900 }, cycles),
         historicalEvidence: "supervisor_cycle_cap",
       });
-      await persistOwnedCooling(deps.store, { runId: input.runId, token, cooling: coolingRecord });
+      let capped = await persistOwnedCooling(deps.store, { runId: input.runId, token, cooling: coolingRecord });
+      capped = bindLifecycle(
+        contract,
+        {
+          ...capped,
+          stop: { reason: "supervisor_cycle_cap", time, limit: cyclesSafetyCap, outstanding_ready: outstandingReadyItemIds(capped) },
+        },
+        deriveLifecycleState({ stopReason: "supervisor_cycle_cap", cooling: true }),
+        time,
+      );
+      await writeLedger(deps.store, capped, token);
       await appendActionEvidence(deps.store, input.runId, token, {
         item_id: null,
         action: "noop",

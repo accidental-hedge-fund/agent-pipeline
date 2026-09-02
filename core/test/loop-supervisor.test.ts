@@ -46,6 +46,7 @@ import {
 } from "../scripts/loop/types.ts";
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, type LoopExecutionRequest, type LoopExecutionResponse } from "../scripts/loop-execution-contract.ts";
 import { buildStageDiagnostic, projectStageDiagnostic } from "../scripts/stage-diagnostic.ts";
+import { consultLifecycleRecord } from "../scripts/recovery-lifecycle-ownership.ts";
 
 const READY_LABEL = "pipeline:ready-to-deploy";
 // The precondition stage gate (#568, capability `loop-precondition-stage-gate`) excludes a
@@ -779,6 +780,36 @@ test("stage transitions originate in the advance state machine (transitionItem/b
   const trail = await auditSupervisor(deps, "run-1").then((r) => r.action_evidence);
   const dispatchEntry = trail.find((e) => e.action === "dispatch_item");
   assert.equal(dispatchEntry?.outcome, "failed");
+});
+
+test("RecoverySupervisor persists a closed lifecycle record and consults it after a later wake (#1322)", async () => {
+  const contract = testContract({
+    logical_operation_id: "lop-lifecycle-1322",
+    items: [{ id: "100", depends_on: [] }],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { deps: observe } = fakeObserveDeps();
+  const { dispatchItem } = coordinatedFakes(() => "merged_and_pushed_to_prod" as unknown as string);
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop, null);
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
+  const persisted = await readLedger(deps, "run-1");
+  assert.equal(persisted.lifecycle?.logical_operation_id, "lop-lifecycle-1322");
+  assert.equal(persisted.lifecycle?.state, "cooling");
+  assert.equal(persisted.lifecycle?.owned, true);
+  assert.equal(persisted.lifecycle?.ownerless, false);
+  assert.equal(persisted.lifecycle?.human_owned, false);
+  const wake = consultLifecycleRecord(persisted.lifecycle, {
+    labels: ["pipeline:needs-human", "blocked"],
+    processExitCode: 1,
+  });
+  assert.equal(wake.state, "cooling");
+  assert.notEqual(wake.state, "typed-input-wait");
+  assert.notEqual(wake.state, "cancelled");
+  assert.notEqual(wake.state, "succeeded");
 });
 
 // ---------------------------------------------------------------------------
