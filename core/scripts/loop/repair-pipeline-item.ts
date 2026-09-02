@@ -219,8 +219,8 @@ export function createRepairPipelineItemExecutor(
         const status = await git(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
         if (status.code !== 0 || status.stdout.trim() !== "") {
           const error =
-            `recovery candidate moved before repair: claimed ${expected}, worktree is ${actualHead} ` +
-            "with uncommitted changes; refusing destructive reconciliation";
+            `identity-mismatch: recovery candidate moved before repair: claimed ${expected}, worktree is ${actualHead} ` +
+            "with uncommitted changes; local/remote drift stays RecoverySupervisor-owned";
           return { succeeded: false, evidence: error, error };
         }
         const branch = branchName(issueNumber, wt.slug);

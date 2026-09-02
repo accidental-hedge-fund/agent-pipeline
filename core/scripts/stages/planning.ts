@@ -10,6 +10,7 @@
 //   7. Run the primary implementer harness in the worktree against the revised impl prompt.
 //   8. Verify commits exist, push branch, create PR, transition implementing → review-1.
 
+import { successorMutationsAllowed } from "../operation-observation.ts";
 import {
   addLabel,
   createPr,
@@ -2363,6 +2364,11 @@ export interface ResumeFromImplementingDeps {
   /** Exact-branch PR lookup — scoped to wt.branch so stale same-issue PRs are never reused. */
   getPrForBranch?: typeof getPrForBranch;
   createPr?: typeof createPr;
+  /**
+   * Integration side-effect certainty from every linked PR. When
+   * `known_complete` or `uncertain`, resume does not open a successor PR.
+   */
+  integrationCertainty?: () => Promise<"known_complete" | "known_absent" | "uncertain">;
   gitInWorktree?: typeof gitInWorktree;
   setBlocked?: typeof setBlocked;
   transition?: typeof transition;
@@ -2596,6 +2602,16 @@ export async function resumeFromImplementing(
   // Track whether the PR is newly created this run so we emit pr_created vs pr_updated.
   let prIsNew = false;
   const existing = await prLookup(cfg, branch);
+  if (!existing && deps.integrationCertainty) {
+    const certainty = await deps.integrationCertainty();
+    if (!successorMutationsAllowed(certainty).openSuccessorPr) {
+      return {
+        advanced: false,
+        status: "no-op",
+        reason: "linked PR already merged and contained; not opening a successor PR",
+      };
+    }
+  }
   if (existing) {
     prNumber = existing;
     console.log(`[pipeline] #${issueNumber}: PR #${prNumber} already exists for branch ${branch} — reusing`);

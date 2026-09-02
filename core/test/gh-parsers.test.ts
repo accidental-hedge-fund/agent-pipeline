@@ -26,6 +26,7 @@ import {
   parsePrList,
   parsePrMergeState,
   pickPrFromTimelinePage,
+  listPrsFromTimelinePage,
   pickStage,
   resolveOpenPrsForIssue,
   resolvePrForIssue,
@@ -1084,6 +1085,13 @@ test("pickPrFromTimelinePage: fork cannot spoof pipeline-head or (#N) title iden
 
 test("pickPrFromTimelinePage: scans newest-first when multiple links exist", () => {
   assert.equal(pickPrFromTimelinePage([connectedEventNode(5), connectedEventNode(9)], 154), 9);
+});
+
+test("listPrsFromTimelinePage: returns every linked PR, newest first", () => {
+  assert.deepEqual(
+    listPrsFromTimelinePage([connectedEventNode(5), connectedEventNode(9)], 154),
+    [9, 5],
+  );
 });
 
 test("getPrForIssueAnyState: resolves via GraphQL timeline query, not a repo-wide gh pr list scan", async () => {

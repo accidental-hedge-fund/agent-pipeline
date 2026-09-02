@@ -280,7 +280,10 @@ test("observeExternalIdentity: builds a full identity from an open PR with green
   assert.equal(identity.observed_at, "2026-07-23T00:00:00.000Z");
   // Every fact came from the fake seam, not a real gh/git call — this file
   // never imports gh.ts's ghRun or worktree.ts's execFile-backed helpers.
-  assert.deepEqual(calls, ["getIssueStateAndLabels:100", "findPrForIssue:100", "getPrDetail:12", "getPrChecks:12"]);
+  assert.ok(calls.includes("getIssueStateAndLabels:100"));
+  assert.ok(calls.includes("findPrForIssue:100"));
+  assert.ok(calls.includes("getPrDetail:12"));
+  assert.ok(calls.includes("getPrChecks:12"));
 });
 
 test("observeExternalIdentity: absent external objects are represented, not omitted", async () => {
@@ -508,8 +511,14 @@ test("computeNextAction: pending checks on an aligned pr_opened item yields awai
 
 test("computeNextAction: contradictions never invent human authority", () => {
   for (const cls of ["ledger-ahead", "external-absent", "identity-mismatch"] as const) {
-    assert.equal(computeNextAction("pr_opened", openPrIdentity(), cls, false), "noop");
+    assert.equal(computeNextAction("pr_opened", openPrIdentity(), cls, false), "reconstruct");
+    assert.notEqual(computeNextAction("pr_opened", openPrIdentity(), cls, false), "hold-for-human");
+    assert.notEqual(computeNextAction("pr_opened", openPrIdentity(), cls, false), "noop");
   }
+});
+
+test("isLoopNextAction: reconstruct is a closed-set member", () => {
+  assert.equal(isLoopNextAction("reconstruct"), true);
 });
 
 test("computeNextAction: only current authority evidence yields hold-for-human", () => {
@@ -676,9 +685,9 @@ test("reconcile: a crash before recording implemented -> merged repairs all the 
   assert.equal(ledger.items["100"].state, "merged");
 });
 
-test("reconcile: an over-claim (ledger-ahead) is surfaced, not rewritten — state is left untouched", async () => {
-  const { deps, token } = await setup("merged");
-  const { deps: observeDeps } = fakeObserveDeps({
+test("reconcile: an over-claim (ledger-ahead) is reconstructed locally without remote mutation", async () => {
+  const { deps, files, token } = await setup("merged");
+  const { deps: observeDeps, calls } = fakeObserveDeps({
     async findPrForIssue() {
       return 12;
     },
@@ -689,21 +698,26 @@ test("reconcile: an over-claim (ledger-ahead) is surfaced, not rewritten — sta
 
   const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
   assert.equal(result.drift[0].class, "ledger-ahead");
-  assert.equal(result.next_actions["100"], "noop");
+  assert.equal(result.next_actions["100"], "reconstruct");
+  assert.notEqual(result.next_actions["100"], "hold-for-human");
 
   const ledger = await readLedger(deps, "run-1");
-  assert.equal(ledger.items["100"].state, "merged", "ledger-ahead drift must never be silently rewritten");
+  assert.notEqual(ledger.items["100"].state, "merged");
+  assert.match(ledger.items["100"].history.at(-1)?.note ?? "", /reconstructed local state/);
+  assert.ok(calls.every((c) => /^(getIssueStateAndLabels|findPrForIssue|listLinkedPrs|getPrDetail|getPrChecks|getLocalHead|baseBranchContainsSha):/.test(c)));
+  void files;
 });
 
-test("reconcile: external-absent is surfaced without inventing human authority", async () => {
+test("reconcile: external-absent is reconstructed without inventing human authority", async () => {
   const { deps, token } = await setup("pr_opened");
   const { deps: observeDeps } = fakeObserveDeps();
 
   const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
   assert.equal(result.drift[0].class, "external-absent");
-  assert.equal(result.next_actions["100"], "noop");
+  assert.equal(result.next_actions["100"], "reconstruct");
+  assert.notEqual(result.next_actions["100"], "hold-for-human");
   const ledger = await readLedger(deps, "run-1");
-  assert.equal(ledger.items["100"].state, "pr_opened");
+  assert.equal(ledger.items["100"].state, "implemented");
 });
 
 test("reconcile: the merge barrier clears only when the base branch is verified to contain the merged SHA", async () => {

@@ -1093,7 +1093,10 @@ test("missing observer proof cannot complete a post-ready phase (#1331)", async 
   assert.match(result.last_error ?? "", /artifact_digest|reconciliation|OID|digest/i);
   const tag = shipPhaseInvariant("tag");
   assert.match(tag.observer, /origin annotated tag/);
+  assert.match(tag.side_effect_identity, /origin annotated tag/);
+  assert.match(tag.reconstruction_rule, /do not push a tag/);
   assert.match(shipPhaseInvariant("deployment").postcondition, /digest live/);
+  assert.match(shipPhaseInvariant("deployment").safe_replay_predicate, /live observer/);
 });
 
 test("ship status view names phase, candidate, and next action without mutations (#1331)", async () => {

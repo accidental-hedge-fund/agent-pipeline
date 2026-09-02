@@ -95,19 +95,33 @@ function describeObservedStage(stage: string | null): string {
 /** Derives a `pipeline_stage` value (see {@link LoopExternalIdentity.pipeline_stage}) from a raw
  *  label list — the shared primitive both the reconciliation observation (loop/reconcile.ts) and
  *  the dispatch-outcome safety net (loop/supervisor.ts Pass 2, design.md decision 3) derive it
- *  from, so "what counts as pre-pipeline" has exactly one definition. */
+ *  from, so "what counts as pre-pipeline" has exactly one definition.
+ *
+ *  When more than one `pipeline:*` label whose suffix is a {@link STAGES} member is present,
+ *  the member with the greatest `STAGES` index wins. `needs-human` is last and therefore wins
+ *  over any in-flight stage. Does not throw. Does not write GitHub labels. */
 export function pipelineStageFromLabels(labels: readonly string[]): string | null {
-  const label = labels.find((l) => l.startsWith(LABEL_PREFIX));
-  return label ? label.slice(LABEL_PREFIX.length) : null;
+  let best: (typeof STAGES)[number] | null = null;
+  let bestIndex = -1;
+  for (const label of labels) {
+    if (!label.startsWith(LABEL_PREFIX)) continue;
+    const suffix = label.slice(LABEL_PREFIX.length);
+    const index = (STAGES as readonly string[]).indexOf(suffix);
+    if (index > bestIndex) {
+      bestIndex = index;
+      best = STAGES[index]!;
+    }
+  }
+  return best;
 }
 
 /** True when `labels` carries the pipeline's `blocked` label (the canonical
  *  {@link BLOCKED_LABEL} = `"blocked"`, the exact string `gh.ts` applies — NOT a
  *  `pipeline:`-prefixed variant, which is never written), checked by **presence** rather than by
  *  {@link pipelineStageFromLabels}'s single stage-winner (#581, capability
- *  `loop-blocked-item-hold-continuation`). `pipelineStageFromLabels` returns only the first
- *  `pipeline:*` label it finds in list order, so an item carrying `blocked` alongside
- *  another `pipeline:*` stage label can have that other label win the single-stage derivation —
+ *  `loop-blocked-item-hold-continuation`). `pipelineStageFromLabels` returns the most
+ *  advanced `STAGES` member, so an item carrying `blocked` alongside another `pipeline:*`
+ *  stage label can have that other label win the single-stage derivation —
  *  this predicate exists so detection of "is this item blocked" never depends on label order. */
 export function isBlockedInLabels(labels: readonly string[]): boolean {
   return labels.includes(BLOCKED_LABEL);

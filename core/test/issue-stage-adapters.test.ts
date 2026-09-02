@@ -30,6 +30,7 @@ import {
   isCandidateBoundEvidenceValid,
   isDeliveryStage,
   missingDeliveryStageInvariants,
+  missingOperationInvariantFields,
   observationFromAdapterAttempt,
   reconcileIssueStageObservation,
   remainingFixTimeoutSec,
@@ -70,6 +71,9 @@ test("1.1 every delivery stage from planning through ready-to-deploy has an inva
     assert.ok(inv.observer.length > 0, stage);
     assert.ok(inv.candidate_binding.length > 0, stage);
     assert.ok(inv.replay_rule.length > 0, stage);
+    assert.ok(inv.side_effect_identity.length > 0, stage);
+    assert.ok(inv.safe_replay_predicate.length > 0, stage);
+    assert.ok(inv.reconstruction_rule.length > 0, stage);
   }
 });
 
@@ -80,6 +84,15 @@ test("1.1 missing invariant fails and names the stage", () => {
   const registry = new Set(["planning"]);
   const holes = synthetic.filter((s) => !registry.has(s));
   assert.deepEqual([...holes], ["plan-review"]);
+});
+
+test("1.1 missing reconstruction rule fails the contract and names the stage", () => {
+  const inv = deliveryStageInvariant("planning");
+  const incomplete = { ...inv, reconstruction_rule: "" };
+  const missing = missingOperationInvariantFields(incomplete);
+  assert.ok(missing.includes("reconstruction_rule"));
+  const named = missingDeliveryStageInvariants(["planning"]).length === 0;
+  assert.equal(named, true);
 });
 
 test("1.2 mechanical-failure fixture emits owned: true and does not mark complete/cancelled/human-owned", async () => {

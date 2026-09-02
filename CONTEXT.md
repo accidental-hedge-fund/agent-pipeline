@@ -126,20 +126,20 @@ Versioned evidence about an operation invariant, candidate, and side-effect cert
 _Avoid_: exit code as lifecycle state, prose blocker
 
 **Operation invariant**:
-The declared precondition, postcondition, authoritative observer, candidate binding, and replay rule for a supervised operation.
-_Avoid_: best-effort success heuristic
+The declared precondition, postcondition, authoritative observer, candidate binding, replay rule, side-effect identity, safe replay predicate, and reconstruction rule for a supervised operation. A process exit is ingress evidence, not success.
+_Avoid_: best-effort success heuristic, exit zero as completion
 
 **Authoritative observer**:
-The system whose fresh state proves an operation-specific fact. Local intent history cannot overrule the forge, git remote, CI, release provider, or deployment provider for facts those systems own.
-_Avoid_: local ledger as universal truth
+The system whose fresh state proves an operation-specific fact. Git, forge, CI, release, and deployment facts come from those systems. Local ledger, claims, and comments record durable intent and history and cannot overrule those authorities. The observer reports facts; RecoverySupervisor owns treatment. Reconstruction rewrites local ledger/claim/identity to match the observer and does not merge, push, write labels, edit a PR, release, or deploy.
+_Avoid_: local ledger as universal truth, observer repair
 
 **Candidate epoch**:
-The period during which all candidate-bearing authoritative facts retain one identity. Candidate movement starts a new epoch and invalidates candidate-bound review, test, decision, and authority evidence.
+The period during which all candidate-bearing authoritative facts retain one identity. Candidate movement (new HEAD, rematerialized SHA, remote-advanced tip, or replacement worktree) starts a new epoch and invalidates candidate-bound review, test, decision, and authority evidence. RecoverySupervisor requires those facts to be re-proven against the new candidate.
 _Avoid_: process lifetime, retry number
 
 **Side-effect certainty**:
-An observation classifying a side effect as known complete, known absent, or uncertain. Uncertainty requires reconciliation before replay.
-_Avoid_: timeout means absent, exit zero means complete
+An observation classifying a side effect as known complete, known absent, or uncertain. Known complete is reconciled forward without replay. Known absent may replay under the same identity and epoch. Uncertain stays Cooling, an external-condition wait, or a CapabilityRequest. Ledger contradictions (`ledger-ahead`, `external-absent`, `identity-mismatch`) stay RecoverySupervisor-owned (`reconstruct`) unless independent typed-request evidence exists.
+_Avoid_: timeout means absent, exit zero means complete, contradiction routes to a human
 
 **Recovery episode**:
 Durable recovery state for one operation invariant, candidate epoch, and normalized evidence identity. It survives process restart and owns its treatment history.

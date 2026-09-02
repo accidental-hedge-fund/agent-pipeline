@@ -52,6 +52,7 @@ import {
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 import { buildStageDiagnostic } from "../stage-diagnostic.ts";
+import { archiveReplayDecision } from "../operation-observation.ts";
 import { preMergeBlocked } from "./pre-merge-shared.ts";
 import type { AdvancePreMergeDeps } from "./pre-merge-routing.ts";
 import { diffFilePaths, findLatestReviewCommentBody, extractReviewArtifact } from "./review.ts";
@@ -454,6 +455,18 @@ export async function maybeArchiveOpenspec(
   const withoutMarkers = stripPipelineInternalMarkers(preArchiveStatus.stdout);
   const { product: productPaths, untrackedScratch: scratchPaths } =
     classifyPreArchiveDirt(withoutMarkers);
+  let rebaseInProgress = false;
+  const rebaseHead = await gitFn(wt.path, ["rev-parse", "-q", "--verify", "REBASE_HEAD"], {
+    ignoreFailure: true,
+  });
+  rebaseInProgress =
+    rebaseHead.code === 0 && /^[0-9a-f]{7,40}$/i.test(rebaseHead.stdout.trim());
+  const alreadyArchived = await archiveAlreadyDone(gitFn, wt.path, cfg.base_branch, issueNumber);
+  const archiveDecision = archiveReplayDecision({
+    archiveAlreadyDone: alreadyArchived,
+    rebaseInProgress,
+    productDirt: productPaths,
+  });
   if (productPaths.length > 0) {
     const detail = `pre-existing dirty paths:\n${productPaths.join("\n")}`;
     // Workspace/git failures — not OpenSpec structural validation. Use needs-human
@@ -468,6 +481,12 @@ export async function maybeArchiveOpenspec(
     );
     await recordDecision("fail", "worktree dirty before archive");
     return preMergeBlocked("worktree dirty before archive", "needs-human");
+  }
+  if (alreadyArchived && archiveDecision.rebase_in_progress && !archiveDecision.replay_archive) {
+    const reason =
+      "unfinished rebase observed after a completed archive; archive is not replayed";
+    await recordDecision("skipped", reason);
+    return preMergeBlocked(reason, "harness-failure");
   }
   // Marker and/or untracked non-product scratch residual only: remove engine-owned
   // paths so later porcelain checks stay clean. Product / tracked-scratch work was

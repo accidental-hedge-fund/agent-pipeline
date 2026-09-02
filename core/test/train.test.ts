@@ -297,9 +297,17 @@ test("parseIssueList: commas and spaces", () => {
 test("pipelineStageFromLabels: single stage", () => {
   assert.equal(pipelineStageFromLabels(["pipeline:ready-to-deploy"]), "ready-to-deploy");
   assert.equal(pipelineStageFromLabels(["bug"]), null);
-  assert.throws(
-    () => pipelineStageFromLabels(["pipeline:ready", "pipeline:implementing"]),
-    /ambiguous/,
+  assert.equal(pipelineStageFromLabels(["pipeline:ready", "pipeline:implementing"]), "implementing");
+});
+
+test("pipelineStageFromLabels: contradictory labels reconcile to the most advanced STAGES member", () => {
+  assert.equal(
+    pipelineStageFromLabels(["pipeline:pre-merge", "pipeline:design-gate"]),
+    "pre-merge",
+  );
+  assert.equal(
+    pipelineStageFromLabels(["pipeline:needs-human", "pipeline:review-2"]),
+    "needs-human",
   );
 });
 

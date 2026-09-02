@@ -26,10 +26,17 @@ import {
   getPrChecks,
   getPrDetail,
   getPrForIssueAnyState,
+  listPrsForIssueAnyState,
   parseChecksAggregate,
 } from "../gh.ts";
 import { getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
 import { isAdvanceStillNeeded, isBlockedInLabels, pipelineStageFromLabels } from "./precondition.ts";
+import {
+  integrationSideEffectCertainty,
+  selectAuthoritativeLinkedPr,
+  type LinkedPrIntegrationFact,
+  type SideEffectCertainty,
+} from "../operation-observation.ts";
 import {
   LoopError,
   isLoopAuthorityGate,
@@ -76,6 +83,11 @@ export const REMOTE_PROVING_STATES: ReadonlySet<LoopItemState> = new Set([
 export interface ReconcileObserveDeps {
   getIssueStateAndLabels(issueNumber: number): Promise<{ state: "open" | "closed"; labels: string[] } | null>;
   findPrForIssue(issueNumber: number): Promise<number | null>;
+  /**
+   * Every pull request linked to the issue (open, closed, merged). Completeness
+   * consults this set so a later open PR cannot hide a prior squash-merge.
+   */
+  listLinkedPrs?(issueNumber: number): Promise<number[]>;
   getPrDetail(prNumber: number): Promise<{
     state: "open" | "closed" | "merged";
     head_ref: string;
@@ -85,7 +97,12 @@ export interface ReconcileObserveDeps {
   getPrChecks(prNumber: number): Promise<{ bucket: string }[]>;
   /** Local worktree fallback used only when no PR exists yet — reads the
    *  on-disk branch/head for the issue with zero GitHub calls. */
-  getLocalHead(issueNumber: number): Promise<{ branch: string; sha: string } | null>;
+  getLocalHead(issueNumber: number): Promise<{
+    branch: string;
+    sha: string;
+    rebase_in_progress?: boolean;
+    product_dirt?: boolean;
+  } | null>;
   /** True when `sha` is an ancestor of the base branch's current remote head
    *  — the evidence the merge-barrier requirement (durable-loop-engine) needs
    *  to clear a barrier. Returns null when the base branch head cannot be
@@ -118,6 +135,9 @@ export function defaultReconcileObserveDeps(cfg: PipelineConfig): ReconcileObser
     async findPrForIssue(issueNumber) {
       return getPrForIssueAnyState(cfg, issueNumber);
     },
+    async listLinkedPrs(issueNumber) {
+      return listPrsForIssueAnyState(cfg, issueNumber);
+    },
     async getPrDetail(prNumber) {
       try {
         const detail = await getPrDetail(cfg, prNumber);
@@ -148,7 +168,22 @@ export function defaultReconcileObserveDeps(cfg: PipelineConfig): ReconcileObser
         ]);
         const branch = branchOut.stdout.trim();
         const sha = shaOut.stdout.trim();
-        return branch && sha ? { branch, sha } : null;
+        if (!branch || !sha) return null;
+        let rebase_in_progress = false;
+        let product_dirt = false;
+        try {
+          const rebaseOut = await gitInWorktree(wt.path, ["rev-parse", "-q", "--verify", "REBASE_HEAD"]);
+          rebase_in_progress = Boolean(rebaseOut.stdout.trim());
+        } catch {
+          rebase_in_progress = false;
+        }
+        try {
+          const status = await gitInWorktree(wt.path, ["status", "--porcelain"]);
+          product_dirt = status.stdout.trim().length > 0;
+        } catch {
+          product_dirt = false;
+        }
+        return { branch, sha, rebase_in_progress, product_dirt };
       } catch {
         return null;
       }
@@ -221,27 +256,70 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
   let head_sha = "";
   let merge_commit_sha: string | null = null;
   let checks_conclusion: LoopExternalIdentity["checks_conclusion"] = "none";
+  let integration_certainty: SideEffectCertainty = "known_absent";
+  let linked_pr_numbers: number[] = [];
 
   const foundPrNumber = await deps.findPrForIssue(issueNumber);
-  if (foundPrNumber !== null) {
-    const detail = await deps.getPrDetail(foundPrNumber);
+  const listed = deps.listLinkedPrs ? await deps.listLinkedPrs(issueNumber) : [];
+  const consultAllLinked = Boolean(deps.listLinkedPrs);
+  linked_pr_numbers = consultAllLinked
+    ? listed
+    : foundPrNumber !== null
+      ? [foundPrNumber]
+      : [];
+
+  const detailByNumber = new Map<number, Awaited<ReturnType<ReconcileObserveDeps["getPrDetail"]>>>();
+  const linkedFacts: LinkedPrIntegrationFact[] = [];
+  for (const n of linked_pr_numbers) {
+    const detail = await deps.getPrDetail(n);
+    detailByNumber.set(n, detail);
+    if (!detail) continue;
+    let contained: boolean | null = null;
+    if (detail.state === "merged" && detail.merge_commit_sha) {
+      contained = await deps.baseBranchContainsSha(detail.merge_commit_sha);
+    }
+    linkedFacts.push({
+      number: n,
+      state: detail.state,
+      merge_commit_sha: detail.merge_commit_sha,
+      contained,
+    });
+  }
+  integration_certainty = consultAllLinked
+    ? integrationSideEffectCertainty(linkedFacts)
+    : linkedFacts.some((pr) => pr.state === "merged")
+      ? (linkedFacts.find((pr) => pr.state === "merged")?.contained === true ? "known_complete" : "uncertain")
+      : "known_absent";
+  const authoritative = consultAllLinked
+    ? selectAuthoritativeLinkedPr(linkedFacts)
+    : linkedFacts[0] ?? null;
+  const chosen = authoritative?.number ?? foundPrNumber;
+  if (chosen !== null) {
+    const detail = detailByNumber.get(chosen) ?? await deps.getPrDetail(chosen);
     if (detail) {
-      pr_number = foundPrNumber;
+      pr_number = chosen;
       pr_state = detail.state;
       head_branch = detail.head_ref;
       head_sha = detail.head_sha;
       merge_commit_sha = detail.merge_commit_sha;
-      const checks = await deps.getPrChecks(foundPrNumber);
+      const checks = await deps.getPrChecks(chosen);
       checks_conclusion = deriveChecksConclusion(checks);
     }
   }
 
-  if (!head_branch) {
-    const local = await deps.getLocalHead(issueNumber);
-    if (local) {
-      head_branch = local.branch;
-      head_sha = local.sha;
+  let local: Awaited<ReturnType<ReconcileObserveDeps["getLocalHead"]>> = null;
+  if (head_branch) {
+    try {
+      local = await deps.getLocalHead(issueNumber);
+    } catch {
+      local = null;
     }
+  } else {
+    local = await deps.getLocalHead(issueNumber);
+  }
+  if (!head_branch && local) {
+    head_branch = local.branch;
+    head_sha = local.sha;
   }
 
   return {
@@ -257,6 +335,11 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
     checks_conclusion,
     pipeline_stage,
     observed_at: deps.now().toISOString(),
+    local_head_sha: local?.sha ?? null,
+    rebase_in_progress: local?.rebase_in_progress === true,
+    product_dirt: local?.product_dirt === true,
+    integration_certainty,
+    linked_pr_numbers,
   };
 }
 
@@ -266,6 +349,54 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
 
 function checksRegressed(bound: LoopExternalIdentity | null, identity: LoopExternalIdentity): boolean {
   return !!bound && bound.checks_conclusion === "success" && (identity.checks_conclusion === "failure" || identity.checks_conclusion === "pending");
+}
+
+/** Claimed SHA versus on-disk HEAD, unfinished rebase, or product dirt. */
+export function localRemoteIdentityDrift(
+  identity: LoopExternalIdentity,
+  bound: LoopExternalIdentity | null,
+): boolean {
+  if (identity.rebase_in_progress === true) return true;
+  const local = (identity.local_head_sha ?? "").trim().toLowerCase();
+  const claimed = (bound?.head_sha ?? "").trim().toLowerCase();
+  if (local && claimed && local !== claimed && identity.pr_state !== "merged") return true;
+  if (identity.product_dirt === true && identity.rebase_in_progress === true) return true;
+  return false;
+}
+
+/**
+ * Ledger state the observer actually supports. Used by `reconstruct` so an
+ * over-claim is rewritten locally without a remote mutation.
+ */
+export function reconstructedLocalState(
+  identity: LoopExternalIdentity,
+  current: LoopItemState,
+): LoopItemState {
+  const target = verifiedForwardTarget(identity);
+  if (target) return target;
+  if (identity.pr_number !== null && identity.pr_state === "open" && isAdvanceStillNeeded(identity)) {
+    return "in_progress";
+  }
+  if (REMOTE_PROVING_STATES.has(current)) return "implemented";
+  return current;
+}
+
+/** A recovery recipe is never verified completion of the original mutation. */
+export function recoveryRecipeCompletesOriginalMutation(
+  _recipe: "worktree_rematerialize" | "rebase_abort" | "repair_pipeline_item",
+): false {
+  return false;
+}
+
+/** SHA mismatch / unfinished rebase is local-remote drift, not a human STOP. */
+export function repairShaMismatchIsHumanStop(input: {
+  claimedSha: string;
+  onDiskSha: string;
+  rebaseInProgress?: boolean;
+  productDirt?: boolean;
+}): boolean {
+  void input;
+  return false;
 }
 
 /** The furthest {@link LoopItemState} the verified `identity` alone supports —
@@ -320,6 +451,9 @@ export function classifyDrift(
     // Only ready/merged truth may supersede blocked recovery state; otherwise
     // an already-claimed action would be orphaned at pr_opened.
     if (target && !(state === "blocked" && target === "pr_opened")) return "ledger-behind";
+    if (state !== "waiting" && state !== "paused" && localRemoteIdentityDrift(identity, bound)) {
+      return "identity-mismatch";
+    }
     return checksRegressed(bound, identity) ? "checks-regressed" : null;
   }
 
@@ -338,6 +472,9 @@ export function classifyDrift(
   }
 
   if (bound && bound.pr_number !== null && bound.pr_number !== identity.pr_number) {
+    return "identity-mismatch";
+  }
+  if (localRemoteIdentityDrift(identity, bound)) {
     return "identity-mismatch";
   }
   if (
@@ -389,7 +526,16 @@ export function computeNextAction(
 ): LoopNextAction {
   if (drift === "ledger-behind") return "repair-forward";
   if (currentHumanAuthority) return "hold-for-human";
-  if (drift === "ledger-ahead" || drift === "external-absent" || drift === "identity-mismatch") return "noop";
+  if (
+    (drift === "ledger-ahead" || drift === "external-absent" || drift === "identity-mismatch") &&
+    state !== "waiting" &&
+    state !== "paused"
+  ) {
+    return "reconstruct";
+  }
+  if (drift === "ledger-ahead" || drift === "external-absent" || drift === "identity-mismatch") {
+    return "noop";
+  }
   if (drift === "checks-regressed") return identity.checks_conclusion === "pending" ? "await-checks" : "noop";
   // Labels carry workflow state, never authority.
   if (identity.blocked_label_present) return "noop";
@@ -470,6 +616,31 @@ export async function reconcile(
         delete repaired.blocked_theme;
       }
       items[id] = repaired;
+    } else if (
+      (driftClass === "ledger-ahead" ||
+        driftClass === "external-absent" ||
+        driftClass === "identity-mismatch") &&
+      entry.state !== "waiting" &&
+      entry.state !== "paused" &&
+      entry.state !== "blocked"
+    ) {
+      const reconstructed = reconstructedLocalState(identity, entry.state);
+      const time = deps.now().toISOString();
+      items[id] = {
+        ...entry,
+        state: reconstructed,
+        last_verified_identity: identity,
+        history: [
+          ...entry.history,
+          {
+            time,
+            from: entry.state,
+            to: reconstructed,
+            engine: input.engine,
+            note: "reconciliation reconstructed local state from owning-system observer",
+          },
+        ],
+      };
     } else if (
       // Advance-still-needed heal (#1068 / #712 Decision 4 class expansion):
       // stranded `pr_opened` OR non-dispatchable local `implemented` with open PR
