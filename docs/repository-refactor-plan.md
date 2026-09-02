@@ -88,6 +88,8 @@ digest proof. Ordinary issue delivery should not depend on this boundary.
 - Deterministic merge gates and merge-result containment.
 - Authenticated authority requests and governed overrides.
 - Dependency-ordered issue integration.
+- The evaluation framework for reproducible harness, model, effort, quality,
+  reliability, cost, and isolation comparisons.
 - Release, package, promotion, rollback, and deployment provenance where the
   release surface is used.
 - Machine-readable status for hosts and external supervisors.
@@ -155,9 +157,16 @@ Determine whether the boundary remains an internal namespace or becomes an
 optional package only after mapping its real consumers. Do not make ordinary
 issue delivery import self-host release machinery.
 
-Scoreboards, planning telemetry, recurrence tracking, and evaluation machinery
-must identify the decisions or policies they influence. Measurement that has no
-consumer or removal criterion is a deletion candidate.
+The evaluation framework is a retained product capability. Refactoring may
+consolidate its schemas, stores, adapters, fixtures, and reporting boundaries,
+but must not remove the ability to run reproducible harness/model/effort
+comparisons with quality, reliability, cost, provenance, and isolation
+evidence.
+
+Scoreboards, planning telemetry, recurrence tracking, and other measurement
+surfaces must still identify the decisions or policies they influence.
+Measurement outside the retained evaluation contract that has no consumer or
+removal criterion remains a deletion candidate.
 
 ### 5. Establish one issue-delivery service
 
@@ -260,7 +269,8 @@ For each stage or gate, document:
 
 ### Phase 6: evidence-based deletion
 
-1. Remove telemetry with no demonstrated consumer.
+1. Remove non-evaluation telemetry with no demonstrated consumer; consolidate
+   retained evaluation telemetry behind its owned framework boundary.
 2. Remove state models made obsolete by the new boundaries.
 3. Remove compatibility paths after their callers migrate.
 4. Verify external consumption before narrowing source-level exports.
