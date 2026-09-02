@@ -12,6 +12,7 @@ import {
   KEEP_ALIVE_ADAPTER_IDS,
   classifyWorkerFromSnapshot,
   defaultKeepAliveAdapters,
+  fenceHolderIsOriginalWorker,
   livenessStatus,
   restoreEligibleRuns,
   type AttachResult,
@@ -38,6 +39,7 @@ import {
   readLoopRunHandoff,
   readSupervisorProcess,
   recoverLock,
+  releaseLock,
   resolveStateHome,
   writeSupervisorProcess,
   type LoopStoreDeps,
@@ -48,6 +50,9 @@ import type { WorkerIdentity } from "./worker-identity.ts";
 
 /** Env set on a spawned `--resume` child so attach waits for this parent to exit. */
 export const LIVENESS_PARENT_PID_ENV = "PIPELINE_LIVENESS_PARENT_PID";
+
+const ATTACH_HANDSHAKE_POLL_MS = 25;
+const ATTACH_HANDSHAKE_TIMEOUT_MS = 30_000;
 
 const DONE_OR_ABANDONED = new Set([
   "ready",
@@ -149,21 +154,6 @@ async function listLoopRuns(store: LoopStoreDeps): Promise<DurableRunSnapshot[]>
       const handoff = await readLoopRunHandoff(store, runId);
       const supervisor = await readSupervisorProcess(store, runId);
       const events = await readEvents(store, runId);
-      const sameHost = !lock || lock.hostname === hostname;
-      const pidAlive = lock ? await store.isPidAlive(lock.pid) : supervisor ? await store.isPidAlive(supervisor.pid) : false;
-      const staleness = lock ? await classifyStaleness(store, lock) : null;
-      const worker = classifyWorkerFromSnapshot({
-        now,
-        recorded: supervisor
-          ? { pid: supervisor.pid, boot_id: supervisor.boot_id, started_at: supervisor.started_at, heartbeat_at: supervisor.heartbeat_at }
-          : lock
-            ? { pid: lock.pid }
-            : null,
-        observed: supervisor
-          ? { pid: supervisor.pid, boot_id: supervisor.boot_id, started_at: supervisor.started_at, heartbeat_at: supervisor.heartbeat_at }
-          : null,
-        pidAlive,
-      });
       const contractText = await store.readTextFile(path.join(root, runId, "contract.json"));
       let logicalOperationId = runId;
       if (contractText) {
@@ -173,21 +163,98 @@ async function listLoopRuns(store: LoopStoreDeps): Promise<DurableRunSnapshot[]>
         }
       }
       const terminal = projectLoopRunTerminal(ledger, events);
+      const identityHosts = [lock?.hostname, supervisor?.hostname].filter(
+        (h): h is string => typeof h === "string" && h.length > 0,
+      );
+      const uniqueHosts = new Set(identityHosts);
+      const foreignOrConflict = uniqueHosts.size > 1 || [...uniqueHosts].some((h) => h !== hostname);
+      const snapshotHostname = lock?.hostname ?? supervisor?.hostname ?? hostname;
+      const lockSnap = lock
+        ? {
+            pid: lock.pid,
+            token: lock.token,
+            hostname: lock.hostname,
+            starttime: supervisor?.starttime,
+          }
+        : undefined;
+      if (foreignOrConflict) {
+        out.push({
+          kind: "loop",
+          runId,
+          logicalOperationId,
+          hostname: snapshotHostname,
+          hasResumeBinding: Boolean(handoff || ledger),
+          verifiedComplete: terminal.verifiedComplete,
+          cancelled: terminal.cancelled,
+          typedRequestForbidsResume: terminal.typedRequestForbidsResume,
+          sameHostDeadPid: false,
+          worker: { status: "unknown", reason: "unreadable_identity" },
+          postconditionProven: terminal.postconditionProven,
+          lock: lockSnap,
+        });
+        continue;
+      }
+      const probePid = lock?.pid ?? supervisor?.pid;
+      const pidAlive = probePid != null ? await store.isPidAlive(probePid) : false;
+      const liveStarttime =
+        probePid != null && pidAlive && store.getProcessStartTime
+          ? await store.getProcessStartTime(probePid)
+          : null;
+      const recordedStarttime = supervisor?.starttime;
+      const pidReuse =
+        probePid != null &&
+        Boolean(recordedStarttime) &&
+        liveStarttime != null &&
+        !fenceHolderIsOriginalWorker({
+          lockMarker: `${probePid} ${recordedStarttime}`,
+          livePid: probePid,
+          liveStarttime,
+          pidAlive,
+        });
+      const staleness = lock ? await classifyStaleness(store, lock) : null;
+      const recorded = supervisor
+        ? {
+            pid: supervisor.pid,
+            boot_id: supervisor.boot_id,
+            started_at: supervisor.started_at,
+            heartbeat_at: supervisor.heartbeat_at,
+            starttime: supervisor.starttime,
+          }
+        : lock
+          ? { pid: lock.pid }
+          : null;
+      const observed =
+        pidAlive && probePid != null
+          ? {
+              pid: probePid,
+              starttime: liveStarttime ?? undefined,
+              heartbeat_at: supervisor?.heartbeat_at,
+            }
+          : supervisor
+            ? {
+                pid: supervisor.pid,
+                boot_id: supervisor.boot_id,
+                started_at: supervisor.started_at,
+                heartbeat_at: supervisor.heartbeat_at,
+                starttime: supervisor.starttime,
+              }
+            : null;
+      const worker = pidReuse
+        ? { status: "not-live" as const, reason: "pid_reuse" as const, heartbeat_at: supervisor?.heartbeat_at }
+        : classifyWorkerFromSnapshot({ now, recorded, observed, pidAlive });
       out.push({
         kind: "loop",
         runId,
         logicalOperationId,
-        hostname: lock?.hostname ?? hostname,
+        hostname: snapshotHostname,
         hasResumeBinding: Boolean(handoff || ledger),
         verifiedComplete: terminal.verifiedComplete,
         cancelled: terminal.cancelled,
         typedRequestForbidsResume: terminal.typedRequestForbidsResume,
-        sameHostDeadPid: sameHost && staleness === "stale_same_host_dead_pid",
+        sameHostDeadPid: staleness === "stale_same_host_dead_pid" || pidReuse,
         worker,
         postconditionProven: terminal.postconditionProven,
-        lock: lock
-          ? { pid: lock.pid, token: lock.token, hostname: lock.hostname }
-          : undefined,
+        lock: lockSnap,
       });
     } catch {
       continue;
@@ -207,14 +274,49 @@ function liveHolderFromLock(lock: { pid: number; hostname: string } | null, runI
 
 /** Recover a stale same-host lock and acquire a fresh fence token. */
 export async function claimLoopFence(store: LoopStoreDeps, run: DurableRunSnapshot): Promise<FenceClaim> {
+  if (run.hostname !== store.hostname()) {
+    return liveHolderFromLock(await readLock(store, run.runId), run.runId);
+  }
   const existing = await readLock(store, run.runId);
+  const supervisor = await readSupervisorProcess(store, run.runId);
+  if (supervisor?.hostname && supervisor.hostname !== store.hostname()) {
+    return {
+      ok: false,
+      runId: run.runId,
+      supervisorStarted: false,
+      liveHolder: { pid: supervisor.pid, hostname: supervisor.hostname },
+    };
+  }
   if (existing) {
+    if (existing.hostname !== store.hostname()) {
+      return liveHolderFromLock(existing, run.runId);
+    }
     const staleness = await classifyStaleness(store, existing);
-    if (staleness !== "stale_same_host_dead_pid") {
+    const pidAlive = staleness === "not_stale";
+    const liveStarttime =
+      store.getProcessStartTime && pidAlive ? await store.getProcessStartTime(existing.pid) : null;
+    const recordedStarttime = supervisor?.starttime ?? run.lock?.starttime ?? undefined;
+    const pidReuse =
+      Boolean(recordedStarttime) &&
+      liveStarttime != null &&
+      !fenceHolderIsOriginalWorker({
+        lockMarker: `${existing.pid} ${recordedStarttime}`,
+        livePid: existing.pid,
+        liveStarttime,
+        pidAlive,
+      });
+    if (staleness !== "stale_same_host_dead_pid" && !pidReuse) {
       return liveHolderFromLock(existing, run.runId);
     }
     try {
-      await recoverLock(store, run.runId, "liveness restore: prior holder provably dead");
+      await recoverLock(
+        store,
+        run.runId,
+        pidReuse
+          ? "liveness restore: lock pid reused by a different process"
+          : "liveness restore: prior holder provably dead",
+        pidReuse,
+      );
     } catch (err) {
       if (err instanceof LoopError && err.loopFailureClass === "lock") {
         const latest = await readLock(store, run.runId);
@@ -254,6 +356,13 @@ export interface ProductionProviderOver {
     engine: LoopEngineName;
     parentPid: number;
   }) => Promise<{ pid: number }>;
+  awaitAttach?: (input: {
+    runId: string;
+    pid: number;
+    fence: FenceClaim;
+  }) => Promise<WorkerIdentity>;
+  attachTimeoutMs?: number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 function defaultSpawnSupervisor(input: {
@@ -295,7 +404,6 @@ export function productionProviderDeps(
 ): LivenessProviderDeps {
   const store = over.store ?? defaultLoopStoreDeps(env);
   const spawnSupervisor = over.spawnSupervisor ?? defaultSpawnSupervisor;
-  const claimedTokens = new Map<string, string>();
   return {
     hostname: () => store.hostname(),
     now: () => store.now(),
@@ -305,15 +413,13 @@ export function productionProviderDeps(
       if (run.kind !== "loop") {
         return { ok: true, runId: run.runId, supervisorStarted: false };
       }
-      const claimed = await claimLoopFence(store, run);
-      if (claimed.ok && claimed.token) claimedTokens.set(run.runId, claimed.token);
-      return claimed;
+      return claimLoopFence(store, run);
     },
-    attach: async (run, fence) => productionAttachLoop(store, spawnSupervisor, run, fence),
+    attach: async (run, fence) => productionAttachLoop(store, spawnSupervisor, run, fence, over),
     refreshIdentity: async (run, identity) => {
-      const token = claimedTokens.get(run.runId);
-      if (!token) return;
-      await persistWorkerIdentity(store, run, identity, token);
+      const lock = await readLock(store, run.runId);
+      if (!lock || lock.hostname !== store.hostname()) return;
+      await persistWorkerIdentity(store, run, identity, lock.token);
     },
   };
 }
@@ -323,6 +429,7 @@ async function productionAttachLoop(
   spawnSupervisor: NonNullable<ProductionProviderOver["spawnSupervisor"]>,
   run: DurableRunSnapshot,
   fence: FenceClaim,
+  over: ProductionProviderOver = {},
 ): Promise<AttachResult> {
   let engine: LoopEngineName = "codex";
   try {
@@ -336,21 +443,61 @@ async function productionAttachLoop(
     engine,
     parentPid: store.pid(),
   });
-  const now = store.now().toISOString();
-  const identity: WorkerIdentity = {
-    pid: spawned.pid,
-    boot_id: store.uuid(),
-    started_at: now,
-    heartbeat_at: now,
-  };
   if (fence.token) {
-    await persistWorkerIdentity(store, run, identity, fence.token);
+    try {
+      await releaseLock(store, run.runId, fence.token);
+    } catch {
+      /* child may already have recovered a stale lock */
+    }
   }
+  const identity = over.awaitAttach
+    ? await over.awaitAttach({ runId: run.runId, pid: spawned.pid, fence })
+    : await waitForSpawnedSupervisorAttach(store, run, spawned.pid, over);
   return {
     runId: run.runId,
     logicalOperationId: run.logicalOperationId,
     identity,
   };
+}
+
+async function waitForSpawnedSupervisorAttach(
+  store: LoopStoreDeps,
+  run: DurableRunSnapshot,
+  spawnedPid: number,
+  over: ProductionProviderOver,
+): Promise<WorkerIdentity> {
+  const timeoutMs = over.attachTimeoutMs ?? ATTACH_HANDSHAKE_TIMEOUT_MS;
+  const sleep = over.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let waited = 0;
+  while (waited <= timeoutMs) {
+    const rec = await readSupervisorProcess(store, run.runId);
+    const lock = await readLock(store, run.runId);
+    if (
+      rec &&
+      rec.pid === spawnedPid &&
+      rec.hostname === store.hostname() &&
+      rec.token &&
+      rec.boot_id &&
+      rec.started_at &&
+      lock &&
+      lock.pid === spawnedPid &&
+      lock.hostname === store.hostname()
+    ) {
+      return {
+        pid: rec.pid,
+        boot_id: rec.boot_id,
+        started_at: rec.started_at,
+        heartbeat_at: rec.heartbeat_at,
+        starttime: rec.starttime,
+      };
+    }
+    if (!(await store.isPidAlive(spawnedPid))) {
+      break;
+    }
+    await sleep(ATTACH_HANDSHAKE_POLL_MS);
+    waited += ATTACH_HANDSHAKE_POLL_MS;
+  }
+  throw new Error(`liveness restore: supervisor ${spawnedPid} did not attach for ${run.runId}`);
 }
 
 async function persistWorkerIdentity(
@@ -368,6 +515,10 @@ async function persistWorkerIdentity(
   }
   const prior = await readSupervisorProcess(store, run.runId);
   const now = store.now().toISOString();
+  const starttime =
+    identity.starttime ??
+    (await store.getProcessStartTime?.(identity.pid)) ??
+    prior?.starttime;
   await writeSupervisorProcess(
     store,
     {
@@ -380,6 +531,7 @@ async function persistWorkerIdentity(
       heartbeat_at: identity.heartbeat_at ?? now,
       token,
       consecutive_no_progress: prior?.consecutive_no_progress ?? 0,
+      ...(starttime ? { starttime } : {}),
     },
     token,
   );

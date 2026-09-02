@@ -2768,6 +2768,8 @@ export async function attachSupervisor(deps: SupervisorDeps, input: SupervisorAt
   if (input.parentPid && input.parentPid !== deps.store.pid()) {
     const deadline = Date.now() + 30_000;
     while (await deps.store.isPidAlive(input.parentPid) && Date.now() < deadline) {
+      const held = await readLock(deps.store, runId);
+      if (!held || held.pid !== input.parentPid) break;
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
   }
@@ -2804,6 +2806,7 @@ export async function attachSupervisor(deps: SupervisorDeps, input: SupervisorAt
 
   const acquired = await acquireLock(deps.store, runId, engine);
   const now = deps.store.now().toISOString();
+  const starttime = (await deps.store.getProcessStartTime?.(deps.store.pid())) ?? undefined;
   const record: LoopSupervisorProcess = {
     run_id: runId,
     engine,
@@ -2814,6 +2817,7 @@ export async function attachSupervisor(deps: SupervisorDeps, input: SupervisorAt
     heartbeat_at: now,
     token: acquired.token,
     consecutive_no_progress: 0,
+    ...(starttime ? { starttime } : {}),
   };
   await writeSupervisorProcess(deps.store, record, acquired.token);
   return { token: acquired.token, record, resumed };

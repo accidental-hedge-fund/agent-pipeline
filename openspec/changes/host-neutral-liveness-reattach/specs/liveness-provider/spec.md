@@ -76,6 +76,13 @@ The Liveness Provider SHALL start or reattach the same durable supervisor for an
 - **AND** the new worker identity SHALL replace the dead identity on the fence
 - **AND** a new Logical Operation SHALL NOT be minted
 
+#### Scenario: Restore reports attached only after supervisor handshake
+
+- **WHEN** restore spawns a replacement supervisor
+- **AND** that process has not yet acquired the replacement fence and written a valid worker identity
+- **THEN** restore SHALL NOT report attached
+- **AND** it SHALL NOT persist the spawned pid as the recorded worker
+
 #### Scenario: systemd and launchd use the same restore contract
 
 - **WHEN** a systemd unit, launchd job, container entrypoint, or harness worker restores after restart

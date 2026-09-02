@@ -8,6 +8,7 @@
 - [x] 2.1 Add a Liveness Provider module that discovers same-host durable runs with a resume binding, non-terminal ledger, and `not-live` worker, and verify a unit test with injected store/lock/identity deps lists that run and hides verified-complete, cancelled, and cross-host records
 - [x] 2.2 Claim the existing issue-run lock or loop-store lock (pid + starttime + token) before attach, and verify two concurrent restore fixtures grant exactly one fence and start no second supervisor
 - [x] 2.3 Attach the same supervisor through existing `--resume` / `recoverLock` / detached re-entry, refresh worker identity, and verify the fixture keeps the original run identity and Logical Operation
+- [x] 2.7 Report restore attached only after the resumed supervisor acquires the replacement fence and writes a valid worker identity, probe live pid/starttime (never a cached supervisor record as observed identity), exclude lock-or-supervisor foreign-host records before local PID probing, and verify handshake failure does not persist the spawned pid
 - [x] 2.4 Treat wrapper `sentinel.json` with a non-zero exit as attempt evidence, and verify a non-zero sentinel plus unproven postcondition remains eligible and is not verified completion
 - [x] 2.5 Relinquish the fence only after terminal evidence RecoverySupervisor already owns, and verify follow interruption or #1302 sink failure leaves the ledger unchanged
 - [x] 2.6 Reject human-authority projection on worker death, and verify a fixture that classifies dead-worker as needs-human or a Decision Request fails

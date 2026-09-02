@@ -91,7 +91,7 @@ export interface RestoreResult {
   runId: string;
   logicalOperationId: string;
   supervisorStarted: boolean;
-  reason?: "live_holder" | "not_eligible" | "attached";
+  reason?: "live_holder" | "not_eligible" | "attached" | "attach_failed";
   liveHolder?: { pid: number; hostname: string };
   identity?: WorkerIdentity;
   follow?: { eventsPath?: string; runId: string };
@@ -207,7 +207,18 @@ export async function restoreRun(
       liveHolder: fence.liveHolder,
     };
   }
-  const attached = await deps.attach(run, fence);
+  let attached: AttachResult;
+  try {
+    attached = await deps.attach(run, fence);
+  } catch {
+    return {
+      ok: false,
+      runId: run.runId,
+      logicalOperationId: run.logicalOperationId,
+      supervisorStarted: false,
+      reason: "attach_failed",
+    };
+  }
   await deps.refreshIdentity(run, attached.identity);
   return {
     ok: true,

@@ -39,6 +39,7 @@ import {
   acquireLock,
   readLock,
   readSupervisorProcess,
+  writeSupervisorProcess,
   type LoopStoreDeps,
 } from "../scripts/loop/store.ts";
 import {
@@ -394,6 +395,7 @@ test("projectLoopRunTerminal reads completion and cancellation from ledger/event
 function memStore(over: Partial<LoopStoreDeps> = {}): { deps: LoopStoreDeps; files: Map<string, string> } {
   const files = new Map<string, string>();
   const alive = new Set<number>([111]);
+  const starttimes = new Map<number, string>([[111, "111-start"]]);
   let uuid = 0;
   const env = { AGENT_PIPELINE_STATE_HOME: "/state-liveness" };
   const deps: LoopStoreDeps = {
@@ -434,6 +436,9 @@ function memStore(over: Partial<LoopStoreDeps> = {}): { deps: LoopStoreDeps; fil
     },
     async isPidAlive(pid) {
       return alive.has(pid);
+    },
+    getProcessStartTime(pid) {
+      return starttimes.get(pid) ?? null;
     },
     hostname: () => HOST,
     pid: () => 111,
@@ -499,6 +504,61 @@ function seedDeadLock(files: Map<string, string>, runId: string, pid = 999): voi
   );
 }
 
+function seedSupervisor(
+  files: Map<string, string>,
+  runId: string,
+  over: { pid: number; hostname?: string; starttime?: string; heartbeatAt?: string } = { pid: 4242 },
+): void {
+  files.set(
+    `/state-liveness/runs/${runId}/supervisor.json`,
+    JSON.stringify({
+      run_id: runId,
+      engine: "codex",
+      pid: over.pid,
+      hostname: over.hostname ?? HOST,
+      boot_id: "boot-1",
+      started_at: "2026-09-02T00:00:00.000Z",
+      heartbeat_at: over.heartbeatAt ?? "2026-09-02T00:00:00.000Z",
+      token: "old-tok",
+      consecutive_no_progress: 0,
+      ...(over.starttime ? { starttime: over.starttime } : {}),
+    }),
+  );
+}
+
+async function simulateChildAttach(
+  store: LoopStoreDeps,
+  input: { runId: string; pid: number },
+): Promise<{ pid: number; boot_id: string; started_at: string; heartbeat_at: string; starttime: string }> {
+  const child: LoopStoreDeps = { ...store, pid: () => input.pid };
+  const acquired = await acquireLock(child, input.runId, "codex");
+  const now = store.now().toISOString();
+  const identity = {
+    pid: input.pid,
+    boot_id: "boot-child",
+    started_at: now,
+    heartbeat_at: now,
+    starttime: "child-start",
+  };
+  await writeSupervisorProcess(
+    child,
+    {
+      run_id: input.runId,
+      engine: "codex",
+      pid: input.pid,
+      hostname: store.hostname(),
+      boot_id: identity.boot_id,
+      started_at: identity.started_at,
+      heartbeat_at: identity.heartbeat_at,
+      token: acquired.token,
+      consecutive_no_progress: 0,
+      starttime: identity.starttime,
+    },
+    acquired.token,
+  );
+  return identity;
+}
+
 test("production listRuns projects verified-complete and cancelled loop runs", async () => {
   const { deps, files } = memStore();
   seedLoopRun(files, { runId: "done", itemState: "ready", logicalOperationId: "lop-done" });
@@ -549,7 +609,7 @@ test("production claimFence recovers a stale same-host dead-pid lock before atta
   assert.equal(second.liveHolder?.pid, 111);
 });
 
-test("production attach spawns the supervisor and persists worker identity", async () => {
+test("production attach reports attached only after the child acquires the fence", async () => {
   const { deps, files } = memStore();
   seedLoopRun(files);
   const spawned: string[] = [];
@@ -559,6 +619,7 @@ test("production attach spawns the supervisor and persists worker identity", asy
       spawned.push(input.runId);
       return { pid: 2001 };
     },
+    awaitAttach: (input) => simulateChildAttach(deps, input),
   });
   const snapshot = run({ runId: "loop-1", logicalOperationId: "lop-abc" });
   const result = await restoreRun(snapshot, provider);
@@ -571,6 +632,107 @@ test("production attach spawns the supervisor and persists worker identity", asy
   const supervisor = await readSupervisorProcess(deps, "loop-1");
   assert.equal(supervisor?.pid, 2001);
   assert.equal(supervisor?.run_id, "loop-1");
+  const held = await readLock(deps, "loop-1");
+  assert.equal(held?.pid, 2001);
+});
+
+test("production attach does not persist spawned pid when handshake fails", async () => {
+  const { deps, files } = memStore();
+  seedLoopRun(files);
+  const provider = productionProviderDeps({}, {
+    store: deps,
+    spawnSupervisor: async () => ({ pid: 2001 }),
+    attachTimeoutMs: 0,
+    sleep: async () => {},
+  });
+  const snapshot = run({ runId: "loop-1", logicalOperationId: "lop-abc" });
+  const result = await restoreRun(snapshot, provider);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "attach_failed");
+  assert.equal(result.supervisorStarted, false);
+  const supervisor = await readSupervisorProcess(deps, "loop-1");
+  assert.equal(supervisor, null);
+});
+
+test("production listRuns classifies PID reuse as not-live using live starttime", async () => {
+  const { deps, files } = memStore({
+    async isPidAlive(pid) {
+      return pid === 4242 || pid === 111;
+    },
+    getProcessStartTime(pid) {
+      return pid === 4242 ? "reused-start" : pid === 111 ? "111-start" : null;
+    },
+  });
+  seedLoopRun(files);
+  seedDeadLock(files, "loop-1", 4242);
+  seedSupervisor(files, "loop-1", { pid: 4242, starttime: "orig-start" });
+  const provider = productionProviderDeps({}, { store: deps, spawnSupervisor: async () => ({ pid: 2001 }) });
+  const listed = await provider.listRuns();
+  assert.equal(listed[0]?.worker.status, "not-live");
+  assert.equal(listed[0]?.worker.reason, "pid_reuse");
+  const eligible = await discoverEligibleRuns(provider);
+  assert.deepEqual(eligible.map((r) => r.runId), ["loop-1"]);
+});
+
+test("production listRuns treats matching pid and starttime as live", async () => {
+  const { deps, files } = memStore({
+    async isPidAlive(pid) {
+      return pid === 4242 || pid === 111;
+    },
+    getProcessStartTime(pid) {
+      return pid === 4242 ? "orig-start" : pid === 111 ? "111-start" : null;
+    },
+  });
+  seedLoopRun(files);
+  seedDeadLock(files, "loop-1", 4242);
+  seedSupervisor(files, "loop-1", { pid: 4242, starttime: "orig-start" });
+  const provider = productionProviderDeps({}, { store: deps, spawnSupervisor: async () => ({ pid: 2001 }) });
+  const listed = await provider.listRuns();
+  assert.equal(listed[0]?.worker.status, "live");
+  const eligible = await discoverEligibleRuns(provider);
+  assert.deepEqual(eligible.map((r) => r.runId), []);
+});
+
+test("production claimFence recovers a lock whose pid was reused", async () => {
+  const { deps, files } = memStore({
+    async isPidAlive(pid) {
+      return pid === 4242 || pid === 111;
+    },
+    getProcessStartTime(pid) {
+      return pid === 4242 ? "reused-start" : "111-start";
+    },
+  });
+  seedLoopRun(files);
+  const reused: LoopStoreDeps = { ...deps, pid: () => 4242 };
+  await acquireLock(reused, "loop-1", "codex");
+  seedSupervisor(files, "loop-1", { pid: 4242, starttime: "orig-start" });
+  const snapshot = run({
+    runId: "loop-1",
+    lock: { pid: 4242, hostname: HOST, starttime: "orig-start" },
+  });
+  const claimed = await claimLoopFence(deps, snapshot);
+  assert.equal(claimed.ok, true);
+  const held = await readLock(deps, "loop-1");
+  assert.equal(held?.pid, 111);
+});
+
+test("production listRuns excludes a foreign-host supervisor when lock is absent", async () => {
+  const probed: number[] = [];
+  const { deps, files } = memStore({
+    async isPidAlive(pid) {
+      probed.push(pid);
+      return false;
+    },
+  });
+  seedLoopRun(files);
+  seedSupervisor(files, "loop-1", { pid: 4242, hostname: "host-b" });
+  const provider = productionProviderDeps({}, { store: deps, spawnSupervisor: async () => ({ pid: 2001 }) });
+  const listed = await provider.listRuns();
+  assert.equal(listed[0]?.hostname, "host-b");
+  assert.equal(listed[0]?.worker.status, "unknown");
+  assert.deepEqual(probed, []);
+  const eligible = await discoverEligibleRuns(provider);
+  assert.deepEqual(eligible.map((r) => r.runId), []);
 });
 
 test("productionRestoreDeadDetached reattaches existing identity and refuses a live holder", async () => {

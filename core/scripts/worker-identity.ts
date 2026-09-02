@@ -23,6 +23,8 @@ export interface WorkerIdentity {
   boot_id?: string;
   started_at?: string;
   heartbeat_at?: string;
+  /** Host process starttime token (`/proc/<pid>/stat` field 22 or `ps -o lstart=`). */
+  starttime?: string;
 }
 
 export type ReadableOrUnreadable<T> = T | null | "unreadable";
@@ -95,6 +97,13 @@ function identityFieldsMatch(recorded: WorkerIdentity, observed: WorkerIdentity)
     recorded.started_at !== undefined &&
     observed.started_at !== undefined &&
     recorded.started_at !== observed.started_at
+  ) {
+    return false;
+  }
+  if (
+    recorded.starttime !== undefined &&
+    observed.starttime !== undefined &&
+    recorded.starttime !== observed.starttime
   ) {
     return false;
   }

@@ -980,6 +980,8 @@ export interface LoopSupervisorProcess {
   boot_id: string;
   started_at: string;
   heartbeat_at: string;
+  /** Host process starttime token. Distinguishes PID reuse from the original worker. */
+  starttime?: string;
   /** The lock token this process currently holds. */
   token: string;
   /** The run-level watchdog's current consecutive-no-progress count — reset

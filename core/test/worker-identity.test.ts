@@ -49,6 +49,20 @@ test("PID reuse without matching start/boot is not-live", () => {
   assert.equal(result.reason, "pid_reuse");
 });
 
+test("PID reuse without matching process starttime is not-live", () => {
+  const result = classifyWorkerLiveness(evidence({
+    recorded: { pid: 4242, starttime: "orig-start", heartbeat_at: "2026-08-29T11:59:55.000Z" },
+    observed: {
+      pid: 4242,
+      starttime: "reused-start",
+      heartbeat_at: "2026-08-29T11:59:55.000Z",
+    },
+    pidAlive: true,
+  }));
+  assert.equal(result.status, "not-live");
+  assert.equal(result.reason, "pid_reuse");
+});
+
 test("stale heartbeat is not-live", () => {
   const result = classifyWorkerLiveness(evidence({
     observed: {
