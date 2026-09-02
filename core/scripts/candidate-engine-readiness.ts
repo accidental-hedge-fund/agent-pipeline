@@ -74,6 +74,8 @@ export interface PrepareCandidateEngineDeps {
   parentIdentity(): { pid: number; starttime: string | null };
   processAlive(pid: number, starttime: string | null): boolean;
   processGroupAlive(pgid: number): boolean;
+  /** Follows symlinks. Null if the root cannot be canonicalized. */
+  realpath(root: string): string | null;
   startInstall(opts: { cwd: string; lockfilePath: string }): InstallerHandle;
   heartbeatIntervalMs?: number;
   heartbeatStaleMs?: number;
@@ -91,6 +93,7 @@ function nestedLockfilePath(root: string): string {
   return path.join(root, CANDIDATE_CORE_LOCKFILE_REL);
 }
 
+/** `root` must already be the injected-realpath canonical checkout. */
 export function candidateStateKey(root: string, sha: string): string {
   return createHash("sha256").update(`${path.resolve(root)}\n${sha}`).digest("hex").slice(0, 32);
 }
@@ -181,6 +184,22 @@ function ownerProcessInfo(lock: CandidateSetupLock): string {
 function childGroupMayLive(lock: CandidateSetupLock, deps: PrepareCandidateEngineDeps): boolean {
   if (lock.childPgid == null) return false;
   return deps.processGroupAlive(lock.childPgid);
+}
+
+function childIdentityUnpublished(lock: CandidateSetupLock): boolean {
+  return lock.childPgid == null;
+}
+
+function unresolvedChildIdentityError(
+  root: string,
+  lock: CandidateSetupLock,
+): PreparedCandidateResult {
+  return closedError(
+    "lock",
+    root,
+    "setup lock is missing installer child identity after owner death; unresolved ownership does not reclaim",
+    ownerProcessInfo(lock) + ". Retry only after that process group is gone.",
+  );
 }
 
 function heartbeatFresh(lock: CandidateSetupLock, deps: PrepareCandidateEngineDeps): boolean {
@@ -347,6 +366,9 @@ async function waitForOwner(
       await deps.sleep(poll);
       continue;
     }
+    if (childIdentityUnpublished(lock)) {
+      return unresolvedChildIdentityError(engine.engineRoot, lock);
+    }
     if (childGroupMayLive(lock, deps)) {
       return closedError(
         "lock",
@@ -378,7 +400,11 @@ export async function prepareCandidateEngine(
   engine: PreparedCandidateEngine,
   deps: ResolveAndPrepareDeps,
 ): Promise<PreparedCandidateResult> {
-  const root = path.resolve(engine.engineRoot);
+  const lexical = path.resolve(engine.engineRoot);
+  const root = deps.realpath(lexical);
+  if (!root) {
+    return closedError("readiness", lexical, "cannot canonicalize candidate root");
+  }
   const prepared: PreparedCandidateEngine = { ...engine, engineRoot: root };
   const lockfilePath = nestedLockfilePath(root);
   if (!deps.fileExists(lockfilePath)) {
@@ -436,6 +462,10 @@ export async function prepareCandidateEngine(
 
   if (deps.processAlive(existing.parentPid, existing.parentStarttime)) {
     return waitForOwner(prepared, digest, lockPath, existing, deps);
+  }
+
+  if (childIdentityUnpublished(existing)) {
+    return unresolvedChildIdentityError(root, existing);
   }
 
   if (childGroupMayLive(existing, deps)) {
@@ -572,6 +602,13 @@ export function defaultPrepareCandidateEngineDeps(): PrepareCandidateEngineDeps 
     },
     processAlive: defaultProcessAlive,
     processGroupAlive: defaultProcessGroupAlive,
+    realpath: (root) => {
+      try {
+        return fs.realpathSync(root);
+      } catch {
+        return null;
+      }
+    },
     startInstall: defaultStartInstall,
   };
 }

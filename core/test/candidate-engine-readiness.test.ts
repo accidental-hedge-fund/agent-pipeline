@@ -96,6 +96,8 @@ function prepareHarness(opts: {
   setupCommand?: string;
   fetchOk?: boolean;
   addOk?: boolean;
+  realpath?: (p: string) => string | null;
+  onStartInstall?: () => void;
 }): {
   deps: ResolveAndPrepareCandidateEngineDeps;
   events: EventLog;
@@ -106,6 +108,7 @@ function prepareHarness(opts: {
   spawned: string[][];
   releaseInstall: () => void;
   setChildGroupAlive: (v: boolean) => void;
+  setOwnerParentAlive: (v: boolean) => void;
   files: Map<string, string>;
 } {
   const events: EventLog = [];
@@ -124,6 +127,7 @@ function prepareHarness(opts: {
   });
   let holdResolve: ((r: { code: number; stdout: string; stderr: string }) => void) | null = null;
   let childGroupAlive = opts.childGroupAlive ?? false;
+  let ownerParentAlive = true;
   let now = 1_000;
   const lockfiles = opts.lockfiles ?? {};
   const digests = opts.digests ?? {};
@@ -141,6 +145,7 @@ function prepareHarness(opts: {
   const startInstall = (installOpts: { cwd: string; lockfilePath: string }): InstallerHandle => {
     installs.push({ ...installOpts });
     events.push("install");
+    opts.onStartInstall?.();
     if (opts.porcelainAfterInstall !== undefined) {
       const root = path.dirname(installOpts.cwd);
       if (opts.roots[root]) opts.roots[root].porcelain = opts.porcelainAfterInstall;
@@ -217,12 +222,14 @@ function prepareHarness(opts: {
     tmpDir: () => "/tmp-state",
     parentIdentity: () => ({ pid: 111, starttime: "parent-st" }),
     processAlive: (pid) => {
+      if (pid === 111) return ownerParentAlive;
       if (opts.parentAlive === false && pid === 999) return false;
       if (opts.parentAlive === false && pid !== 111) return false;
       if (pid === 999) return false;
-      return pid === 111;
+      return false;
     },
     processGroupAlive: (pgid) => pgid === 4242 && childGroupAlive,
+    realpath: opts.realpath ?? ((p) => path.resolve(p)),
     startInstall,
     heartbeatIntervalMs: 10,
     heartbeatStaleMs: 1_000,
@@ -246,6 +253,9 @@ function prepareHarness(opts: {
     },
     setChildGroupAlive: (v) => {
       childGroupAlive = v;
+    },
+    setOwnerParentAlive: (v) => {
+      ownerParentAlive = v;
     },
     files,
   };
@@ -577,6 +587,43 @@ test("concurrent waiters share one install and observe heartbeats", async () => 
   assert.ok(h.heartbeatsSeen.length > 0, "waiter must observe installer heartbeats");
 });
 
+test("two lexical aliases of one checkout share exactly one install", async () => {
+  const canonical = "/canonical/candidate";
+  const aliasEnv = "/aliases/env-root";
+  const aliasOther = "/aliases/other-root";
+  const h = prepareHarness({
+    roots: {
+      "/repo": { head: OTHER, porcelain: "" },
+      [aliasEnv]: { head: SHA, porcelain: "" },
+      [aliasOther]: { head: SHA, porcelain: "" },
+      [canonical]: { head: SHA, porcelain: "" },
+    },
+    lockfiles: {
+      [path.join(aliasEnv, CANDIDATE_CORE_LOCKFILE_REL)]: LOCKFILE_V1,
+      [path.join(aliasOther, CANDIDATE_CORE_LOCKFILE_REL)]: LOCKFILE_V1,
+      [path.join(canonical, CANDIDATE_CORE_LOCKFILE_REL)]: LOCKFILE_V1,
+    },
+    realpath: (p) => {
+      if (p === aliasEnv || p === aliasOther) return canonical;
+      return path.resolve(p);
+    },
+  });
+  const first = await resolveAndPrepareCandidateEngine(
+    { repoDir: "/repo", candidateSha: SHA, candidateEngineRootEnv: aliasEnv },
+    h.deps,
+  );
+  const second = await resolveAndPrepareCandidateEngine(
+    { repoDir: "/repo", candidateSha: SHA, candidateEngineRootEnv: aliasOther },
+    h.deps,
+  );
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(h.installs.length, 1, "aliases of one checkout must serialize on the canonical root");
+  assert.equal(h.installs[0]?.cwd, path.join(canonical, "core"));
+  if (first.ok) assert.equal(first.engine.engineRoot, canonical);
+  if (second.ok) assert.equal(second.engine.engineRoot, canonical);
+});
+
 test("abandoned ownership fails closed with path and process data", async () => {
   const repo = "/repo";
   const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
@@ -677,6 +724,41 @@ test("retry is refused while the prior process group remains and allowed once it
   );
   assert.equal(allowed.ok, true);
   assert.equal(h.installs.length, 1);
+});
+
+test("owner death between startInstall and child-PGID publication does not reclaim", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const lockPath = candidateSetupLockPath(repo, SHA, "/tmp-state");
+  let retryP: ReturnType<typeof resolveAndPrepareCandidateEngine> | undefined;
+  let retryStarted = false;
+  let h: ReturnType<typeof prepareHarness>;
+  h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+    onStartInstall: () => {
+      if (retryStarted) return;
+      retryStarted = true;
+      const raw = h.files.get(lockPath);
+      assert.ok(raw, "lock must exist before startInstall returns");
+      const parsed = JSON.parse(raw!) as { childPgid: number | null };
+      assert.equal(parsed.childPgid, null, "child identity is unpublished during startInstall");
+      h.setOwnerParentAlive(false);
+      retryP = resolveAndPrepareCandidateEngine({ repoDir: repo, candidateSha: SHA }, h.deps);
+    },
+  });
+  const first = await resolveAndPrepareCandidateEngine({ repoDir: repo, candidateSha: SHA }, h.deps);
+  assert.ok(retryP, "startInstall must observe the unpublished-child window");
+  const retry = await retryP!;
+  assert.equal(retry.ok, false);
+  if (!retry.ok) {
+    assert.equal(retry.kind, "lock");
+    assert.match(retry.error, /missing installer child identity|unresolved ownership does not reclaim/);
+    assert.match(retry.error, /pid=111/);
+    assert.match(retry.error, /Retry only after/);
+  }
+  assert.equal(h.installs.length, 1, "retry must not start a second install while child identity is unpublished");
+  assert.equal(first.ok, true);
 });
 
 test("locks and ready records are not stored inside the tracked candidate worktree", async () => {

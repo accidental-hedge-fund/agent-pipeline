@@ -23,6 +23,8 @@
 - [x] 4.1 Serialize setup by canonical root and SHA with atomic create, pid+starttime parent identity, installer child PGID, and bounded heartbeats. Store the lock outside the tracked candidate worktree. Verify two concurrent injected callers perform one install and the waiter observes heartbeats.
 - [x] 4.2 Do not reclaim on owner parent PID death. Verify the abandoned-ownership test fails closed with candidate path plus owner/process data when the lock vanishes without a success record, and that parent `ESRCH` with a possibly live child does not unlink the lock.
 - [x] 4.3 Allow retry only after the prior process group is proven gone. Verify a follow-up injected call is refused while that group remains and is allowed once it is gone.
+- [x] 4.4 Canonicalize candidate root via injected realpath before lock and readiness identity. Verify two lexical aliases of one checkout perform exactly one install.
+- [x] 4.5 Treat missing child identity after owner death as unresolved ownership. Verify a retry during startInstall-before-child-PGID-publication fails closed and does not start a second install.
 
 ## 5. Caller wiring
 

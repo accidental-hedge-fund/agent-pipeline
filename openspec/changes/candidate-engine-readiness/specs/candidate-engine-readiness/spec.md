@@ -103,7 +103,7 @@ Engine bootstrap SHALL select the nested candidate `core/package-lock.json` and 
 
 ### Requirement: Concurrent consumers SHALL share one child-safe serialized install
 
-The pipeline SHALL serialize candidate setup by canonical candidate root and SHA. Concurrent consumers of that pair SHALL perform one install. Waiters SHALL reuse that result and SHALL observe bounded heartbeats from the live installer. Locks and readiness records SHALL NOT be stored inside the tracked candidate worktree. Ownership SHALL be child-safe: death of the owner parent PID alone SHALL NOT reclaim the lock while an installer child may still run. The engine SHALL NOT automatically reclaim a setup lock when the owner parent PID is dead.
+The pipeline SHALL serialize candidate setup by canonical candidate root and SHA. Canonical root SHALL be the symlink-resolved checkout path. Concurrent consumers of that pair SHALL perform one install. Waiters SHALL reuse that result and SHALL observe bounded heartbeats from the live installer. Locks and readiness records SHALL NOT be stored inside the tracked candidate worktree. Ownership SHALL be child-safe: death of the owner parent PID alone SHALL NOT reclaim the lock while an installer child may still run. Missing installer child identity after owner death SHALL be unresolved ownership and SHALL NOT reclaim. The engine SHALL NOT automatically reclaim a setup lock when the owner parent PID is dead.
 
 #### Scenario: Two waiters share one install
 
@@ -112,12 +112,27 @@ The pipeline SHALL serialize candidate setup by canonical candidate root and SHA
 - **AND** the waiter SHALL reuse that result
 - **AND** the waiter SHALL observe bounded heartbeats from the live installer
 
+#### Scenario: Two aliases of one checkout share one install
+
+- **WHEN** two consumers request resolve-and-prepare for the same physical candidate checkout at SHA `C` through different lexical paths
+- **AND** no matching readiness record exists
+- **THEN** exactly one install SHALL run
+- **AND** lock and readiness identity SHALL use the canonical root
+
 #### Scenario: Parent death does not reclaim a live installer
 
 - **WHEN** the owner parent PID is dead
 - **AND** an installer child process group may still run
 - **THEN** the engine SHALL NOT reclaim the setup lock
 - **AND** waiters SHALL continue to treat the install as owned until the child-safe contract allows a closed outcome
+
+#### Scenario: Missing child identity after owner death does not reclaim
+
+- **WHEN** the owner parent PID is dead
+- **AND** the setup lock has no installer child process-group identity
+- **THEN** the engine SHALL NOT reclaim the setup lock
+- **AND** the operation SHALL fail closed
+- **AND** a later retry SHALL be refused until the prior process group is proven gone
 
 ---
 
@@ -213,7 +228,7 @@ Operator-facing ship and candidate-engine documentation SHALL state that every a
 
 ### Requirement: Injected-I/O tests SHALL prove spawn-after-ready
 
-Unit tests with injected I/O SHALL cover fresh roots; every selection source (clean `REPO_DIR`, existing ship-candidate worktree, `PIPELINE_CANDIDATE_ENGINE_ROOT`, newly created worktree); partial or unmarked install retry; setup failure with no success record and no spawn; concurrent waiters sharing one install; abandoned ownership fail-closed; nested-core lockfile selection; post-bootstrap SHA or tracked-dirty mismatch fail-closed; and spawn ordering (no candidate command before readiness success). Unit tests SHALL perform no real network, git, or npm calls. `npm run ci` SHALL pass.
+Unit tests with injected I/O SHALL cover fresh roots; every selection source (clean `REPO_DIR`, existing ship-candidate worktree, `PIPELINE_CANDIDATE_ENGINE_ROOT`, newly created worktree); partial or unmarked install retry; setup failure with no success record and no spawn; concurrent waiters sharing one install; two lexical aliases of one checkout sharing one install; abandoned ownership fail-closed; owner death before child-PGID publication fail-closed without reclaim; nested-core lockfile selection; post-bootstrap SHA or tracked-dirty mismatch fail-closed; and spawn ordering (no candidate command before readiness success). Unit tests SHALL perform no real network, git, or npm calls. `npm run ci` SHALL pass.
 
 #### Scenario: Spawn ordering test fails if a command precedes readiness
 
@@ -224,5 +239,5 @@ Unit tests with injected I/O SHALL cover fresh roots; every selection source (cl
 #### Scenario: Unit tests inject I/O
 
 - **WHEN** the candidate-readiness unit suite runs
-- **THEN** it SHALL inject filesystem, process, lock, digest, and install seams
+- **THEN** it SHALL inject filesystem, process, lock, digest, canonicalize, and install seams
 - **AND** it SHALL NOT perform real network, git, or npm calls
