@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change complete-declared-dependency-discovery. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Each authoritative discovery source observation SHALL report a closed status vocabulary
 
 Pipeline SHALL classify each enabled authoritative discovery source observation, when it
@@ -52,8 +54,10 @@ source and enough scope to act (issue id and/or list-level source) when it initi
 **fresh** durable run that is multi-item (resolved snapshot contains two or more issues) or
 factory-owned and any **enabled** authoritative discovery source observation for that
 compile is `unavailable` or `incomplete`. Pipeline SHALL NOT initialize a run contract or
-ledger for that refused attempt. Successfully observed edges from other sources SHALL NOT
-override the refuse when any enabled source remains incomplete.
+ledger for that refused attempt. A fresh multi-item `pipeline train` invocation is the same
+class of admission: train SHALL NOT create a train run store or advance work for that
+refused attempt. Successfully observed edges from other sources SHALL NOT override the
+refuse when any enabled source remains incomplete.
 
 #### Scenario: Incomplete native source blocks multi-item init
 
@@ -76,6 +80,15 @@ override the refuse when any enabled source remains incomplete.
 - **THEN** admission MAY proceed
 - **AND** compiled items SHALL remain independent (`depends_on` / `external_depends_on`
   empty) rather than inventing edges
+
+#### Scenario: Incomplete native source blocks multi-item train before store init
+
+- **WHEN** a fresh multi-item `pipeline train` invocation enables native `blockedBy`
+  discovery
+- **AND** that source is `unavailable` or `incomplete` for at least one selected issue
+- **THEN** admission SHALL fail with a typed actionable result naming that native source
+- **AND** no train run store SHALL be created for that attempt
+- **AND** no advance wave or merge mutation SHALL run
 
 ### Requirement: Accepted contract and audit output SHALL identify edge source and observation identity
 
@@ -126,4 +139,3 @@ source's edges and SHALL NOT be treated as discovery failure.
 - **THEN** they SHALL cover source disagreement between fully observed sources, partial or
   truncated responses, and total source failure
 - **AND** they SHALL inject fakes with zero real network, git, and subprocess calls
-
