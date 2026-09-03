@@ -15,6 +15,10 @@ import {
   type ResolveIssueNumberDeps,
   type RunStatusDeps,
 } from "../scripts/pipeline.ts";
+import {
+  computeFingerprintId,
+  formatRecoverParkedSpentComment,
+} from "../scripts/recover-parked.ts";
 import type { PreflightResult } from "../scripts/stages/doctor.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -52,17 +56,33 @@ const TWO_FINDINGS = [
 // ---------------------------------------------------------------------------
 
 test("needsHumanPunchlist: well-formed ceiling comment returns the finding count + resume hint", () => {
-  const out = needsHumanPunchlist([ceilingComment({ round: 2, findings: TWO_FINDINGS })]);
+  const out = needsHumanPunchlist([ceilingComment({ round: 2, findings: TWO_FINDINGS })], {
+    hostGuidance: "recover-parked",
+    issueNumber: 115,
+  });
   assert.ok(out !== null, "expected a punch-list string, got null");
   assert.match(out, /2 unresolved blocking findings/, `count missing; got:\n${out}`);
   // Override path auto-resumes; fix-by-hand path still needs relabel to the ceiling round.
-  assert.match(out, /pipeline recover-parked/, `recover-parked first missing; got:\n${out}`);
+  assert.match(out, /pipeline recover-parked 115/, `recover-parked first missing; got:\n${out}`);
   assert.match(out, /operator-supplied/, `operator-supplied missing; got:\n${out}`);
   assert.match(out, /not host authority/, `host-authority qualifier missing; got:\n${out}`);
   assert.match(out, /--override "<key>: <reason>"/, `override hint missing; got:\n${out}`);
   assert.match(out, /auto-resumes/, `auto-resume hint missing; got:\n${out}`);
   assert.match(out, /fix it by hand/, `fix-by-hand hint missing; got:\n${out}`);
   assert.match(out, /pipeline:needs-human` → `pipeline:review-2/, `relabel hint missing; got:\n${out}`);
+});
+
+test("needsHumanPunchlist: human-disposition-required omits recover-parked (#1379)", () => {
+  const out = needsHumanPunchlist([ceilingComment({ round: 2, findings: TWO_FINDINGS })], {
+    hostGuidance: "human-disposition-required",
+    issueNumber: 115,
+  });
+  assert.ok(out !== null, "expected a punch-list string, got null");
+  assert.match(out, /2 unresolved blocking findings/, `count missing; got:\n${out}`);
+  assert.match(out, /Stop and request an exact operator-supplied disposition/, `STOP missing; got:\n${out}`);
+  assert.doesNotMatch(out, /Run `pipeline recover-parked/, `spent path must not advertise recover-parked; got:\n${out}`);
+  assert.match(out, /not host authority/, `host-authority qualifier missing; got:\n${out}`);
+  assert.match(out, /--override "<key>: <reason>"/, `override hint missing; got:\n${out}`);
 });
 
 test("needsHumanPunchlist: a single finding is reported with singular wording", () => {
@@ -316,7 +336,7 @@ test("runStatus: a needs-human stage with a ceiling comment appends the punch-li
   assert.equal(lines[2], "Stage: needs-human");
   const text = lines.join("\n");
   assert.match(text, /Needs human: 2 unresolved blocking findings/, `count missing; got:\n${text}`);
-  assert.match(text, /pipeline recover-parked/, `recover-parked first missing; got:\n${text}`);
+  assert.match(text, /pipeline recover-parked 115/, `recover-parked first missing; got:\n${text}`);
   assert.match(text, /not host authority/, `host-authority qualifier missing; got:\n${text}`);
   assert.match(text, /--override "<key>: <reason>"/, `override hint missing; got:\n${text}`);
   assert.match(text, /pipeline:needs-human` → `pipeline:review-2/, `relabel hint missing; got:\n${text}`);
@@ -330,7 +350,78 @@ test("runStatus: a needs-human stage with NO ceiling comment prints a graceful f
   assert.equal(lines[2], "Stage: needs-human");
   const text = lines.join("\n");
   assert.match(text, /no Pipeline: Review ceiling reached comment was found/, `fallback missing; got:\n${text}`);
+  assert.match(text, /pipeline recover-parked 115/, `unspent fallback must name recover-parked with issue; got:\n${text}`);
   assert.match(text, /pipeline:needs-human` → `pipeline:review-<round>/, `fallback resume hint missing; got:\n${text}`);
+});
+
+const SPENT_KEY = "abcd1234";
+
+function residualReviewComment(
+  key = SPENT_KEY,
+  createdAt = "2026-09-01T00:00:00Z",
+): Comment {
+  return {
+    author: "bot",
+    body: [
+      "## Review 1 — needs-attention (commit abc1234)",
+      "**Reviewer**: codex",
+      "",
+      "### Findings",
+      `**1. [MEDIUM] Missing test** (confidence: 0.8) \`override-key: ${key}\``,
+    ].join("\n"),
+    createdAt,
+  };
+}
+
+function spentComment(
+  issue: number,
+  stage: string,
+  keys: string[] = [SPENT_KEY],
+): Comment {
+  return {
+    author: "bot",
+    body: formatRecoverParkedSpentComment({
+      fingerprint: computeFingerprintId(issue, stage, keys),
+      issue,
+      stage,
+      keys,
+      at: "2026-09-02T00:00:00Z",
+    }),
+    createdAt: "2026-09-02T00:00:00Z",
+  };
+}
+
+test("runStatus: unspent residual park names recover-parked with issue number (#1379)", async () => {
+  const lines = await captureStatus("needs-human", [
+    residualReviewComment(),
+    ceilingComment({
+      round: 2,
+      findings: [`\`${SPENT_KEY}\` **[MEDIUM]** Missing test`],
+    }),
+  ]);
+  const punch = lines.find((l) => l.startsWith("Needs human:")) ?? "";
+  assert.match(punch, /Run `pipeline recover-parked 115`/, `unspent punchlist must name recover-parked 115; got:\n${punch}`);
+  assert.match(punch, /If still parked, stop and request an exact operator-supplied disposition/, `STOP-if-parked missing; got:\n${punch}`);
+});
+
+test("runStatus: spent fingerprint omits recover-parked from text punchlist (#1379)", async () => {
+  const lines = await captureStatus("needs-human", [
+    residualReviewComment(),
+    ceilingComment({
+      round: 2,
+      findings: [`\`${SPENT_KEY}\` **[MEDIUM]** Missing test`],
+    }),
+    spentComment(115, "needs-human", [SPENT_KEY]),
+  ]);
+  const punch = lines.find((l) => l.startsWith("Needs human:")) ?? "";
+  assert.match(punch, /Needs human: 1 unresolved blocking finding/, `count missing; got:\n${punch}`);
+  assert.match(punch, /Stop and request an exact operator-supplied disposition/, `spent punchlist must STOP; got:\n${punch}`);
+  assert.doesNotMatch(
+    punch,
+    /Run `pipeline recover-parked/,
+    `spent punchlist must not advertise recover-parked; got:\n${punch}`,
+  );
+  assert.match(punch, /not host authority/, `host-authority qualifier missing; got:\n${punch}`);
 });
 
 // ---------------------------------------------------------------------------

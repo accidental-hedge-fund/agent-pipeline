@@ -60,6 +60,8 @@ When the issue is in a `needs-human` stage or a residual review park (`blocked` 
 
 The human-readable `next_action` string for a `needs-human` stage or residual review park SHALL identify recovery-first and human-disposition-required states. It SHALL NOT instruct an autonomous host to invoke `--override` or `pipeline override`. When host-guidance is `recover-parked`, the prose SHALL name `pipeline recover-parked` as the recovery-first action and SHALL state that a remaining park requires an exact human disposition. When host-guidance is `human-disposition-required`, the prose SHALL tell the host to stop and request an exact operator-supplied disposition. Mention of `pipeline override` in that prose, if present at all, SHALL be labeled as operator-supplied or explicitly approved and SHALL NOT be the autonomous next action.
 
+The same recovery-first vs STOP split SHALL apply to prose `pipeline status` for a `needs-human` stage: the punch-list from `needsHumanPunchlist` and the ceiling-comment fallback SHALL consume the same fingerprint-aware host-guidance projection as JSON. Recovery-first text SHALL name `pipeline recover-parked <N>` only when host-guidance is `recover-parked`. When host-guidance is `human-disposition-required`, that punch-list or fallback SHALL omit the recover-parked instruction and SHALL tell the host to stop and request an exact operator-supplied disposition.
+
 Existing `blocked` next_action text for non-park question/unblock paths MAY continue to name `pipeline unblock` when that is the typed-response surface for a recorded question. Residual review parks SHALL NOT treat generic `--unblock` or label removal as the host next action.
 
 #### Scenario: needs-human next_action does not advertise autonomous override
@@ -85,3 +87,18 @@ Existing `blocked` next_action text for non-park question/unblock paths MAY cont
 - **WHEN** a unit test inspects `next_action` for `needs-human` and for a residual review park fixture
 - **THEN** the test SHALL fail if the string matches an autonomous `--override` or `pipeline override` instruction of the pre-change form
 - **AND** the test SHALL perform no real network, git, or subprocess calls
+
+#### Scenario: spent fingerprint prose status omits recover-parked
+
+- **WHEN** `pipeline status` runs in prose mode for a `needs-human` issue
+- **AND** a ceiling comment is present so the punch-list is printed
+- **AND** recover-parked spend evidence covers the current park fingerprint
+- **THEN** the punch-list SHALL tell the host to stop and request an exact operator-supplied disposition
+- **AND** it SHALL NOT instruct the host to run `pipeline recover-parked`
+
+#### Scenario: unspent residual park prose status names recover-parked with the issue number
+
+- **WHEN** `pipeline status` runs in prose mode for a `needs-human` issue
+- **AND** host-guidance is `recover-parked`
+- **THEN** the punch-list or fallback SHALL name `pipeline recover-parked <N>` with that issue's number
+- **AND** SHALL state that a remaining park requires an exact human disposition

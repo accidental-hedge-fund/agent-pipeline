@@ -5,6 +5,7 @@
 - [x] 1.3 Rewrite `needs-human` `next_action` prose so it names recover-parked then STOP and does not instruct an autonomous `--override` / `pipeline override`, and verify `core/test/status-json.test.ts` fails on the pre-change override instruction and passes on the new wording
 - [x] 1.4 Keep residual-review-park `next_action` from treating generic `--unblock` or label removal as the host next action, and verify a blocked residual-park fixture emits `recover-parked` or `human-disposition-required` rather than an autonomous override or drop-`blocked` instruction
 - [x] 1.5 Classify recover-parked spend by the current park fingerprint (issue + stage + keys from status-available review evidence), fail closed when that fingerprint cannot be derived, and verify a previously spent same-stage park followed by a distinct residual park projects `recover-parked`
+- [x] 1.6 Thread the same fingerprint-aware `host_guidance` into prose `pipeline status` (`needsHumanPunchlist` and the ceiling-comment fallback), name `pipeline recover-parked <N>` only when guidance is `recover-parked`, and verify a text-status fixture with a matching spent marker omits the recover-parked instruction
 
 ## 2. Operation surface and generated CLI
 
