@@ -2332,13 +2332,14 @@ export async function runSupervisorCycle(
         theme: exhausted.blocked_theme,
         historicalEvidence: "recovery_exhausted",
       });
+      ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
       ledger = bindLifecycle(
         contract,
-        { ...ledger, cooling },
+        ledger,
         deriveLifecycleState({ cooling: true, stopReason: "recovery_exhausted", faultClass: "retry-exhaustion" }),
         time,
       );
-      ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
+      await writeLedger(deps.store, ledger, token);
       return {
         progress: recoveryProgress,
         stop: null,
@@ -3885,10 +3886,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
         let newLedger = await persistOwnedCooling(deps.store, { runId: input.runId, token, cooling: coolingRecord });
         newLedger = bindLifecycle(
           contract,
-          {
-            ...newLedger,
-            stop: { reason: "supervisor_no_progress", time, outstanding_ready: outstandingReadyItemIds(newLedger) },
-          },
+          newLedger,
           deriveLifecycleState({ stopReason: "supervisor_no_progress", cooling: true }),
           time,
         );
@@ -3916,10 +3914,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       let capped = await persistOwnedCooling(deps.store, { runId: input.runId, token, cooling: coolingRecord });
       capped = bindLifecycle(
         contract,
-        {
-          ...capped,
-          stop: { reason: "supervisor_cycle_cap", time, limit: cyclesSafetyCap, outstanding_ready: outstandingReadyItemIds(capped) },
-        },
+        capped,
         deriveLifecycleState({ stopReason: "supervisor_cycle_cap", cooling: true }),
         time,
       );
