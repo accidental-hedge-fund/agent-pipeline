@@ -363,10 +363,18 @@ export function lifecycleOwnershipAfterItemTransition(
   });
 }
 
-/** Recovery recipes are refused only after a lawful lifecycle exit. */
+/** Recovery recipes are refused after a lawful lifecycle exit, or for the
+ *  specific item that currently owns a typed-input wait. A shared
+ *  ledger-level `typed-input-wait` does not refuse an independent sibling. */
 export function lifecycleAllowsRecoveryRecipe(
   record: DurableLifecycleRecord | null | undefined,
+  item?: { hold_request?: { typed_request?: string } | null | undefined } | null,
 ): boolean {
+  if (record?.state === "cancelled" || record?.state === "succeeded") return false;
+  if (record?.state === "typed-input-wait") {
+    const typed = item?.hold_request?.typed_request;
+    return typed !== "DecisionRequest" && typed !== "CapabilityRequest" && typed !== "AuthorityRequest";
+  }
   const life = consultLifecycleRecord(record);
   return life.state !== "cancelled" && life.state !== "succeeded";
 }

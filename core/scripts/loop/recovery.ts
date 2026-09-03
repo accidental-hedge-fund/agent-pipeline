@@ -50,6 +50,7 @@ import {
   deriveLifecycleState,
   isMechanicalCompatibilityStopReason,
   lifecycleAllowsRecoveryRecipe,
+  typedRequestFromOwnedItems,
 } from "../recovery-lifecycle-ownership.ts";
 
 // ---------------------------------------------------------------------------
@@ -524,6 +525,7 @@ function admitRecoveryLifecycle(
     loopStore: contract.logical_operation_id,
   });
   const facts = {
+    typedRequest: typedRequestFromOwnedItems(ledger.items),
     cooling: Boolean(ledger.cooling),
     stopReason: ledger.stop?.reason ?? null,
     activeAttempt: true as const,
@@ -576,7 +578,7 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
   const contract = upgradeContractForRecovery(contractInput);
 
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
-  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle)) {
+  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle, ledger.items[input.itemId])) {
     throw new LoopError("stop", `logical operation lifecycle is ${consultLifecycleRecord(ledger.lifecycle).state}`);
   }
   if (ledger.stop && !input.allowAlreadyStopped && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
@@ -761,7 +763,7 @@ export async function startRecoveryAttempt(
 ): Promise<RecoverItemResult> {
   const contract = upgradeContractForRecovery(contractInput);
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
-  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle)) {
+  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle, ledger.items[input.itemId])) {
     throw new LoopError("stop", `logical operation lifecycle is ${consultLifecycleRecord(ledger.lifecycle).state}`);
   }
   if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, input.itemId)) {
@@ -928,7 +930,7 @@ export async function completeRecoveryAttempt(
 ): Promise<RecoverItemResult> {
   const contract = upgradeContractForRecovery(contractInput);
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
-  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle)) {
+  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle, ledger.items[input.itemId])) {
     throw new LoopError("stop", `logical operation lifecycle is ${consultLifecycleRecord(ledger.lifecycle).state}`);
   }
   const attempt = ledger.recovery_attempts.find((candidate) => candidate.attempt_id === input.attemptId);
@@ -1020,7 +1022,7 @@ export async function recoverItem(
   input: RecoverItemInput,
 ): Promise<RecoverItemResult> {
   const current = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
-  if (!lifecycleAllowsRecoveryRecipe(current.lifecycle)) {
+  if (!lifecycleAllowsRecoveryRecipe(current.lifecycle, current.items[input.itemId])) {
     throw new LoopError("stop", `logical operation lifecycle is ${consultLifecycleRecord(current.lifecycle).state}`);
   }
   if (current.stop) {
@@ -1157,4 +1159,62 @@ export function eligibleIndependentItems(
       return externalDeps.every((id) => externalStatuses[id] === "satisfied");
     })
     .map((i) => i.id);
+}
+
+/** Blocked items that still have a permitted recovery recipe and remaining
+ *  budget, do not depend on a blocked peer, and are not the item named by a
+ *  mechanical compatibility stop. Used with {@link eligibleIndependentItems}
+ *  so a mechanical stop does not globally cool the run while a sibling can
+ *  still be recovered. */
+export function independentlyRecoverableBlockedItems(
+  contractInput: LoopContract,
+  ledgerInput: LoopLedger,
+): string[] {
+  const contract = upgradeContractForRecovery(contractInput);
+  const ledger = upgradeLedgerForRecovery(ledgerInput);
+  if (ledger.stop && !isMechanicalCompatibilityStopReason(ledger.stop.reason)) return [];
+
+  const blockedIds = new Set(
+    Object.values(ledger.items).filter((item) => item.state === "blocked").map((item) => item.id),
+  );
+  const dependsOn = new Map(contract.items.map((i) => [i.id, i.depends_on]));
+
+  return contract.items
+    .filter((i) => {
+      const entry = ledger.items[i.id];
+      if (!entry || entry.state !== "blocked" || !entry.blocked_theme || !isDurableBlockerClass(entry.blocked_theme)) {
+        return false;
+      }
+      if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, i.id)) return false;
+      if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle, entry)) return false;
+      const policy = contract.recovery_policy[entry.blocked_theme];
+      if (!policy || policy.terminal_outcome === "human_authority") return false;
+      const remaining = entry.recovery_budgets_remaining[entry.blocked_theme] ?? policy.retry_budget;
+      if (remaining <= 0) return false;
+      if ((entry.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit) return false;
+      const deps = dependsOn.get(i.id) ?? [];
+      return !deps.some((d) => blockedIds.has(d));
+    })
+    .map((i) => i.id);
+}
+
+/** True when a mechanical compatibility stop must not globally cool the run:
+ *  a pending independent item, a recoverable blocked sibling, or an
+ *  in-progress item that the stop does not refuse. */
+export function hasContinuableIndependentSibling(
+  contractInput: LoopContract,
+  ledgerInput: LoopLedger,
+  externalStatuses: Readonly<Record<string, ExternalDependencyStatus>> = {},
+): boolean {
+  const ledger = upgradeLedgerForRecovery(ledgerInput);
+  if (
+    Object.values(ledger.items).some((item) => {
+      if (item.state !== "in_progress") return false;
+      return !ledger.stop || !compatibilityStopRefusesItem(ledger.stop, item.id);
+    })
+  ) {
+    return true;
+  }
+  if (eligibleIndependentItems(contractInput, ledgerInput, externalStatuses).length > 0) return true;
+  return independentlyRecoverableBlockedItems(contractInput, ledgerInput).length > 0;
 }

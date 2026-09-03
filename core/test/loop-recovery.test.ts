@@ -749,6 +749,70 @@ test("startRecoveryAttempt consults the durable lifecycle record and refuses can
   );
 });
 
+test("startRecoveryAttempt: a typed hold on item A does not refuse recovery of independent blocked sibling B", async () => {
+  const { deps, contract, token } = await setup();
+  const current = await readLedger(deps, "run-1");
+  const waiting = applyLifecycleTransition(
+    current.lifecycle ?? admitLifecycleRecord({
+      logical_operation_id: "lop-hold-sibling-1322",
+      updated_at: "2026-09-02T00:00:00.000Z",
+    }),
+    deriveLifecycleState({ typedRequest: "DecisionRequest", activeAttempt: true }),
+    "2026-09-02T00:01:00.000Z",
+    "lop-hold-sibling-1322",
+  );
+  await writeLedger(deps, {
+    ...current,
+    lifecycle: waiting,
+    items: {
+      "100": {
+        ...current.items["100"],
+        state: "waiting",
+        hold_request: {
+          request_id: "req-a",
+          item_id: "100",
+          kind: "decision",
+          prompt: "which branch?",
+          permitted_responses: ["main", "staging"],
+          requested_by_engine: "claude",
+          requested_at: "2026-09-02T00:00:00.000Z",
+          typed_request: "DecisionRequest",
+          decision_package: {
+            recommendation: "main",
+            rationale: "default",
+            alternatives: ["main", "staging"],
+            risk: "low",
+            evidence: ["issue"],
+          },
+        },
+      },
+      "200": { ...current.items["200"], state: "in_progress" },
+    },
+  }, token);
+
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "200", engine: "claude",
+    blockerClass: "implementation-ci", evidence: "ci failed on sibling",
+  });
+  const started = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "200", engine: "claude",
+    action: "repair_pipeline_item", candidateIdentity: "head-abc:base-def",
+  });
+  assert.equal(started.attempt.outcome, "started");
+  assert.equal(started.ledger.items["100"].state, "waiting");
+  assert.equal(started.ledger.lifecycle?.state, "typed-input-wait");
+
+  const completed = await completeRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "200", engine: "claude",
+    attemptId: started.attempt.attempt_id, succeeded: true,
+  });
+  assert.equal(completed.attempt.outcome, "recovered");
+  assert.equal(completed.ledger.items["200"].state, "in_progress");
+  assert.equal(completed.ledger.items["100"].state, "waiting");
+  assert.equal(completed.ledger.lifecycle?.state, "typed-input-wait");
+  assert.equal((await readLedger(deps, "run-1")).lifecycle?.state, "typed-input-wait");
+});
+
 test("recoveryAttemptId is deterministic and changes with candidate, evidence, or action", () => {
   const base = {
     itemId: "100",

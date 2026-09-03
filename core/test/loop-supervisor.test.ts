@@ -3895,6 +3895,96 @@ test("continuation (#581): a held item alongside two schedulable siblings does n
   assert.equal(finalLedger.items["300"].state, "pending", "the second sibling is still queued for a later cycle");
 });
 
+test("regression (#1322): a typed hold on item A still recovers independent blocked sibling B", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const canonicalEvidence = JSON.stringify({
+    schema: "pipeline/loop-recovery-evidence@1",
+    diagnostic: buildStageDiagnostic({
+      blockerKind: "merge-conflict",
+      reason: "The PR head must be rebased onto main",
+      stage: "pre-merge",
+    }),
+    transport: { pr_number: null, pipeline_run_id: "advance-200" },
+  });
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": { ...workflowState, backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 } },
+    },
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "100": {
+      id: "100",
+      state: "waiting",
+      history: [],
+      recovery_budgets_remaining: { default: 3 },
+      hold_request: {
+        request_id: "req-a",
+        item_id: "100",
+        kind: "decision",
+        prompt: "which branch?",
+        permitted_responses: ["main", "staging"],
+        requested_by_engine: "claude",
+        requested_at: "2026-07-23T00:00:00.000Z",
+        typed_request: "DecisionRequest",
+        decision_package: {
+          recommendation: "main",
+          rationale: "default",
+          alternatives: ["main", "staging"],
+          risk: "low",
+          evidence: ["issue"],
+        },
+      },
+    },
+    "200": {
+      ...itemEntry("200", "blocked"),
+      blocked_theme: "workflow-state",
+      evidence_fingerprint: "sibling-fp",
+      repeated_evidence_count: 0,
+      recovery_budgets_remaining: { "workflow-state": 3 },
+      history: [
+        {
+          time: "2026-07-22T00:00:00.000Z",
+          from: "in_progress",
+          to: "blocked",
+          engine: "claude",
+          theme: "workflow-state",
+          evidence: canonicalEvidence,
+        },
+      ],
+    },
+  });
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  let recoveryCalls = 0;
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    recoveryCalls++;
+    assert.equal(input.itemId, "200");
+    return { succeeded: true, evidence: "workflow state resynchronized" };
+  };
+
+  const cycle = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(recoveryCalls, 1, "bounded recovery ran for the blocked sibling");
+  assert.equal(cycle.stop, null);
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "waiting");
+  assert.equal(finalLedger.items["100"].hold_request?.typed_request, "DecisionRequest");
+  assert.equal(finalLedger.lifecycle?.state, "typed-input-wait");
+  assert.ok(finalLedger.recovery_attempts.some((attempt) => attempt.item_id === "200"));
+  assert.ok(!calls.some((c) => c.item_id === "100"), "the held item is not dispatched");
+});
+
 test("terminal hold (#581): once every remaining item is held, the run reaches the terminal outstanding-hold condition and enumerates every held item id", async () => {
   const contract = testContract({
     items: [
@@ -5670,7 +5760,7 @@ test("regression (#787): a mid-pass run stop before a sibling's pass-2 recovery 
   };
   const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
     recoveryCalls++;
-    return { succeeded: true, evidence: "must never run once the run is stopped" };
+    return { succeeded: true, evidence: "independent sibling recovery after mechanical stop" };
   };
 
   const cycle = await runSupervisorCycle(
@@ -5687,14 +5777,107 @@ test("regression (#787): a mid-pass run stop before a sibling's pass-2 recovery 
   );
 
   assert.equal(cycle.stop, null, "live run_fatal is Cooling, not a lifecycle terminal");
-  assert.equal(cycle.cooling?.reason, "mechanical_exhaustion");
-  assert.equal(cycle.cooling?.historical_evidence, "run_fatal");
+  assert.ok(recoveryCalls >= 1, "the independent blocked sibling is still recovered");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.stop?.reason, "run_fatal", "historical stop remains as a compatibility projection");
   assert.equal(finalLedger.stop?.item_id, "100", "the first-cause stop record is preserved, not overwritten by the sibling");
   assert.notEqual(finalLedger.items["200"].state, "abandoned", "the sibling remains owned");
   assert.ok(finalLedger.cooling, "mechanical preflight persists Cooling");
   assert.equal(finalLedger.cooling?.historical_evidence, "run_fatal");
+});
+
+test("regression (#1322): a mechanical compatibility stop still recovers an independent blocked sibling", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const canonicalEvidence = JSON.stringify({
+    schema: "pipeline/loop-recovery-evidence@1",
+    diagnostic: buildStageDiagnostic({
+      blockerKind: "merge-conflict",
+      reason: "The PR head must be rebased onto main",
+      stage: "pre-merge",
+    }),
+    transport: { pr_number: null, pipeline_run_id: "advance-200" },
+  });
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": { ...workflowState, backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 } },
+    },
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = {
+    ...testLedger({
+      "100": {
+        ...itemEntry("100", "blocked"),
+        blocked_theme: "workflow-engine-defect",
+        recovery_budgets_remaining: { "workflow-engine-defect": 0 },
+        history: [
+          {
+            time: "2026-07-22T00:00:00.000Z",
+            from: "in_progress",
+            to: "blocked",
+            engine: "claude",
+            theme: "workflow-engine-defect",
+            evidence: "dispatch crashed",
+          },
+        ],
+      },
+      "200": {
+        ...itemEntry("200", "blocked"),
+        blocked_theme: "workflow-state",
+        evidence_fingerprint: "sibling-fp",
+        repeated_evidence_count: 0,
+        recovery_budgets_remaining: { "workflow-state": 3 },
+        history: [
+          {
+            time: "2026-07-22T00:00:00.000Z",
+            from: "in_progress",
+            to: "blocked",
+            engine: "claude",
+            theme: "workflow-state",
+            evidence: canonicalEvidence,
+          },
+        ],
+      },
+    }),
+    stop: {
+      reason: "run_fatal" as const,
+      time: "2026-07-23T00:00:00.000Z",
+      item_id: "100",
+      theme: "workflow-engine-defect",
+    },
+  };
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  let recoveryCalls = 0;
+  const { observe, dispatchItem } = coordinatedFakes();
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    recoveryCalls++;
+    assert.equal(input.itemId, "200");
+    return { succeeded: true, evidence: "workflow state resynchronized" };
+  };
+
+  const cycle = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(recoveryCalls, 1, "the blocked sibling was recovered before global Cooling");
+  assert.equal(cycle.stop, null, "mechanical stop remains a compatibility projection");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.stop?.reason, "run_fatal");
+  assert.equal(finalLedger.stop?.item_id, "100");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.ok(
+    finalLedger.items["200"].state === "in_progress" ||
+      finalLedger.items["200"].state === "ready" ||
+      finalLedger.recovery_attempts.some((attempt) => attempt.item_id === "200" && attempt.outcome === "recovered"),
+    "sibling B left blocked-without-recovery",
+  );
 });
 
 test("regression (#787): a pre-#509 ledger (no recovery_attempts) and contract (no recovery_policy) drive recovery without a TypeError", async () => {

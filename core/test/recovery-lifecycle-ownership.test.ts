@@ -48,6 +48,8 @@ import {
 import { collectNeedsHumanParkWithoutClassifier } from "../scripts/fault-recovery-static-guards.ts";
 import {
   eligibleIndependentItems,
+  hasContinuableIndependentSibling,
+  independentlyRecoverableBlockedItems,
 } from "../scripts/loop/recovery.ts";
 import {
   LOOP_CONTRACT_SCHEMA,
@@ -263,6 +265,23 @@ test("3.1 live run_fatal projects Cooling; siblings remain schedulable; operatio
   assert.equal(noSiblings.stop, null);
   assert.equal(noSiblings.cooling?.reason, "mechanical_exhaustion");
   assert.equal(noSiblings.cooling?.historical_evidence, "run_fatal");
+
+  const bothBlocked = {
+    ...ledger,
+    items: {
+      "100": ledger.items["100"],
+      "200": { id: "200", state: "blocked", blocked_theme: "workflow-state", history: [], recovery_budgets_remaining: { "workflow-state": 3 } },
+    },
+  } as LoopLedger;
+  assert.deepEqual(eligibleIndependentItems(contract, bothBlocked), [], "blocked siblings are not pending-eligible");
+  assert.deepEqual(independentlyRecoverableBlockedItems(contract, bothBlocked), ["200"]);
+  assert.equal(hasContinuableIndependentSibling(contract, bothBlocked), true);
+  const blockedSibling = supervisorCycleDispositionForStop({
+    stop: bothBlocked.stop,
+    hasSchedulableSibling: hasContinuableIndependentSibling(contract, bothBlocked),
+  });
+  assert.equal(blockedSibling.continueSiblings, true);
+  assert.equal(blockedSibling.cooling, null);
 });
 
 test("3.2 recovery_exhausted is Cooling, not human ownership", () => {
@@ -450,6 +469,24 @@ test("applyLifecycleTransition refuses leaving cancelled or succeeded", () => {
     "lop-cool-1322",
   );
   assert.equal(lifecycleAllowsRecoveryRecipe(cooling), true);
+  const waiting = applyLifecycleTransition(
+    null,
+    deriveLifecycleState({ typedRequest: "DecisionRequest" }),
+    "2026-09-02T00:00:00.000Z",
+    "lop-hold-1322",
+  );
+  assert.equal(waiting.state, "typed-input-wait");
+  assert.equal(lifecycleAllowsRecoveryRecipe(waiting), true, "a shared typed-input-wait does not globally refuse recovery");
+  assert.equal(
+    lifecycleAllowsRecoveryRecipe(waiting, { hold_request: { typed_request: "DecisionRequest" } }),
+    false,
+    "the item that owns the typed request is refused",
+  );
+  assert.equal(
+    lifecycleAllowsRecoveryRecipe(waiting, { hold_request: null }),
+    true,
+    "an independent sibling is still allowed",
+  );
 });
 
 test("bindLifecycleRecord persists the closed state on a ledger-shaped document", () => {

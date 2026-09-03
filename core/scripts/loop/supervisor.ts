@@ -64,7 +64,7 @@ import {
   transitionItem,
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
-import { blockItem, completeRecoveryAttempt, eligibleIndependentItems, fingerprintEvidence, persistOwnedCooling, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
+import { blockItem, completeRecoveryAttempt, eligibleIndependentItems, fingerprintEvidence, hasContinuableIndependentSibling, persistOwnedCooling, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
 import {
   buildCoolingRecord,
   coolingDeadline,
@@ -868,7 +868,7 @@ async function executeBlockedRecovery(
   if (ledger.stop && compatibilityStopRefusesItem(ledger.stop, itemId)) {
     return { ledger, attempted: false };
   }
-  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle)) {
+  if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle, ledger.items[itemId])) {
     return { ledger, attempted: false };
   }
   let item = ledger.items[itemId];
@@ -1915,10 +1915,9 @@ async function cycleResultForCompatibilityStop(
 ): Promise<SupervisorCycleResult | null> {
   const stop = ledger.stop;
   if (!stop) return null;
-  const siblings = eligibleIndependentItems(contract, ledger);
   const disposition = supervisorCycleDispositionForStop({
     stop,
-    hasSchedulableSibling: siblings.length > 0,
+    hasSchedulableSibling: hasContinuableIndependentSibling(contract, ledger),
   });
   if (disposition.continueSiblings) return null;
   if (disposition.cooling) {
@@ -3391,6 +3390,13 @@ export async function runSupervisorCycle(
   if (ledger.stop) {
     const projected = await cycleResultForCompatibilityStop(deps, runId, token, contract, ledger, true);
     if (projected) return { ...projected, holdOutstanding: terminalHold };
+    return {
+      progress: true,
+      stop: null,
+      holdOutstanding: terminalHold,
+      allDone: false,
+      heldItemIds: finalHeldItemIds,
+    };
   }
   return { progress: true, stop: ledger.stop, holdOutstanding: terminalHold, allDone: false, heldItemIds: finalHeldItemIds };
 }
