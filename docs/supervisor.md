@@ -150,9 +150,11 @@ Recommended pattern:
 2. Parse stderr `train_run_handoff` for `run_id` and follow
    `pipeline logs <train-run-id> --events --follow | material-filter.mjs`.
    Dual-follow `train_loop_linked` as soon as it appears — that event is published
-   from the child `onRunReady` handoff while the child can still be live.
-   Re-arm until train `run_complete`. When `events_coverage` is `degraded` or
-   `unknown`, do not treat a missing stream as a merge or advance blocker.
+   from the child `onRunReady` handoff (run id plus absolute events path) while
+   the child can still be live. Train omits the event when the path is missing or
+   not absolute. Re-arm until train `run_complete`. When `events_coverage` is
+   `degraded` or `unknown`, do not treat a missing stream as a merge or advance
+   blocker.
 3. On a timer (e.g. 5–15 minutes) or on process exit, post a short summary:
    - issue list / milestone
    - `complete` / `blocker` / current issue

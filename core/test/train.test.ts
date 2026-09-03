@@ -2829,6 +2829,130 @@ test("train events: wave-result loopRun is not an append site when onLoopReady n
   assert.ok(!trainEventsFromStore(deps.store).some((e) => e.type === "train_loop_linked"));
 });
 
+// ---------------------------------------------------------------------------
+// Train live-link absolute identity (#1417)
+// ---------------------------------------------------------------------------
+
+test("train events: missing events path does not append train_loop_linked (#1417 1.1)", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList, ctx) {
+      await ctx?.onLoopReady?.({ runId: "abc" });
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.status.kind, "train_status");
+  assert.ok(
+    result.status.events_coverage === undefined || result.status.events_coverage === "ok",
+    "incomplete handoff must not degrade coverage",
+  );
+  assert.equal(deps.mergeCalls.length, 0);
+  assert.ok(
+    !trainEventsFromStore(deps.store).some((e) => e.type === "train_loop_linked"),
+    "missing events path must not append train_loop_linked",
+  );
+});
+
+test("train events: relative events path does not append train_loop_linked (#1417 1.2)", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList, ctx) {
+      await ctx?.onLoopReady?.({ runId: "abc", eventsPath: "runs/abc/events.jsonl" });
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.ok(
+    result.status.events_coverage === undefined || result.status.events_coverage === "ok",
+    "relative-path omit must not degrade coverage",
+  );
+  assert.ok(
+    !trainEventsFromStore(deps.store).some((e) => e.type === "train_loop_linked"),
+    "relative events path must not append train_loop_linked",
+  );
+});
+
+test("train events: same-id different-path later handoff keeps first link and degrades (#1417 1.3)", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList, ctx) {
+      await ctx?.onLoopReady?.({ runId: "abc", eventsPath: "/abs/E" });
+      await ctx?.onLoopReady?.({ runId: "abc", eventsPath: "/abs/F" });
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      out.loopRun = { runId: "abc", eventsPath: "/abs/E" };
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.status.kind, "train_status");
+  assert.equal(result.status.events_coverage, "degraded");
+  assert.equal(deps.mergeCalls.length, 0);
+  const linked = trainEventsFromStore(deps.store).filter((e) => e.type === "train_loop_linked");
+  assert.equal(linked.length, 1, "conflicting later handoff must not append a second link");
+  assert.equal(linked[0]!.loop_run_id, "abc");
+  assert.equal(linked[0]!.events, "/abs/E");
+});
+
+test("train events: later wave with a new run id still appends once (#1417 2.2)", async () => {
+  let wave = 0;
+  const deps = makeDeps({
+    async advanceWave(issueList, ctx) {
+      wave += 1;
+      if (wave === 1) {
+        await ctx?.onLoopReady?.({ runId: "abc", eventsPath: "/abs/E" });
+      } else {
+        await ctx?.onLoopReady?.({ runId: "def", eventsPath: "/abs/G" });
+      }
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "prereq"));
+  deps.seedIssue(snap(2, "Depends on: #1"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual(deps.mergeCalls, [101, 102]);
+  assert.equal(deps.waveCalls.length, 2);
+  const linked = trainEventsFromStore(deps.store).filter((e) => e.type === "train_loop_linked");
+  assert.equal(linked.length, 2);
+  assert.equal(linked[0]!.loop_run_id, "abc");
+  assert.equal(linked[0]!.events, "/abs/E");
+  assert.equal(linked[1]!.loop_run_id, "def");
+  assert.equal(linked[1]!.events, "/abs/G");
+  assert.ok(
+    result.status.events_coverage === undefined || result.status.events_coverage === "ok",
+  );
+});
+
 test("train events: EEXIST collision writes only the suffix directory (#1301 2.1)", async () => {
   const store = memRunStore();
   const colliding = `/tmp/repo/.agent-pipeline/runs/${trainRunIdForAttempt(new Date("2026-08-28T17:28:03.000Z"), 1)}`;

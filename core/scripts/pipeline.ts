@@ -3956,13 +3956,10 @@ export async function advanceWaveThroughLoop(
         console.error(
           `[train] advance-wave loop ready ${ctx.runId}; issues ${issues.map((n) => `#${n}`).join(", ")}`,
         );
-        if (typeof ctx.runId === "string" && ctx.runId.trim() !== "") {
-          linkedLoop = {
-            runId: ctx.runId,
-            ...(typeof ctx.events === "string" && ctx.events.trim() !== ""
-              ? { eventsPath: ctx.events }
-              : {}),
-          };
+        const id = typeof ctx.runId === "string" ? ctx.runId.trim() : "";
+        const eventsPath = typeof ctx.events === "string" ? ctx.events.trim() : "";
+        if (id && eventsPath && path.isAbsolute(eventsPath)) {
+          linkedLoop = { runId: id, eventsPath };
           // Awaited: train_loop_linked must be durable before the engine
           // returns and before the child can block on work (#1301).
           if (opts.onLoopReady) {

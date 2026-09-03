@@ -14,7 +14,7 @@
 
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { parseDeclaredDependencyIds } from "../declared-dependency-grammar.ts";
 import {
@@ -1154,8 +1154,8 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
 
   const startedIssues = new Set<number>();
   const announcedPrs = new Set<string>();
-  const linkedLoopIds = new Set<string>();
-  const liveLoopByWave = new Map<number, { runId: string; eventsPath?: string }>();
+  const linkedLoopIds = new Map<string, string>();
+  const liveLoopByWave = new Map<number, { runId: string; eventsPath: string }>();
   const emitItemStarted = async (issue: number): Promise<void> => {
     if (startedIssues.has(issue)) return;
     startedIssues.add(issue);
@@ -1574,23 +1574,32 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       const publishLiveLoop = async (loopRun: LinkedLoopRun): Promise<void> => {
         if (!published) return;
         const id = loopRun.runId.trim();
-        if (!id || linkedLoopIds.has(id)) return;
+        const eventsPath =
+          typeof loopRun.eventsPath === "string" ? loopRun.eventsPath.trim() : "";
+        if (!id || !eventsPath || !isAbsolute(eventsPath)) return;
+        const publishedPath = linkedLoopIds.get(id);
+        if (publishedPath !== undefined) {
+          if (publishedPath !== eventsPath) eventsCoverage = "degraded";
+          return;
+        }
+        const live = liveLoopByWave.get(waveNumber);
+        if (live && (live.runId !== id || live.eventsPath !== eventsPath)) {
+          eventsCoverage = "degraded";
+          return;
+        }
         try {
           const ok = await session.append("train_loop_linked", {
             wave: waveNumber,
             loop_run_id: id,
             logical_operation_id: session.logicalOperationId,
-            ...(loopRun.eventsPath ? { events: loopRun.eventsPath } : {}),
+            events: eventsPath,
           });
           if (!ok) {
             eventsCoverage = "degraded";
             return;
           }
-          linkedLoopIds.add(id);
-          liveLoopByWave.set(waveNumber, {
-            runId: id,
-            eventsPath: loopRun.eventsPath,
-          });
+          linkedLoopIds.set(id, eventsPath);
+          liveLoopByWave.set(waveNumber, { runId: id, eventsPath });
         } catch {
           eventsCoverage = "degraded";
         }
