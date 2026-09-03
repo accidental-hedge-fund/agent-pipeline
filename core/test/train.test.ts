@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -18,6 +19,7 @@ import {
   orderIssuesForTrain,
   parseIssueList,
   pipelineStageFromLabels,
+  realTrainDeps,
   runTrain,
   selectFreezeEligibleIssues,
   type AdvanceOutcome,
@@ -3290,4 +3292,47 @@ test("train (#1413): snapshot gh json does not grow a train-local blockedBy fiel
   assert.doesNotMatch(src, /--json[\s\S]{0,80}blockedBy/);
   assert.match(src, /discoverDeclaredDependencies/);
   assert.match(src, /assertDiscoveryCompleteForAdmission/);
+});
+
+test("realTrainDeps (#1413): production discoverDeps loads ROADMAP declared edges (3a4f9013)", async () => {
+  // Bites if production hardcodes getRoadmapDeclaredEdges: async () => [].
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "train-roadmap-"));
+  try {
+    fs.writeFileSync(
+      path.join(dir, "ROADMAP.md"),
+      [
+        "**v2.0.0 — Slice:**",
+        "| # | What | Why |",
+        "|---|------|-----|",
+        "| #608 | Config | blocked by #607 |",
+        "| #607 | Isolation | none |",
+      ].join("\n"),
+    );
+    const wired = realTrainDeps({
+      repoDir: dir,
+      repo: "o/r",
+      baseBranch: "main",
+      advanceWave: async () => new Map(),
+    });
+    assert.equal(typeof wired.discoverDeps.getRoadmapDeclaredEdges, "function");
+    assert.deepEqual(await wired.discoverDeps.getRoadmapDeclaredEdges!(), [
+      { depender: "608", prerequisite: "607" },
+    ]);
+
+    const missingDir = fs.mkdtempSync(path.join(os.tmpdir(), "train-roadmap-missing-"));
+    try {
+      const missing = realTrainDeps({
+        repoDir: missingDir,
+        repo: "o/r",
+        baseBranch: "main",
+        advanceWave: async () => new Map(),
+      });
+      assert.equal(typeof missing.discoverDeps.getRoadmapDeclaredEdges, "function");
+      assert.deepEqual(await missing.discoverDeps.getRoadmapDeclaredEdges!(), []);
+    } finally {
+      fs.rmSync(missingDir, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

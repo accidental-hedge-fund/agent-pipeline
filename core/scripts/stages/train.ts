@@ -13,15 +13,19 @@
 // Unit tests inject TrainDeps — no real network, git, or subprocess in tests.
 
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { parseDeclaredDependencyIds } from "../declared-dependency-grammar.ts";
 import {
   assertDiscoveryCompleteForAdmission,
   discoverDeclaredDependencies,
+  extractRoadmapDeclaredEdges,
   realWorkListDependencyDiscoverDeps,
   type DeclaredDependencyDiscoveryResult,
   type DeclaredEdgeProvenance,
   type IgnoredDep,
+  type RoadmapDeclaredEdge,
   type SourceObservation,
   type WorkListDependencyDiscoverDeps,
 } from "../loop/work-list-deps.ts";
@@ -1842,6 +1846,20 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
 // Production deps
 // ---------------------------------------------------------------------------
 
+/**
+ * Production ROADMAP.md edges for train discovery. Matches loop compile
+ * `tryLoadRoadmapDeclaredEdges`: missing/unreadable files contribute no
+ * edges (source stays enabled-empty, not omitted or unavailable).
+ */
+function loadRoadmapDeclaredEdges(repoDir: string): readonly RoadmapDeclaredEdge[] {
+  try {
+    const text = readFileSync(join(repoDir, "ROADMAP.md"), "utf8");
+    return extractRoadmapDeclaredEdges(text);
+  } catch {
+    return [];
+  }
+}
+
 export function realTrainDeps(opts: {
   repoDir: string;
   repo: string;
@@ -1879,7 +1897,7 @@ export function realTrainDeps(opts: {
     },
 
     discoverDeps: realWorkListDependencyDiscoverDeps(discoverCfg, {
-      getRoadmapDeclaredEdges: async () => [],
+      getRoadmapDeclaredEdges: async () => loadRoadmapDeclaredEdges(opts.repoDir),
     }),
 
     async listMilestoneIssues(milestone) {
