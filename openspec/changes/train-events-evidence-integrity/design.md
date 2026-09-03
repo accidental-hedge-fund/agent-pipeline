@@ -34,7 +34,7 @@ See `proposal.md` for why. Current law and code:
 
 ### 1. Live linkage uses the existing `onRunReady` callback (primary)
 
-**Choice:** Extend the existing `advanceWave` context (`logicalOperationId` today) with an `onLoopReady` callback. Production `advanceWaveThroughLoop` invokes it from the current `onRunReady` handler after it has the exact `runId` and absolute `events` path, and before `runLoopEngine` returns. `runTrain` appends `train_loop_linked` there, once per loop run id. After the wave returns, the same identity MAY be confirmed via `waveResult.loopRun`. That confirmation SHALL NOT append a second event and SHALL NOT replace the live identity with a guessed or latest-run id.
+**Choice:** Extend the existing `advanceWave` context (`logicalOperationId` today) with an `onLoopReady` callback. Production `advanceWaveThroughLoop` **awaits** it from the current `onRunReady` handler after it has the exact `runId` and absolute `events` path, and before `runLoopEngine` returns. `runTrain` appends `train_loop_linked` there, once per loop run id, and that append SHALL complete before the await returns. After the wave returns, the same identity MAY be confirmed via `waveResult.loopRun`. That confirmation SHALL NOT append a second event and SHALL NOT replace the live identity with a guessed or latest-run id.
 
 **Why:** The supervisor already fires `onRunReady` after exclusive lock and before dispatch (#665). `advanceWaveThroughLoop` already reads that identity. Moving the append to that callback is the first holding rung. A new bus, stdout scrape, or mtime lookup would recreate the defect FRG already forbids.
 

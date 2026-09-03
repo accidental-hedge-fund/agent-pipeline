@@ -2,7 +2,7 @@
 
 ### Requirement: Train SHALL publish train_loop_linked from the child onRunReady handoff
 
-Train SHALL append `train_loop_linked` from the child loop's typed `onRunReady` handoff after the loop store and the exact events path exist, and before that child can block on work. The event SHALL include the train `run_id`, the wave identity, the exact child loop `run_id`, and the absolute loop `events.jsonl` path from that handoff. Train SHALL emit each live linkage once. A later wave result MAY confirm the same identity. It SHALL NOT append a second `train_loop_linked` for that identity and SHALL NOT replace the live identity with a guessed run, a latest-run lookup, or a synthetic `pipeline-loop-…` string. Train SHALL NOT scrape stdout or stderr prose to mint the link.
+Train SHALL append `train_loop_linked` from the child loop's typed `onRunReady` handoff after the loop store and the exact events path exist, and before that child can block on work. Production `advanceWaveThroughLoop` SHALL await `onLoopReady` from inside the existing `onRunReady` handler so `train_loop_linked` is durably appended before `runLoopEngine` returns and before the child can block. A fire-and-forget callback SHALL NOT satisfy this requirement. The event SHALL include the train `run_id`, the wave identity, the exact child loop `run_id`, and the absolute loop `events.jsonl` path from that handoff. Train SHALL emit each live linkage once. A later wave result MAY confirm the same identity. It SHALL NOT append a second `train_loop_linked` for that identity and SHALL NOT replace the live identity with a guessed run, a latest-run lookup, or a synthetic `pipeline-loop-…` string. Train SHALL NOT scrape stdout or stderr prose to mint the link.
 
 #### Scenario: Live child is followable before it is terminal
 
@@ -11,6 +11,7 @@ Train SHALL append `train_loop_linked` from the child loop's typed `onRunReady` 
 - **THEN** the train `events.jsonl` SHALL contain `train_loop_linked` with `loop_run_id` equal to `abc` and `events` equal to `E`
 - **AND** that line SHALL exist before the child loop reaches a terminal state
 - **AND** that line SHALL exist before `advanceWave` returns
+- **AND** `onLoopReady` SHALL have been awaited inside `onRunReady` before `runLoopEngine` returns its drive result
 
 #### Scenario: Duplicate handoff does not append a second link
 

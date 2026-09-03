@@ -17,7 +17,7 @@
 
 ## 3. Live loop linkage
 
-- [ ] 3.1 Extend the existing `advanceWave` context with `onLoopReady`. Production `advanceWaveThroughLoop` SHALL invoke it from the current `onRunReady` handler after exact `runId` and events path are known and before `runLoopEngine` returns. Verify a unit test of that wiring fires the callback before the engine result is returned.
+- [ ] 3.1 Extend the existing `advanceWave` context with `onLoopReady`. Production `advanceWaveThroughLoop` SHALL **await** it from the current `onRunReady` handler after exact `runId` and events path are known and before `runLoopEngine` returns. Verify a unit test fails if the callback is fire-and-forget and passes only when `train_loop_linked` is durable before the engine result is returned.
 - [ ] 3.2 In `runTrain`, append `train_loop_linked` from `onLoopReady` once per loop run id, using the exact handoff identity. After the wave returns, confirm the same identity without a second append and without replacing it. Verify tasks 1.1 and 1.2. Keep existing per-wave `loop_run_handoff` on stderr. Keep `--json` stdout as one object.
 
 ## 4. Complete merge proof
