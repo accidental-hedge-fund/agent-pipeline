@@ -1576,8 +1576,15 @@ test("runPlanningPhases #547: implement harness fails, salvage also fails → bl
     // is actually consulted (rather than short-circuiting on an empty headBefore
     // as the base fake does).
     gitInWorktree: async () => ({ stdout: "deadbeef", stderr: "", code: 0 }),
-    trySalvageUncommittedWork: async (): Promise<TrySalvageResult> =>
-      ({ salvaged: false, failureReason: "git add failed: disk full" }),
+    trySalvageUncommittedWork: async (
+      _wt: string,
+      _issue: number,
+      _runId: string,
+      stageLabel: string,
+    ): Promise<TrySalvageResult> =>
+      String(stageLabel).includes("plan revision")
+        ? { salvaged: false }
+        : { salvaged: false, failureReason: "git add failed: disk full" },
   };
   callCount = 0;
   const f = await runAndCapture(freeformHooks(), failOnSecondCall);
@@ -2366,4 +2373,279 @@ test("runPlanningPhases (#314): unreachable plan-review executor blocks with a n
 
   assert.equal(blocked?.stage, "plan-review");
   assert.match(blocked!.reason, /local-ollama/);
+});
+
+// ---------------------------------------------------------------------------
+// #1419: plan-revision salvages uncommitted openspec/ work before revalidate/block
+// ---------------------------------------------------------------------------
+
+const REVISION_INVALID_AFTER = "OpenSpec change `test-change` is invalid after revision: requirement body is missing SHALL";
+const SALVAGE_FAIL_PHRASE = "Salvage of uncommitted work also failed:";
+
+type RevisionSalvageEvent = {
+  type: "head" | "invoke-revision" | "salvage" | "revalidate" | "setBlocked";
+  sha?: string;
+  repair?: boolean;
+  stageLabel?: string;
+  scope?: string;
+  comparisonHead?: string;
+  reason?: string;
+  stage?: string;
+  tag?: string;
+};
+
+function eventIndex(
+  events: RevisionSalvageEvent[],
+  type: RevisionSalvageEvent["type"],
+  pred?: (e: RevisionSalvageEvent) => boolean,
+): number {
+  return events.findIndex((e) => e.type === type && (!pred || pred(e)));
+}
+
+async function runRevisionSalvageScenario(args: {
+  salvageResult?: TrySalvageResult | ((stageLabel: string, scope?: string) => TrySalvageResult);
+  initialHead?: string;
+  revisionResults?: HarnessResult[];
+  revalidate?: PlanningPhaseHooks["revalidateArtifact"];
+} = {}): Promise<{
+  events: RevisionSalvageEvent[];
+  captured: { tag: string; reason: string; stage: string } | undefined;
+  outcome: Outcome;
+}> {
+  const events: RevisionSalvageEvent[] = [];
+  let head = args.initialHead ?? "sha-initial";
+  let revisionCalls = 0;
+  const results = args.revisionResults ?? [revisionOkResult];
+  let captured: { tag: string; reason: string; stage: string } | undefined;
+
+  const deps = {
+    ...eqBaseDeps(),
+    gitInWorktree: async (_cwd: string, gitArgs: string[]) => {
+      if (Array.isArray(gitArgs) && gitArgs[0] === "rev-parse" && gitArgs[1] === "HEAD") {
+        events.push({ type: "head", sha: head });
+        return { stdout: head, stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    trySalvageUncommittedWork: async (
+      _wt: string,
+      _issue: number,
+      _runId: string,
+      stageLabel: string,
+      _salvageDeps: unknown,
+      scope?: string,
+    ): Promise<TrySalvageResult> => {
+      events.push({ type: "salvage", stageLabel, scope, comparisonHead: head });
+      const result =
+        typeof args.salvageResult === "function"
+          ? args.salvageResult(stageLabel, scope)
+          : (args.salvageResult ?? { salvaged: true });
+      if (result.salvaged) head = `${head}-salvaged`;
+      return result;
+    },
+    invoke: async (_h: unknown, _cwd: unknown, prompt: string) => {
+      if (typeof prompt === "string" && prompt.includes("Revise the implementation plan")) {
+        events.push({ type: "invoke-revision", repair: prompt.includes("FORMAT REPAIR") });
+        const idx = Math.min(revisionCalls, results.length - 1);
+        revisionCalls++;
+        return results[idx];
+      }
+      return harnessOk;
+    },
+    setBlocked: async (_cfg: unknown, _n: unknown, reason: string, stage: string, tag: string) => {
+      events.push({ type: "setBlocked", reason, stage, tag });
+      captured = { tag, reason, stage };
+    },
+  };
+
+  const hooks = openspecHooks({
+    async revalidateArtifact(wt, stdout) {
+      events.push({ type: "revalidate" });
+      if (args.revalidate) return args.revalidate(wt, stdout);
+      return { ok: true, updatedPlanText: stdout, updatedSpecContext: "" };
+    },
+  });
+
+  const outcome = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    {},
+    hooks,
+    deps as any,
+  );
+  return { events, captured, outcome };
+}
+
+const revalidateBlock: PlanningPhaseHooks["revalidateArtifact"] = async () => ({
+  ok: false,
+  reason: REVISION_INVALID_AFTER,
+  tag: "openspec-invalid",
+});
+
+test("runPlanningPhases #1419: dirty openspec/ after plan revision is salvaged before revalidate and block", async () => {
+  const { events, captured, outcome } = await runRevisionSalvageScenario({
+    salvageResult: { salvaged: true },
+    revalidate: revalidateBlock,
+  });
+
+  const salvageIdx = eventIndex(events, "salvage", (e) => e.scope === "openspec/");
+  const revalidateIdx = eventIndex(events, "revalidate");
+  const blockedIdx = eventIndex(events, "setBlocked");
+  assert.ok(salvageIdx !== -1, `salvage with scope openspec/ must run; events=${JSON.stringify(events)}`);
+  assert.ok(revalidateIdx !== -1, "revalidate must run");
+  assert.ok(blockedIdx !== -1, "setBlocked must run");
+  assert.ok(salvageIdx < revalidateIdx, "salvage must run before revalidate");
+  assert.ok(revalidateIdx < blockedIdx, "revalidate must run before setBlocked");
+  assert.equal(events[salvageIdx]?.stageLabel, "plan revision");
+  assert.equal(captured?.tag, "openspec-invalid");
+  assert.equal(captured?.stage, "plan-review");
+  assert.equal(outcome.advanced, false);
+});
+
+test("planning.ts source pin #1419: removing plan-revision salvage would return blocked without attempting salvage", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/planning.ts", import.meta.url)), "utf8");
+  const helperIdx = src.indexOf("const salvagePlanRevisionOpenspec = async (headBefore: string, stageLabel: string) => {");
+  const invokeIdx = src.indexOf("let revisionResult = await invokeRevisionOnce(revisionPrompt);");
+  const initialSalvageIdx = src.indexOf('await salvagePlanRevisionOpenspec(headBeforeInitial, "plan revision");');
+  const repairHeadIdx = src.indexOf("const headBeforeRetry = (");
+  const repairInvokeIdx = src.indexOf("const repairResult = await invokeRevisionOnce(repairPrompt);");
+  const retrySalvageIdx = src.indexOf('await salvagePlanRevisionOpenspec(headBeforeRetry, "plan revision format-repair");');
+  const revalidateIdx = src.indexOf("const rv = await hooks.revalidateArtifact(wt, revisionResult.stdout.trim());");
+  const revisionSlice = src.slice(helperIdx, revalidateIdx);
+  assert.ok(helperIdx !== -1, "plan-revision salvage helper must exist");
+  assert.ok(invokeIdx !== -1, "initial plan-revision invoke must exist");
+  assert.ok(initialSalvageIdx !== -1, "initial salvage call must exist — without it, dirty openspec/ blocks with no salvage attempt");
+  assert.ok(invokeIdx < initialSalvageIdx, "initial salvage must run after the first successful invoke");
+  assert.ok(initialSalvageIdx < revalidateIdx, "initial salvage must run before revalidate");
+  assert.ok(repairHeadIdx !== -1 && repairInvokeIdx !== -1 && retrySalvageIdx !== -1);
+  assert.ok(repairHeadIdx < repairInvokeIdx, "retry HEAD must be captured before the retry invoke");
+  assert.ok(repairInvokeIdx < retrySalvageIdx, "retry salvage must run after the retry invoke");
+  assert.ok(retrySalvageIdx < revalidateIdx, "retry salvage must run before revalidate");
+  assert.ok(revisionSlice.includes('"openspec/"'), "plan-revision salvage must pass scope openspec/");
+  assert.ok(!revisionSlice.includes("runHarnessRound("), "plan-revision must not migrate onto runHarnessRound");
+});
+
+test("runPlanningPhases #1419: format-repair retry also salvages openspec/ before revalidate", async () => {
+  const { events, captured } = await runRevisionSalvageScenario({
+    salvageResult: { salvaged: true },
+    revisionResults: [revisionMissingAck, revisionOkResult],
+    revalidate: revalidateBlock,
+  });
+
+  const initialInvokeIdx = eventIndex(events, "invoke-revision", (e) => e.repair === false);
+  const initialSalvageIdx = eventIndex(events, "salvage", (e) => e.stageLabel === "plan revision");
+  const retryInvokeIdx = eventIndex(events, "invoke-revision", (e) => e.repair === true);
+  const retrySalvageIdx = eventIndex(events, "salvage", (e) => e.stageLabel === "plan revision format-repair");
+  const revalidateIdx = eventIndex(events, "revalidate");
+  const blockedIdx = eventIndex(events, "setBlocked");
+  assert.ok(initialInvokeIdx !== -1 && initialSalvageIdx !== -1);
+  assert.ok(retryInvokeIdx !== -1 && retrySalvageIdx !== -1);
+  assert.ok(initialSalvageIdx < retryInvokeIdx, "initial salvage must run before the format-repair retry invoke");
+  assert.ok(retryInvokeIdx < retrySalvageIdx, "retry salvage must run after the retry invoke");
+  assert.ok(retrySalvageIdx < revalidateIdx, "retry salvage must run before revalidate");
+  assert.ok(revalidateIdx < blockedIdx, "revalidate must run before setBlocked");
+  assert.equal(events[retrySalvageIdx]?.scope, "openspec/");
+  assert.equal(captured?.tag, "openspec-invalid");
+});
+
+test("runPlanningPhases #1419: retry salvage still runs after an initial salvage commit advances HEAD", async () => {
+  const { events } = await runRevisionSalvageScenario({
+    salvageResult: { salvaged: true },
+    revisionResults: [revisionMissingAck, revisionOkResult],
+    revalidate: revalidateBlock,
+  });
+
+  const salvages = events.filter((e) => e.type === "salvage");
+  assert.equal(salvages.length, 2, `expected initial + retry salvage; events=${JSON.stringify(events)}`);
+  assert.equal(salvages[0]?.comparisonHead, "sha-initial");
+  assert.equal(salvages[1]?.comparisonHead, "sha-initial-salvaged");
+  assert.notEqual(
+    salvages[1]?.comparisonHead,
+    "sha-initial",
+    "retry salvage must recapture HEAD; reusing the pre-initial HEAD would skip the second attempt",
+  );
+  assert.equal(salvages[1]?.scope, "openspec/");
+});
+
+test("runPlanningPhases #1419: plan-revision salvage is invoked with scope openspec/", async () => {
+  const { events } = await runRevisionSalvageScenario({
+    salvageResult: { salvaged: true },
+    revalidate: revalidateBlock,
+  });
+  const salvages = events.filter((e) => e.type === "salvage");
+  assert.ok(salvages.length >= 1, "salvage must be attempted");
+  for (const salvage of salvages) {
+    assert.equal(salvage.scope, "openspec/", `call-site scope must be openspec/; got ${JSON.stringify(salvage)}`);
+    assert.notEqual(salvage.scope, "tasks/todo.md");
+    assert.notEqual(salvage.scope, undefined);
+  }
+});
+
+test("runPlanningPhases #1419: clean openspec/ creates no salvage commit and leaves revalidate wording unchanged", async () => {
+  const { events, captured } = await runRevisionSalvageScenario({
+    salvageResult: { salvaged: false },
+    revalidate: revalidateBlock,
+  });
+  const salvages = events.filter((e) => e.type === "salvage");
+  assert.equal(salvages.length, 1, "helper is still consulted when HEAD did not advance");
+  assert.equal(captured?.tag, "openspec-invalid");
+  assert.equal(captured?.reason, REVISION_INVALID_AFTER);
+  assert.ok(
+    !captured?.reason.includes(SALVAGE_FAIL_PHRASE),
+    `clean in-scope worktree must not add a salvage-failure section; got: ${captured?.reason}`,
+  );
+});
+
+test("runPlanningPhases #1419: salvage git failure plus successful revalidate still blocks and names the failure", async () => {
+  const { events, captured, outcome } = await runRevisionSalvageScenario({
+    salvageResult: { salvaged: false, failureReason: "git add failed: disk full" },
+  });
+  assert.equal(eventIndex(events, "revalidate") !== -1, true, "revalidate must still run after salvage failure");
+  assert.equal(captured?.tag, "harness-failure");
+  assert.equal(captured?.stage, "plan-review");
+  assert.ok(
+    captured?.reason.includes(`${SALVAGE_FAIL_PHRASE} git add failed: disk full`),
+    `blocker must name the salvage failure; got: ${captured?.reason}`,
+  );
+  assert.equal(outcome.advanced, false);
+  if (!outcome.advanced && outcome.status === "blocked") {
+    assert.equal(outcome.blockerKind, "harness-failure");
+  }
+});
+
+test("runPlanningPhases #1419: salvage failure is named on a later revalidate block", async () => {
+  const { captured } = await runRevisionSalvageScenario({
+    salvageResult: { salvaged: false, failureReason: "git add failed: disk full" },
+    revalidate: revalidateBlock,
+  });
+  assert.equal(captured?.tag, "openspec-invalid");
+  assert.ok(captured?.reason.includes(REVISION_INVALID_AFTER), `got: ${captured?.reason}`);
+  assert.ok(
+    captured?.reason.includes(`${SALVAGE_FAIL_PHRASE} git add failed: disk full`),
+    `revalidate block must keep the salvage failure; got: ${captured?.reason}`,
+  );
+});
+
+test("runPlanningPhases #1419: salvage failure survives the format-repair contract-exhausted block", async () => {
+  const { events, captured } = await runRevisionSalvageScenario({
+    salvageResult: { salvaged: false, failureReason: "git add failed: disk full" },
+    revisionResults: [revisionMissingAck, revisionMissingAck],
+  });
+  const retrySalvageIdx = eventIndex(events, "salvage", (e) => e.stageLabel === "plan revision format-repair");
+  const blockedIdx = eventIndex(events, "setBlocked");
+  assert.ok(retrySalvageIdx !== -1, "retry salvage must still be attempted");
+  assert.ok(retrySalvageIdx < blockedIdx, "retry salvage must run before the contract-exhausted block");
+  assert.equal(eventIndex(events, "revalidate"), -1, "contract exhaustion must not reach revalidate");
+  assert.equal(captured?.tag, "harness-failure");
+  assert.ok(
+    captured?.reason.includes("## Feedback Incorporated"),
+    `contract reason must remain; got: ${captured?.reason}`,
+  );
+  assert.ok(
+    captured?.reason.includes(`${SALVAGE_FAIL_PHRASE} git add failed: disk full`),
+    `contract-exhausted block must keep the salvage failure; got: ${captured?.reason}`,
+  );
 });
