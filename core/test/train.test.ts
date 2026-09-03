@@ -2953,6 +2953,42 @@ test("train events: later wave with a new run id still appends once (#1417 2.2)"
   );
 });
 
+test("train events: later wave reusing a published events path with a different run id degrades (#1417)", async () => {
+  let wave = 0;
+  const deps = makeDeps({
+    async advanceWave(issueList, ctx) {
+      wave += 1;
+      if (wave === 1) {
+        await ctx?.onLoopReady?.({ runId: "abc", eventsPath: "/abs/E" });
+      } else {
+        await ctx?.onLoopReady?.({ runId: "def", eventsPath: "/abs/E" });
+      }
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      out.loopRun =
+        wave === 1
+          ? { runId: "abc", eventsPath: "/abs/E" }
+          : { runId: "def", eventsPath: "/abs/E" };
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "prereq"));
+  deps.seedIssue(snap(2, "Depends on: #1"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual(deps.mergeCalls, [101, 102]);
+  assert.equal(deps.waveCalls.length, 2);
+  const linked = trainEventsFromStore(deps.store).filter((e) => e.type === "train_loop_linked");
+  assert.equal(linked.length, 1, "conflicting later handoff must not append a second link");
+  assert.equal(linked[0]!.loop_run_id, "abc");
+  assert.equal(linked[0]!.events, "/abs/E");
+  assert.equal(result.status.events_coverage, "degraded");
+});
+
 test("train events: EEXIST collision writes only the suffix directory (#1301 2.1)", async () => {
   const store = memRunStore();
   const colliding = `/tmp/repo/.agent-pipeline/runs/${trainRunIdForAttempt(new Date("2026-08-28T17:28:03.000Z"), 1)}`;

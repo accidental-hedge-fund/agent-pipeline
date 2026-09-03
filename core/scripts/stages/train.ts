@@ -1155,7 +1155,14 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
   const startedIssues = new Set<number>();
   const announcedPrs = new Set<string>();
   const linkedLoopIds = new Map<string, string>();
+  const linkedLoopPaths = new Map<string, string>();
   const liveLoopByWave = new Map<number, { runId: string; eventsPath: string }>();
+  const conflictsPublishedLiveLink = (id: string, eventsPath: string): boolean => {
+    const publishedPath = linkedLoopIds.get(id);
+    if (publishedPath !== undefined) return publishedPath !== eventsPath;
+    const publishedId = linkedLoopPaths.get(eventsPath);
+    return publishedId !== undefined && publishedId !== id;
+  };
   const emitItemStarted = async (issue: number): Promise<void> => {
     if (startedIssues.has(issue)) return;
     startedIssues.add(issue);
@@ -1577,11 +1584,11 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         const eventsPath =
           typeof loopRun.eventsPath === "string" ? loopRun.eventsPath.trim() : "";
         if (!id || !eventsPath || !isAbsolute(eventsPath)) return;
-        const publishedPath = linkedLoopIds.get(id);
-        if (publishedPath !== undefined) {
-          if (publishedPath !== eventsPath) eventsCoverage = "degraded";
+        if (conflictsPublishedLiveLink(id, eventsPath)) {
+          eventsCoverage = "degraded";
           return;
         }
+        if (linkedLoopIds.has(id)) return;
         const live = liveLoopByWave.get(waveNumber);
         if (live && (live.runId !== id || live.eventsPath !== eventsPath)) {
           eventsCoverage = "degraded";
@@ -1599,6 +1606,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             return;
           }
           linkedLoopIds.set(id, eventsPath);
+          linkedLoopPaths.set(eventsPath, id);
           liveLoopByWave.set(waveNumber, { runId: id, eventsPath });
         } catch {
           eventsCoverage = "degraded";
@@ -1629,6 +1637,19 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         (later.runId !== live.runId || later.eventsPath !== live.eventsPath)
       ) {
         eventsCoverage = "degraded";
+      }
+      if (later) {
+        const laterId = later.runId.trim();
+        const laterPath =
+          typeof later.eventsPath === "string" ? later.eventsPath.trim() : "";
+        if (
+          laterId !== "" &&
+          laterPath !== "" &&
+          isAbsolute(laterPath) &&
+          conflictsPublishedLiveLink(laterId, laterPath)
+        ) {
+          eventsCoverage = "degraded";
+        }
       }
 
       for (const issue of toAdvance) {
