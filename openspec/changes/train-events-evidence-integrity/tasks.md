@@ -6,6 +6,9 @@
 - [ ] 1.4 Add an injected allocation-exhaustion test whose mkdir seam fails exclusive create for every `train-*` attempt. Assert the test **fails** against current code if a shared store is written, if `run_id` is published for a colliding id, or if the work-list issues that advance or merge change.
 - [ ] 1.5 Add an injected `--merge` already-contained fixture (merged linked PR, containment proven, no merge mutation). Assert the test **fails** against current code if `train_merge_proven` is missing or lacks `proof_disposition` `already-contained`. Keep asserting `train_merge_integrated` is present.
 - [ ] 1.6 Add an injected `--merge` newly-merged fixture. Assert the test **fails** against current code if `train_merge_proven` lacks `proof_disposition` `newly-merged`.
+- [ ] 1.7 Add an injected conflicting later handoff test (live `abc`/`E`, later `xyz`/`F`). Assert the test **fails** against current code if two links exist, if the first link is replaced, if the wave is aborted, or if `events_coverage` is not `degraded`.
+- [ ] 1.8 Add an injected non-`EEXIST` exclusive-mkdir failure (`EACCES`). Assert the test **fails** against current code if a suffix retry opens a store or `events_coverage` is not `unknown`.
+- [ ] 1.9 Add an injected `train_loop_linked` append failure after a published store. Assert the test **fails** against current code if the wave is aborted or `run_id` is cleared.
 
 ## 2. Exclusive train identity
 
