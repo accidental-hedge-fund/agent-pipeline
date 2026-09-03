@@ -2012,6 +2012,8 @@ function makeReclaimSafetyDeps(
     unlinkPath: async () => {},
     hasDirtyWorkdir: async () => false,
     hasLocalOnlyCommits: async () => false,
+    hasLinkedMergedPr: async () => false,
+    writeManagedMarker: async () => {},
     ...overrides,
   };
 }
@@ -2076,7 +2078,41 @@ test("createWorktree: definitive local-only commits block reclaim — remove not
   assert.equal(removeCalled, false, "removeWorktree must NOT be called when candidate has local-only commits");
 });
 
-test("createWorktree: unverifiable local-only blocks reclaim without mutation (#622)", async () => {
+test("createWorktree: never-pushed unverifiable salvage at target path is reused, not reclaimed", async () => {
+  const cfg = makeCreateCfg();
+  const rec = makeRec(42, "slug");
+  const other = makeRec(99, "other");
+  let removeCalled = false;
+  let gitCalled = false;
+  let markerPath: string | null = null;
+
+  const deps = makeReclaimSafetyDeps({
+    listActive: async () => [rec, other],
+    existsSync: (p) => p === rec.path,
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async () => "unverifiable",
+    hasLinkedMergedPr: async () => false,
+    gitCmd: async () => {
+      gitCalled = true;
+      throw new Error("no git: reuse must not add or delete");
+    },
+    removeWorktree: async () => {
+      removeCalled = true;
+    },
+    writeManagedMarker: async (p) => {
+      markerPath = p;
+    },
+  });
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(result.path, rec.path);
+  assert.equal(result.branch, rec.branch);
+  assert.equal(removeCalled, false, "unpublished salvage must not be removed");
+  assert.equal(gitCalled, false, "reuse must not call git (no worktree add / branch -D)");
+  assert.equal(markerPath, rec.path);
+});
+
+test("createWorktree: unverifiable + linked merged PR still blocks reclaim without mutation", async () => {
   const cfg = makeCreateCfg();
   const rec = makeRec(42, "slug");
   let removeCalled = false;
@@ -2086,6 +2122,7 @@ test("createWorktree: unverifiable local-only blocks reclaim without mutation (#
     existsSync: (p) => p === rec.path,
     hasDirtyWorkdir: async () => false,
     hasLocalOnlyCommits: async () => "unverifiable",
+    hasLinkedMergedPr: async () => true,
     removeWorktree: async () => {
       removeCalled = true;
     },
@@ -2095,6 +2132,84 @@ test("createWorktree: unverifiable local-only blocks reclaim without mutation (#
     () => createWorktree(cfg, 42, "slug", deps),
     /Cannot reclaim.*cannot verify all commits are merged/i,
   );
+  assert.equal(removeCalled, false);
+});
+
+test("createWorktree: never-pushed unverifiable on a different slug still blocks reclaim", async () => {
+  const cfg = makeCreateCfg();
+  const rec = makeRec(42, "old-slug");
+  let removeCalled = false;
+
+  const deps = makeReclaimSafetyDeps({
+    listActive: async () => [rec],
+    existsSync: (p) => p === rec.path,
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async () => "unverifiable",
+    hasLinkedMergedPr: async () => false,
+    removeWorktree: async () => {
+      removeCalled = true;
+    },
+  });
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "new-slug", deps),
+    (err: Error) => {
+      assert.match(err.message, /Cannot reclaim worktree for issue #42/);
+      assert.match(err.message, /local-only commits/i);
+      assert.doesNotMatch(err.message, /cannot verify all commits are merged/);
+      assert.doesNotMatch(err.message, /use --force to proceed if work was squash-merged/);
+      return true;
+    },
+  );
+  assert.equal(removeCalled, false);
+});
+
+test("createWorktree: same-path definitive local-only salvage is reused, not reclaimed", async () => {
+  const cfg = makeCreateCfg();
+  const rec = makeRec(42, "slug");
+  let removeCalled = false;
+
+  const deps = makeReclaimSafetyDeps({
+    listActive: async () => [rec],
+    existsSync: (p) => p === rec.path,
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async () => true,
+    gitCmd: async () => {
+      throw new Error("no git");
+    },
+    removeWorktree: async () => {
+      removeCalled = true;
+    },
+  });
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(result.path, rec.path);
+  assert.equal(removeCalled, false);
+});
+
+test("createWorktree: linked-merged-PR probe failure reclassifies unverifiable as local-only reuse", async () => {
+  const cfg = makeCreateCfg();
+  const rec = makeRec(42, "slug");
+  let removeCalled = false;
+
+  const deps = makeReclaimSafetyDeps({
+    listActive: async () => [rec],
+    existsSync: (p) => p === rec.path,
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async () => "unverifiable",
+    hasLinkedMergedPr: async () => {
+      throw new Error("no network");
+    },
+    gitCmd: async () => {
+      throw new Error("no git");
+    },
+    removeWorktree: async () => {
+      removeCalled = true;
+    },
+  });
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(result.path, rec.path);
   assert.equal(removeCalled, false);
 });
 

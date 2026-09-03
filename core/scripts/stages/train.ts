@@ -26,6 +26,8 @@ import type { RunStoreDeps } from "../run-store.ts";
 import {
   flushTrainRunHandoff,
   initTrainRunStore,
+  type TrainEventSession,
+  type TrainEventsCoverage,
 } from "../train-events.ts";
 import type { PipelineConfig } from "../types.ts";
 import { pipelineStageFromLabels } from "../loop/precondition.ts";
@@ -102,6 +104,12 @@ export interface TrainStatus {
   complete: boolean;
   /** Additive train-level run id when the generic run store was initialized. */
   run_id?: string;
+  /**
+   * Observational train-event coverage (#1301). Omitted on successful exclusive
+   * identity allocation (`ok`). Present as `degraded` or `unknown` when the
+   * run store could not be published exclusively or a later observation failed.
+   */
+  events_coverage?: TrainEventsCoverage;
 }
 
 /** Closed snapshot actions for `pipeline train --dry-run` (#1275). */
@@ -184,6 +192,17 @@ export type AdvanceWaveResult = Map<number, AdvanceOutcome> & {
   loopRun?: LinkedLoopRun;
 };
 
+/** Context passed into each advance wave (#1277 / #1301). */
+export interface AdvanceWaveContext {
+  logicalOperationId?: string;
+  /**
+   * Live child-loop handoff. Production `advanceWaveThroughLoop` awaits this
+   * from `onRunReady` after the exact run id and events path exist, before the
+   * loop engine can block on work. Sole append site for `train_loop_linked`.
+   */
+  onLoopReady?: (loopRun: LinkedLoopRun) => void | Promise<void>;
+}
+
 /** Result shape consumed from recover-parked (shared entrypoint). */
 export type TrainRecoverParkedStatus =
   | "deterministic-cleared"
@@ -215,7 +234,7 @@ export interface TrainDeps {
    */
   advanceWave(
     issues: readonly number[],
-    ctx?: { logicalOperationId?: string },
+    ctx?: AdvanceWaveContext,
   ): Promise<AdvanceWaveResult>;
   /**
    * Legacy single-item advance. Used only when tests/adapters lack advanceWave
@@ -478,7 +497,7 @@ export async function mergeReadyToDeployItem(
     kind: "integrated",
     pr,
     mergeCommitOid: obs.mergeCommitOid,
-    already: false,
+    already: !attempted,
     attempted,
     verifiedMergeProof: proof,
   };
@@ -1006,7 +1025,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
   deps.log(formatTrainOrderedIssuesLine(ordered, mergeMode, mergeFirst));
 
   const startedAt = deps.now?.() ?? new Date();
-  const session = await initTrainRunStore({
+  const storeInit = await initTrainRunStore({
     repoDir: opts.repoDir,
     repo: opts.repo,
     startedAt,
@@ -1021,7 +1040,20 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     store: deps.runStore,
     now: deps.now,
   });
-  await flushTrainRunHandoff(session, deps.writeHandoff);
+  let eventsCoverage = storeInit.eventsCoverage;
+  const published = storeInit.session;
+  const session: TrainEventSession = published ?? {
+    runId: "",
+    runDir: "",
+    eventsPath: "",
+    logicalOperationId: "",
+    async append() {
+      return true;
+    },
+  };
+  if (published) {
+    await flushTrainRunHandoff(published, deps.writeHandoff);
+  }
   await session.append("train_work_list_resolved", {
     ordered_issues: ordered,
     merge_mode: mergeMode,
@@ -1029,6 +1061,8 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
 
   const startedIssues = new Set<number>();
   const announcedPrs = new Set<string>();
+  const linkedLoopIds = new Set<string>();
+  const liveLoopByWave = new Map<number, { runId: string; eventsPath?: string }>();
   const emitItemStarted = async (issue: number): Promise<void> => {
     if (startedIssues.has(issue)) return;
     startedIssues.add(issue);
@@ -1058,13 +1092,12 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       await session.append("train_merge_attempted", { issue, pr: merged.pr });
     }
     if (merged.kind !== "integrated") return;
-    if (!merged.already) {
-      await session.append("train_merge_proven", {
-        issue,
-        pr: merged.pr,
-        merge_result_oid: merged.mergeCommitOid,
-      });
-    }
+    await session.append("train_merge_proven", {
+      issue,
+      pr: merged.pr,
+      merge_result_oid: merged.mergeCommitOid,
+      proof_disposition: merged.already ? "already-contained" : "newly-merged",
+    });
     await session.append("train_merge_integrated", {
       issue,
       pr: merged.pr,
@@ -1163,7 +1196,8 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         blocker === null &&
         ordered.every((n) => finished.has(n) || integrated.has(n)) &&
         held.size === 0,
-      run_id: session.runId,
+      ...(published ? { run_id: published.runId } : {}),
+      ...(eventsCoverage !== "ok" ? { events_coverage: eventsCoverage } : {}),
     });
 
   const markFinished = (issue: number, item: TrainItemResult) => {
@@ -1317,11 +1351,13 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
               : "";
           deps.log(`[train] #${issue}: already integrated (PR #${linkedPr}${oidNote})`);
           await emitItemStarted(issue);
-          await emitPr(issue, linkedPr);
-          await session.append("train_merge_integrated", {
-            issue,
+          await emitMergeCatalog(issue, {
+            kind: "integrated",
             pr: linkedPr,
-            merge_result_oid: recon.mergeCommitOid,
+            mergeCommitOid: recon.mergeCommitOid,
+            already: true,
+            attempted: false,
+            verifiedMergeProof: recon.verifiedMergeProof,
           });
           const already: TrainItemResult = {
             issue,
@@ -1442,10 +1478,35 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       for (const issue of toAdvance) {
         await emitItemStarted(issue);
       }
+      const publishLiveLoop = async (loopRun: LinkedLoopRun): Promise<void> => {
+        if (!published) return;
+        const id = loopRun.runId.trim();
+        if (!id || linkedLoopIds.has(id)) return;
+        try {
+          const ok = await session.append("train_loop_linked", {
+            wave: waveNumber,
+            loop_run_id: id,
+            logical_operation_id: session.logicalOperationId,
+            ...(loopRun.eventsPath ? { events: loopRun.eventsPath } : {}),
+          });
+          if (!ok) {
+            eventsCoverage = "degraded";
+            return;
+          }
+          linkedLoopIds.add(id);
+          liveLoopByWave.set(waveNumber, {
+            runId: id,
+            eventsPath: loopRun.eventsPath,
+          });
+        } catch {
+          eventsCoverage = "degraded";
+        }
+      };
       let waveResult: AdvanceWaveResult;
       try {
         waveResult = await advanceWave(toAdvance, {
-          logicalOperationId: session.logicalOperationId,
+          logicalOperationId: published ? session.logicalOperationId : undefined,
+          onLoopReady: publishLiveLoop,
         });
       } catch (err) {
         blocker = `advance wave failed: ${(err as Error).message}`;
@@ -1457,14 +1518,15 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         });
         return { exitCode: 1, status: status() };
       }
-      const linked = waveResult.loopRun;
-      if (linked && linked.runId.trim() !== "") {
-        await session.append("train_loop_linked", {
-          wave: waveNumber,
-          loop_run_id: linked.runId,
-          logical_operation_id: session.logicalOperationId,
-          ...(linked.eventsPath ? { events: linked.eventsPath } : {}),
-        });
+      const live = liveLoopByWave.get(waveNumber);
+      const later = waveResult.loopRun;
+      if (
+        live &&
+        later &&
+        later.runId.trim() !== "" &&
+        (later.runId !== live.runId || later.eventsPath !== live.eventsPath)
+      ) {
+        eventsCoverage = "degraded";
       }
 
       for (const issue of toAdvance) {
@@ -1702,7 +1764,7 @@ export function realTrainDeps(opts: {
    */
   advanceWave: (
     issues: readonly number[],
-    ctx?: { logicalOperationId?: string },
+    ctx?: AdvanceWaveContext,
   ) => Promise<AdvanceWaveResult>;
   mergeDeps?: MergeDeps;
 }): TrainDeps {

@@ -12,6 +12,7 @@ import {
   defaultRunStoreDeps,
   initRunDir,
   runDirPath,
+  runsDir,
   trainRunIdFor,
   type RunEvent,
   type RunStoreDeps,
@@ -20,6 +21,16 @@ import {
 
 export const TRAIN_RUN_HANDOFF_KIND = "train_run_handoff" as const;
 export const TRAIN_RUN_HANDOFF_SCHEMA_VERSION = "1" as const;
+
+/** Exclusive mkdir attempts: unsuffixed id plus `-2` … `-8`. */
+export const TRAIN_RUN_ID_MAX_EXCLUSIVE_ATTEMPTS = 8;
+
+export type TrainEventsCoverage = "ok" | "degraded" | "unknown";
+
+export interface TrainRunStoreInit {
+  session: TrainEventSession | null;
+  eventsCoverage: TrainEventsCoverage;
+}
 
 export const TRAIN_EVENT_TYPES = [
   "run_start",
@@ -62,6 +73,7 @@ export interface TrainEventPayload {
   blocker?: string | null;
   item_count?: number;
   merge_result_oid?: string | null;
+  proof_disposition?: "newly-merged" | "already-contained";
   final_state?: string;
   elapsed_ms?: number;
   logical_operation_id?: string;
@@ -72,7 +84,10 @@ export interface TrainEventSession {
   readonly runDir: string;
   readonly eventsPath: string;
   readonly logicalOperationId: string;
-  append(type: TrainEventType, payload?: TrainEventPayload & Record<string, unknown>): Promise<void>;
+  append(
+    type: TrainEventType,
+    payload?: TrainEventPayload & Record<string, unknown>,
+  ): Promise<boolean>;
 }
 
 export function formatTrainRunHandoff(input: {
@@ -119,29 +134,41 @@ export function createTrainEventSession(opts: {
         if (value === undefined) continue;
         event[key] = Array.isArray(value) ? [...value] : value;
       }
-      await appendEvent(opts.runDir, event as RunEvent, store);
+      return appendEvent(opts.runDir, event as RunEvent, store);
     },
   };
 }
 
-export async function initTrainRunStore(input: {
+function errnoCode(err: unknown): string | undefined {
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
+export function trainRunIdForAttempt(startedAt: Date, attempt: number): string {
+  const base = trainRunIdFor(startedAt);
+  return attempt <= 1 ? base : `${base}-${attempt}`;
+}
+
+async function openClaimedTrainStore(input: {
   repoDir: string;
   repo: string;
   startedAt: Date;
   mergeMode: boolean;
   orderedIssues: readonly number[];
   selector: TrainRunSelector;
-  store?: RunStoreDeps;
+  store: RunStoreDeps;
   now?: () => Date;
   logicalOperationId?: string | null;
-}): Promise<TrainEventSession> {
-  const runId = trainRunIdFor(input.startedAt);
-  const runDir = runDirPath(input.repoDir, runId);
-  const store = input.store ?? defaultRunStoreDeps;
+  runId: string;
+  runDir: string;
+}): Promise<TrainEventSession | null> {
   await initRunDir(
     {
-      runDir,
-      runId,
+      runDir: input.runDir,
+      runId: input.runId,
       repo: input.repo,
       profile: null,
       startedAt: input.startedAt.toISOString(),
@@ -151,14 +178,21 @@ export async function initTrainRunStore(input: {
       orderedIssues: input.orderedIssues,
       logicalOperationId: input.logicalOperationId,
     },
-    store,
+    input.store,
   );
-  let logicalOperationId = typeof input.logicalOperationId === "string" && input.logicalOperationId.trim()
-    ? input.logicalOperationId.trim()
-    : "";
+  try {
+    await input.store.readFile(path.join(input.runDir, "run.json"));
+    await input.store.readFile(path.join(input.runDir, "events.jsonl"));
+  } catch {
+    return null;
+  }
+  let logicalOperationId =
+    typeof input.logicalOperationId === "string" && input.logicalOperationId.trim()
+      ? input.logicalOperationId.trim()
+      : "";
   if (!logicalOperationId) {
     try {
-      const raw = await store.readFile(path.join(runDir, "run.json"));
+      const raw = await input.store.readFile(path.join(input.runDir, "run.json"));
       const meta = JSON.parse(raw) as { logical_operation_id?: unknown };
       if (typeof meta.logical_operation_id === "string" && meta.logical_operation_id.trim()) {
         logicalOperationId = meta.logical_operation_id.trim();
@@ -171,18 +205,68 @@ export async function initTrainRunStore(input: {
     logicalOperationId = mintLogicalOperationId();
   }
   const session = createTrainEventSession({
-    runDir,
-    runId,
+    runDir: input.runDir,
+    runId: input.runId,
     logicalOperationId,
-    store,
+    store: input.store,
     now: input.now,
   });
-  await session.append("run_start", {
+  const started = await session.append("run_start", {
     repo: input.repo,
     merge_mode: input.mergeMode,
     logical_operation_id: logicalOperationId,
   });
+  if (!started) return null;
   return session;
+}
+
+export async function initTrainRunStore(input: {
+  repoDir: string;
+  repo: string;
+  startedAt: Date;
+  mergeMode: boolean;
+  orderedIssues: readonly number[];
+  selector: TrainRunSelector;
+  store?: RunStoreDeps;
+  now?: () => Date;
+  logicalOperationId?: string | null;
+}): Promise<TrainRunStoreInit> {
+  const store = input.store ?? defaultRunStoreDeps;
+  try {
+    await store.mkdir(runsDir(input.repoDir), { recursive: true });
+  } catch (err) {
+    if (errnoCode(err) !== "EEXIST") {
+      return { session: null, eventsCoverage: "unknown" };
+    }
+  }
+
+  let sawNonEexist = false;
+  for (let attempt = 1; attempt <= TRAIN_RUN_ID_MAX_EXCLUSIVE_ATTEMPTS; attempt++) {
+    const runId = trainRunIdForAttempt(input.startedAt, attempt);
+    const runDir = runDirPath(input.repoDir, runId);
+    try {
+      await store.mkdir(runDir, { recursive: false });
+    } catch (err) {
+      if (errnoCode(err) === "EEXIST") continue;
+      sawNonEexist = true;
+      break;
+    }
+    const session = await openClaimedTrainStore({
+      ...input,
+      store,
+      runId,
+      runDir,
+    });
+    if (!session) {
+      return { session: null, eventsCoverage: "degraded" };
+    }
+    return { session, eventsCoverage: "ok" };
+  }
+
+  return {
+    session: null,
+    eventsCoverage: sawNonEexist ? "unknown" : "degraded",
+  };
 }
 
 export async function flushTrainRunHandoff(
