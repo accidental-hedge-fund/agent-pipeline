@@ -16,7 +16,10 @@ import {
   type StageTimeoutConfig,
   type StatusIssueDetail,
 } from "../scripts/status-json.ts";
-import { formatRecoverParkedSpentComment } from "../scripts/recover-parked.ts";
+import {
+  computeFingerprintId,
+  formatRecoverParkedSpentComment,
+} from "../scripts/recover-parked.ts";
 import type { WriteHealthRecord } from "../scripts/run-store.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -491,7 +494,10 @@ test("event_stream_write_health: healthy writeHealth stays null (does not invent
 const PRE_CHANGE_AUTONOMOUS_OVERRIDE =
   /use `--override "<key>: <reason>"` or fix residual findings/;
 
-function residualReviewComment(): StatusIssueDetail["comments"][number] {
+function residualReviewComment(
+  key = "abcd1234",
+  createdAt = "2026-09-01T00:00:00Z",
+): StatusIssueDetail["comments"][number] {
   return {
     author: "bot",
     body: [
@@ -499,20 +505,24 @@ function residualReviewComment(): StatusIssueDetail["comments"][number] {
       "**Reviewer**: codex",
       "",
       "### Findings",
-      "**1. [MEDIUM] Missing test** (confidence: 0.8) `override-key: abcd1234`",
+      `**1. [MEDIUM] Missing test** (confidence: 0.8) \`override-key: ${key}\``,
     ].join("\n"),
-    createdAt: "2026-09-01T00:00:00Z",
+    createdAt,
   };
 }
 
-function spentComment(issue: number, stage: string): StatusIssueDetail["comments"][number] {
+function spentComment(
+  issue: number,
+  stage: string,
+  keys: string[] = ["abcd1234"],
+): StatusIssueDetail["comments"][number] {
   return {
     author: "bot",
     body: formatRecoverParkedSpentComment({
-      fingerprint: "deadbeefdeadbeef",
+      fingerprint: computeFingerprintId(issue, stage, keys),
       issue,
       stage,
-      keys: ["abcd1234"],
+      keys,
       at: "2026-09-02T00:00:00Z",
     }),
     createdAt: "2026-09-02T00:00:00Z",
@@ -571,7 +581,7 @@ test("host_guidance: spent fingerprint projects human-disposition-required (#137
     makeDetail({
       number: 154,
       labels: ["pipeline:needs-human"],
-      comments: [spentComment(154, "needs-human")],
+      comments: [residualReviewComment("abcd1234"), spentComment(154, "needs-human", ["abcd1234"])],
     }),
     null,
     null,
@@ -581,6 +591,49 @@ test("host_guidance: spent fingerprint projects human-disposition-required (#137
   assert.match(payload.next_action, /operator-supplied disposition/i);
   assert.doesNotMatch(payload.next_action, PRE_CHANGE_AUTONOMOUS_OVERRIDE);
   assert.equal(payload.schema_version, "1");
+});
+
+test("host_guidance: prior same-stage spend does not spend a later distinct park (#1379)", () => {
+  const priorKeys = ["abcd1234"];
+  const laterKey = "ffff0001";
+  const comments = [
+    residualReviewComment(priorKeys[0], "2026-09-01T00:00:00Z"),
+    spentComment(154, "needs-human", priorKeys),
+    residualReviewComment(laterKey, "2026-09-03T00:00:00Z"),
+  ];
+  assert.equal(
+    classifyRecoverParkedSpend({
+      issue: 154,
+      stage: "needs-human",
+      comments,
+    }),
+    "unspent",
+  );
+  const payload = buildStatusPayload(
+    makeDetail({
+      number: 154,
+      labels: ["pipeline:needs-human"],
+      comments,
+    }),
+    null,
+    null,
+    CFG,
+  );
+  assert.equal(payload.host_guidance, "recover-parked");
+  assert.notEqual(payload.host_guidance, "human-disposition-required");
+  assert.match(payload.next_action, /pipeline recover-parked/);
+  assert.doesNotMatch(payload.next_action, PRE_CHANGE_AUTONOMOUS_OVERRIDE);
+});
+
+test("classifyRecoverParkedSpend: spend without derivable current fingerprint fails closed (#1379)", () => {
+  assert.equal(
+    classifyRecoverParkedSpend({
+      issue: 154,
+      stage: "needs-human",
+      comments: [spentComment(154, "needs-human", ["abcd1234"])],
+    }),
+    "unknown",
+  );
 });
 
 test("host_guidance: unknown spend fails closed to human-disposition-required (#1379)", () => {

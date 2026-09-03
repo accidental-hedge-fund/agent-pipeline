@@ -27,6 +27,14 @@ When the issue is in a `needs-human` stage or a residual review park (`blocked` 
 - **THEN** the typed host-guidance field SHALL equal `human-disposition-required`
 - **AND** `schema_version` SHALL equal `"1"`
 
+#### Scenario: Distinct later residual park in the same stage is unspent
+
+- **WHEN** `pipeline <issue> --status --json` runs for an issue that remains in a residual review park at the same stage as an earlier recovered park
+- **AND** a recover-parked spend marker covers the earlier park fingerprint
+- **AND** the current park fingerprint is distinct and unspent
+- **THEN** the typed host-guidance field SHALL equal `recover-parked`
+- **AND** it SHALL NOT equal `human-disposition-required` solely because the earlier same-stage park was spent
+
 #### Scenario: Unknown spend fails closed
 
 - **WHEN** status assembly cannot determine whether the current park fingerprint is spent

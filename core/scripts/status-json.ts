@@ -4,8 +4,12 @@
 
 import { isBlocked, pickStage } from "./gh.ts";
 import {
+  computeFingerprintId,
   extractAuthorityKeysFromComments,
+  extractParkKeySet,
   extractRecoverParkedSpent,
+  isFingerprintSpent,
+  selectCausalParkComment,
 } from "./recover-parked.ts";
 import {
   isElevatedWriteHealth,
@@ -159,8 +163,11 @@ function hasResidualReviewEvidence(comments: readonly { body: string }[]): boole
 
 /**
  * Recover-parked spend projection from issue comments already available to
- * status assembly. Fail closed to `unknown` when a spend heading is present
- * without a parseable fingerprint record.
+ * status assembly. Spent only when a parsed record covers the current park
+ * fingerprint (issue + stage + keys). Fail closed to `unknown` when a spend
+ * heading is present without a parseable fingerprint record, or when spend
+ * evidence exists for this issue and stage but the current fingerprint cannot
+ * be derived from review/park comments.
  */
 export function classifyRecoverParkedSpend(args: {
   issue: number;
@@ -175,9 +182,14 @@ export function classifyRecoverParkedSpend(args: {
   if (args.stage == null) {
     return spent.some((s) => s.issue === args.issue) ? "unknown" : "unspent";
   }
-  const relevant = spent.filter((s) => s.issue === args.issue && s.stage === args.stage);
-  if (relevant.length > 0) return "spent";
-  return "unspent";
+  const applicable = spent.filter((s) => s.issue === args.issue && s.stage === args.stage);
+  if (applicable.length === 0) return "unspent";
+  if (selectCausalParkComment(args.comments) == null) return "unknown";
+  const keys = extractParkKeySet(args.comments);
+  const fingerprint = computeFingerprintId(args.issue, args.stage, keys);
+  return isFingerprintSpent(spent, args.issue, args.stage, fingerprint, keys)
+    ? "spent"
+    : "unspent";
 }
 
 /**
