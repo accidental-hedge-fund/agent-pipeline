@@ -38,6 +38,7 @@ import {
   lifecycleAfterProcessExit,
   lifecycleAllowsRecoveryRecipe,
   lifecycleForMechanicalFault,
+  lifecycleOwnershipAfterItemTransition,
   mutatingSurfaceVerbsMissingInventory,
   observerCatalogHas,
   registeredForbiddenLifecycleVerbs,
@@ -127,6 +128,29 @@ test("2.2 synthetic needs-human bypass without classifier fails the guard", () =
   const synthetic = `await transitionFn(cfg, issueNumber, "fix-2", "needs-human", "retry exhausted");\n`;
   const hits = collectNeedsHumanParkWithoutClassifier(synthetic, "scripts/stages/fix.ts");
   assert.ok(hits.some((h) => /needs-human park without shared classifier/.test(h.reason)));
+});
+
+test("2.2 recovery modules are not exempt from the needs-human classifier guard", () => {
+  const mechanicalPark = `await transitionFn(cfg, issueNumber, "fix-2", "needs-human", "retry exhausted");\n`;
+  for (const file of ["scripts/loop/recovery.ts", "scripts/recovery.ts"]) {
+    const hits = collectNeedsHumanParkWithoutClassifier(mechanicalPark, file);
+    assert.ok(
+      hits.some((h) => /needs-human park without shared classifier/.test(h.reason)),
+      `expected a hit for ${file}`,
+    );
+  }
+  const importOnly = `import { resolveTypedRequest } from "./typed-request-resolution.ts";\nawait transitionFn(cfg, issueNumber, "fix-2", "needs-human", "retry exhausted");\n`;
+  const importOnlyHits = collectNeedsHumanParkWithoutClassifier(importOnly, "scripts/loop/recovery.ts");
+  assert.ok(
+    importOnlyHits.some((h) => /needs-human park without shared classifier/.test(h.reason)),
+    "classifier import without an adjacent invocation must still fail",
+  );
+  const adjacent = `import { resolveTypedRequest } from "./typed-request-resolution.ts";
+const classified = resolveTypedRequest({ nodeClass: "interface-contract", recommendation: "REST", factText: "REST" });
+await transitionFn(cfg, issueNumber, "fix-2", "needs-human", "typed request");
+`;
+  assert.deepEqual(collectNeedsHumanParkWithoutClassifier(adjacent, "scripts/loop/recovery.ts"), []);
+  assert.deepEqual(collectNeedsHumanParkWithoutClassifier(adjacent, "scripts/recovery.ts"), []);
 });
 
 test("2.3 DecisionRequest, CapabilityRequest, and AuthorityRequest stay distinct; raw failure emits none", () => {
@@ -445,4 +469,29 @@ test("bindLifecycleRecord persists the closed state on a ledger-shaped document"
   assert.equal(bound.lifecycle?.revision, 1);
   const consulted = consultLifecycleRecord(bound.lifecycle, { labels: ["pipeline:needs-human"] });
   assert.equal(consulted.state, "cooling");
+});
+
+test("lifecycleOwnershipAfterItemTransition requires observer proof and every success terminal", () => {
+  const succeeded = lifecycleOwnershipAfterItemTransition(
+    { "100": { state: "ready" } },
+    { observerProvedPostcondition: true, activeAttempt: true },
+  );
+  assert.equal(succeeded.state, "succeeded");
+  const siblingPending = lifecycleOwnershipAfterItemTransition(
+    { "100": { state: "ready" }, "200": { state: "pending" } },
+    { observerProvedPostcondition: true, activeAttempt: true },
+  );
+  assert.equal(siblingPending.state, "active");
+  assert.notEqual(siblingPending.state, "succeeded");
+  const noProof = lifecycleOwnershipAfterItemTransition(
+    { "100": { state: "ready" } },
+    { observerProvedPostcondition: false, activeAttempt: true },
+  );
+  assert.equal(noProof.state, "active");
+  const waiting = lifecycleOwnershipAfterItemTransition(
+    { "100": { state: "waiting", hold_request: { typed_request: "DecisionRequest" } } },
+    { observerProvedPostcondition: false, activeAttempt: true },
+  );
+  assert.equal(waiting.state, "typed-input-wait");
+  assert.equal(waiting.typed_request, "DecisionRequest");
 });

@@ -31,6 +31,10 @@ import {
   type LoopExternalIdentity,
   type LoopLedger,
 } from "../scripts/loop/types.ts";
+import {
+  admitLifecycleRecord,
+  consultLifecycleRecord,
+} from "../scripts/recovery-lifecycle-ownership.ts";
 
 // ---------------------------------------------------------------------------
 // In-memory fakes (mirrors loop-recovery.test.ts's fakeDeps).
@@ -1114,6 +1118,127 @@ test("transitionItem: a remote-proving transition without the granted authority 
       return true;
     },
   );
+});
+
+test("transitionItem: observer-backed ready binds succeeded in the same write; restart consults it", async () => {
+  const admitted = admitLifecycleRecord({
+    logical_operation_id: "lop-transition-1322",
+    updated_at: "2026-07-23T00:00:00.000Z",
+  });
+  const { deps, contract, token } = await setup(
+    "in_progress",
+    { logical_operation_id: "lop-transition-1322" },
+    { lifecycle: admitted },
+  );
+  const observeDeps = openPrObserveDeps({ stage: "ready-to-deploy", readyLabel: true });
+  const ledger = await transitionItem(deps, observeDeps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    to: "ready",
+    logicalOperationId: "lop-transition-1322",
+    observerProof: { provedPostcondition: true },
+  });
+  assert.equal(ledger.items["100"].state, "ready");
+  assert.equal(ledger.lifecycle?.logical_operation_id, "lop-transition-1322");
+  assert.equal(ledger.lifecycle?.state, "succeeded");
+  assert.equal(ledger.lifecycle?.revision, 2);
+
+  const restarted = await readLedger(deps, "run-1");
+  assert.equal(restarted.lifecycle?.state, "succeeded");
+  const wake = consultLifecycleRecord(restarted.lifecycle, {
+    labels: ["pipeline:needs-human"],
+    processExitCode: 1,
+  });
+  assert.equal(wake.state, "succeeded");
+  assert.notEqual(wake.state, "active");
+});
+
+test("transitionItem: observer-backed ready with a pending sibling stays active", async () => {
+  const admitted = admitLifecycleRecord({
+    logical_operation_id: "lop-sibling-1322",
+    updated_at: "2026-07-23T00:00:00.000Z",
+  });
+  const { deps, contract, token } = await setup(
+    "in_progress",
+    {
+      logical_operation_id: "lop-sibling-1322",
+      items: [
+        { id: "100", depends_on: [] },
+        { id: "200", depends_on: [] },
+      ],
+    },
+    {
+      lifecycle: admitted,
+      items: {
+        "100": { id: "100", state: "in_progress", history: [], recovery_budgets_remaining: { default: 3 } },
+        "200": { id: "200", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+      },
+    },
+  );
+  const observeDeps = openPrObserveDeps({ stage: "ready-to-deploy", readyLabel: true });
+  const ledger = await transitionItem(deps, observeDeps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    to: "ready",
+    logicalOperationId: "lop-sibling-1322",
+    observerProof: { provedPostcondition: true },
+  });
+  assert.equal(ledger.items["100"].state, "ready");
+  assert.equal(ledger.items["200"].state, "pending");
+  assert.equal(ledger.lifecycle?.state, "active");
+  assert.notEqual(ledger.lifecycle?.state, "succeeded");
+});
+
+test("transitionItem: caller observerProof cannot mark succeeded without live observer evidence", async () => {
+  const admitted = admitLifecycleRecord({
+    logical_operation_id: "lop-noproof-1322",
+    updated_at: "2026-07-23T00:00:00.000Z",
+  });
+  const { deps, contract, token } = await setup(
+    "in_progress",
+    { logical_operation_id: "lop-noproof-1322" },
+    { lifecycle: admitted },
+  );
+  const { deps: observeDeps } = fakeObserveDeps();
+  const ledger = await transitionItem(deps, observeDeps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    to: "implemented",
+    logicalOperationId: "lop-noproof-1322",
+    observerProof: { provedPostcondition: true },
+  });
+  assert.equal(ledger.items["100"].state, "implemented");
+  assert.equal(ledger.lifecycle?.state, "active");
+  assert.notEqual(ledger.lifecycle?.state, "succeeded");
+});
+
+test("reconcile: observer-backed ledger-behind repair binds succeeded in the same write", async () => {
+  const admitted = admitLifecycleRecord({
+    logical_operation_id: "lop-reconcile-1322",
+    updated_at: "2026-07-23T00:00:00.000Z",
+  });
+  const { deps, token } = await setup("pr_opened", { logical_operation_id: "lop-reconcile-1322" }, { lifecycle: admitted });
+  const { deps: observeDeps } = fakeObserveDeps({
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "merged", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: "mergesha" };
+    },
+  });
+  await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const restarted = await readLedger(deps, "run-1");
+  assert.equal(restarted.items["100"].state, "merged");
+  assert.equal(restarted.lifecycle?.logical_operation_id, "lop-reconcile-1322");
+  assert.equal(restarted.lifecycle?.state, "succeeded");
+  const wake = consultLifecycleRecord(restarted.lifecycle, { processExitCode: 1 });
+  assert.equal(wake.state, "succeeded");
 });
 
 // ---------------------------------------------------------------------------

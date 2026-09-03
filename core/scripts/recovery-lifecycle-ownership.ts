@@ -262,6 +262,50 @@ export function bindLifecycleRecord<T extends { lifecycle?: DurableLifecycleReco
   return { ...ledger, lifecycle };
 }
 
+const OBSERVER_SUCCESS_ITEM_STATES: ReadonlySet<string> = new Set([
+  "ready",
+  "merged",
+  "released",
+  "deployed",
+]);
+
+/** Current typed request on any owned item, if present. */
+export function typedRequestFromOwnedItems(
+  items: Record<string, { hold_request?: { typed_request?: string } | null | undefined }>,
+): PublicTypedRequest | null {
+  for (const item of Object.values(items)) {
+    const typed = item.hold_request?.typed_request;
+    if (isPublicTypedRequest(typed)) return typed;
+  }
+  return null;
+}
+
+/**
+ * Derive lifecycle ownership from the item states that a lawful transition
+ * just wrote, plus observer-proof and cooling facts. `succeeded` requires
+ * both observer proof and every item in an observer-success terminal.
+ */
+export function lifecycleOwnershipAfterItemTransition(
+  items: Record<string, { state: string; hold_request?: { typed_request?: string } | null | undefined }>,
+  facts: {
+    cooling?: boolean;
+    stopReason?: string | null;
+    observerProvedPostcondition?: boolean;
+    activeAttempt?: boolean;
+  },
+): LifecycleOwnership {
+  const list = Object.values(items);
+  const allObserverSuccess =
+    list.length > 0 && list.every((item) => OBSERVER_SUCCESS_ITEM_STATES.has(item.state));
+  return deriveLifecycleState({
+    typedRequest: typedRequestFromOwnedItems(items),
+    cooling: facts.cooling,
+    stopReason: facts.stopReason,
+    observerProvedPostcondition: facts.observerProvedPostcondition === true && allObserverSuccess,
+    activeAttempt: facts.activeAttempt,
+  });
+}
+
 /** Recovery recipes are refused only after a lawful lifecycle exit. */
 export function lifecycleAllowsRecoveryRecipe(
   record: DurableLifecycleRecord | null | undefined,

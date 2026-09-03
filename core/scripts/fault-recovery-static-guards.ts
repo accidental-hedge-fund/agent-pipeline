@@ -109,6 +109,8 @@ export function collectDirectStageLifecycleWrites(source: string, file = "fixtur
 
 const CLASSIFIER_IMPORT_RE =
   /from\s+["'][^"']*(?:typed-request-resolution|grill-settle)[^"']*["']/;
+const CLASSIFIER_INVOCATION_RE =
+  /\b(?:resolveTypedRequest|classifyHumanAsk|settleRecommendation)\s*\(/;
 const HUMAN_ASK_PARK_RE =
   /\bwaitItem\s*\(|disposition:\s*["']human_authority["']/;
 
@@ -131,21 +133,36 @@ const NEEDS_HUMAN_STAGE_PARK_RE =
 
 /**
  * Production sites must not park `pipeline:needs-human` as human ownership
- * without the shared typed-request classifier. design_gate.ts is bound by
+ * without the shared typed-request classifier. Recovery modules are not
+ * exempt: a park is allowed only when the file imports the classifier and
+ * an invocation sits adjacent to that park. design_gate.ts is bound by
  * recovery-lifecycle-ownership class law (change D6) rather than rewritten here.
  */
+function everyNeedsHumanParkHasAdjacentClassifier(source: string): boolean {
+  const lines = source.split("\n");
+  let parkFound = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (!NEEDS_HUMAN_STAGE_PARK_RE.test(lines[i]!)) continue;
+    parkFound = true;
+    const start = Math.max(0, i - 8);
+    const end = Math.min(lines.length, i + 9);
+    if (!CLASSIFIER_INVOCATION_RE.test(lines.slice(start, end).join("\n"))) {
+      return false;
+    }
+  }
+  return parkFound;
+}
+
 export function collectNeedsHumanParkWithoutClassifier(source: string, file = "fixture.ts"): StaticGuardHit[] {
   if (
     file.endsWith("stage-diagnostic.ts") ||
-    file.endsWith("loop/recovery.ts") ||
-    file.endsWith("recovery.ts") ||
     file.endsWith("design_gate.ts") ||
     file.endsWith("types.ts")
   ) {
     return [];
   }
   if (!NEEDS_HUMAN_STAGE_PARK_RE.test(source)) return [];
-  if (CLASSIFIER_IMPORT_RE.test(source)) return [];
+  if (CLASSIFIER_IMPORT_RE.test(source) && everyNeedsHumanParkHasAdjacentClassifier(source)) return [];
   return [{ file, reason: "production needs-human park without shared classifier import" }];
 }
 

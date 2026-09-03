@@ -48,6 +48,17 @@ test("needs-human park without classifier fails the static guard", () => {
   assert.ok(hits.some((h) => /needs-human park without shared classifier/.test(h.reason)));
 });
 
+test("needs-human park in recovery modules without classifier fails the static guard", () => {
+  const synthetic = `await transition(cfg, n, "review-2", "needs-human", "retry exhausted");\n`;
+  for (const file of ["scripts/loop/recovery.ts", "scripts/recovery.ts"]) {
+    const hits = collectNeedsHumanParkWithoutClassifier(synthetic, file);
+    assert.ok(
+      hits.some((h) => /needs-human park without shared classifier/.test(h.reason)),
+      `expected a hit for ${file}`,
+    );
+  }
+});
+
 test("retired controller import fails the static guard", () => {
   const synthetic = `import { recover } from "./legacy-recovery-controller.ts";\n`;
   const hits = collectRetiredControllerImports(synthetic, "fixture.ts");
