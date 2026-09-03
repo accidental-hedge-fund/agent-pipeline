@@ -23,9 +23,10 @@ export const STAGES = [
   "eval-gate",
   "shipcheck-gate",
   "ready-to-deploy",
-  // Terminal off-ramp: a review round hit `max_adversarial_rounds` with findings
-  // still blocking. The item stops here with an advisory punch-list for a human
-  // to override or fix — it is never auto-advanced to ready-to-deploy.
+  // Compatibility off-ramp projecting a current typed-input wait
+  // (DecisionRequest, CapabilityRequest, or AuthorityRequest). Mechanical
+  // exhaustion does not enter this label as human ownership. RecoverySupervisor
+  // retains lifecycle ownership. Never auto-advanced to ready-to-deploy.
   "needs-human",
 ] as const;
 export type Stage = (typeof STAGES)[number];

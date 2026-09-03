@@ -57,6 +57,12 @@ import {
 } from "./types.ts";
 import { appendEvent, readLedger, writeLedger, type LoopStoreDeps } from "./store.ts";
 import { authorizeGatedTransition, NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS } from "./pause.ts";
+import { resolveLogicalOperationId } from "../logical-operation.ts";
+import {
+  bindLifecycleRecord,
+  isMechanicalCompatibilityStopReason,
+  lifecycleOwnershipAfterItemTransition,
+} from "../recovery-lifecycle-ownership.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -71,6 +77,45 @@ export const REMOTE_PROVING_STATES: ReadonlySet<LoopItemState> = new Set([
   "released",
   "deployed",
 ]);
+
+const OBSERVER_SUCCESS_STATES: ReadonlySet<LoopItemState> = new Set([
+  "ready",
+  "merged",
+  "released",
+  "deployed",
+]);
+
+function resolveTransitionLogicalOperationId(
+  ledger: LoopLedger,
+  contractLogicalOperationId?: string,
+  inputLogicalOperationId?: string,
+): string {
+  return resolveLogicalOperationId({
+    written: ledger.lifecycle?.logical_operation_id,
+    loopStore: inputLogicalOperationId ?? contractLogicalOperationId,
+  });
+}
+
+function bindLifecycleForItemTransition(
+  ledger: LoopLedger,
+  logicalOperationId: string,
+  updatedAt: string,
+  observerProvedPostcondition: boolean,
+): LoopLedger {
+  return bindLifecycleRecord(
+    ledger,
+    logicalOperationId,
+    lifecycleOwnershipAfterItemTransition(ledger.items, {
+      cooling: Boolean(ledger.cooling),
+      stopReason: ledger.stop?.reason ?? null,
+      observerProvedPostcondition,
+      activeAttempt: true,
+      nowMs: Date.parse(updatedAt),
+      freshnessWindowSeconds: NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS,
+    }),
+    updatedAt,
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Live observation seam.
@@ -582,13 +627,15 @@ export async function reconcile(
   input: ReconcileInput,
 ): Promise<LoopReconciliation> {
   const ledger = await readLedger(deps, input.runId);
-  if (ledger.stop) {
+  if (ledger.stop && !isMechanicalCompatibilityStopReason(ledger.stop.reason)) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
 
   const observed: Record<string, LoopExternalIdentity> = {};
   const drift: LoopDrift[] = [];
   const items: LoopLedger["items"] = { ...ledger.items };
+  let itemStateChanged = false;
+  let observerProvedPostcondition = false;
 
   for (const [id, entry] of Object.entries(ledger.items)) {
     const identity = await observeExternalIdentity(observeDeps, id);
@@ -623,6 +670,8 @@ export async function reconcile(
         delete repaired.blocked_theme;
       }
       items[id] = repaired;
+      itemStateChanged = true;
+      if (OBSERVER_SUCCESS_STATES.has(target)) observerProvedPostcondition = true;
     } else if (
       driftClass === "ledger-ahead" ||
       driftClass === "external-absent" ||
@@ -645,6 +694,7 @@ export async function reconcile(
           },
         ],
       };
+      itemStateChanged = true;
     } else if (
       // Advance-still-needed heal (#1068 / #712 Decision 4 class expansion):
       // stranded `pr_opened` OR non-dispatchable local `implemented` with open PR
@@ -684,6 +734,7 @@ export async function reconcile(
         ],
       };
       items[id] = healed;
+      itemStateChanged = true;
     } else if (!driftClass && (REMOTE_PROVING_STATES.has(entry.state) || identity.pr_number !== null)) {
       items[id] = { ...entry, last_verified_identity: identity };
     }
@@ -724,13 +775,21 @@ export async function reconcile(
     next_actions,
   };
 
-  const newLedger: LoopLedger = {
+  let newLedger: LoopLedger = {
     ...ledger,
     items,
     merge_barrier,
     last_reconciliation: reconciliation,
     reconciliation_sequence: sequence,
   };
+  if (itemStateChanged) {
+    newLedger = bindLifecycleForItemTransition(
+      newLedger,
+      resolveTransitionLogicalOperationId(ledger),
+      reconciliation.time,
+      observerProvedPostcondition,
+    );
+  }
   await writeLedger(deps, newLedger, input.token);
   await appendEvent(deps, input.runId, input.token, "loop_reconciled", {
     sequence,
@@ -798,7 +857,14 @@ export async function resumeRecoveryExhaustedTerminalCatchUp(
 
   if (repaired.length === 0) return;
 
-  await writeLedger(deps, { ...ledger, items }, input.token);
+  const observerProvedPostcondition = repaired.some((row) => OBSERVER_SUCCESS_STATES.has(row.to));
+  const nextLedger = bindLifecycleForItemTransition(
+    { ...ledger, items },
+    resolveTransitionLogicalOperationId(ledger),
+    deps.now().toISOString(),
+    observerProvedPostcondition,
+  );
+  await writeLedger(deps, nextLedger, input.token);
   for (const row of repaired) {
     await appendEvent(deps, input.runId, input.token, "loop_item_transitioned", {
       item_id: row.id,
@@ -839,6 +905,44 @@ function identitySupportsState(state: LoopItemState, identity: LoopExternalIdent
   }
 }
 
+/** Fresh live proof for every success-terminal item. Stored sibling `ready`
+ *  (or merged) is not enough to close the Logical Operation. */
+async function everySuccessItemHasFreshLiveProof(
+  observeDeps: ReconcileObserveDeps,
+  ledger: LoopLedger,
+  liveItemId: string,
+  liveIdentity: LoopExternalIdentity | undefined,
+  now: Date,
+): Promise<boolean> {
+  const entries = Object.entries(ledger.items);
+  if (entries.length === 0) return false;
+  if (!entries.every(([, item]) => OBSERVER_SUCCESS_STATES.has(item.state))) return false;
+
+  const nextItems: LoopLedger["items"] = { ...ledger.items };
+  for (const [id, item] of entries) {
+    let identity: LoopExternalIdentity;
+    try {
+      identity =
+        id === liveItemId && liveIdentity ? liveIdentity : await observeExternalIdentity(observeDeps, id);
+    } catch {
+      return false;
+    }
+    const ageSeconds = (now.getTime() - Date.parse(identity.observed_at)) / 1000;
+    const fresh =
+      Number.isFinite(ageSeconds) &&
+      ageSeconds >= 0 &&
+      ageSeconds <= NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS;
+    if (!fresh || !identitySupportsState(item.state, identity)) {
+      return false;
+    }
+    if (id !== liveItemId) {
+      nextItems[id] = { ...item, last_verified_identity: identity };
+    }
+  }
+  ledger.items = nextItems;
+  return true;
+}
+
 function describeIdentityEvidence(identity: LoopExternalIdentity): string {
   return `verified ${describeObservedState(identity)} at ${identity.observed_at}`;
 }
@@ -850,6 +954,13 @@ export interface TransitionItemInput {
   engine: LoopEngineName;
   to: LoopItemState;
   note?: string;
+  /** Logical Operation this transition binds. Falls back to contract / ledger. */
+  logicalOperationId?: string;
+  /**
+   * Observer-proof facts for this transition. A caller cannot mark `succeeded`
+   * without the live observation this function takes itself.
+   */
+  observerProof?: { provedPostcondition: boolean };
 }
 
 /** The sanctioned entry point for moving an item into a remote-proving state.
@@ -860,7 +971,9 @@ export interface TransitionItemInput {
  *  (within {@link NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS}) and supports that
  *  exact state. A caller cannot fabricate this evidence: `TransitionItemInput`
  *  carries no identity field at all, so there is nothing for a caller to
- *  substitute a claim into. Composes with (never bypasses) the existing
+ *  substitute a claim into. `logicalOperationId` and `observerProof` bind the
+ *  durable lifecycle record in the same ledger write; they are not remote
+ *  identity. Composes with (never bypasses) the existing
  *  authority-gate + directly-verified-evidence requirement via
  *  `authorizeGatedTransition` (loop/pause.ts) for every state that maps to a
  *  {@link LoopAuthorityGate}. */
@@ -872,7 +985,12 @@ export async function transitionItem(
 ): Promise<LoopLedger> {
   const ledger = await readLedger(deps, input.runId);
   if (ledger.stop) {
-    throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
+    const mechanical = isMechanicalCompatibilityStopReason(ledger.stop.reason);
+    const sibling = ledger.stop.item_id !== input.itemId;
+    const observerCatchUp = REMOTE_PROVING_STATES.has(input.to);
+    if (!mechanical || (!sibling && !observerCatchUp)) {
+      throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
+    }
   }
   const item = ledger.items[input.itemId];
   if (!item) {
@@ -926,11 +1044,31 @@ export async function transitionItem(
   }
   ledger.items = { ...ledger.items, [input.itemId]: updated };
 
-  await writeLedger(deps, ledger, input.token);
+  const liveObserverProof = Boolean(
+    observedIdentity &&
+      identitySupportsState(input.to, observedIdentity) &&
+      OBSERVER_SUCCESS_STATES.has(input.to),
+  );
+  const observerProvedPostcondition =
+    liveObserverProof &&
+    (input.observerProof?.provedPostcondition ?? true) &&
+    (await everySuccessItemHasFreshLiveProof(observeDeps, ledger, input.itemId, observedIdentity, deps.now()));
+  const bound = bindLifecycleForItemTransition(
+    ledger,
+    resolveTransitionLogicalOperationId(
+      ledger,
+      contractInput.logical_operation_id,
+      input.logicalOperationId,
+    ),
+    time,
+    observerProvedPostcondition,
+  );
+
+  await writeLedger(deps, bound, input.token);
   await appendEvent(deps, input.runId, input.token, "loop_item_transitioned", {
     item_id: input.itemId,
     from,
     to: input.to,
   });
-  return ledger;
+  return bound;
 }

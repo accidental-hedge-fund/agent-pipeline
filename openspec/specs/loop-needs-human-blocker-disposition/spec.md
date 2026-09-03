@@ -9,16 +9,18 @@ TBD - created by archiving change loop-needs-human-blocker-disposition. Update P
 
 The supervisor SHALL record an attested nonterminal needs-human hold only when a blocked dispatch
 carries a current canonical `human-decision-required` diagnostic whose structured blocker kind is
-also `human-decision-required`. The supervisor SHALL verify that diagnostic against fresh dispatch
+also `human-decision-required` and the shared classifier emits a current `DecisionRequest`,
+`CapabilityRequest`, or `AuthorityRequest`. The supervisor SHALL verify that diagnostic against fresh dispatch
 evidence before creating or retaining the hold. A `pipeline:blocked` label, a
 `blocked_needs_human` outcome without that diagnostic, a missing or
 reason-less diagnostic, a plan/output format error, an artifact failure, an exhausted mechanical
 attempt, or any co-present stage label SHALL be insufficient authority evidence. Every unattested
-case SHALL enter typed engine recovery or terminal system failure and SHALL NOT emit
+case SHALL enter typed engine recovery or Cooling and SHALL NOT emit
 `human_intervention`, even when the live issue still carries the product blocked label.
-While a genuine human hold exists, the run SHALL continue any schedulable dependency-independent
+While a genuine typed-input wait exists, the run SHALL continue any schedulable dependency-independent
 sibling and preserve every sibling's state. A rejected/crashed dispatch or protocol defect SHALL
-remain engine-owned and SHALL follow bounded recovery before any terminal system stop.
+remain engine-owned and SHALL follow bounded recovery, then Cooling. It SHALL NOT become a terminal
+system stop, ownerless terminal, or human ownership.
 
 #### Scenario: A plan-review format blocker remains engine-owned
 
@@ -38,7 +40,7 @@ remain engine-owned and SHALL follow bounded recovery before any terminal system
 
 - **WHEN** per-item execution reports `blocked_needs_human`
 - **THEN** the supervisor SHALL inspect its current canonical diagnostic
-- **AND** it SHALL create an attested authority hold only when the strict authority predicate passes
+- **AND** it SHALL create an attested typed-input wait only when the strict authority predicate passes
 
 #### Scenario: An unattested needs-human outcome with a live blocked label remains engine-owned
 
@@ -52,7 +54,8 @@ remain engine-owned and SHALL follow bounded recovery before any terminal system
 #### Scenario: Current human-decision diagnostic creates a resumable hold
 
 - **WHEN** a blocked dispatch carries a current canonical `human-decision-required` diagnostic
-- **THEN** the supervisor SHALL move the item to a `paused` or `waiting` hold and report
+- **AND** the shared classifier emits a typed request
+- **THEN** the supervisor SHALL move the item to a typed-input wait and report
   `hold_outstanding=true`
 - **AND** it SHALL retain the candidate and authority evidence needed to validate a later answer
 
@@ -60,7 +63,8 @@ remain engine-owned and SHALL follow bounded recovery before any terminal system
 
 - **WHEN** a dispatch is rejected, crashes, or reports a protocol defect without authority evidence
 - **THEN** the outcome SHALL be classified as an engine-owned diagnostic
-- **AND** bounded recovery SHALL run before any terminal system stop
+- **AND** bounded recovery SHALL run
+- **AND** exhaustion SHALL enter Cooling rather than a terminal system stop
 
 #### Scenario: A ready sibling survives a genuine human hold
 

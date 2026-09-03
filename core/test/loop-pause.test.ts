@@ -185,6 +185,38 @@ function typedWaitRequest(
 // Entering a hold — admission and non-charging.
 // ---------------------------------------------------------------------------
 
+test("pauseItem admits a lifecycle record on a pre-#1322 ledger from the supplied logical operation id", async () => {
+  const { deps, token } = await setup();
+  const before = await readLedger(deps, "run-1");
+  assert.equal(before.lifecycle, undefined);
+  const ledger = await pauseItem(deps, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    logicalOperationId: "lop-legacy-hold-1322",
+  });
+  assert.equal(ledger.lifecycle?.logical_operation_id, "lop-legacy-hold-1322");
+  assert.equal(ledger.items["100"].state, "paused");
+  const persisted = await readLedger(deps, "run-1");
+  assert.equal(persisted.lifecycle?.logical_operation_id, "lop-legacy-hold-1322");
+});
+
+test("waitItem admits typed-input-wait on a pre-#1322 ledger from the supplied logical operation id", async () => {
+  const { deps, token } = await setup();
+  const ledger = await waitItem(deps, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    logicalOperationId: "lop-legacy-wait-1322",
+    request: typedWaitRequest("decision", "which branch?", { permitted_responses: ["main", "staging"] }),
+  });
+  assert.equal(ledger.lifecycle?.logical_operation_id, "lop-legacy-wait-1322");
+  assert.equal(ledger.lifecycle?.state, "typed-input-wait");
+  assert.equal((await readLedger(deps, "run-1")).lifecycle?.logical_operation_id, "lop-legacy-wait-1322");
+});
+
 test("pauseItem: an in_progress item enters paused, no budget charged, no block counted", async () => {
   const { deps, token } = await setup();
   const before = (await readLedger(deps, "run-1")).items["100"].recovery_budgets_remaining;

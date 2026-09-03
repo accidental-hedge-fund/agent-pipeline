@@ -24,6 +24,7 @@ import {
   upgradeLedgerForRecovery,
 } from "../scripts/loop/recovery.ts";
 import { mapLegacyThemeToBlockerClass } from "../scripts/loop/import.ts";
+import { admitLifecycleRecord, applyLifecycleTransition, deriveLifecycleState } from "../scripts/recovery-lifecycle-ownership.ts";
 import { initRun, readContract, readLedger, writeLedger, acquireLock, type LoopStoreDeps } from "../scripts/loop/store.ts";
 import {
   DURABLE_BLOCKER_CLASSES,
@@ -667,6 +668,151 @@ test("startRecoveryAttempt: claim persists before execution and restart replay d
   assert.equal(replayedCompletion.ledger.recovery_attempts.length, 1);
 });
 
+test("recovery mutations admit a lifecycle record on a pre-#1322 ledger before the first write", async () => {
+  const { deps, contract, token } = await setup({ logical_operation_id: "lop-legacy-recovery-1322" });
+  const before = await readLedger(deps, "run-1");
+  assert.equal(before.lifecycle, undefined);
+
+  const blocked = await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "implementation-ci", evidence: "ci failed on current head",
+  });
+  assert.equal(blocked.lifecycle?.logical_operation_id, "lop-legacy-recovery-1322");
+  assert.equal(blocked.lifecycle?.state, "active");
+  assert.equal(blocked.items["100"].state, "blocked");
+
+  const afterBlock = await readLedger(deps, "run-1");
+  assert.equal(afterBlock.lifecycle?.logical_operation_id, "lop-legacy-recovery-1322");
+
+  const { lifecycle: _dropped, ...legacyAfterBlock } = afterBlock;
+  await writeLedger(deps, legacyAfterBlock as typeof afterBlock, token);
+  assert.equal((await readLedger(deps, "run-1")).lifecycle, undefined);
+
+  const started = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    action: "repair_pipeline_item", candidateIdentity: "head-abc:base-def",
+  });
+  assert.equal(started.ledger.lifecycle?.logical_operation_id, "lop-legacy-recovery-1322");
+  assert.equal(started.attempt.outcome, "started");
+
+  const afterStart = await readLedger(deps, "run-1");
+  const { lifecycle: _droppedStart, ...legacyAfterStart } = afterStart;
+  await writeLedger(deps, legacyAfterStart as typeof afterStart, token);
+
+  const completed = await completeRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    attemptId: started.attempt.attempt_id, succeeded: false, error: "repair failed",
+  });
+  assert.equal(completed.ledger.lifecycle?.logical_operation_id, "lop-legacy-recovery-1322");
+  assert.equal((await readLedger(deps, "run-1")).lifecycle?.logical_operation_id, "lop-legacy-recovery-1322");
+});
+
+test("recoverItem admits a lifecycle record on a pre-#1322 ledger", async () => {
+  const { deps, contract, token } = await setup({ logical_operation_id: "lop-legacy-recover-item-1322" });
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "implementation-ci", evidence: "ci failed",
+  });
+  const current = await readLedger(deps, "run-1");
+  const { lifecycle: _dropped, ...legacy } = current;
+  await writeLedger(deps, legacy as typeof current, token);
+
+  const recovered = await recoverItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    actions: ["rerun_ci"], candidateIdentity: "ci-1", succeeded: true,
+  });
+  assert.equal(recovered.ledger.lifecycle?.logical_operation_id, "lop-legacy-recover-item-1322");
+  assert.equal(recovered.attempt.outcome, "recovered");
+  assert.equal((await readLedger(deps, "run-1")).lifecycle?.logical_operation_id, "lop-legacy-recover-item-1322");
+});
+
+test("startRecoveryAttempt consults the durable lifecycle record and refuses cancelled/succeeded", async () => {
+  const { deps, contract, token } = await setup();
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "implementation-ci", evidence: "ci failed on current head",
+  });
+  const current = await readLedger(deps, "run-1");
+  const cancelled = applyLifecycleTransition(
+    admitLifecycleRecord({ logical_operation_id: "lop-recovery-1322", updated_at: "2026-09-02T00:00:00.000Z" }),
+    deriveLifecycleState({ cancelledByAuthenticatedCaller: true }),
+    "2026-09-02T00:01:00.000Z",
+    "lop-recovery-1322",
+  );
+  await writeLedger(deps, { ...current, lifecycle: cancelled }, token);
+  await assert.rejects(
+    () => startRecoveryAttempt(deps, contract, {
+      runId: "run-1", token, itemId: "100", engine: "claude",
+      action: "repair_pipeline_item", candidateIdentity: "head-abc:base-def",
+    }),
+    (err: unknown) => err instanceof LoopError && err.loopFailureClass === "stop" && /cancelled/.test(err.message),
+  );
+});
+
+test("startRecoveryAttempt: a typed hold on item A does not refuse recovery of independent blocked sibling B", async () => {
+  const { deps, contract, token } = await setup();
+  const current = await readLedger(deps, "run-1");
+  const waiting = applyLifecycleTransition(
+    current.lifecycle ?? admitLifecycleRecord({
+      logical_operation_id: "lop-hold-sibling-1322",
+      updated_at: "2026-09-02T00:00:00.000Z",
+    }),
+    deriveLifecycleState({ typedRequest: "DecisionRequest", activeAttempt: true }),
+    "2026-09-02T00:01:00.000Z",
+    "lop-hold-sibling-1322",
+  );
+  await writeLedger(deps, {
+    ...current,
+    lifecycle: waiting,
+    items: {
+      "100": {
+        ...current.items["100"],
+        state: "waiting",
+        hold_request: {
+          request_id: "req-a",
+          item_id: "100",
+          kind: "decision",
+          prompt: "which branch?",
+          permitted_responses: ["main", "staging"],
+          requested_by_engine: "claude",
+          requested_at: "2026-09-02T00:00:00.000Z",
+          typed_request: "DecisionRequest",
+          decision_package: {
+            recommendation: "main",
+            rationale: "default",
+            alternatives: ["main", "staging"],
+            risk: "low",
+            evidence: ["issue"],
+          },
+        },
+      },
+      "200": { ...current.items["200"], state: "in_progress" },
+    },
+  }, token);
+
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "200", engine: "claude",
+    blockerClass: "implementation-ci", evidence: "ci failed on sibling",
+  });
+  const started = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "200", engine: "claude",
+    action: "repair_pipeline_item", candidateIdentity: "head-abc:base-def",
+  });
+  assert.equal(started.attempt.outcome, "started");
+  assert.equal(started.ledger.items["100"].state, "waiting");
+  assert.equal(started.ledger.lifecycle?.state, "typed-input-wait");
+
+  const completed = await completeRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "200", engine: "claude",
+    attemptId: started.attempt.attempt_id, succeeded: true,
+  });
+  assert.equal(completed.attempt.outcome, "recovered");
+  assert.equal(completed.ledger.items["200"].state, "in_progress");
+  assert.equal(completed.ledger.items["100"].state, "waiting");
+  assert.equal(completed.ledger.lifecycle?.state, "typed-input-wait");
+  assert.equal((await readLedger(deps, "run-1")).lifecycle?.state, "typed-input-wait");
+});
+
 test("recoveryAttemptId is deterministic and changes with candidate, evidence, or action", () => {
   const base = {
     itemId: "100",
@@ -838,6 +984,26 @@ test("eligibleIndependentItems: a non-run-fatal block lets an independent pendin
   const ledger = await readLedger(deps, "run-1");
   const eligible = eligibleIndependentItems(contract, ledger);
   assert.deepEqual(eligible, ["200"]);
+});
+
+test("eligibleIndependentItems: a live run_fatal compatibility stop does not strand an independent sibling", async () => {
+  const { contract } = await setup();
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-1",
+    items: {
+      "100": { id: "100", state: "blocked", history: [], recovery_budgets_remaining: { default: 3 } },
+      "200": { id: "200", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: { reason: "run_fatal", time: "2026-09-02T00:00:00.000Z", item_id: "100", theme: "workflow-engine-defect" },
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+  } as LoopLedger;
+  assert.deepEqual(eligibleIndependentItems(contract, ledger), ["200"]);
 });
 
 test("eligibleIndependentItems: a recoverable run-fatal block does not strand an independent sibling", async () => {

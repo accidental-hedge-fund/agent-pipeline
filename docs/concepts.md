@@ -150,7 +150,7 @@ When the feedback window ends with **no** human comments, plan revision proceeds
 
 When human comments are present, the revised plan comment attributes contributors, and the revision **must** end with a `## Human Feedback Acknowledgement` section listing each commenter as `addressed — <reason>` or `declined — <reason>`.
 
-**Authority boundary:** when the reviewer harness runs, independent agent plan review is the plan-review control; when same-harness fallback applies, the labeled self-review is the plan-review evidence and is **not** independent; the human feedback window is optional steering; **human attestation** (pipeline output markers / operator capability attestations) is provenance, not plan sign-off. Plan-review is **not** human sign-off for high-risk work. Opt-in **pre-code human attestation** (`pre_code_attestation`, #575) is a separate risk-triggered control before implementing — required only when configured and a risk trigger matches; omitted configuration preserves autonomous advancement without that human gate. Merge authority remains outside the advance path. A direct operator (or external supervisor under operator authority) can invoke a loop-isolated merge surface. True human-decision gates such as `needs-human` dispositions remain human-owned.
+**Authority boundary:** when the reviewer harness runs, independent agent plan review is the plan-review control; when same-harness fallback applies, the labeled self-review is the plan-review evidence and is **not** independent; the human feedback window is optional steering; **human attestation** (pipeline output markers / operator capability attestations) is provenance, not plan sign-off. Plan-review is **not** human sign-off for high-risk work. Opt-in **pre-code human attestation** (`pre_code_attestation`, #575) is a separate risk-triggered control before implementing — required only when configured and a risk trigger matches; omitted configuration preserves autonomous advancement without that human gate. Merge authority remains outside the advance path. A direct operator (or external supervisor under operator authority) can invoke a loop-isolated merge surface. `needs-human` is a compatibility projection of a current typed-input wait (`DecisionRequest`, `CapabilityRequest`, or `AuthorityRequest`). RecoverySupervisor retains ownership. Mechanical exhaustion is Cooling, not human-owned cancellation.
 
 ## Review severity policy & audited overrides
 
@@ -289,7 +289,7 @@ pipeline status N
 pipeline doctor
 ```
 
-Common outcomes: missing reviewer CLI (same-harness fallback or block), CI red, merge conflicts, review ceiling → `needs-human`, OpenSpec invalid. Use `pipeline unblock` or `pipeline override` as appropriate, or fix and re-label.
+Common outcomes: missing reviewer CLI (same-harness fallback or block), CI red, merge conflicts, review-ceiling Cooling (not human-owned `needs-human` unless a current typed request exists), OpenSpec invalid. Use `pipeline unblock` or `pipeline override` as appropriate, or fix and re-label.
 
 ### Evidence bundle
 
@@ -458,7 +458,7 @@ Carry-forward lessons live in a maintainer-curated `## Lessons / Gotchas` sectio
 
 Local-only artifact paths (must stay gitignored): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, and `.agent-pipeline/factory-release/`.
 
-Full stage inventory lives in living specs and engine `STAGES`, not in the generated SKILL. Loop selectors are documented above; see [cli.md](cli.md) for the generated verb inventory.
+Full stage inventory lives in living specs and engine `STAGES`, not in the generated SKILL. Label-inventory terminals are exactly `TERMINAL_STAGES` = `{ready-to-deploy, needs-human}`. `needs-human` projects a current typed-input wait; it is not lifecycle cancellation. Mechanical exhaustion is Cooling. Loop selectors are documented above; see [cli.md](cli.md) for the generated verb inventory.
 
 Release-plan rows live in `ROADMAP.md`. Columns: Release, Bump, Theme, Issues, Why. The unshipped row shape is `| **vX.Y.Z** | bump | theme | issues | why |`. `pipeline release <version>` prepares a release PR from the matching GitHub milestone plan. Release scaffolds a missing unshipped row when the `| *(none)* |` insert sentinel is present, or fails with remediation (file, copy-paste row, restore the sentinel) when it is not. `Ship milestone vX.Y.Z` maps to `pipeline ship --milestone vX.Y.Z`.
 

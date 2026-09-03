@@ -13,6 +13,7 @@ import {
   collectProviderIncidentDispatch,
   collectRetiredControllerImports,
   collectHumanAskWithoutClassifier,
+  collectNeedsHumanParkWithoutClassifier,
   scanProductionRecoveryGuards,
 } from "../scripts/fault-recovery-static-guards.ts";
 import { FAULT_RECOVERY_MATRIX } from "../scripts/fault-recovery-matrix.ts";
@@ -39,6 +40,23 @@ test("human-ask park without classifier fails the static guard", () => {
   const synthetic = `await waitItem(store, { request: { kind: "decision" } });\n`;
   const hits = collectHumanAskWithoutClassifier(synthetic, "fixture.ts");
   assert.ok(hits.some((h) => /without shared classifier/.test(h.reason)));
+});
+
+test("needs-human park without classifier fails the static guard", () => {
+  const synthetic = `await transition(cfg, n, "review-2", "needs-human", "retry exhausted");\n`;
+  const hits = collectNeedsHumanParkWithoutClassifier(synthetic, "fixture.ts");
+  assert.ok(hits.some((h) => /needs-human park without shared classifier/.test(h.reason)));
+});
+
+test("needs-human park in recovery modules without classifier fails the static guard", () => {
+  const synthetic = `await transition(cfg, n, "review-2", "needs-human", "retry exhausted");\n`;
+  for (const file of ["scripts/loop/recovery.ts", "scripts/recovery.ts"]) {
+    const hits = collectNeedsHumanParkWithoutClassifier(synthetic, file);
+    assert.ok(
+      hits.some((h) => /needs-human park without shared classifier/.test(h.reason)),
+      `expected a hit for ${file}`,
+    );
+  }
 });
 
 test("retired controller import fails the static guard", () => {

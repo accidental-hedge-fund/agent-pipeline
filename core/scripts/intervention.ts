@@ -35,6 +35,21 @@ export const HUMAN_INTERVENTION_KINDS = [
 
 export type HumanInterventionKind = (typeof HUMAN_INTERVENTION_KINDS)[number];
 
+/** Reporting dimension only — these kinds do not grant human ownership. */
+export const REPORTING_ONLY_HUMAN_INTERVENTION_KINDS = [
+  "review-non-convergence",
+  "test-build-failure",
+  "eval-shipcheck-failure",
+  "merge-conflict-or-branch-drift",
+  "auth-tooling-preflight-failure",
+  "reviewer-unavailable",
+  "unknown",
+] as const satisfies readonly HumanInterventionKind[];
+
+export function interventionKindGrantsHumanOwnership(kind: HumanInterventionKind): boolean {
+  return !(REPORTING_ONLY_HUMAN_INTERVENTION_KINDS as readonly string[]).includes(kind);
+}
+
 // ---------------------------------------------------------------------------
 // Event shape
 // ---------------------------------------------------------------------------

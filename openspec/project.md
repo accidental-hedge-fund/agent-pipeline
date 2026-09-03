@@ -3,7 +3,9 @@
 ## Purpose
 A label-driven pipeline that advances a GitHub issue (or a PR's linked issue)
 through a 18-stage state machine (code `STAGES` in `core/scripts/types.ts`,
-including the terminal park off-ramp `needs-human`) to `pipeline:ready-to-deploy`.
+including the compatibility park off-ramp `needs-human` for a current typed-input
+wait) to `pipeline:ready-to-deploy`. Mechanical exhaustion is RecoverySupervisor
+Cooling, not human-owned cancellation.
 The product is the `pipeline` CLI (`pipeline <verb> [--json]` plus event JSONL).
 Hosts are argv or JSON wrappers (short SKILL shims) around that CLI; they are
 not a second engine. Implementer and reviewer are config roles from

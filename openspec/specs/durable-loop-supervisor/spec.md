@@ -677,7 +677,7 @@ The supervisor SHALL classify outstanding items against live observed identity w
 evidence, before it
 emits `loop_drive_started` and before it dispatches any item. An item SHALL count as valid-outstanding
 when all of the following hold: it is on the compiled contract; its ledger state is not
-done, abandoned, or skipped; it is not under a current human-authority hold; live labels still
+done, abandoned, or skipped; it is not under a current typed-input wait; live labels still
 admit it under the existing loop precondition gate.
 
 When at least one item is valid-outstanding, the supervisor SHALL supersede the historical
@@ -693,14 +693,18 @@ the terminal drive summary with `resumed` true and `dispatched` 0. It SHALL NOT 
 when refusal is required because every remaining item is a genuine human-authority hold.
 
 A live drive that first records a mechanical class that previously mapped to `run_fatal` SHALL persist
-Cooling or an external-condition wait. The supervisor SHALL NOT require a new operator `--resume`
-invocation solely to keep ownership of that mechanical fault.
+Cooling or an external-condition wait under `recovery-lifecycle-ownership`. The supervisor SHALL NOT
+require a new operator `--resume` invocation solely to keep ownership of that mechanical fault. The
+supervisor SHALL NOT auto-retry that fault without a later wake (operator `--resume`, cooling
+eligibility, or an external-condition probe). Historical `stop.reason = run_fatal` MAY remain as a
+compatibility projection. That record SHALL NOT end Logical Operation ownership or grant human
+authority.
 
 #### Scenario: Stale transient run_fatal with valid outstanding items re-drives in place
 
 - **WHEN** `--resume <run-id>` targets a run stopped with historical `reason = run_fatal`
 - **AND** at least one contract item is valid-outstanding (admitted label, not done or abandoned,
-  no current human-authority hold)
+  no current typed-input wait)
 - **THEN** the supervisor SHALL supersede that stop and dispatch at least one valid-outstanding
   item through `pipeline/loop-execution@1`
 - **AND** the `run_id` SHALL be the resumed run's id (no second run directory)
@@ -734,7 +738,9 @@ invocation solely to keep ownership of that mechanical fault.
 - **AND** that dispatch exhausts applicable strategies
 - **THEN** RecoverySupervisor SHALL persist Cooling or an external-condition wait
 - **AND** SHALL NOT persist a new `run_fatal` lifecycle stop
+- **AND** if a `run_fatal` compatibility projection is recorded, its `time` SHALL differ from the superseded stop's `time`
 - **AND** the item-dispatch seam SHALL have been called for that drive
+- **AND** RecoverySupervisor SHALL retain ownership as Cooling
 
 #### Scenario: Live-drive run_fatal policy is unchanged
 
@@ -742,12 +748,16 @@ invocation solely to keep ownership of that mechanical fault.
   mechanical class that previously mapped to `run_fatal`
 - **THEN** it SHALL persist Cooling or an external-condition wait
 - **AND** SHALL NOT persist `stop.reason = run_fatal` as the lifecycle outcome
+- **AND** it MAY persist `stop.reason = run_fatal` only as a compatibility projection
+- **AND** it SHALL NOT become ownerless or human-owned
+- **AND** independent siblings SHALL remain schedulable
 - **AND** it SHALL NOT require a later operator `--resume` solely to retain ownership
+- **AND** it SHALL NOT auto-retry until a later wake
 
 #### Scenario: Human-authority hold is not valid-outstanding
 
 - **WHEN** `--resume <run-id>` targets a run stopped with historical `reason = run_fatal`
-- **AND** every remaining non-done item is under a current human-authority hold
+- **AND** every remaining non-done item is under a current human-authority hold or typed-input wait
 - **THEN** the command SHALL refuse distinctly
 - **AND** it SHALL NOT re-drive those held items
 
