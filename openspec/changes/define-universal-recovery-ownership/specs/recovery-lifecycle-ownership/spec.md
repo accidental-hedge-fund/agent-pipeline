@@ -120,7 +120,7 @@ Mechanical failure, unknown failure, malformed output, process death, no progres
 
 ### Requirement: Verified success SHALL require authoritative observer evidence
 
-Verified completion SHALL require the declared owning-system observer to prove the postcondition for the bound candidate and side-effect identity. Git facts SHALL come from git. Forge state, checks, and reviews SHALL come from the forge. Merge containment SHALL come from the fetched base. Release and deploy facts SHALL come from their owning systems. Orchestration state SHALL come from the durable RecoverySupervisor records, not from a process exit or a comment. A process exit, exception, timeout, model response, or `run_complete` event SHALL be ingress evidence and SHALL NOT by itself mark `succeeded`.
+Verified completion SHALL require the declared owning-system observer to prove the postcondition for the bound candidate and side-effect identity. Git facts SHALL come from git. Forge state, checks, and reviews SHALL come from the forge. Merge containment SHALL come from the fetched base. Release and deploy facts SHALL come from their owning systems. Orchestration state SHALL come from the durable RecoverySupervisor records, not from a process exit or a comment. A process exit, exception, timeout, model response, or `run_complete` event SHALL be ingress evidence and SHALL NOT by itself mark `succeeded`. A Logical Operation that owns more than one item SHALL NOT enter `succeeded` until every success-terminal item has current authoritative observer proof. Stored sibling state SHALL NOT substitute for that proof.
 
 #### Scenario: Exit zero is not succeeded
 
@@ -139,6 +139,13 @@ Verified completion SHALL require the declared owning-system observer to prove t
 - **WHEN** a host reports `run_complete` with `final_state: error`
 - **THEN** that event SHALL NOT by itself cancel or succeed the Logical Operation
 - **AND** RecoverySupervisor SHALL retain ownership until an observer-backed exit applies
+
+#### Scenario: One item's proof does not close a multi-item operation
+
+- **WHEN** a Logical Operation owns two items and one item's observer proves `ready`
+- **AND** the sibling is recorded `ready` without current authoritative observer proof
+- **THEN** RecoverySupervisor SHALL NOT record `succeeded`
+- **AND** SHALL keep the operation owned until every success-terminal item has current observer proof
 
 ---
 

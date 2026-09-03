@@ -110,6 +110,8 @@ function bindLifecycleForItemTransition(
       stopReason: ledger.stop?.reason ?? null,
       observerProvedPostcondition,
       activeAttempt: true,
+      nowMs: Date.parse(updatedAt),
+      freshnessWindowSeconds: NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS,
     }),
     updatedAt,
   );
@@ -903,6 +905,44 @@ function identitySupportsState(state: LoopItemState, identity: LoopExternalIdent
   }
 }
 
+/** Fresh live proof for every success-terminal item. Stored sibling `ready`
+ *  (or merged) is not enough to close the Logical Operation. */
+async function everySuccessItemHasFreshLiveProof(
+  observeDeps: ReconcileObserveDeps,
+  ledger: LoopLedger,
+  liveItemId: string,
+  liveIdentity: LoopExternalIdentity | undefined,
+  now: Date,
+): Promise<boolean> {
+  const entries = Object.entries(ledger.items);
+  if (entries.length === 0) return false;
+  if (!entries.every(([, item]) => OBSERVER_SUCCESS_STATES.has(item.state))) return false;
+
+  const nextItems: LoopLedger["items"] = { ...ledger.items };
+  for (const [id, item] of entries) {
+    let identity: LoopExternalIdentity;
+    try {
+      identity =
+        id === liveItemId && liveIdentity ? liveIdentity : await observeExternalIdentity(observeDeps, id);
+    } catch {
+      return false;
+    }
+    const ageSeconds = (now.getTime() - Date.parse(identity.observed_at)) / 1000;
+    const fresh =
+      Number.isFinite(ageSeconds) &&
+      ageSeconds >= 0 &&
+      ageSeconds <= NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS;
+    if (!fresh || !identitySupportsState(item.state, identity)) {
+      return false;
+    }
+    if (id !== liveItemId) {
+      nextItems[id] = { ...item, last_verified_identity: identity };
+    }
+  }
+  ledger.items = nextItems;
+  return true;
+}
+
 function describeIdentityEvidence(identity: LoopExternalIdentity): string {
   return `verified ${describeObservedState(identity)} at ${identity.observed_at}`;
 }
@@ -1010,7 +1050,9 @@ export async function transitionItem(
       OBSERVER_SUCCESS_STATES.has(input.to),
   );
   const observerProvedPostcondition =
-    liveObserverProof && (input.observerProof?.provedPostcondition ?? true);
+    liveObserverProof &&
+    (input.observerProof?.provedPostcondition ?? true) &&
+    (await everySuccessItemHasFreshLiveProof(observeDeps, ledger, input.itemId, observedIdentity, deps.now()));
   const bound = bindLifecycleForItemTransition(
     ledger,
     resolveTransitionLogicalOperationId(

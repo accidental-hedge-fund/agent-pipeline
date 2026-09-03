@@ -269,6 +269,51 @@ const OBSERVER_SUCCESS_ITEM_STATES: ReadonlySet<string> = new Set([
   "deployed",
 ]);
 
+/** Default freshness window for stored per-item observer proof. Loop callers
+ *  MUST pass the native-goal freshness window via `facts.freshnessWindowSeconds`. */
+export const OBSERVER_PROOF_FRESHNESS_WINDOW_SECONDS = 300;
+
+/** Stored identity facts that can prove an observer-success item state. */
+export interface ObserverSuccessIdentityFacts {
+  observed_at?: string;
+  pr_number?: number | null;
+  pr_state?: string | null;
+  ready_label_present?: boolean;
+}
+
+export interface LifecycleOwnedItemFacts {
+  state: string;
+  hold_request?: { typed_request?: string } | null | undefined;
+  last_verified_identity?: ObserverSuccessIdentityFacts | null | undefined;
+}
+
+/** True when `identity` currently proves `state` as an observer-success terminal. */
+export function identityProvesObserverSuccessState(
+  state: string,
+  identity: ObserverSuccessIdentityFacts | null | undefined,
+  nowMs?: number,
+  freshnessWindowSeconds: number = OBSERVER_PROOF_FRESHNESS_WINDOW_SECONDS,
+): boolean {
+  if (!identity || !OBSERVER_SUCCESS_ITEM_STATES.has(state)) return false;
+  if (nowMs !== undefined) {
+    const ageSeconds = (nowMs - Date.parse(identity.observed_at ?? "")) / 1000;
+    if (!Number.isFinite(ageSeconds) || ageSeconds < 0 || ageSeconds > freshnessWindowSeconds) {
+      return false;
+    }
+  }
+  switch (state) {
+    case "ready":
+      return identity.pr_number != null && identity.pr_state === "open" && identity.ready_label_present === true;
+    case "merged":
+      return identity.pr_state === "merged";
+    case "released":
+    case "deployed":
+      return false;
+    default:
+      return false;
+  }
+}
+
 /** Current typed request on any owned item, if present. */
 export function typedRequestFromOwnedItems(
   items: Record<string, { hold_request?: { typed_request?: string } | null | undefined }>,
@@ -283,25 +328,37 @@ export function typedRequestFromOwnedItems(
 /**
  * Derive lifecycle ownership from the item states that a lawful transition
  * just wrote, plus observer-proof and cooling facts. `succeeded` requires
- * both observer proof and every item in an observer-success terminal.
+ * observer proof and current authoritative proof for every success-terminal
+ * item — stored sibling state is not proof.
  */
 export function lifecycleOwnershipAfterItemTransition(
-  items: Record<string, { state: string; hold_request?: { typed_request?: string } | null | undefined }>,
+  items: Record<string, LifecycleOwnedItemFacts>,
   facts: {
     cooling?: boolean;
     stopReason?: string | null;
     observerProvedPostcondition?: boolean;
     activeAttempt?: boolean;
+    nowMs?: number;
+    freshnessWindowSeconds?: number;
   },
 ): LifecycleOwnership {
   const list = Object.values(items);
-  const allObserverSuccess =
-    list.length > 0 && list.every((item) => OBSERVER_SUCCESS_ITEM_STATES.has(item.state));
+  const windowSeconds = facts.freshnessWindowSeconds ?? OBSERVER_PROOF_FRESHNESS_WINDOW_SECONDS;
+  const allCurrentSuccessProof =
+    list.length > 0 &&
+    list.every((item) =>
+      identityProvesObserverSuccessState(
+        item.state,
+        item.last_verified_identity,
+        facts.nowMs,
+        windowSeconds,
+      ),
+    );
   return deriveLifecycleState({
     typedRequest: typedRequestFromOwnedItems(items),
     cooling: facts.cooling,
     stopReason: facts.stopReason,
-    observerProvedPostcondition: facts.observerProvedPostcondition === true && allObserverSuccess,
+    observerProvedPostcondition: facts.observerProvedPostcondition === true && allCurrentSuccessProof,
     activeAttempt: facts.activeAttempt,
   });
 }

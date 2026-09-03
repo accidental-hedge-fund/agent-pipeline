@@ -472,20 +472,51 @@ test("bindLifecycleRecord persists the closed state on a ledger-shaped document"
 });
 
 test("lifecycleOwnershipAfterItemTransition requires observer proof and every success terminal", () => {
+  const nowMs = Date.parse("2026-09-02T00:00:00.000Z");
+  const readyProof = {
+    observed_at: "2026-09-02T00:00:00.000Z",
+    pr_number: 12,
+    pr_state: "open" as const,
+    ready_label_present: true,
+  };
   const succeeded = lifecycleOwnershipAfterItemTransition(
-    { "100": { state: "ready" } },
-    { observerProvedPostcondition: true, activeAttempt: true },
+    { "100": { state: "ready", last_verified_identity: readyProof } },
+    { observerProvedPostcondition: true, activeAttempt: true, nowMs },
   );
   assert.equal(succeeded.state, "succeeded");
   const siblingPending = lifecycleOwnershipAfterItemTransition(
-    { "100": { state: "ready" }, "200": { state: "pending" } },
-    { observerProvedPostcondition: true, activeAttempt: true },
+    {
+      "100": { state: "ready", last_verified_identity: readyProof },
+      "200": { state: "pending" },
+    },
+    { observerProvedPostcondition: true, activeAttempt: true, nowMs },
   );
   assert.equal(siblingPending.state, "active");
   assert.notEqual(siblingPending.state, "succeeded");
+  const siblingReadyWithoutProof = lifecycleOwnershipAfterItemTransition(
+    {
+      "100": { state: "ready", last_verified_identity: readyProof },
+      "200": { state: "ready" },
+    },
+    { observerProvedPostcondition: true, activeAttempt: true, nowMs },
+  );
+  assert.equal(siblingReadyWithoutProof.state, "active");
+  assert.notEqual(siblingReadyWithoutProof.state, "succeeded");
+  const siblingStaleProof = lifecycleOwnershipAfterItemTransition(
+    {
+      "100": { state: "ready", last_verified_identity: readyProof },
+      "200": {
+        state: "ready",
+        last_verified_identity: { ...readyProof, observed_at: "2026-09-01T23:50:00.000Z" },
+      },
+    },
+    { observerProvedPostcondition: true, activeAttempt: true, nowMs },
+  );
+  assert.equal(siblingStaleProof.state, "active");
+  assert.notEqual(siblingStaleProof.state, "succeeded");
   const noProof = lifecycleOwnershipAfterItemTransition(
-    { "100": { state: "ready" } },
-    { observerProvedPostcondition: false, activeAttempt: true },
+    { "100": { state: "ready", last_verified_identity: readyProof } },
+    { observerProvedPostcondition: false, activeAttempt: true, nowMs },
   );
   assert.equal(noProof.state, "active");
   const waiting = lifecycleOwnershipAfterItemTransition(
