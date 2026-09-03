@@ -1202,6 +1202,89 @@ test("advanceWaveThroughLoop onRunReady emits loop_run_handoff with absolute eve
   assert.doesNotMatch(stdout, /loop_run_handoff/);
 });
 
+test("advanceWaveThroughLoop awaits onLoopReady inside onRunReady before the engine returns (#1301 3.1)", async () => {
+  const { advanceWaveThroughLoop } = await import("../scripts/pipeline.ts");
+  const pipelineSrc = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/pipeline.ts"),
+    "utf8",
+  );
+  const fnStart = pipelineSrc.indexOf("export async function advanceWaveThroughLoop");
+  const fnEnd = pipelineSrc.indexOf("/** Production default: read loop events");
+  assert.ok(fnStart >= 0 && fnEnd > fnStart, "advanceWaveThroughLoop source not found");
+  const ready = pipelineSrc.slice(fnStart, fnEnd);
+  const readyBlock = ready.slice(
+    ready.indexOf("onRunReady:"),
+    ready.indexOf("if (engineResult.kind === \"error\")"),
+  );
+  assert.match(readyBlock, /await opts\.onLoopReady/);
+  assert.doesNotMatch(
+    readyBlock.replace(/\s+/g, " "),
+    /void opts\.onLoopReady/,
+    "onLoopReady must not be fire-and-forget",
+  );
+
+  const fakeCfg = {
+    repo_dir: "/tmp/repo",
+    repo: "o/r",
+    base_branch: "main",
+    domain: "o-r",
+  };
+  let loopReadyResolved = false;
+  let resolvedBeforeEngineReturned = false;
+  await advanceWaveThroughLoop(
+    [10],
+    {
+      onLoopReady: async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        loopReadyResolved = true;
+      },
+    },
+    async () => ({
+      number: 10,
+      title: "t",
+      body: "",
+      labels: ["pipeline:ready-to-deploy"],
+      state: "open",
+    }),
+    async (input) => {
+      assert.ok(input.onRunReady, "advance-wave must wire onRunReady");
+      await input.onRunReady!({
+        runId: "loop-ready-1301",
+        runDir: "/abs/state/runs/loop-ready-1301",
+        events: "/abs/state/runs/loop-ready-1301/events.jsonl",
+        engine: "codex",
+        resumed: false,
+        selector: { type: "work-list", value: ["10"] },
+      });
+      resolvedBeforeEngineReturned = loopReadyResolved;
+      return {
+        kind: "drive",
+        result: {
+          runId: "loop-ready-1301",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 1,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
+      };
+    },
+    () => fakeCfg as never,
+    async () => [],
+    async () => {},
+  );
+  assert.equal(
+    resolvedBeforeEngineReturned,
+    true,
+    "onLoopReady must complete before runLoopEngine returns",
+  );
+});
+
 test("pipeline-cli: train --json stdout stays one train_status with run_id; handoff is stderr-only (#1277)", async () => {
   const { opts } = parseCli(["train", "--issues", "10,11", "--json"]);
   const trainCfg = {

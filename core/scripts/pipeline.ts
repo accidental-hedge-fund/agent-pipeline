@@ -415,6 +415,14 @@ export interface CliOpts {
    * Internal: train/ship handoff. Not a public CLI flag.
    */
   parentLogicalOperationId?: string;
+  /**
+   * Train live-link callback (#1301). Internal: awaited from `onRunReady`
+   * after the exact child run id and events path are known. Not a public CLI flag.
+   */
+  onLoopReady?: (loopRun: {
+    runId: string;
+    eventsPath?: string;
+  }) => void | Promise<void>;
   status?: boolean;
   summary?: boolean;
   unblock?: string;
@@ -3955,6 +3963,11 @@ export async function advanceWaveThroughLoop(
               ? { eventsPath: ctx.events }
               : {}),
           };
+          // Awaited: train_loop_linked must be durable before the engine
+          // returns and before the child can block on work (#1301).
+          if (opts.onLoopReady) {
+            await opts.onLoopReady(linkedLoop);
+          }
         }
       },
     });
@@ -4098,7 +4111,11 @@ export async function runTrainCommand(
       advanceWave: (issues, ctx) =>
         wave(
           issues,
-          { ...opts, parentLogicalOperationId: ctx?.logicalOperationId },
+          {
+            ...opts,
+            parentLogicalOperationId: ctx?.logicalOperationId,
+            onLoopReady: ctx?.onLoopReady,
+          },
           baseDeps.getIssue,
         ),
     },

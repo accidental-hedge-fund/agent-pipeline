@@ -127,7 +127,8 @@ Document allowlists and tokens in the **host** config, not in repository files.
 |---|---|
 | `schema_version` | Always `1` for this shape |
 | `kind` | Always `"train_status"` |
-| `run_id` | Additive durable train run id (`train-<timestamp>`) when the run store was initialized |
+| `run_id` | Additive durable train run id (`train-<timestamp>`) when the run store was initialized. Omitted when exclusive identity allocation cannot publish a store. |
+| `events_coverage` | Observational. Omitted (or `ok`) when the train event store published exclusively. `degraded` when every exclusive create collides (`EEXIST`) or a later observation fails. `unknown` when exclusive create fails with a non-`EEXIST` error before any claim. Does not change merge or advance. |
 | `ordered_issues` | Dependency-ordered issue numbers |
 | `current_issue` / `current_index` | Item in progress, or `null` / last when complete |
 | `next_action` | `advance` \| `merge` \| `wait-for-base` \| `next-item` \| `complete` \| `stopped` \| … |
@@ -148,7 +149,10 @@ Recommended pattern:
 1. Start train in a long-lived process (foreground, `systemd`, or host job runner).
 2. Parse stderr `train_run_handoff` for `run_id` and follow
    `pipeline logs <train-run-id> --events --follow | material-filter.mjs`.
-   Dual-follow `train_loop_linked` loop run ids. Re-arm until train `run_complete`.
+   Dual-follow `train_loop_linked` as soon as it appears — that event is published
+   from the child `onRunReady` handoff while the child can still be live.
+   Re-arm until train `run_complete`. When `events_coverage` is `degraded` or
+   `unknown`, do not treat a missing stream as a merge or advance blocker.
 3. On a timer (e.g. 5–15 minutes) or on process exit, post a short summary:
    - issue list / milestone
    - `complete` / `blocker` / current issue

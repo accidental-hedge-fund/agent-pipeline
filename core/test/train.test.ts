@@ -28,7 +28,10 @@ import {
 } from "../scripts/stages/train.ts";
 import {
   createTrainEventSession,
+  initTrainRunStore,
   TRAIN_EVENT_TYPES,
+  TRAIN_RUN_ID_MAX_EXCLUSIVE_ATTEMPTS,
+  trainRunIdForAttempt,
 } from "../scripts/train-events.ts";
 import {
   initRunDir,
@@ -115,6 +118,46 @@ function trainEventsPath(store: ReturnType<typeof memRunStore>): string | undefi
   );
 }
 
+function trainEventPaths(store: ReturnType<typeof memRunStore>): string[] {
+  const keys = new Set([...store.appends.keys(), ...store.files.keys()]);
+  return [...keys].filter((p) => /[/\\]train-[^/\\]+[/\\]events\.jsonl$/.test(p)).sort();
+}
+
+function eventsFromPath(
+  store: ReturnType<typeof memRunStore>,
+  eventsPath: string,
+): Record<string, unknown>[] {
+  return store
+    .readFile(eventsPath)
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+function errno(code: string, p = ""): NodeJS.ErrnoException {
+  const e = new Error(`${code}: ${p}`) as NodeJS.ErrnoException;
+  e.code = code;
+  return e;
+}
+
+function installExclusiveMkdir(
+  store: ReturnType<typeof memRunStore>,
+  fail?: (p: string, recursive: boolean) => NodeJS.ErrnoException | void,
+): { created: Set<string>; attempts: string[] } {
+  const created = new Set<string>();
+  const attempts: string[] = [];
+  store.deps.mkdir = async (p, opts) => {
+    attempts.push(`${opts.recursive ? "rec" : "ex"}:${path.basename(p)}`);
+    const forced = fail?.(p, opts.recursive);
+    if (forced) throw forced;
+    if (!opts.recursive) {
+      if (created.has(p)) throw errno("EEXIST", p);
+      created.add(p);
+    }
+  };
+  return { created, attempts };
+}
+
 function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
   advanceCalls: number[];
   waveCalls: number[][];
@@ -164,9 +207,9 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
       if (!s) throw new Error(`missing issue ${n}`);
       return s;
     },
-    async advanceWave(issueList) {
+    async advanceWave(issueList, ctx) {
       waveCalls.push([...issueList]);
-      if (userAdvanceWave) return userAdvanceWave(issueList);
+      if (userAdvanceWave) return userAdvanceWave(issueList, ctx);
       const single = userAdvanceIssue ?? defaultAdvance;
       const out: AdvanceWaveResult = new Map();
       for (const n of issueList) {
@@ -215,9 +258,9 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
     },
     ...overrides,
     // Always keep our advanceWave wrapper (overrides.advanceWave handled inside).
-    advanceWave: async (issueList) => {
+    advanceWave: async (issueList, ctx) => {
       waveCalls.push([...issueList]);
-      if (userAdvanceWave) return userAdvanceWave(issueList);
+      if (userAdvanceWave) return userAdvanceWave(issueList, ctx);
       const single = userAdvanceIssue ?? defaultAdvance;
       const out: AdvanceWaveResult = new Map();
       for (const n of issueList) {
@@ -2218,7 +2261,8 @@ test("train events: train_loop_linked records a confirmed wave loop id (#1277 1.
   const loopId = "2026-08-28T17-28-03-000Z";
   const loopEvents = `/abs/state/runs/${loopId}/events.jsonl`;
   const deps = makeDeps({
-    async advanceWave(issueList) {
+    async advanceWave(issueList, ctx) {
+      await ctx?.onLoopReady?.({ runId: loopId, eventsPath: loopEvents });
       const out: AdvanceWaveResult = new Map();
       for (const n of issueList) {
         out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
@@ -2479,6 +2523,345 @@ test("train events: TRAIN_EVENT_TYPES catalog is closed", () => {
     "train_wave_ended",
     "run_complete",
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// Train evidence integrity (#1301)
+// ---------------------------------------------------------------------------
+
+test("train events: live onLoopReady publishes train_loop_linked before the child is terminal (#1301 1.1)", async () => {
+  let releaseWave!: () => void;
+  const waveGate = new Promise<void>((resolve) => {
+    releaseWave = resolve;
+  });
+  let resolveLive!: (linked: boolean) => void;
+  const liveSeen = new Promise<boolean>((resolve) => {
+    resolveLive = resolve;
+  });
+  const deps = makeDeps({
+    async advanceWave(issueList, ctx) {
+      await ctx?.onLoopReady?.({
+        runId: "abc",
+        eventsPath: "/abs/E",
+      });
+      resolveLive(
+        trainEventsFromStore(deps.store).some(
+          (e) => e.type === "train_loop_linked" && e.loop_run_id === "abc" && e.events === "/abs/E",
+        ),
+      );
+      await waveGate;
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      out.loopRun = { runId: "abc", eventsPath: "/abs/E" };
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  const done = runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  const linkedBeforeTerminal = await liveSeen;
+  assert.equal(
+    linkedBeforeTerminal,
+    true,
+    "train_loop_linked must exist before the child loop is terminal",
+  );
+  releaseWave();
+  await done;
+});
+
+test("train events: duplicate live + wave-result handoff appends one train_loop_linked (#1301 1.2)", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList, ctx) {
+      await ctx?.onLoopReady?.({ runId: "abc", eventsPath: "/abs/E" });
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      out.loopRun = { runId: "abc", eventsPath: "/abs/E" };
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  const linked = trainEventsFromStore(deps.store).filter((e) => e.type === "train_loop_linked");
+  assert.equal(linked.length, 1, "duplicate handoff must not append a second link");
+  assert.equal(linked[0]!.loop_run_id, "abc");
+  assert.equal(linked[0]!.events, "/abs/E");
+});
+
+test("train events: same-clock trains get distinct exclusive stores (#1301 1.3)", async () => {
+  const store = memRunStore();
+  installExclusiveMkdir(store);
+  const startedAt = new Date("2026-08-28T17:28:03.000Z");
+  const input = {
+    repoDir: "/tmp/repo",
+    repo: "o/r",
+    startedAt,
+    mergeMode: false,
+    orderedIssues: [10, 11] as const,
+    selector: { issues: [10, 11] },
+    store: store.deps,
+    now: () => startedAt,
+  };
+  const first = await initTrainRunStore(input);
+  const second = await initTrainRunStore(input);
+  assert.ok(first.session, "first train must publish a store");
+  assert.ok(second.session, "second train must publish a store");
+  assert.notEqual(first.session!.runId, second.session!.runId);
+  assert.ok(first.session!.runId.startsWith("train-"));
+  assert.ok(second.session!.runId.startsWith("train-"));
+  assert.equal(first.session!.runId, trainRunIdForAttempt(startedAt, 1));
+  assert.equal(second.session!.runId, trainRunIdForAttempt(startedAt, 2));
+  const paths = trainEventPaths(store);
+  assert.equal(paths.length, 2);
+  const seqs = paths.map((p) => eventsFromPath(store, p).map((e) => e.seq));
+  assert.ok(
+    !paths.some((p) => path.basename(path.dirname(p)) !== first.session!.runId
+      && path.basename(path.dirname(p)) !== second.session!.runId),
+  );
+  assert.deepEqual(seqs[0], [1]);
+  assert.deepEqual(seqs[1], [1]);
+  assert.notEqual(first.session!.runDir, second.session!.runDir);
+});
+
+test("train events: exhausted exclusive allocation degrades coverage and continues mutations (#1301 1.4)", async () => {
+  const deps = makeDeps();
+  const { attempts } = installExclusiveMkdir(deps.store, (p, recursive) => {
+    if (!recursive && path.basename(p).startsWith("train-")) return errno("EEXIST", p);
+  });
+  deps.seedIssue(snap(10, "a", ["pipeline:ready-to-deploy"]));
+  deps.seedIssue(snap(11, "b independent", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(10, 20);
+  deps.seedPr(11, 21);
+  const result = await runTrain(baseOpts({ issues: [10, 11], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.equal(result.status.events_coverage, "degraded");
+  assert.equal(result.status.run_id, undefined);
+  assert.equal(result.status.schema_version, 1);
+  assert.equal(result.status.kind, "train_status");
+  assert.equal(trainEventPaths(deps.store).length, 0);
+  assert.ok(
+    !deps.handoffLines.some((line) => line.includes("train_run_handoff")),
+    "exhausted allocation must not flush train_run_handoff",
+  );
+  assert.deepEqual(deps.mergeCalls.slice().sort((a, b) => a - b), [20, 21]);
+  assert.equal(result.status.items.filter((i) => i.integrated).length, 2);
+  assert.equal(
+    attempts.filter((a) => a.startsWith("ex:train-")).length,
+    TRAIN_RUN_ID_MAX_EXCLUSIVE_ATTEMPTS,
+  );
+});
+
+test("train events: already-contained merge emits proven with already-contained disposition (#1301 1.5)", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "done", ["pipeline:ready-to-deploy"]));
+  deps.seedMergedPrAnyState(10, 20);
+  const result = await runTrain(baseOpts({ issues: [10], merge: true }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.equal(deps.mergeCalls.length, 0);
+  const events = trainEventsFromStore(deps.store);
+  const proven = events.filter((e) => e.type === "train_merge_proven");
+  const integrated = events.filter((e) => e.type === "train_merge_integrated");
+  assert.equal(proven.length, 1, "already-contained must emit train_merge_proven");
+  assert.equal(proven[0]!.proof_disposition, "already-contained");
+  assert.equal(proven[0]!.issue, 10);
+  assert.equal(proven[0]!.pr, 20);
+  assert.equal(typeof proven[0]!.merge_result_oid, "string");
+  assert.equal(integrated.length, 1);
+  assert.equal(integrated[0]!.proof_disposition, undefined);
+  assert.ok(
+    events.findIndex((e) => e.type === "train_merge_proven") <
+      events.findIndex((e) => e.type === "train_merge_integrated"),
+  );
+});
+
+test("train events: newly-merged item emits proven with newly-merged disposition (#1301 1.6)", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "a", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(10, 20);
+  await runTrain(baseOpts({ issues: [10], merge: true }), deps);
+  const events = trainEventsFromStore(deps.store);
+  const proven = events.filter((e) => e.type === "train_merge_proven");
+  const integrated = events.filter((e) => e.type === "train_merge_integrated");
+  assert.equal(proven.length, 1);
+  assert.equal(proven[0]!.proof_disposition, "newly-merged");
+  assert.equal(proven[0]!.issue, 10);
+  assert.equal(proven[0]!.pr, 20);
+  assert.equal(typeof proven[0]!.merge_result_oid, "string");
+  assert.equal(integrated.length, 1);
+  assert.equal(integrated[0]!.proof_disposition, undefined);
+  assert.ok(
+    events.findIndex((e) => e.type === "train_merge_proven") <
+      events.findIndex((e) => e.type === "train_merge_integrated"),
+  );
+});
+
+test("train events: conflicting later handoff keeps first link and degrades coverage (#1301 1.7)", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList, ctx) {
+      await ctx?.onLoopReady?.({ runId: "abc", eventsPath: "/abs/E" });
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      out.loopRun = { runId: "xyz", eventsPath: "/abs/F" };
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.status.events_coverage, "degraded");
+  assert.equal(result.status.run_id, "train-2026-08-28T17-28-03-000Z");
+  const linked = trainEventsFromStore(deps.store).filter((e) => e.type === "train_loop_linked");
+  assert.equal(linked.length, 1);
+  assert.equal(linked[0]!.loop_run_id, "abc");
+  assert.equal(linked[0]!.events, "/abs/E");
+});
+
+test("train events: non-EEXIST exclusive mkdir is unknown and does not suffix-retry (#1301 1.8)", async () => {
+  const deps = makeDeps();
+  const { attempts } = installExclusiveMkdir(deps.store, (p, recursive) => {
+    if (!recursive && path.basename(p).startsWith("train-")) return errno("EACCES", p);
+  });
+  deps.seedIssue(snap(10, "a", ["pipeline:ready-to-deploy"]));
+  deps.seedIssue(snap(11, "b independent", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(10, 20);
+  deps.seedPr(11, 21);
+  const result = await runTrain(baseOpts({ issues: [10, 11], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.equal(result.status.events_coverage, "unknown");
+  assert.equal(result.status.run_id, undefined);
+  assert.ok(!attempts.some((a) => a.startsWith("ex:train-") && a.endsWith("-2")));
+  assert.equal(trainEventPaths(deps.store).length, 0);
+  assert.deepEqual(deps.mergeCalls.slice().sort((a, b) => a - b), [20, 21]);
+});
+
+test("train events: failed train_loop_linked append degrades coverage and continues (#1301 1.9)", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList, ctx) {
+      await ctx?.onLoopReady?.({ runId: "abc", eventsPath: "/abs/E" });
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      return out;
+    },
+  });
+  const origAppend = deps.store.deps.appendFile;
+  deps.store.deps.appendFile = async (p, data) => {
+    if (String(data).includes('"type":"train_loop_linked"')) {
+      throw new Error("disk full");
+    }
+    return origAppend(p, data);
+  };
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.status.events_coverage, "degraded");
+  assert.equal(result.status.run_id, "train-2026-08-28T17-28-03-000Z");
+  assert.equal(result.status.kind, "train_status");
+});
+
+test("train events: wave-result loopRun is not an append site when onLoopReady never fired (#1301 3.2)", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      out.loopRun = { runId: "guessed", eventsPath: "/abs/missing.jsonl" };
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.ok(!trainEventsFromStore(deps.store).some((e) => e.type === "train_loop_linked"));
+});
+
+test("train events: EEXIST collision writes only the suffix directory (#1301 2.1)", async () => {
+  const store = memRunStore();
+  const colliding = `/tmp/repo/.agent-pipeline/runs/${trainRunIdForAttempt(new Date("2026-08-28T17:28:03.000Z"), 1)}`;
+  installExclusiveMkdir(store);
+  await store.deps.mkdir(colliding, { recursive: false });
+  await store.deps.writeFile(`${colliding}/run.json`, JSON.stringify({ run_id: "other" }));
+  await store.deps.appendFile(`${colliding}/events.jsonl`, '{"seq":9,"type":"run_start"}\n');
+  const startedAt = new Date("2026-08-28T17:28:03.000Z");
+  const init = await initTrainRunStore({
+    repoDir: "/tmp/repo",
+    repo: "o/r",
+    startedAt,
+    mergeMode: false,
+    orderedIssues: [10],
+    selector: { issues: [10] },
+    store: store.deps,
+    now: () => startedAt,
+  });
+  assert.ok(init.session);
+  assert.equal(init.session!.runId, trainRunIdForAttempt(startedAt, 2));
+  assert.equal(init.eventsCoverage, "ok");
+  const collidingEvents = eventsFromPath(store, `${colliding}/events.jsonl`);
+  assert.equal(collidingEvents.length, 1);
+  assert.equal(collidingEvents[0]!.seq, 9);
+  assert.ok(!store.files.has(`${colliding}/write-health.json`));
+});
+
+test("train events: store-init failure after exclusive claim is degraded and does not write a sibling (#1301 2.3)", async () => {
+  const store = memRunStore();
+  installExclusiveMkdir(store);
+  const origWrite = store.deps.writeFile;
+  store.deps.writeFile = async (p, data) => {
+    if (p.endsWith("run.json")) throw new Error("ENOSPC");
+    return origWrite(p, data);
+  };
+  const startedAt = new Date("2026-08-28T17:28:03.000Z");
+  const init = await initTrainRunStore({
+    repoDir: "/tmp/repo",
+    repo: "o/r",
+    startedAt,
+    mergeMode: false,
+    orderedIssues: [10],
+    selector: { issues: [10] },
+    store: store.deps,
+    now: () => startedAt,
+  });
+  assert.equal(init.session, null);
+  assert.equal(init.eventsCoverage, "degraded");
+  assert.equal(trainEventPaths(store).length, 0);
+});
+
+test("train events: successful claim omits events_coverage and sets run_id (#1301 2.3)", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1, "a"));
+  const result = await runTrain(baseOpts({ issues: [1], merge: false }), deps);
+  assert.equal(result.status.run_id, "train-2026-08-28T17-28-03-000Z");
+  assert.equal(result.status.events_coverage, undefined);
+  assert.equal(result.status.schema_version, 1);
+});
+
+test("trainRunIdForAttempt: suffix keeps train- prefix and stays within 8 attempts", () => {
+  const at = new Date("2026-08-28T17:28:03.000Z");
+  assert.equal(trainRunIdForAttempt(at, 1), "train-2026-08-28T17-28-03-000Z");
+  assert.equal(trainRunIdForAttempt(at, 2), "train-2026-08-28T17-28-03-000Z-2");
+  assert.equal(trainRunIdForAttempt(at, 8), "train-2026-08-28T17-28-03-000Z-8");
+  assert.equal(TRAIN_RUN_ID_MAX_EXCLUSIVE_ATTEMPTS, 8);
+  assert.ok(!/^\d+-/.test(trainRunIdForAttempt(at, 8)));
 });
 
 test("train merge: Cooling item does not abandon independent siblings (#1330)", async () => {
