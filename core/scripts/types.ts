@@ -251,7 +251,8 @@ export interface ModelEndpointProvenance {
 // `setBlocked` posts the same "## Pipeline: Blocked" comment for every blocker,
 // but the recovery VERB differs per class: a test-gate failure wants "fix the
 // test, commit, re-run"; a merge conflict wants "rebase, push, re-run"; a
-// needs-human off-ramp wants "fix or --override". The uniform `--unblock` hint
+// needs-human off-ramp wants recover-parked first, then a human disposition
+// (override is operator-supplied, not a host next action). The uniform `--unblock` hint
 // (a label-clear + comment, no recovery) is the right verb for none of these.
 // The call site always knows its class, so the recipe is a static lookup over a
 // closed enum — not an inference about repo state.
@@ -318,12 +319,17 @@ export const DEFAULT_BLOCKER_KIND: BlockerKind = "needs-human";
  */
 export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
   "needs-human":
-    "A human decision is required. Fix the findings described above, remove the " +
-    "`blocked` label, and re-run `$pipeline {{N}}`. Or record an " +
-    "audited disposition with " +
-    '`$pipeline {{N}} --override "<finding-key>: <reason>"` to advance past an ' +
-    "accepted or out-of-scope finding (the key comes from the review comment; " +
-    "`--override` clears the label and resumes automatically).",
+    "A residual review park requires recovery first. Run `$pipeline recover-parked {{N}}` " +
+    "at most once for the current park fingerprint. If the issue remains parked, stop " +
+    "and request an exact operator-supplied disposition — do not invent an override key " +
+    "or reason, and do not treat this recipe as authority for an autonomous host to " +
+    "execute override. A human may fix the findings described above and re-run " +
+    "`$pipeline {{N}}`. The exact disposition is operator-supplied or explicitly " +
+    "approved; an operator may record it with " +
+    '`$pipeline {{N}} --override "<finding-key>: <reason>"` (the key comes from the ' +
+    "review comment; `--override` clears the label and resumes automatically). That " +
+    "override command is the human decision path, not host authority to execute it. " +
+    "Do not remove the `blocked` label from the host.",
   "review-findings":
     "Blocking review findings remain after the stage-local fix budget. The durable " +
     "controller owns bounded remediation and a fresh review. If automated recovery " +
@@ -454,13 +460,18 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
   "human-decision-required":
     "The fix harness determined that the correct next step is a human " +
     "product decision, an authority it lacks, or an unavailable external " +
-    "capability — not a code change. Read the recorded decision request(s) " +
-    "above, make the decision, and either fix the underlying blocker and " +
-    "remove the `blocked` label to re-run `$pipeline {{N}}`, or record an " +
-    "audited disposition with " +
-    '`$pipeline {{N}} --override "<finding-key>: <reason>"` to advance past ' +
-    "it (the key comes from the review comment; `--override` clears the " +
-    "label and resumes automatically).",
+    "capability — not a code change. Run `$pipeline recover-parked {{N}}` at " +
+    "most once if this residual park may still be unspent. If the issue remains " +
+    "parked, stop and request an exact operator-supplied disposition. Read the " +
+    "recorded decision request(s) above. Do not invent an override key or reason, " +
+    "and do not treat this recipe as authority for an autonomous host to execute " +
+    "override. A human may fix the underlying blocker and re-run `$pipeline {{N}}`. " +
+    "The exact disposition is operator-supplied or explicitly approved; an operator " +
+    "may record it with " +
+    '`$pipeline {{N}} --override "<finding-key>: <reason>"` (the key comes from ' +
+    "the review comment; `--override` clears the label and resumes automatically). " +
+    "That override command is the human decision path, not host authority to " +
+    "execute it. Do not remove the `blocked` label from the host.",
   "ci-exhausted":
     "Pre-merge GitHub CI recovery budget for this head SHA is exhausted " +
     "(automatic re-run / archive-aware recovery / optional assertion fix may " +

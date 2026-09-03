@@ -30,7 +30,7 @@ discover a run id.
 ```
 pipeline status <n>                                 Read-only — print stage, blocker, PR, last review
 pipeline unblock <n> "<answer>"                     Post an answer and clear the blocked label
-pipeline override <n> "<key>: <reason>"             Disposition a review finding and auto-resume the advance loop
+pipeline override <n> "<key>: <reason>"             Operator-supplied or explicitly approved exact disposition ("<key>: <reason>"); auto-resumes. Not an autonomous host next action
 pipeline recover-parked <n> [--json] [--dry-run]    One supervisor pass for a parked issue: deterministic recover first (including publish of an unpublished stage commit), then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); pre-PR engine parks re-enter without a linked PR; re-enter single if clear
 pipeline summary <issue-number|run-id>              Print the run evidence bundle for an issue number or exact run-id
 pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke] Deterministic preflight check; print summary, exit 0/1. Reports continuous liveness as configured/available/active/degraded/unavailable without treating absence as human authority. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
@@ -92,6 +92,12 @@ Do not treat them as seconds-only or as fire-and-forget.
 The follower or observer never invokes a merge-capable command: `merge`,
 `merge-queue --apply`, `train --merge`, or `ship`.
 
+Residual review park at current HEAD: the host MAY run `pipeline recover-parked <N>`
+at most once for the current park fingerprint. If the issue remains parked, STOP
+in the same turn and notify a human. Never invent `pipeline override` or remove
+`blocked` / `pipeline:needs-human`. Do not invoke `recover-parked` from inside
+`pipeline train`.
+
 ### Host notify map
 
 Select the row for the active host. Shared orchestration does not hard-require
@@ -116,6 +122,7 @@ Operator-authorized, non-advance surfaces:
 - `pipeline merge-queue --apply` (merge-queue is dry-run by default unless `--apply` is explicit)
 - `pipeline train --merge`
 - `pipeline ship --milestone`
+- `pipeline override <n> "<key>: <reason>"` — operator-supplied or explicitly approved exact key and reason. The host must not invent that disposition.
 
 `Ship milestone vX.Y.Z` maps to `pipeline ship --milestone vX.Y.Z`. No grant
 file is required.

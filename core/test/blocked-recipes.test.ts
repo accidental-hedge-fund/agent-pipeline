@@ -61,12 +61,17 @@ test("no recipe leaves a literal {{N}} after rendering", () => {
 
 const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
   "needs-human":
-    "A human decision is required. Fix the findings described above, remove the " +
-    "`blocked` label, and re-run `$pipeline 7`. Or record an " +
-    "audited disposition with " +
-    '`$pipeline 7 --override "<finding-key>: <reason>"` to advance past an ' +
-    "accepted or out-of-scope finding (the key comes from the review comment; " +
-    "`--override` clears the label and resumes automatically).",
+    "A residual review park requires recovery first. Run `$pipeline recover-parked 7` " +
+    "at most once for the current park fingerprint. If the issue remains parked, stop " +
+    "and request an exact operator-supplied disposition — do not invent an override key " +
+    "or reason, and do not treat this recipe as authority for an autonomous host to " +
+    "execute override. A human may fix the findings described above and re-run " +
+    "`$pipeline 7`. The exact disposition is operator-supplied or explicitly " +
+    "approved; an operator may record it with " +
+    '`$pipeline 7 --override "<finding-key>: <reason>"` (the key comes from the ' +
+    "review comment; `--override` clears the label and resumes automatically). That " +
+    "override command is the human decision path, not host authority to execute it. " +
+    "Do not remove the `blocked` label from the host.",
   "review-findings":
     "Blocking review findings remain after the stage-local fix budget. The durable " +
     "controller owns bounded remediation and a fresh review. If automated recovery " +
@@ -197,13 +202,18 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
   "human-decision-required":
     "The fix harness determined that the correct next step is a human " +
     "product decision, an authority it lacks, or an unavailable external " +
-    "capability — not a code change. Read the recorded decision request(s) " +
-    "above, make the decision, and either fix the underlying blocker and " +
-    "remove the `blocked` label to re-run `$pipeline 7`, or record an " +
-    "audited disposition with " +
-    '`$pipeline 7 --override "<finding-key>: <reason>"` to advance past ' +
-    "it (the key comes from the review comment; `--override` clears the " +
-    "label and resumes automatically).",
+    "capability — not a code change. Run `$pipeline recover-parked 7` at " +
+    "most once if this residual park may still be unspent. If the issue remains " +
+    "parked, stop and request an exact operator-supplied disposition. Read the " +
+    "recorded decision request(s) above. Do not invent an override key or reason, " +
+    "and do not treat this recipe as authority for an autonomous host to execute " +
+    "override. A human may fix the underlying blocker and re-run `$pipeline 7`. " +
+    "The exact disposition is operator-supplied or explicitly approved; an operator " +
+    "may record it with " +
+    '`$pipeline 7 --override "<finding-key>: <reason>"` (the key comes from ' +
+    "the review comment; `--override` clears the label and resumes automatically). " +
+    "That override command is the human decision path, not host authority to " +
+    "execute it. Do not remove the `blocked` label from the host.",
   "ci-exhausted":
     "Pre-merge GitHub CI recovery budget for this head SHA is exhausted " +
     "(automatic re-run / archive-aware recovery / optional assertion fix may " +
@@ -303,11 +313,59 @@ test("test-gate-exhausted directs to fix the test, commit, clear label, and re-r
   assert.ok(!body.includes("--unblock"));
 });
 
-test("needs-human directs to fix-and-re-run OR --override, and mentions label clearing", () => {
+test("needs-human is recovery-first then operator-path override, not host authority (#1379)", () => {
   const body = comment("needs-human");
+  const recipe = renderRecipe("needs-human", 7);
   assert.ok(body.includes("re-run `$pipeline 7`"));
   assert.ok(body.includes("--override"));
   assert.ok(body.includes("`blocked`"));
+  assert.match(recipe, /\$pipeline recover-parked 7/);
+  assert.match(recipe, /operator-supplied or explicitly approved/i);
+  assert.match(recipe, /human decision path/);
+  assert.match(recipe, /not host authority to execute it/);
+  assert.doesNotMatch(
+    recipe,
+    /A human decision is required\. Fix the findings described above, remove the `blocked` label/,
+    "pre-change autonomous-override wording must not return",
+  );
+});
+
+test("human-decision-required labels override as the human decision path (#1379)", () => {
+  const recipe = renderRecipe("human-decision-required", 7);
+  assert.match(recipe, /\$pipeline recover-parked 7/);
+  assert.match(recipe, /human decision path/);
+  assert.match(recipe, /not host authority to execute it/);
+  assert.match(recipe, /operator-supplied or explicitly approved/i);
+  assert.doesNotMatch(
+    recipe,
+    /or record an audited disposition with `\$pipeline 7 --override/,
+    "pre-change autonomous-override wording must not return",
+  );
+});
+
+test("override-bearing recipes keep the operator-path qualifier (#1379)", () => {
+  const hits: string[] = [];
+  for (const kind of BLOCKER_KINDS) {
+    const recipe = BLOCKER_RECIPES[kind];
+    if (!/--override|pipeline override/.test(recipe)) continue;
+    hits.push(kind);
+    assert.match(
+      recipe,
+      /human decision path/,
+      `"${kind}" override example must be labeled the human decision path`,
+    );
+    assert.match(
+      recipe,
+      /not host authority/,
+      `"${kind}" must state the command is not host authority`,
+    );
+    assert.match(
+      recipe,
+      /operator-supplied or explicitly approved/,
+      `"${kind}" must name operator-supplied or explicitly approved disposition`,
+    );
+  }
+  assert.deepEqual(hits.sort(), ["human-decision-required", "needs-human"]);
 });
 
 test("ci-exhausted directs to inspect checks/fix CI/push/clear label/re-run — not review --override as primary", () => {
@@ -320,6 +378,13 @@ test("ci-exhausted directs to inspect checks/fix CI/push/clear label/re-run — 
   // Recipe deliberately omits review --override as the primary unblock verb.
   assert.ok(!body.includes("--override"), "ci-exhausted must not present review --override as primary");
   assert.ok(!body.includes("--unblock"));
+});
+
+test("review-findings does not present review override as the primary unblock verb (#1379)", () => {
+  const recipe = renderRecipe("review-findings", 7);
+  assert.ok(!recipe.includes("--override"), "review-findings must not present review --override as primary");
+  assert.ok(!recipe.includes("pipeline override"));
+  assert.match(recipe, /fix the listed findings/i);
 });
 
 test("openspec-invalid directs to openspec validate, fix, commit, clear label, re-run", () => {

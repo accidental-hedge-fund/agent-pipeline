@@ -5,13 +5,18 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   buildStatusPayload,
+  classifyRecoverParkedSpend,
+  deriveHostGuidance,
   deriveNextAction,
   deriveStatus,
   formatWriteHealthStatusWarning,
+  HOST_GUIDANCE_VALUES,
   largestConfiguredStageTimeoutSec,
+  type HostGuidance,
   type StageTimeoutConfig,
   type StatusIssueDetail,
 } from "../scripts/status-json.ts";
+import { formatRecoverParkedSpentComment } from "../scripts/recover-parked.ts";
 import type { WriteHealthRecord } from "../scripts/run-store.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -55,6 +60,7 @@ test("buildStatusPayload: all minimum fields are present", () => {
   assert.ok("last_event" in payload);
   assert.ok("review_summary" in payload);
   assert.ok("next_action" in payload);
+  assert.ok("host_guidance" in payload);
   assert.ok("config" in payload);
   assert.ok("possibly_wedged" in payload);
   assert.ok("event_stream_write_health" in payload);
@@ -385,8 +391,31 @@ test("deriveNextAction: blocked flag overrides stage description", () => {
   assert.match(out, /unblock/i);
 });
 
-test("deriveNextAction: needs-human → human decision required", () => {
-  assert.match(deriveNextAction("needs-human", false), /human decision/i);
+test("deriveNextAction: needs-human → human disposition required, not autonomous override (#1379)", () => {
+  const out = deriveNextAction("needs-human", false);
+  assert.match(out, /human disposition required/i);
+  assert.doesNotMatch(
+    out,
+    /use `--override "<key>: <reason>"` or fix residual findings/,
+    "pre-change autonomous override instruction must not return",
+  );
+  assert.doesNotMatch(out, /use `--override/);
+  assert.doesNotMatch(out, /run `pipeline override`/);
+});
+
+test("deriveNextAction: recover-parked guidance names recover-parked then STOP (#1379)", () => {
+  const out = deriveNextAction("needs-human", false, "recover-parked");
+  assert.match(out, /pipeline recover-parked/);
+  assert.match(out, /remains parked/i);
+  assert.match(out, /operator-supplied disposition/i);
+  assert.doesNotMatch(out, /use `--override/);
+});
+
+test("deriveNextAction: human-disposition-required forbids invented override (#1379)", () => {
+  const out = deriveNextAction("needs-human", false, "human-disposition-required");
+  assert.match(out, /stop and request an exact operator-supplied disposition/i);
+  assert.doesNotMatch(out, /use `--override/);
+  assert.match(out, /do not invoke `pipeline override`/i);
 });
 
 test("deriveNextAction: ready-to-deploy → awaiting operator-authorized merge", () => {
@@ -453,6 +482,205 @@ test("event_stream_write_health: healthy writeHealth stays null (does not invent
     },
   );
   assert.equal(payload.event_stream_write_health, null);
+});
+
+// ---------------------------------------------------------------------------
+// host_guidance (#1379)
+// ---------------------------------------------------------------------------
+
+const PRE_CHANGE_AUTONOMOUS_OVERRIDE =
+  /use `--override "<key>: <reason>"` or fix residual findings/;
+
+function residualReviewComment(): StatusIssueDetail["comments"][number] {
+  return {
+    author: "bot",
+    body: [
+      "## Review 1 — needs-attention (commit abc1234)",
+      "**Reviewer**: codex",
+      "",
+      "### Findings",
+      "**1. [MEDIUM] Missing test** (confidence: 0.8) `override-key: abcd1234`",
+    ].join("\n"),
+    createdAt: "2026-09-01T00:00:00Z",
+  };
+}
+
+function spentComment(issue: number, stage: string): StatusIssueDetail["comments"][number] {
+  return {
+    author: "bot",
+    body: formatRecoverParkedSpentComment({
+      fingerprint: "deadbeefdeadbeef",
+      issue,
+      stage,
+      keys: ["abcd1234"],
+      at: "2026-09-02T00:00:00Z",
+    }),
+    createdAt: "2026-09-02T00:00:00Z",
+  };
+}
+
+test("host_guidance closed enum round-trips each value without schema bump (#1379)", () => {
+  const fixtures: Array<{ labels: string[]; comments?: StatusIssueDetail["comments"]; expected: HostGuidance }> = [
+    { labels: ["pipeline:review-1"], expected: "continue" },
+    { labels: ["pipeline:needs-human"], expected: "recover-parked" },
+    {
+      labels: ["pipeline:needs-human"],
+      comments: [spentComment(154, "needs-human")],
+      expected: "human-disposition-required",
+    },
+    { labels: ["pipeline:ready-to-deploy"], expected: "operator-merge" },
+  ];
+  const seen = new Set<HostGuidance>();
+  for (const f of fixtures) {
+    const payload = buildStatusPayload(
+      makeDetail({ labels: f.labels, comments: f.comments ?? [] }),
+      null,
+      null,
+      CFG,
+    );
+    assert.equal(payload.schema_version, "1");
+    assert.equal(payload.host_guidance, f.expected);
+    seen.add(payload.host_guidance);
+  }
+  for (const value of HOST_GUIDANCE_VALUES) {
+    assert.ok(seen.has(value), `missing round-trip fixture for host_guidance=${value}`);
+  }
+  assert.deepEqual([...HOST_GUIDANCE_VALUES], [
+    "continue",
+    "recover-parked",
+    "human-disposition-required",
+    "operator-merge",
+  ]);
+});
+
+test("host_guidance: unspent residual park projects recover-parked (#1379)", () => {
+  const payload = buildStatusPayload(
+    makeDetail({ labels: ["pipeline:needs-human"], comments: [] }),
+    null,
+    null,
+    CFG,
+  );
+  assert.equal(payload.host_guidance, "recover-parked");
+  assert.match(payload.next_action, /pipeline recover-parked/);
+  assert.doesNotMatch(payload.next_action, PRE_CHANGE_AUTONOMOUS_OVERRIDE);
+  assert.equal(payload.schema_version, "1");
+});
+
+test("host_guidance: spent fingerprint projects human-disposition-required (#1379)", () => {
+  const payload = buildStatusPayload(
+    makeDetail({
+      number: 154,
+      labels: ["pipeline:needs-human"],
+      comments: [spentComment(154, "needs-human")],
+    }),
+    null,
+    null,
+    CFG,
+  );
+  assert.equal(payload.host_guidance, "human-disposition-required");
+  assert.match(payload.next_action, /operator-supplied disposition/i);
+  assert.doesNotMatch(payload.next_action, PRE_CHANGE_AUTONOMOUS_OVERRIDE);
+  assert.equal(payload.schema_version, "1");
+});
+
+test("host_guidance: unknown spend fails closed to human-disposition-required (#1379)", () => {
+  const unknownSpendComments = [
+    {
+      author: "bot",
+      body:
+        "## Pipeline: recover-parked supervisor pass spent\n" +
+        "<!-- pipeline-recover-parked-spent: v1 {not-json} -->",
+      createdAt: "2026-09-02T00:00:00Z",
+    },
+  ];
+  assert.equal(
+    classifyRecoverParkedSpend({
+      issue: 154,
+      stage: "needs-human",
+      comments: unknownSpendComments,
+    }),
+    "unknown",
+  );
+  const payload = buildStatusPayload(
+    makeDetail({ labels: ["pipeline:needs-human"], comments: unknownSpendComments }),
+    null,
+    null,
+    CFG,
+  );
+  assert.equal(payload.host_guidance, "human-disposition-required");
+  assert.notEqual(payload.host_guidance, "recover-parked");
+  assert.doesNotMatch(payload.next_action, PRE_CHANGE_AUTONOMOUS_OVERRIDE);
+});
+
+test("host_guidance: ready-to-deploy projects operator-merge (#1379)", () => {
+  const payload = buildStatusPayload(
+    makeDetail({ labels: ["pipeline:ready-to-deploy"] }),
+    42,
+    null,
+    CFG,
+  );
+  assert.equal(payload.host_guidance, "operator-merge");
+  assert.match(payload.next_action, /operator-authorized merge/i);
+});
+
+test("blocked residual park does not instruct unblock or autonomous override (#1379)", () => {
+  const payload = buildStatusPayload(
+    makeDetail({
+      labels: ["pipeline:review-1", "blocked"],
+      comments: [
+        residualReviewComment(),
+        {
+          author: "bot",
+          body: "## Pipeline: Blocked at review 1\n<!-- pipeline-blocker-kind: needs-human -->",
+          createdAt: "2026-09-01T01:00:00Z",
+        },
+      ],
+    }),
+    null,
+    null,
+    CFG,
+  );
+  assert.ok(
+    payload.host_guidance === "recover-parked" ||
+      payload.host_guidance === "human-disposition-required",
+  );
+  assert.doesNotMatch(payload.next_action, PRE_CHANGE_AUTONOMOUS_OVERRIDE);
+  assert.doesNotMatch(payload.next_action, /Unblock with `--unblock/);
+  assert.doesNotMatch(payload.next_action, /remove the `blocked` label/);
+});
+
+test("question-blocked non-park keeps typed unblock next_action (#1379)", () => {
+  const payload = buildStatusPayload(
+    makeDetail({
+      labels: ["pipeline:implementing", "blocked"],
+      comments: [
+        {
+          author: "bot",
+          body: "## Pipeline: Blocked at implementing\nA recorded question.\n<!-- pipeline-blocker-kind: harness-failure -->",
+          createdAt: "2026-09-01T01:00:00Z",
+        },
+      ],
+    }),
+    null,
+    null,
+    CFG,
+  );
+  assert.equal(payload.host_guidance, "continue");
+  assert.match(payload.next_action, /`--unblock/);
+});
+
+test("human-decision-required park is human-disposition-required even if unspent (#1379)", () => {
+  const guidance = deriveHostGuidance({
+    stage: "needs-human",
+    blocked: true,
+    issue: 154,
+    comments: [
+      {
+        body: "## Pipeline: Human decision required\n**Category**: product-decision\n<!-- pipeline-blocker-kind: human-decision-required -->",
+      },
+    ],
+  });
+  assert.equal(guidance, "human-disposition-required");
 });
 
 test("formatWriteHealthStatusWarning: warns only when elevated (#633)", () => {

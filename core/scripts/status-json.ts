@@ -4,11 +4,24 @@
 
 import { isBlocked, pickStage } from "./gh.ts";
 import {
+  extractAuthorityKeysFromComments,
+  extractRecoverParkedSpent,
+} from "./recover-parked.ts";
+import {
   isElevatedWriteHealth,
   type RunEventsSummary,
   type WriteHealthRecord,
 } from "./run-store.ts";
 import type { PipelineConfig } from "./types.ts";
+
+/** Closed host-guidance projection (#1379). Additive; schema_version stays `"1"`. */
+export const HOST_GUIDANCE_VALUES = [
+  "continue",
+  "recover-parked",
+  "human-disposition-required",
+  "operator-merge",
+] as const;
+export type HostGuidance = (typeof HOST_GUIDANCE_VALUES)[number];
 
 // ---------------------------------------------------------------------------
 // Envelope shapes (the public JSON contract — field names/types are stable)
@@ -34,6 +47,12 @@ export interface StatusPayload {
   last_event: { timestamp: string; description: string } | null;
   review_summary: { verdict: string; findings_count: number; timestamp: string } | null;
   next_action: string;
+  /**
+   * Host-guidance projection (#1379). Tells a host what it may do next without
+   * inferring authority from `next_action` prose. Never authorizes invented
+   * `pipeline override`. Additive; schema_version stays `"1"`.
+   */
+  host_guidance: HostGuidance;
   config: { repo: string; domain: string };
   possibly_wedged: PossiblyWedged | null;
   /**
@@ -93,7 +112,116 @@ export function deriveStatus(
   return "ok";
 }
 
-export function deriveNextAction(stage: string | null, blocked: boolean): string {
+const RECOVER_PARKED_SPENT_HEADING = "## Pipeline: recover-parked supervisor pass spent";
+const BLOCKER_KIND_RE = /<!--\s*pipeline-blocker-kind:\s*([a-z0-9-]+)\s*-->/gi;
+const RESIDUAL_PARK_STAGES = new Set([
+  "needs-human",
+  "review-1",
+  "review-2",
+  "fix-1",
+  "fix-2",
+  "pre-merge",
+]);
+
+const NEXT_ACTION_RECOVER_PARKED =
+  "Residual review park — run `pipeline recover-parked` once for the current park fingerprint. If the issue remains parked, stop and request an exact operator-supplied disposition. Do not invent `pipeline override` or remove `blocked`.";
+const NEXT_ACTION_HUMAN_DISPOSITION =
+  "Human disposition required — stop and request an exact operator-supplied disposition. Do not invent a finding key or reason and do not invoke `pipeline override`.";
+
+/** Latest `pipeline-blocker-kind` marker in comments (guidance only; fail closed, no trust). */
+export function latestBlockerKindLoose(
+  comments: readonly { body: string }[],
+): string | null {
+  let last: string | null = null;
+  for (const c of comments) {
+    BLOCKER_KIND_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = BLOCKER_KIND_RE.exec(c.body ?? "")) !== null) {
+      last = m[1]!.toLowerCase();
+    }
+  }
+  BLOCKER_KIND_RE.lastIndex = 0;
+  return last;
+}
+
+function hasResidualReviewEvidence(comments: readonly { body: string }[]): boolean {
+  return comments.some((c) => {
+    const body = c.body ?? "";
+    return (
+      (body.startsWith("## Review ") || body.startsWith("## Delta review")) &&
+      (body.includes("### Findings") ||
+        body.includes("override-key") ||
+        body.includes("blocking-keys") ||
+        body.includes("blockingKeys"))
+    );
+  });
+}
+
+/**
+ * Recover-parked spend projection from issue comments already available to
+ * status assembly. Fail closed to `unknown` when a spend heading is present
+ * without a parseable fingerprint record.
+ */
+export function classifyRecoverParkedSpend(args: {
+  issue: number;
+  stage: string | null;
+  comments: readonly { body: string }[];
+}): "unspent" | "spent" | "unknown" {
+  const headingPresent = args.comments.some((c) =>
+    (c.body ?? "").includes(RECOVER_PARKED_SPENT_HEADING),
+  );
+  const spent = extractRecoverParkedSpent(args.comments);
+  if (headingPresent && spent.length === 0) return "unknown";
+  if (args.stage == null) {
+    return spent.some((s) => s.issue === args.issue) ? "unknown" : "unspent";
+  }
+  const relevant = spent.filter((s) => s.issue === args.issue && s.stage === args.stage);
+  if (relevant.length > 0) return "spent";
+  return "unspent";
+}
+
+/**
+ * Host-guidance projection (#1379). Residual parks: unspent → `recover-parked`;
+ * spent, unknown spend, or true human-authority → `human-disposition-required`.
+ * Never returns a value that authorizes invented `pipeline override`.
+ */
+export function deriveHostGuidance(args: {
+  stage: string | null;
+  blocked: boolean;
+  issue: number;
+  comments: readonly { body: string }[];
+}): HostGuidance {
+  if (args.stage === "ready-to-deploy" && !args.blocked) return "operator-merge";
+
+  const kind = latestBlockerKindLoose(args.comments);
+  const authority = extractAuthorityKeysFromComments(args.comments);
+  const parked = args.blocked || args.stage === "needs-human";
+  const humanAuthorityPark =
+    parked &&
+    (kind === "human-decision-required" || authority.wholeParkAuthority === true);
+  if (humanAuthorityPark) return "human-disposition-required";
+
+  const residualPark =
+    args.stage === "needs-human" ||
+    (args.blocked && kind === "needs-human") ||
+    (args.blocked &&
+      args.stage != null &&
+      RESIDUAL_PARK_STAGES.has(args.stage) &&
+      hasResidualReviewEvidence(args.comments));
+  if (!residualPark) return "continue";
+
+  const spend = classifyRecoverParkedSpend(args);
+  if (spend === "unspent") return "recover-parked";
+  return "human-disposition-required";
+}
+
+export function deriveNextAction(
+  stage: string | null,
+  blocked: boolean,
+  hostGuidance?: HostGuidance,
+): string {
+  if (hostGuidance === "recover-parked") return NEXT_ACTION_RECOVER_PARKED;
+  if (hostGuidance === "human-disposition-required") return NEXT_ACTION_HUMAN_DISPOSITION;
   if (blocked) {
     return "Unblock with `--unblock \"<answer>\"` or fix the blocker, then re-run.";
   }
@@ -116,8 +244,8 @@ export function deriveNextAction(stage: string | null, blocked: boolean): string
     "eval-gate": "Eval gate will run next.",
     "shipcheck-gate": "Shipcheck will run next.",
     "ready-to-deploy": "Ready to deploy — awaiting an operator-authorized merge.",
-    "needs-human":
-      "Human decision required — use `--override \"<key>: <reason>\"` or fix residual findings.",
+    // Fail closed: without spend evidence, do not advertise autonomous override.
+    "needs-human": NEXT_ACTION_HUMAN_DISPOSITION,
   };
   if (stage === null) return "Add a `pipeline:ready` label to start the pipeline.";
   return actions[stage] ?? `Pipeline is at stage \`${stage}\`.`;
@@ -248,6 +376,12 @@ export function buildStatusPayload(
   const worktree = worktreeInfo ? worktreeInfo.path : null;
 
   const writeHealth = runEvents?.writeHealth ?? null;
+  const hostGuidance = deriveHostGuidance({
+    stage,
+    blocked,
+    issue: detail.number,
+    comments: detail.comments,
+  });
   return {
     schema_version: "1",
     status: deriveStatus(stage, blocked, detail.state),
@@ -258,7 +392,8 @@ export function buildStatusPayload(
     worktree,
     last_event: deriveLastEvent(detail.comments, detail.labelEvents),
     review_summary: deriveReviewSummary(detail.comments),
-    next_action: deriveNextAction(stage, blocked),
+    next_action: deriveNextAction(stage, blocked, hostGuidance),
+    host_guidance: hostGuidance,
     config: { repo: cfg.repo, domain: cfg.domain },
     possibly_wedged: derivePossiblyWedged(runEvents, largestConfiguredStageTimeoutSec(cfg) * 1000 + WEDGE_MARGIN_MS, now),
     // Elevated only — healthy/absent must not invent a failure (#633).

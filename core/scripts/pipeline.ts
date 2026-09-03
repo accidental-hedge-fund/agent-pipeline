@@ -7992,7 +7992,8 @@ export async function runStatus(
     console.log(
       punchlist ??
         `Needs human, but no ${REVIEW_CEILING_MARKER.replace(/^## /, "")} comment was found. ` +
-          `Run \`--override "<key>: <reason>"\` (auto-resumes) or fix the residual findings and relabel ` +
+          `Run \`pipeline recover-parked\` once for the current park fingerprint. If still parked, stop and request an exact operator-supplied disposition. ` +
+          `Do not invent override from the host. An operator may supply or explicitly approve \`--override "<key>: <reason>"\` (auto-resumes), or fix the residual findings and relabel ` +
           `\`pipeline:needs-human\` → \`pipeline:review-<round>\` to resume.`,
     );
     // #647: list pending human-question handoffs without replacing the punch-list.
@@ -8070,7 +8071,9 @@ export function needsHumanPunchlist(
     `Needs human: ${count} unresolved blocking ${noun} from the review ceiling.`,
     ...reviewStage.tagCeilingFindingLines(findings, comments, ceilingIdx),
     `To resume:`,
-    `- \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes.`,
+    `- Run \`pipeline recover-parked\` once for the current park fingerprint.`,
+    `- If still parked, stop and request an exact operator-supplied disposition. Do not invent override from the host.`,
+    `- An operator may supply or explicitly approve \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes. That command is the human decision path, not host authority.`,
     `- Or fix it by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${round}\`.`,
   ].join("\n");
 }

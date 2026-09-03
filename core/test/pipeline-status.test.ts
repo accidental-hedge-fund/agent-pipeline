@@ -56,6 +56,9 @@ test("needsHumanPunchlist: well-formed ceiling comment returns the finding count
   assert.ok(out !== null, "expected a punch-list string, got null");
   assert.match(out, /2 unresolved blocking findings/, `count missing; got:\n${out}`);
   // Override path auto-resumes; fix-by-hand path still needs relabel to the ceiling round.
+  assert.match(out, /pipeline recover-parked/, `recover-parked first missing; got:\n${out}`);
+  assert.match(out, /operator-supplied/, `operator-supplied missing; got:\n${out}`);
+  assert.match(out, /not host authority/, `host-authority qualifier missing; got:\n${out}`);
   assert.match(out, /--override "<key>: <reason>"/, `override hint missing; got:\n${out}`);
   assert.match(out, /auto-resumes/, `auto-resume hint missing; got:\n${out}`);
   assert.match(out, /fix it by hand/, `fix-by-hand hint missing; got:\n${out}`);
@@ -313,6 +316,8 @@ test("runStatus: a needs-human stage with a ceiling comment appends the punch-li
   assert.equal(lines[2], "Stage: needs-human");
   const text = lines.join("\n");
   assert.match(text, /Needs human: 2 unresolved blocking findings/, `count missing; got:\n${text}`);
+  assert.match(text, /pipeline recover-parked/, `recover-parked first missing; got:\n${text}`);
+  assert.match(text, /not host authority/, `host-authority qualifier missing; got:\n${text}`);
   assert.match(text, /--override "<key>: <reason>"/, `override hint missing; got:\n${text}`);
   assert.match(text, /pipeline:needs-human` → `pipeline:review-2/, `relabel hint missing; got:\n${text}`);
 });
@@ -399,7 +404,7 @@ test("runStatus --json: schema_version is \"1\"", async () => {
 test("runStatus --json: all minimum fields are present", async () => {
   const parsed = await captureStatusJson("review-1", 42) as Record<string, unknown>;
   for (const field of ["schema_version", "status", "issue", "stage", "pr", "branch", "worktree",
-    "last_event", "review_summary", "next_action", "config", "possibly_wedged", "event_stream_write_health"]) {
+    "last_event", "review_summary", "next_action", "host_guidance", "config", "possibly_wedged", "event_stream_write_health"]) {
     assert.ok(field in parsed, `missing field: ${field}`);
   }
 });

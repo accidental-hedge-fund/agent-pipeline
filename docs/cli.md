@@ -66,7 +66,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `override`
 
 - **Usage:** `pipeline override <n> "<key>: <reason>"`
-- **Summary:** Disposition a review finding and auto-resume the advance loop
+- **Summary:** Operator-supplied or explicitly approved exact disposition ("<key>: <reason>"); auto-resumes. Not an autonomous host next action
 
 #### `recover-parked`
 
