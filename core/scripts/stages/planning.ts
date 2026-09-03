@@ -1970,17 +1970,47 @@ export function makeFreeformPlanningHooks(cfg: PipelineConfig, title: string, bo
 }
 
 /**
+ * Optional listing / validation seams for {@link makeOpenspecPlanningHooks}.
+ * Production omits this and uses `openspec.listChangeDirs` / `openspec.validateItem`.
+ * Tests inject fakes so restore and revalidation stay hermetic.
+ */
+export interface OpenspecPlanningHookInjects {
+  listChangeDirs?: (dir: string) => string[];
+  validateItem?: typeof openspec.validateItem;
+}
+
+/**
  * Build the PlanningPhaseHooks for the OpenSpec path. Captures cfg, title, body,
  * and beforeList. Uses a mutable `changeId` variable that `authorArtifact` sets
- * and all subsequent hooks read.
+ * and all subsequent hooks read. When `changeId` is still empty (plan-review
+ * resume skips authoring), `validateArtifact` / `revalidateArtifact` restore it
+ * via `openspec.change-singular@1` before any `validateItem` call.
  */
 export function makeOpenspecPlanningHooks(
   cfg: PipelineConfig,
   title: string,
   body: string,
   beforeList: string[],
+  inject: OpenspecPlanningHookInjects = {},
 ): PlanningPhaseHooks {
   let changeId = "";
+  const listChangeDirs = inject.listChangeDirs ?? openspec.listChangeDirs;
+  const validateItem = inject.validateItem ?? openspec.validateItem;
+
+  const restoreChangeIdIfEmpty = (
+    wtPath: string,
+  ): { ok: true } | { ok: false; reason: string } => {
+    if (changeId.trim() !== "") return { ok: true };
+    const all = listChangeDirs(wtPath);
+    const fresh = all.filter((c) => !beforeList.includes(c));
+    const check = validateOpenspecChangeSingular({ fresh, all });
+    if (!check.ok || !check.value) {
+      const diagnostic = check.ok ? "missing changeId" : check.reason;
+      return { ok: false, reason: `OpenSpec change-id restore failed: ${diagnostic}` };
+    }
+    changeId = check.value.changeId;
+    return { ok: true };
+  };
 
   return {
     async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext, planningFacts) {
@@ -2083,7 +2113,7 @@ export function makeOpenspecPlanningHooks(
 
       // ---- Discover the change the implementer created (openspec.change-singular@1). ----
       const listSingularInput = () => {
-        const after = openspec.listChangeDirs(wt.path);
+        const after = listChangeDirs(wt.path);
         const fresh = after.filter((c) => !beforeList.includes(c));
         return { fresh, all: after };
       };
@@ -2210,7 +2240,16 @@ export function makeOpenspecPlanningHooks(
     },
 
     async validateArtifact(wt) {
-      const v1 = await openspec.validateItem(wt.path, changeId);
+      const restored = restoreChangeIdIfEmpty(wt.path);
+      if (!restored.ok) {
+        return {
+          ok: false,
+          reason: restored.reason,
+          tag: "openspec-invalid",
+          blockStage: "planning" as Stage,
+        };
+      }
+      const v1 = await validateItem(wt.path, changeId);
       if (!v1.unavailable && !v1.valid) {
         return {
           ok: false,
@@ -2223,7 +2262,15 @@ export function makeOpenspecPlanningHooks(
     },
 
     async revalidateArtifact(wt, _revisionStdout) {
-      const v2 = await openspec.validateItem(wt.path, changeId);
+      const restored = restoreChangeIdIfEmpty(wt.path);
+      if (!restored.ok) {
+        return {
+          ok: false,
+          reason: restored.reason,
+          tag: "openspec-invalid",
+        };
+      }
+      const v2 = await validateItem(wt.path, changeId);
       if (!v2.unavailable && !v2.valid) {
         return {
           ok: false,
