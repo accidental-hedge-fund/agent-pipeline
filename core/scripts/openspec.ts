@@ -170,6 +170,10 @@ export async function validate(dir: string, timeoutMs = 60_000): Promise<Validat
 
 /** Validate a single change: `openspec validate <name> --json`. */
 export async function validateItem(dir: string, name: string, timeoutMs = 60_000): Promise<ValidateResult> {
+  if (!name.trim()) {
+    const message = "OpenSpec validateItem refused an empty item name";
+    return { valid: false, unavailable: false, issues: [{ message }], raw: message };
+  }
   return runValidate(dir, ["validate", name, "--json"], timeoutMs);
 }
 

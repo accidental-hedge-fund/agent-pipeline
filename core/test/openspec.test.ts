@@ -25,6 +25,7 @@ import {
   sharedActiveChangeIdsFromPaths,
   shouldPlanWithOpenspec,
   unarchivedChangeIdsFromPrFiles,
+  validateItem,
 } from "../scripts/openspec.ts";
 
 function tmpDir(): string {
@@ -90,6 +91,25 @@ test("parseValidateResult: nested results.changes shape extracts issues", () => 
   const r = parseValidateResult(1, out);
   assert.equal(r.valid, false);
   assert.ok(r.issues.some((i) => /delta missing scenario/.test(i.message)));
+});
+
+function assertEmptyNameRefused(r: Awaited<ReturnType<typeof validateItem>>, label: string): void {
+  const text = `${r.raw}\n${r.issues.map((i) => i.message).join("\n")}`;
+  assert.equal(r.valid, false, `${label}: must be invalid`);
+  assert.equal(r.unavailable, false, `${label}: must not report the CLI as unavailable`);
+  assert.ok(r.issues.length >= 1, `${label}: must include a named issue`);
+  assert.ok(
+    !/Nothing to validate/i.test(text),
+    `${label}: must not surface CLI text "Nothing to validate"; got: ${text}`,
+  );
+}
+
+test("validateItem: empty or whitespace name is invalid without spawning the CLI (#1416)", async () => {
+  const empty = await validateItem("/no-such-openspec-dir", "");
+  assertEmptyNameRefused(empty, 'name=""');
+
+  const whitespace = await validateItem("/no-such-openspec-dir", "  \t\n  ");
+  assertEmptyNameRefused(whitespace, "whitespace-only name");
 });
 
 test("parseArchiveResult: requires a matching archive object and removed active change", () => {
