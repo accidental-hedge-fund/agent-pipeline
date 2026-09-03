@@ -28,6 +28,21 @@ import {
 } from "../scripts/stages/review-parsing.ts";
 import { lookupCommand, validateFlags, COMMAND_REGISTRY } from "../scripts/command-registry.ts";
 import { runTrain, type TrainDeps, type AdvanceWaveResult } from "../scripts/stages/train.ts";
+import type { WorkListDependencyDiscoverDeps } from "../scripts/loop/work-list-deps.ts";
+
+function observedEmptyDiscoverDeps(): WorkListDependencyDiscoverDeps {
+  return {
+    async getIssueTitleBody() {
+      return { title: "", body: "" };
+    },
+    async getBlockedByIssueNumbers() {
+      return [];
+    },
+    async getIssueOpenState() {
+      return "open";
+    },
+  };
+}
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 import { humanDecisionComment, overrideComment } from "../scripts/review-policy.ts";
 
@@ -836,6 +851,7 @@ test("5.12 train does not invoke recover-parked; holds if still parked", async (
   };
   const deps: TrainDeps = {
     log: (m) => logs.push(m),
+    discoverDeps: observedEmptyDiscoverDeps(),
     listMilestoneIssues: async () => [],
     getIssue: async () => ({ ...snap, labels: ["pipeline:needs-human"] }),
     advanceWave: async (issues) => {
@@ -907,6 +923,7 @@ test("5.12b train continues same issue when advance-wave recovery clears without
   let labels = ["pipeline:review-2"];
   const deps: TrainDeps = {
     log: (m) => logs.push(m),
+    discoverDeps: observedEmptyDiscoverDeps(),
     listMilestoneIssues: async () => [],
     getIssue: async () => ({
       number: 11,

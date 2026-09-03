@@ -43,6 +43,21 @@ import {
   nestedAdvanceChildEnv,
   shouldEmitAdvanceRunHandoff,
 } from "../scripts/advance-handoff.ts";
+import type { WorkListDependencyDiscoverDeps } from "../scripts/loop/work-list-deps.ts";
+
+function observedEmptyDiscoverDeps(): WorkListDependencyDiscoverDeps {
+  return {
+    async getIssueTitleBody() {
+      return { title: "", body: "" };
+    },
+    async getBlockedByIssueNumbers() {
+      return [];
+    },
+    async getIssueOpenState() {
+      return "open";
+    },
+  };
+}
 
 function memTrainRunStore(): RunStoreDeps {
   const files = new Map<string, string>();
@@ -268,6 +283,7 @@ test("pipeline-cli: train --json emits one train_status document after two neste
   const deps: TrainCommandDeps = {
     makeTrainDeps: () => ({
       log: () => {},
+      discoverDeps: observedEmptyDiscoverDeps(),
       listMilestoneIssues: async () => [],
       getIssue: async (issue) => ({
         number: issue,
@@ -1298,6 +1314,7 @@ test("pipeline-cli: train --json stdout stays one train_status with run_id; hand
   const deps: TrainCommandDeps = {
     makeTrainDeps: () => ({
       log: () => {},
+      discoverDeps: observedEmptyDiscoverDeps(),
       listMilestoneIssues: async () => [],
       getIssue: async (issue) => ({
         number: issue,
@@ -1380,6 +1397,7 @@ test("pipeline-cli: train --json stdout stays one train_status when advance-wave
   const deps: TrainCommandDeps = {
     makeTrainDeps: () => ({
       log: () => {},
+      discoverDeps: observedEmptyDiscoverDeps(),
       listMilestoneIssues: async () => [],
       getIssue: async (issue) => ({
         number: issue,
@@ -1456,6 +1474,7 @@ test("pipeline-cli: train --json stdout stays one train_status when nested numer
   const deps: TrainCommandDeps = {
     makeTrainDeps: () => ({
       log: () => {},
+      discoverDeps: observedEmptyDiscoverDeps(),
       listMilestoneIssues: async () => [],
       getIssue: async (issue) => ({
         number: issue,
@@ -1547,6 +1566,7 @@ test("pipeline-cli: train --dry-run does not reject an allowlisted flag (#1275)"
   const deps: TrainCommandDeps = {
     makeTrainDeps: () => ({
       log: () => {},
+      discoverDeps: observedEmptyDiscoverDeps(),
       listMilestoneIssues: async () => [],
       getIssue: async (issue) => ({
         number: issue,
@@ -1609,6 +1629,7 @@ test("pipeline-cli: train --merge --dry-run does not merge or advance (#1275)", 
   const deps: TrainCommandDeps = {
     makeTrainDeps: () => ({
       log: () => {},
+      discoverDeps: observedEmptyDiscoverDeps(),
       listMilestoneIssues: async () => [],
       getIssue: async (issue) => ({
         number: issue,
@@ -1663,6 +1684,7 @@ test("pipeline-cli: train --json --dry-run emits one train_plan object (#1275)",
   const deps: TrainCommandDeps = {
     makeTrainDeps: () => ({
       log: () => {},
+      discoverDeps: observedEmptyDiscoverDeps(),
       listMilestoneIssues: async () => [],
       getIssue: async (issue) => ({
         number: issue,

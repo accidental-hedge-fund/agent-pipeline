@@ -99,9 +99,11 @@ export const SHIP_PATH_COMPOSITION_INVENTORY: readonly ShipPathCompositionClassE
       "unproven independence fails closed — dep-linked R2D not merged while peer held",
       "contained hold continues independent remaining issues",
       "transitive dependent is dependency-skipped and never advanced",
+      "native blockedBy dependent of a held issue is dependency-skipped",
+      "independent sibling of a native dependent still advances",
     ],
     notes:
-      "#1273: merge-mode contained hold continues proven-independent remaining work and merges independent R2D siblings. Direct/transitive dependents are dependency-skipped. Unproven independence still fails closed.",
+      "#1273 / #1413: merge-mode contained hold continues proven-independent remaining work and merges independent R2D siblings. Independence uses the shared discovery graph (lexical + native blockedBy + enabled roadmap), not a train-local lexical parse. Direct/transitive dependents are dependency-skipped. Unproven independence still fails closed.",
   },
   {
     id: "scratch-only-no-needs-human",

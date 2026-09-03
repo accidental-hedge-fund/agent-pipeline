@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -18,6 +19,7 @@ import {
   orderIssuesForTrain,
   parseIssueList,
   pipelineStageFromLabels,
+  realTrainDeps,
   runTrain,
   selectFreezeEligibleIssues,
   type AdvanceOutcome,
@@ -44,6 +46,12 @@ import {
   mergePr,
   type MergeDeps,
 } from "../scripts/stages/merge.ts";
+import {
+  IncompleteDependencyDiscoveryError,
+  type PrerequisiteObservation,
+  type RoadmapDeclaredEdge,
+  type WorkListDependencyDiscoverDeps,
+} from "../scripts/loop/work-list-deps.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -158,26 +166,53 @@ function installExclusiveMkdir(
   return { created, attempts };
 }
 
-function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
+type TrainTestDeps = TrainDeps & {
   advanceCalls: number[];
   waveCalls: number[][];
   mergeCalls: number[];
-  fetchCalls: number;
   anyStateCalls: number[];
+  fetchCalls: number;
+  seedIssue(s: TrainIssueSnapshot): void;
+  seedPr(issue: number, pr: number, head?: string): void;
+  seedMergedPrAnyState(issue: number, pr: number, oid?: string, head?: string): void;
+  seedNativeBlockedBy(issue: number, blockers: readonly number[] | null): void;
+  seedIssueOpenState(issue: number, state: PrerequisiteObservation): void;
+  seedRoadmapEdges(edges: readonly RoadmapDeclaredEdge[] | null): void;
   store: ReturnType<typeof memRunStore>;
   handoffLines: string[];
-} {
+};
+
+function makeDeps(overrides: Partial<TrainDeps> = {}): TrainTestDeps {
   const advanceCalls: number[] = [];
   const waveCalls: number[][] = [];
   const mergeCalls: number[] = [];
   const anyStateCalls: number[] = [];
   let fetchCalls = 0;
   const issues = new Map<number, TrainIssueSnapshot>();
+  const nativeBlockedBy = new Map<number, readonly number[] | null>();
+  const openStateOverride = new Map<number, PrerequisiteObservation>();
   /** Open PRs only — mirrors production getPrForIssue. */
   const openPrByIssue = new Map<number, number>();
   /** Any-state PR (open/closed/merged) — mirrors getPrForIssueAnyState. */
   const anyPrByIssue = new Map<number, number>();
   const prState = new Map<number, { state: "open" | "merged"; oid: string | null; head: string }>();
+  const defaultDiscoverDeps: WorkListDependencyDiscoverDeps = {
+    async getIssueTitleBody(n) {
+      const s = issues.get(n);
+      if (!s) return null;
+      return { title: s.title, body: s.body };
+    },
+    async getBlockedByIssueNumbers(n) {
+      if (nativeBlockedBy.has(n)) return nativeBlockedBy.get(n)!;
+      return [];
+    },
+    async getIssueOpenState(n) {
+      if (openStateOverride.has(n)) return openStateOverride.get(n)!;
+      const s = issues.get(n);
+      if (!s) return null;
+      return s.state === "closed" ? "closed" : "open";
+    },
+  };
 
   const defaultAdvance = async (n: number): Promise<AdvanceOutcome> => {
     advanceCalls.push(n);
@@ -256,6 +291,7 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
       // Contained when ancestor is a recorded merge oid and tip is our fixed tip
       return descendant === "b".repeat(40) && ancestor.startsWith("aa");
     },
+    discoverDeps: defaultDiscoverDeps,
     ...overrides,
     // Always keep our advanceWave wrapper (overrides.advanceWave handled inside).
     advanceWave: async (issueList, ctx) => {
@@ -303,18 +339,16 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
       openPrByIssue.delete(issue);
       prState.set(pr, { state: "merged", oid, head });
     },
-  }) as TrainDeps & {
-    advanceCalls: number[];
-    waveCalls: number[][];
-    mergeCalls: number[];
-    anyStateCalls: number[];
-    fetchCalls: number;
-    seedIssue(s: TrainIssueSnapshot): void;
-    seedPr(issue: number, pr: number, head?: string): void;
-    seedMergedPrAnyState(issue: number, pr: number, oid?: string, head?: string): void;
-    store: ReturnType<typeof memRunStore>;
-    handoffLines: string[];
-  };
+    seedNativeBlockedBy(issue: number, blockers: readonly number[] | null) {
+      nativeBlockedBy.set(issue, blockers);
+    },
+    seedIssueOpenState(issue: number, state: PrerequisiteObservation) {
+      openStateOverride.set(issue, state);
+    },
+    seedRoadmapEdges(edges: readonly RoadmapDeclaredEdge[] | null) {
+      defaultDiscoverDeps.getRoadmapDeclaredEdges = async () => edges;
+    },
+  }) as TrainTestDeps;
 }
 
 const baseOpts = (over: Partial<TrainOpts> = {}): TrainOpts => ({
@@ -2973,4 +3007,332 @@ test("train: recoverParked injected stub is never called (#1330)", async () => {
   assert.equal(rpCalls, 0);
   assert.equal(result.status.items.find((i) => i.issue === 1)?.terminal, "needs-human");
   assert.equal(result.status.items.find((i) => i.issue === 2)?.terminal, "ready-to-deploy");
+});
+
+// ---------------------------------------------------------------------------
+// Native blockedBy ingestion (#1413)
+// ---------------------------------------------------------------------------
+
+function holdAdvance(heldIssue: number) {
+  return async function advanceIssue(
+    this: void,
+    n: number,
+    deps: TrainTestDeps,
+  ): Promise<AdvanceOutcome> {
+    deps.advanceCalls.push(n);
+    const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+    if (n === heldIssue) {
+      issues.get(n)!.labels = ["blocked"];
+      return { ok: false, error: `run_fatal; workflow-engine-defect on #${n}` };
+    }
+    issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+    return { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] };
+  };
+}
+
+test("train (#1413): native blockedBy dependent of a held issue is dependency-skipped", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      return holdAdvance(1322)(n, deps);
+    },
+  });
+  deps.seedIssue(snap(1322, "held ancestor — no lexical Depends on"));
+  deps.seedIssue(snap(1323, "native-only dependent — no lexical Depends on"));
+  deps.seedNativeBlockedBy(1323, [1322]);
+  deps.seedPr(1322, 21322);
+  deps.seedPr(1323, 21323);
+
+  const result = await runTrain(baseOpts({ issues: [1322, 1323], merge: true }), deps);
+  assert.ok(!deps.advanceCalls.includes(1323), "must not advance native dependent #1323");
+  assert.ok(!deps.mergeCalls.includes(21323), "must not merge #1323 while #1322 is held");
+  const skipped = result.status.items.find((item) => item.issue === 1323);
+  assert.equal(skipped?.terminal, "dependency-skipped");
+  assert.equal(skipped?.integrated, false);
+  assert.equal(result.exitCode, 1);
+});
+
+test("train (#1413): transitive mixed-source dependent is dependency-skipped", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      return holdAdvance(100)(n, deps);
+    },
+  });
+  deps.seedIssue(snap(100, "held A — no lexical Depends on"));
+  deps.seedIssue(snap(101, "native-only B — no lexical Depends on"));
+  deps.seedIssue(snap(102, "Depends on: #101"));
+  deps.seedNativeBlockedBy(101, [100]);
+  deps.seedPr(100, 1100);
+  deps.seedPr(101, 1101);
+  deps.seedPr(102, 1102);
+
+  const result = await runTrain(baseOpts({ issues: [100, 101, 102], merge: true }), deps);
+  assert.ok(!deps.advanceCalls.includes(101), "must not advance native dependent B");
+  assert.ok(!deps.advanceCalls.includes(102), "must not advance lexical dependent C of B");
+  assert.ok(!deps.mergeCalls.includes(1101));
+  assert.ok(!deps.mergeCalls.includes(1102));
+  const byIssue = new Map(result.status.items.map((item) => [item.issue, item]));
+  assert.equal(byIssue.get(101)?.terminal, "dependency-skipped");
+  assert.equal(byIssue.get(102)?.terminal, "dependency-skipped");
+});
+
+test("train (#1413): independent sibling of a native dependent still advances (#1273)", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      return holdAdvance(1322)(n, deps);
+    },
+  });
+  deps.seedIssue(snap(1322, "held — no lexical Depends on"));
+  deps.seedIssue(snap(1323, "native-only dependent — no lexical Depends on"));
+  deps.seedIssue(snap(1324, "independent sibling — no path to 1322"));
+  deps.seedNativeBlockedBy(1323, [1322]);
+  deps.seedPr(1322, 21322);
+  deps.seedPr(1323, 21323);
+  deps.seedPr(1324, 21324);
+
+  const result = await runTrain(
+    baseOpts({ issues: [1322, 1323, 1324], merge: true }),
+    deps,
+  );
+  assert.ok(deps.advanceCalls.includes(1324), "independent #1324 must still advance");
+  assert.ok(deps.mergeCalls.includes(21324), "independent #1324 must still merge");
+  const byIssue = new Map(result.status.items.map((item) => [item.issue, item]));
+  assert.notEqual(byIssue.get(1324)?.terminal, "dependency-skipped");
+  assert.equal(byIssue.get(1324)?.integrated, true);
+  assert.equal(byIssue.get(1323)?.terminal, "dependency-skipped");
+});
+
+test("train (#1413): incomplete native source refuses live multi-item train before store or advance", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1322, "a"));
+  deps.seedIssue(snap(1323, "b"));
+  deps.seedNativeBlockedBy(1322, null);
+  deps.seedPr(1322, 21322);
+  deps.seedPr(1323, 21323);
+
+  await assert.rejects(
+    () => runTrain(baseOpts({ issues: [1322, 1323], merge: true }), deps),
+    (err: unknown) => {
+      assert.ok(err instanceof IncompleteDependencyDiscoveryError);
+      assert.match((err as Error).message, /native-blocked-by/);
+      return true;
+    },
+  );
+  assert.equal(deps.waveCalls.length, 0);
+  assert.equal(deps.mergeCalls.length, 0);
+  assert.equal(trainEventsPath(deps.store), undefined);
+  assert.equal(deps.handoffLines.length, 0);
+  assert.equal(deps.store.files.size, 0);
+});
+
+test("train (#1413): incomplete native source refuses dry-run before a plan or store", async () => {
+  const logs: string[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+  });
+  deps.seedIssue(snap(1322, "a"));
+  deps.seedIssue(snap(1323, "b"));
+  deps.seedNativeBlockedBy(1322, null);
+
+  await assert.rejects(
+    () => runTrain(baseOpts({ issues: [1322, 1323], merge: false, dryRun: true }), deps),
+    (err: unknown) => {
+      assert.ok(err instanceof IncompleteDependencyDiscoveryError);
+      assert.match((err as Error).message, /native-blocked-by/);
+      return true;
+    },
+  );
+  assert.equal(deps.waveCalls.length, 0);
+  assert.equal(trainEventsPath(deps.store), undefined);
+  assert.equal(deps.handoffLines.length, 0);
+  assert.ok(!logs.some((line) => line.includes("train_plan") || line.includes("would-advance")));
+});
+
+test("train (#1413): dry-run classifies native dependent as waiting-on-deps", async () => {
+  const logs: string[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+  });
+  deps.seedIssue(snap(1322, "not integrated — no lexical Depends on"));
+  deps.seedIssue(snap(1323, "native-only dependent — no lexical Depends on"));
+  deps.seedNativeBlockedBy(1323, [1322]);
+
+  const result = await runTrain(
+    baseOpts({ issues: [1322, 1323], merge: false, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  const byIssue = new Map(result.plan!.items.map((item) => [item.issue, item]));
+  assert.equal(byIssue.get(1323)?.intended_action, "waiting-on-deps");
+  assert.equal(byIssue.get(1323)?.on_frontier, false);
+  assert.notEqual(byIssue.get(1323)?.intended_action, "would-advance");
+  assert.equal(trainEventsPath(deps.store), undefined);
+  assert.match(logs.join("\n"), /native-blocked-by|#1323/);
+});
+
+test("train (#1413): off-selector native blocker and closed candidate do not skip the depender", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      return holdAdvance(200)(n, deps);
+    },
+  });
+  deps.seedIssue(snap(200, "held peer"));
+  deps.seedIssue(snap(201, "depender with ignored native edges"));
+  deps.seedNativeBlockedBy(201, [999, 50]);
+  deps.seedIssueOpenState(999, "open");
+  deps.seedIssueOpenState(50, "closed");
+  deps.seedPr(200, 1200);
+  deps.seedPr(201, 1201);
+
+  const result = await runTrain(baseOpts({ issues: [200, 201], merge: true }), deps);
+  assert.ok(deps.advanceCalls.includes(201), "off-selector/closed native blockers must not skip #201");
+  assert.ok(deps.mergeCalls.includes(1201));
+  const depender = result.status.items.find((item) => item.issue === 201);
+  assert.notEqual(depender?.terminal, "dependency-skipped");
+  assert.equal(depender?.integrated, true);
+
+  const events = trainEventsFromStore(deps.store);
+  const workList = events.find((e) => e.type === "train_work_list_resolved");
+  assert.ok(workList, "admitted live train must write train_work_list_resolved");
+  const ignored = workList!.ignored_deps as Array<{ depender: string; target: string; reason: string }>;
+  assert.ok(Array.isArray(ignored));
+  assert.ok(
+    ignored.some((d) => d.depender === "201" && d.target === "999" && d.reason === "not_on_selector"),
+    "off-selector ignore must remain visible",
+  );
+  assert.ok(
+    ignored.some((d) => d.depender === "201" && d.target === "50" && d.reason === "closed"),
+    "closed ignore must remain visible",
+  );
+});
+
+test("train (#1413): live work-list event records native edge provenance", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      return holdAdvance(1322)(n, deps);
+    },
+  });
+  deps.seedIssue(snap(1322, "held"));
+  deps.seedIssue(snap(1323, "native-only"));
+  deps.seedNativeBlockedBy(1323, [1322]);
+  deps.seedPr(1322, 21322);
+  deps.seedPr(1323, 21323);
+
+  await runTrain(baseOpts({ issues: [1322, 1323], merge: true }), deps);
+  const events = trainEventsFromStore(deps.store);
+  const workList = events.find((e) => e.type === "train_work_list_resolved");
+  assert.equal(workList?.schema_version, 1);
+  const provenance = workList!.edge_provenance as Array<{
+    depender: string;
+    prerequisite: string;
+    sources: string[];
+  }>;
+  const native = provenance.find((e) => e.depender === "1323" && e.prerequisite === "1322");
+  assert.ok(native, "admitted 1323→1322 edge must be on the work-list event");
+  assert.ok(native!.sources.includes("native-blocked-by"));
+});
+
+test("train (#1413): dry-run logs provenance without a run store", async () => {
+  const logs: string[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+  });
+  deps.seedIssue(snap(1322, "prereq"));
+  deps.seedIssue(snap(1323, "native-only"));
+  deps.seedNativeBlockedBy(1323, [1322, 999]);
+  deps.seedIssueOpenState(999, "open");
+
+  const result = await runTrain(
+    baseOpts({ issues: [1322, 1323], merge: false, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(trainEventsPath(deps.store), undefined);
+  assert.equal(deps.store.files.size, 0);
+  const human = logs.join("\n");
+  assert.match(human, /native-blocked-by/);
+  assert.match(human, /not_on_selector|#999/);
+  assert.ok(result.plan?.edge_provenance?.some((e) => e.sources.includes("native-blocked-by")));
+  assert.ok(
+    result.plan?.ignored_deps?.some((d) => d.target === "999" && d.reason === "not_on_selector"),
+  );
+});
+
+test("train (#1413): lexical, native, and roadmap edges are unioned", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "A"));
+  deps.seedIssue(snap(11, "C"));
+  deps.seedIssue(snap(12, "D"));
+  deps.seedIssue(snap(13, "Depends on: #10"));
+  deps.seedNativeBlockedBy(13, [11]);
+  deps.seedRoadmapEdges([{ depender: "13", prerequisite: "12" }]);
+
+  const result = await runTrain(
+    baseOpts({ issues: [10, 11, 12, 13], merge: false, dryRun: true }),
+    deps,
+  );
+  const item = result.plan!.items.find((i) => i.issue === 13);
+  assert.equal(item?.intended_action, "waiting-on-deps");
+  assert.equal(item?.on_frontier, false);
+  const sourcesByPrereq = new Map(
+    (result.plan?.edge_provenance ?? []).map((e) => [e.prerequisite, e.sources]),
+  );
+  assert.ok(sourcesByPrereq.get("10")?.includes("lexical"));
+  assert.ok(sourcesByPrereq.get("11")?.includes("native-blocked-by"));
+  assert.ok(sourcesByPrereq.get("12")?.includes("roadmap-declared"));
+});
+
+test("train (#1413): snapshot gh json does not grow a train-local blockedBy field", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "scripts", "stages", "train.ts"), "utf8");
+  assert.doesNotMatch(src, /--json[\s\S]{0,80}blockedBy/);
+  assert.match(src, /discoverDeclaredDependencies/);
+  assert.match(src, /assertDiscoveryCompleteForAdmission/);
+});
+
+test("realTrainDeps (#1413): production discoverDeps loads ROADMAP declared edges (3a4f9013)", async () => {
+  // Bites if production hardcodes getRoadmapDeclaredEdges: async () => [].
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "train-roadmap-"));
+  try {
+    fs.writeFileSync(
+      path.join(dir, "ROADMAP.md"),
+      [
+        "**v2.0.0 — Slice:**",
+        "| # | What | Why |",
+        "|---|------|-----|",
+        "| #608 | Config | blocked by #607 |",
+        "| #607 | Isolation | none |",
+      ].join("\n"),
+    );
+    const wired = realTrainDeps({
+      repoDir: dir,
+      repo: "o/r",
+      baseBranch: "main",
+      advanceWave: async () => new Map(),
+    });
+    assert.equal(typeof wired.discoverDeps.getRoadmapDeclaredEdges, "function");
+    assert.deepEqual(await wired.discoverDeps.getRoadmapDeclaredEdges!(), [
+      { depender: "608", prerequisite: "607" },
+    ]);
+
+    const missingDir = fs.mkdtempSync(path.join(os.tmpdir(), "train-roadmap-missing-"));
+    try {
+      const missing = realTrainDeps({
+        repoDir: missingDir,
+        repo: "o/r",
+        baseBranch: "main",
+        advanceWave: async () => new Map(),
+      });
+      assert.equal(typeof missing.discoverDeps.getRoadmapDeclaredEdges, "function");
+      assert.deepEqual(await missing.discoverDeps.getRoadmapDeclaredEdges!(), []);
+    } finally {
+      fs.rmSync(missingDir, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
