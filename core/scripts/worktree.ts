@@ -531,6 +531,13 @@ export interface CreateWorktreeDeps {
     cfg: PipelineConfig,
     branch: string,
   ) => Promise<{ prNumber: number; headSha: string } | null>;
+  /**
+   * Linked merged-PR probe used when reclaim observes empty ls-remote plus
+   * unreachable-from-base (`"unverifiable"`). Same law as park-release: no
+   * merged PR and no bound proof → local-only salvage, not squash-merge
+   * `--force`. Tests inject; production default is GitHub-backed.
+   */
+  hasLinkedMergedPr?: (cfg: PipelineConfig, issueNumber: number) => Promise<boolean>;
 }
 
 export async function realWriteNodeModulesExclude(worktreePath: string): Promise<void> {
@@ -725,6 +732,19 @@ export async function createWorktree(
     deps.hasLocalOnlyCommits ??
     ((c, p, b) => checkLocalOnlyCommits(c, p, b, { gitCmd: deps.gitCmd }));
   const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadForBranch;
+  const hasLinkedMergedPrFn =
+    deps.hasLinkedMergedPr ??
+    (async (c: PipelineConfig, n: number) => {
+      const { getPrForIssueAnyState, getPrDetail } = await import("./gh.ts");
+      try {
+        const pr = await getPrForIssueAnyState(c, n);
+        if (pr == null) return false;
+        const d = await getPrDetail(c, pr);
+        return d.state === "merged";
+      } catch {
+        return false;
+      }
+    });
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
@@ -741,8 +761,13 @@ export async function createWorktree(
 
   /** Apply operator-remove safety without force before any reclaim mutation (#622).
    *  Routes through worktree lifecycle reconcile then evaluateRemoveSafety (#759).
-   *  Throws a clear error and never mutates on a blocking result. */
-  async function assertReclaimSafe(candidatePath: string, candidateBranch: string): Promise<void> {
+   *  Throws a clear error and never mutates on a blocking result.
+   *  Same-path never-pushed unpublished salvage returns `"reuse"` so create
+   *  continues on the existing tree instead of parking as squash-merge. */
+  async function assertReclaimSafe(
+    candidatePath: string,
+    candidateBranch: string,
+  ): Promise<"reuse" | void> {
     // Lazy import avoids circular init: reconcile-and-converge imports evaluateRemoveSafety from this module.
     const { reconcileWorktreeLifecycle } = await import("./reconcile-and-converge.ts");
     const pathOnDisk = existsFn(candidatePath);
@@ -750,7 +775,22 @@ export async function createWorktree(
     if (pathOnDisk) {
       dirty = await dirtyFn(candidatePath);
     }
-    const localOnly = await localOnlyFn(cfg, pathOnDisk ? candidatePath : null, candidateBranch);
+    let localOnly = await localOnlyFn(cfg, pathOnDisk ? candidatePath : null, candidateBranch);
+    // Same #1272 law as park-release: empty remote + unreachable-from-base is
+    // local-only unless a linked merged PR shows publication-then-delete.
+    // Bound merge-result proof is not available at create-time reclaim.
+    if (localOnly === "unverifiable") {
+      let linkedMerged = false;
+      try {
+        linkedMerged = await hasLinkedMergedPrFn(cfg, issueNumber);
+      } catch {
+        linkedMerged = false;
+      }
+      if (!linkedMerged) localOnly = true;
+    }
+    if (candidatePath === wtPath && pathOnDisk && !dirty && localOnly === true) {
+      return "reuse";
+    }
     const reconciled = reconcileWorktreeLifecycle({
       required: true,
       managedPresent: true,
@@ -840,7 +880,10 @@ export async function createWorktree(
   async function performReclaim(candidate: ReclaimCandidate): Promise<void> {
     // Revalidate immediately before mutation so a stale preflight verdict cannot
     // authorize force-like discard of work created after the check.
-    await assertReclaimSafe(candidate.path, candidate.branch);
+    const verdict = await assertReclaimSafe(candidate.path, candidate.branch);
+    if (verdict === "reuse") {
+      return;
+    }
     if (candidate.expectedBranchOid !== null) {
       const currentOid = await resolveBranchOid(candidate.branch);
       if (currentOid !== candidate.expectedBranchOid) {
@@ -879,6 +922,9 @@ export async function createWorktree(
   // Reclaim is never silent force-delete (#622): dirty workdirs and blocking
   // local-only tiers refuse with a clear error (same ladder as operator remove
   // without --force). Clean candidates may still be removed so create proceeds.
+  // Same-path never-pushed unpublished salvage is reused (create-time analogue
+  // of park-release retain): do not remove, do not fail as squash-merge, do not
+  // recreate from base.
   //
   // Preflight ALL candidates before ANY mutation (#622 review-2 finding 37cc1885)
   // so a later unsafe candidate cannot leave earlier clean worktrees already
@@ -887,6 +933,7 @@ export async function createWorktree(
   const mine = active.filter((r) => r.issueNumber === issueNumber && r.slug);
 
   const reclaimCandidates: ReclaimCandidate[] = [];
+  let reuseExisting = false;
   for (const rec of mine) {
     // Only reclaim worktrees explicitly under the managed root. A record with
     // underManagedRoot === false is a developer checkout that shares the pipeline
@@ -898,7 +945,11 @@ export async function createWorktree(
       continue;
     }
     const recBranch = rec.branch ?? branchName(issueNumber, rec.slug!);
-    await assertReclaimSafe(rec.path, recBranch);
+    const verdict = await assertReclaimSafe(rec.path, recBranch);
+    if (verdict === "reuse") {
+      reuseExisting = true;
+      continue;
+    }
     // Pass rec.path so removal targets the discovered path directly, not a path
     // recomputed from cfg.repo_dir (which is wrong when launched from a linked worktree).
     reclaimCandidates.push({
@@ -913,18 +964,27 @@ export async function createWorktree(
   // not classify as active (e.g. a closed/terminal lookup) so the
   // `git worktree add` below cannot collide with it. Same safety gates as above.
   if (existsFn(wtPath) && !mine.some((r) => r.slug === slug)) {
-    await assertReclaimSafe(wtPath, branch);
-    reclaimCandidates.push({
-      path: wtPath,
-      branch,
-      slug,
-      expectedBranchOid: await resolveBranchOid(branch),
-    });
+    const verdict = await assertReclaimSafe(wtPath, branch);
+    if (verdict === "reuse") {
+      reuseExisting = true;
+    } else {
+      reclaimCandidates.push({
+        path: wtPath,
+        branch,
+        slug,
+        expectedBranchOid: await resolveBranchOid(branch),
+      });
+    }
   }
 
   // Mutations only after every candidate passed preflight.
   for (const candidate of reclaimCandidates) {
     await performReclaim(candidate);
+  }
+
+  if (reuseExisting) {
+    await writeManagedMarkerFn(wtPath);
+    return { path: wtPath, branch };
   }
 
   const otherActive = active.filter((r) => r.issueNumber !== issueNumber).length;
