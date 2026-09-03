@@ -189,6 +189,8 @@ test("runPlanningPhases: plan-review resume validates the restored change after 
   const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
     listChangeDirs: () => ["fresh-change"],
     validateItem: recordingValidate(validateCalls),
+    readChangeFile: (_dir, _name, file) => (file === "proposal.md" ? "restored proposal" : null),
+    readSpecDeltas: () => "",
   });
   const originalAuthor = hooks.authorArtifact;
   hooks.authorArtifact = async (...args: Parameters<typeof originalAuthor>) => {
