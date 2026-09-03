@@ -19,5 +19,5 @@
 
 ## 4. Gate
 
-- [ ] 4.1 After any `core/` edit, run `node scripts/build.mjs` from the repo root so host SKILL freshness matches. Verify `node scripts/build.mjs --check` is clean.
-- [ ] 4.2 Run `openspec validate train-honor-native-blockedby` and `npm run ci` from the repo root. Verify both are green. Do not change review, merge authority, release, or the human boundary. Do not add a train-local dependency parser.
+- [x] 4.1 After any `core/` edit, run `node scripts/build.mjs` from the repo root so host SKILL freshness matches. Verify `node scripts/build.mjs --check` is clean.
+- [x] 4.2 Run `openspec validate train-honor-native-blockedby` and `npm run ci` from the repo root. Verify both are green. Do not change review, merge authority, release, or the human boundary. Do not add a train-local dependency parser.

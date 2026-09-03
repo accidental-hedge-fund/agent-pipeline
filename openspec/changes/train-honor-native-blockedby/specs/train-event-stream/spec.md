@@ -2,15 +2,15 @@
 
 ### Requirement: Train work-list-resolved events SHALL record discovery provenance and ignored edges
 
-When a live (non-dry-run) train is admitted after complete discovery, the
-`train_work_list_resolved` event SHALL include enough structured fields for an operator to
-audit which admitted edges were used and which declared candidates were ignored. Those
-fields SHALL identify contributing sources for admitted edges (lexical, native
-`blockedBy`, roadmap-declared when enabled) and SHALL include ignored-edge dispositions
-with stable reason codes (`not_on_selector`, `closed`, `not_open`). `schema_version` SHALL
-remain `1`. Readers SHALL preserve unknown additive fields. Train SHALL NOT silently drop
-provenance after using the graph. Dry-run SHALL log the same observation identity and
-ignored-edge dispositions without writing a run store.
+The `train_work_list_resolved` event SHALL include enough structured fields for an operator
+to audit which admitted edges were used and which declared candidates were ignored when a
+live (non-dry-run) train is admitted after complete discovery. Those fields SHALL identify
+contributing sources for admitted edges (lexical, native `blockedBy`, roadmap-declared when
+enabled) and SHALL include ignored-edge dispositions with stable reason codes
+(`not_on_selector`, `closed`, `not_open`). `schema_version` SHALL remain `1`. Readers SHALL
+preserve unknown additive fields. Train SHALL NOT silently drop provenance after using the
+graph. Dry-run SHALL log the same observation identity and ignored-edge dispositions without
+writing a run store.
 
 #### Scenario: Native edge provenance is on the work-list event
 
