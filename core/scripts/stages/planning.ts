@@ -471,9 +471,10 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
     openspecIsInitialized?: (path: string) => boolean;
     /**
      * Injectable salvage-uncommitted-work seam for the implement stage's
-     * harness failure/timeout path (#547). Defaults to `trySalvageUncommittedWork`
-     * from salvage-harness-work.ts. Tests inject a fake to exercise the salvage
-     * fallback without a real git subprocess.
+     * harness failure/timeout path (#547) and the plan-revision `openspec/`
+     * salvage (#1419). Defaults to `trySalvageUncommittedWork` from
+     * salvage-harness-work.ts. Tests inject a fake to exercise salvage without
+     * a real git subprocess.
      */
     trySalvageUncommittedWork?: typeof trySalvageUncommittedWork;
     /**
@@ -1133,6 +1134,38 @@ export async function runPlanningPhases(
         ? await hooks.invokeRevision(primary, wt, prompt, cfg, opts, deps, issueNumber)
         : await invokePlanStep(primary, wt.path, prompt, cfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "plan-review" });
 
+    // #1419: salvage uncommitted openspec/ work after every successful
+    // plan-revision invoke (initial and format-repair retry). Recapture HEAD
+    // per invoke so an initial salvage commit cannot skip retry leftovers.
+    let revisionSalvageFailureReason: string | undefined;
+    const withRevisionSalvageFailure = (reason: string): string =>
+      revisionSalvageFailureReason
+        ? `${reason} Salvage of uncommitted work also failed: ${revisionSalvageFailureReason}`
+        : reason;
+    const recordRevisionSalvage = (outcome: { salvaged: boolean; failureReason?: string }): void => {
+      if (outcome.failureReason) {
+        revisionSalvageFailureReason = outcome.failureReason;
+      } else if (outcome.salvaged) {
+        revisionSalvageFailureReason = undefined;
+      }
+    };
+    const salvagePlanRevisionOpenspec = async (headBefore: string, stageLabel: string) => {
+      const outcome = await salvageIfNoNewCommit(
+        wt.path,
+        issueNumber,
+        pipelineRunId,
+        stageLabel,
+        headBefore,
+        "openspec/",
+        doGitInWorktree,
+        doTrySalvage,
+      );
+      recordRevisionSalvage(outcome);
+    };
+
+    const headBeforeInitial = (
+      await doGitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+    ).stdout.trim();
     let revisionResult = await invokeRevisionOnce(revisionPrompt);
     // Only treat unsuccessful/timed-out invocations as harness-failure. Exit-0
     // empty/whitespace stdout is an output-contract failure: route it through
@@ -1145,6 +1178,7 @@ export async function runPlanningPhases(
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return blockedOutcome(reason, "harness-failure");
     }
+    await salvagePlanRevisionOpenspec(headBeforeInitial, "plan revision");
     // plan-revision.ack@1 via the central stage-output-contract layer + shared
     // format-repair policy (single automatic re-prompt). Terminal pure shape
     // exhaustion is harness-contract, not product needs-human (#777).
@@ -1157,6 +1191,9 @@ export async function runPlanningPhases(
           `[pipeline] #${issueNumber}: plan-revision ack contract failed; attempting one format-repair re-prompt`,
         );
         const repairPrompt = `${revisionPrompt}\n\n${PLAN_REVISION_ACK_REPAIR_ADDENDUM}`;
+        const headBeforeRetry = (
+          await doGitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+        ).stdout.trim();
         const repairResult = await invokeRevisionOnce(repairPrompt);
         if (!repairResult.success) {
           const reason = repairResult.timed_out
@@ -1164,24 +1201,27 @@ export async function runPlanningPhases(
             : `Plan revision format-repair failed (exit ${repairResult.exit_code})${formatStderrExcerpt(repairResult.stderr)}`;
           return { success: false, reason };
         }
+        await salvagePlanRevisionOpenspec(headBeforeRetry, "plan revision format-repair");
         revisionResult = repairResult;
         return { success: true, output: repairResult.stdout };
       },
     });
     if (ackRepair.status === "invoke-failed") {
-      await doSetBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${ackRepair.reason}`, "plan-review", "harness-failure");
+      const reason = withRevisionSalvageFailure(`Plan revision by ${primary} failed: ${ackRepair.reason}`);
+      await doSetBlocked(cfg, issueNumber, reason, "plan-review", "harness-failure");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return blockedOutcome(ackRepair.reason, "harness-failure");
+      return blockedOutcome(reason, "harness-failure");
     }
     if (ackRepair.status === "contract-exhausted") {
+      const reason = withRevisionSalvageFailure(ackRepair.reason);
       const diagnostic = buildHarnessContractDiagnostic({
-        reason: ackRepair.reason,
+        reason,
         stage: "plan-review",
         evidenceKey: `plan-revision.ack@1#${issueNumber}`,
       });
-      await doSetBlocked(cfg, issueNumber, ackRepair.reason, "plan-review", "harness-failure");
+      await doSetBlocked(cfg, issueNumber, reason, "plan-review", "harness-failure");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return blockedOutcome(ackRepair.reason, "harness-failure", diagnostic);
+      return blockedOutcome(reason, "harness-failure", diagnostic);
     }
     if (ackRepair.warning) {
       console.warn(`[pipeline] #${issueNumber}: plan-revision warning — ${ackRepair.warning}`);
@@ -1189,10 +1229,11 @@ export async function runPlanningPhases(
 
     const revisionClaims = extractPlanningFactClaims(revisionResult.stdout, revisionFacts.bundle);
     if (!revisionClaims.ok) {
-      const diagnostic = planningFactsBlockDiagnostic(revisionClaims.reason, "plan-review");
-      await doSetBlocked(cfg, issueNumber, revisionClaims.reason, "plan-review", revisionClaims.tag);
+      const reason = withRevisionSalvageFailure(revisionClaims.reason);
+      const diagnostic = planningFactsBlockDiagnostic(reason, "plan-review");
+      await doSetBlocked(cfg, issueNumber, reason, "plan-review", revisionClaims.tag);
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return blockedOutcome(revisionClaims.reason, revisionClaims.tag, diagnostic);
+      return blockedOutcome(reason, revisionClaims.tag, diagnostic);
     }
     persistPlanningFactsArtifact(opts.runDir, "planning-fact-claims.json", revisionClaims.claims);
     boundPlanningFacts = revisionFacts.bundle;
@@ -1200,9 +1241,10 @@ export async function runPlanningPhases(
     // Re-validate and re-read artifact after revision (OpenSpec re-reads proposal; freeform is a no-op).
     const rv = await hooks.revalidateArtifact(wt, revisionResult.stdout.trim());
     if (!rv.ok) {
-      await doSetBlocked(cfg, issueNumber, rv.reason, "plan-review", rv.tag);
+      const reason = withRevisionSalvageFailure(rv.reason);
+      await doSetBlocked(cfg, issueNumber, reason, "plan-review", rv.tag);
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return blockedOutcome(rv.reason, rv.tag);
+      return blockedOutcome(reason, rv.tag);
     }
     revisedPlan = rv.updatedPlanText;
     specContext = rv.updatedSpecContext || specContext;
@@ -1212,10 +1254,18 @@ export async function runPlanningPhases(
 
     if (!validateHumanFeedbackAck(revisedPlan, humanComments)) {
       const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
-      const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
+      const reason = withRevisionSalvageFailure(
+        `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`,
+      );
       await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return blockedOutcome(reason, "needs-human");
+    }
+    if (revisionSalvageFailureReason) {
+      const reason = `Salvage of uncommitted work also failed: ${revisionSalvageFailureReason}`;
+      await doSetBlocked(cfg, issueNumber, reason, "plan-review", "harness-failure");
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return blockedOutcome(reason, "harness-failure");
     }
     await doPostComment(
       cfg,
