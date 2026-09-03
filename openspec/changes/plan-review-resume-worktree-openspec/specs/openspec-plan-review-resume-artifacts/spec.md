@@ -29,6 +29,34 @@ OpenSpec plan-review resume SHALL pass the current worktree `proposal.md` as the
 - **WHEN** plan-review resume is requested and a completed plan comment exists
 - **THEN** the pipeline SHALL NOT re-invoke the planning authoring harness solely to bind worktree artifacts
 
+### Requirement: Resume SHALL resolve the change id then bind files from that id
+
+OpenSpec plan-review resume SHALL use one resolved-change flow. If the closed-over change id is empty, resume SHALL restore it with the same acceptance criteria as `openspec.change-singular@1`. Resume SHALL then read `proposal.md` and spec deltas from that resolved id before it constructs the plan-review prompt or any later plan-revision prompt in that session. If the closed-over change id is already non-empty, resume SHALL bind files from that id and SHALL NOT re-run singularity to pick a different id. If that non-empty id has no readable `proposal.md`, resume SHALL block with tag `openspec-invalid` and SHALL NOT fall back to the GitHub plan comment.
+
+#### Scenario: Empty change id is restored then bound
+
+- **WHEN** plan-review resume starts with an empty closed-over change id
+- **AND** restore chooses exactly one in-flight change
+- **THEN** resume SHALL bind that restored id's `proposal.md` and spec deltas
+- **AND** SHALL construct the plan-review prompt from those files
+- **AND** SHALL NOT construct that prompt from the GitHub plan comment as the sole plan text
+
+#### Scenario: Non-empty resolved id is bound without re-picking
+
+- **WHEN** plan-review resume already has a non-empty closed-over change id
+- **THEN** resume SHALL read `proposal.md` and spec deltas from that id
+- **AND** SHALL NOT select a different change from the active-change list
+
+#### Scenario: Non-empty id with unreadable proposal blocks
+
+- **WHEN** plan-review resume has a non-empty closed-over change id
+- **AND** `proposal.md` for that id is missing, unreadable, or blank
+- **THEN** the stage SHALL block at plan-review
+- **AND** the blocker tag SHALL be `openspec-invalid`
+- **AND** the plan-review harness SHALL NOT be invoked
+- **AND** the plan-revision harness SHALL NOT be invoked
+- **AND** the GitHub plan comment SHALL NOT become the plan text
+
 ### Requirement: Later plan revision on that resume SHALL use the same worktree artifacts
 
 The pipeline SHALL pass the bound worktree `proposal.md` and spec deltas to any plan-revision prompt in the same OpenSpec plan-review resume session. The GitHub plan comment SHALL NOT be the sole plan text for that revision prompt when a singular restorable change exists.
@@ -40,6 +68,27 @@ The pipeline SHALL pass the bound worktree `proposal.md` and spec deltas to any 
 - **THEN** the plan-revision prompt SHALL include that worktree `proposal.md` as plan text
 - **AND** SHALL include those spec deltas as spec context
 - **AND** SHALL NOT use the GitHub plan comment as the sole plan text
+
+### Requirement: Unreadable living proposal SHALL block resume
+
+When OpenSpec plan-review resume has a resolved change id and the `proposal.md` reader returns null or blank after trim, the stage SHALL block at plan-review with tag `openspec-invalid`. The plan-review harness and the plan-revision harness SHALL NOT be invoked. The GitHub plan comment SHALL NOT become the plan text. Empty spec-delta concatenation SHALL remain valid spec context (`""`). A thrown spec-delta reader SHALL use the same `openspec-invalid` block path.
+
+#### Scenario: Missing proposal.md blocks without comment fallback
+
+- **WHEN** OpenSpec plan-review resume has resolved a change id
+- **AND** `proposal.md` for that id is missing, unreadable, or blank
+- **THEN** the stage SHALL block at plan-review
+- **AND** the blocker tag SHALL be `openspec-invalid`
+- **AND** the plan-review harness SHALL NOT be invoked with the GitHub plan comment as plan text
+
+#### Scenario: Empty spec deltas still bind
+
+- **WHEN** OpenSpec plan-review resume has resolved a change id
+- **AND** `proposal.md` is readable
+- **AND** spec-delta concatenation is empty
+- **THEN** the plan-review prompt SHALL use that `proposal.md` as plan text
+- **AND** SHALL pass empty spec context
+- **AND** SHALL NOT block solely because spec deltas are empty
 
 ### Requirement: Freeform plan-review resume SHALL keep using the GitHub plan comment
 
@@ -62,7 +111,9 @@ OpenSpec plan-review resume SHALL block with the named change-id restore reason 
 - **AND** the worktree has zero active OpenSpec changes
 - **THEN** the stage SHALL block at plan-review
 - **AND** the blocker reason SHALL name change-id restore failure
-- **AND** the plan-review harness SHALL NOT be invoked with the GitHub plan comment as an OpenSpec proposal
+- **AND** the plan-review harness SHALL NOT be invoked
+- **AND** the plan-revision harness SHALL NOT be invoked
+- **AND** the GitHub plan comment SHALL NOT be used as an OpenSpec proposal
 
 #### Scenario: Multiple candidate changes block without picking one
 
@@ -71,6 +122,8 @@ OpenSpec plan-review resume SHALL block with the named change-id restore reason 
 - **THEN** the stage SHALL block at plan-review
 - **AND** the blocker reason SHALL name change-id restore failure
 - **AND** SHALL NOT select an arbitrary change among many as the plan text
+- **AND** the plan-review harness SHALL NOT be invoked
+- **AND** the plan-revision harness SHALL NOT be invoked
 
 ### Requirement: Resume artifact binding SHALL reuse the existing singularity and file readers
 
@@ -93,6 +146,23 @@ OpenSpec plan-review resume SHALL select the in-flight change with the same acce
 - **WHEN** this change is implemented
 - **THEN** train, merge-authority, and review-schema behavior SHALL remain unchanged
 - **AND** plan-review resume SHALL still skip authoring
+
+### Requirement: design.md and tasks.md SHALL remain worktree files
+
+OpenSpec plan-review resume SHALL NOT add new prompt placeholders for `design.md` or `tasks.md`. Spec context SHALL stay the concatenation of `openspec/changes/<id>/specs/**/*.md`. Resume SHALL keep the plan-review working directory as the issue worktree so the reviewer can inspect `design.md` and `tasks.md` on disk.
+
+#### Scenario: Prompt binds proposal and spec deltas only
+
+- **WHEN** OpenSpec plan-review resume binds living artifacts
+- **THEN** the plan-review prompt SHALL use `proposal.md` as plan text
+- **AND** SHALL use spec-delta files under `specs/` as spec context
+- **AND** SHALL NOT inline `design.md` or `tasks.md` as new prompt fields
+
+#### Scenario: Reviewer cwd stays the worktree
+
+- **WHEN** OpenSpec plan-review resume invokes the reviewer
+- **THEN** the reviewer working directory SHALL be the issue worktree
+- **AND** `design.md` and `tasks.md` SHALL remain readable as files in that change directory
 
 ### Requirement: A regression SHALL fail if resume ignores the worktree proposal
 

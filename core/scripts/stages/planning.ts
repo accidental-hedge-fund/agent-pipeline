@@ -435,6 +435,16 @@ export interface PlanningPhaseHooks {
     deps: RunPlanningPhasesDeps,
     issueNumber?: number,
   ): Promise<HarnessResult>;
+
+  /**
+   * Bind living plan-review resume artifacts from the worktree. OpenSpec
+   * implements this so resume reviews `proposal.md` and spec deltas instead of
+   * a stale GitHub plan comment. Freeform omits it and keeps the comment.
+   */
+  bindResumePlanArtifacts?(wt: { path: string }): Promise<
+    | { ok: true; promptPlanText: string; specContext: string }
+    | { ok: false; reason: string; tag: BlockerKind }
+  >;
 }
 
 // ---------------------------------------------------------------------------
@@ -830,7 +840,21 @@ export async function runPlanningPhases(
     planComment = existingPlan;
     // Strip the markdown header for prompts when present.
     planText = existingPlan.replace(/^## (?:Revised )?Implementation Plan\s*\n+/, "");
-    promptPlanText = planText;
+    // OpenSpec resume binds living worktree files when the hook is present.
+    // The GitHub comment stays `planComment` for human-feedback extraction.
+    // After a successful bind, do not assign `promptPlanText` from the comment.
+    if (hooks.bindResumePlanArtifacts) {
+      const bound = await hooks.bindResumePlanArtifacts(wt);
+      if (!bound.ok) {
+        await doSetBlocked(cfg, issueNumber, bound.reason, "plan-review", bound.tag);
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+        return blockedOutcome(bound.reason, bound.tag);
+      }
+      promptPlanText = bound.promptPlanText;
+      specContext = bound.specContext;
+    } else {
+      promptPlanText = planText;
+    }
     console.log(
       `[pipeline] #${issueNumber}: resuming plan-review from completed plan (skipping planning harness)`,
     );
@@ -1970,21 +1994,24 @@ export function makeFreeformPlanningHooks(cfg: PipelineConfig, title: string, bo
 }
 
 /**
- * Optional listing / validation seams for {@link makeOpenspecPlanningHooks}.
- * Production omits this and uses `openspec.listChangeDirs` / `openspec.validateItem`.
- * Tests inject fakes so restore and revalidation stay hermetic.
+ * Optional listing / validation / file-read seams for {@link makeOpenspecPlanningHooks}.
+ * Production omits this and uses the `openspec` module functions.
+ * Tests inject fakes so restore, revalidation, and resume artifact binding stay hermetic.
  */
 export interface OpenspecPlanningHookInjects {
   listChangeDirs?: (dir: string) => string[];
   validateItem?: typeof openspec.validateItem;
+  readChangeFile?: typeof openspec.readChangeFile;
+  readSpecDeltas?: typeof openspec.readSpecDeltas;
 }
 
 /**
  * Build the PlanningPhaseHooks for the OpenSpec path. Captures cfg, title, body,
  * and beforeList. Uses a mutable `changeId` variable that `authorArtifact` sets
  * and all subsequent hooks read. When `changeId` is still empty (plan-review
- * resume skips authoring), `validateArtifact` / `revalidateArtifact` restore it
- * via `openspec.change-singular@1` before any `validateItem` call.
+ * resume skips authoring), `bindResumePlanArtifacts` / `validateArtifact` /
+ * `revalidateArtifact` restore it via `openspec.change-singular@1` before any
+ * file read or `validateItem` call.
  */
 export function makeOpenspecPlanningHooks(
   cfg: PipelineConfig,
@@ -1996,6 +2023,8 @@ export function makeOpenspecPlanningHooks(
   let changeId = "";
   const listChangeDirs = inject.listChangeDirs ?? openspec.listChangeDirs;
   const validateItem = inject.validateItem ?? openspec.validateItem;
+  const readChangeFile = inject.readChangeFile ?? openspec.readChangeFile;
+  const readSpecDeltas = inject.readSpecDeltas ?? openspec.readSpecDeltas;
 
   const restoreChangeIdIfEmpty = (
     wtPath: string,
@@ -2331,6 +2360,39 @@ export function makeOpenspecPlanningHooks(
         `\`openspec/changes/${changeId}/tasks.md\`, keep that change folder committed, and satisfy its spec deltas.\n\n` +
         `${proposal}${tasks ? `\n\n## Tasks\n\n${tasks}` : ""}`
       );
+    },
+
+    async bindResumePlanArtifacts(wt) {
+      const restored = restoreChangeIdIfEmpty(wt.path);
+      if (!restored.ok) {
+        return { ok: false, reason: restored.reason, tag: "openspec-invalid" };
+      }
+      let raw: string | null;
+      try {
+        raw = readChangeFile(wt.path, changeId, "proposal.md");
+      } catch {
+        raw = null;
+      }
+      const proposal = raw?.trim() ?? "";
+      if (!proposal) {
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` has no readable proposal.md`,
+          tag: "openspec-invalid",
+        };
+      }
+      let specContext = "";
+      try {
+        specContext = readSpecDeltas(wt.path, changeId);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` spec-delta read failed: ${detail}`,
+          tag: "openspec-invalid",
+        };
+      }
+      return { ok: true, promptPlanText: proposal, specContext };
     },
 
     // Plan review must also run from wt.path so the reviewer can read the
