@@ -151,6 +151,24 @@ describe("command-docs metadata", () => {
     assert.ok(!listed.includes("run"));
   });
 
+  test("override CLI summary names operator-supplied authority (#1379)", () => {
+    const override = OPERATION_SURFACE.find((op) => op.name === "override");
+    assert.ok(override);
+    assert.match(override.desc, /operator-supplied or explicitly approved/i);
+    assert.doesNotMatch(
+      override.desc,
+      /^Disposition a review finding and auto-resume the advance loop$/,
+    );
+    const md = renderCliMarkdown();
+    const overrideSection = md.split("#### `override`")[1]?.split("####")[0] ?? "";
+    assert.match(overrideSection, /pipeline override <n> "<key>: <reason>"/);
+    assert.match(overrideSection, /operator-supplied or explicitly approved/i);
+    assert.doesNotMatch(
+      overrideSection,
+      /Summary:\*\* Disposition a review finding and auto-resume the advance loop/,
+    );
+  });
+
   test("OPERATION_SURFACE drives the default CLI catalog", () => {
     const status = OPERATION_SURFACE.find((op) => op.name === "status");
     assert.ok(status);

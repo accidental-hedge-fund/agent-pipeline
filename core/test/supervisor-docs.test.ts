@@ -258,6 +258,19 @@ test("hermes-state pin detector fails when the SKILL default is injected (#1183)
   );
 });
 
+test("supervisor residual-park row is recover-parked once then STOP, not inferred override (#1379)", () => {
+  const supervisor = read("docs/supervisor.md");
+  const rowMatch = supervisor.match(
+    /\| `needs-human` \/ blocked — \*\*residual review park at current HEAD\*\*[^\n]+\|/,
+  );
+  assert.ok(rowMatch, "supervisor.md must keep the residual review park row");
+  const row = rowMatch[0];
+  assert.match(row, /pipeline recover-parked <N>/);
+  assert.match(row, /Do \*\*not\*\* invent `pipeline override` or drop `blocked`/);
+  assert.doesNotMatch(row, /invent `pipeline override` as the default reflow/);
+  assert.match(supervisor, /Train does \*\*not\*\* auto-invoke recover-parked/);
+});
+
 test("supervisor docs name the forbidden Hermes-state pin and v1.40.1 packaging bar (#1183)", () => {
   const supervisor = read("docs/supervisor.md");
   assert.match(supervisor, /install:production-pin-path/);

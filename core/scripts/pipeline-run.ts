@@ -2447,7 +2447,8 @@ export async function runAdvance(
         const resumeLabel = round !== null ? `pipeline:review-${round}` : "pipeline:review-<round>";
         console.log(
           `[pipeline] #${issueNumber}: parked at needs-human — a review round hit the round ceiling. ` +
-            `Disposition a finding with --override "<key>: <reason>" (records the decision and auto-resumes), ` +
+            `Run pipeline recover-parked once for the current park fingerprint. If still parked, stop and request an exact operator-supplied disposition. Do not invent override from the host. ` +
+            `An operator may supply or explicitly approve --override "<key>: <reason>" (records the decision and auto-resumes), ` +
             `or fix the residual findings and relabel pipeline:needs-human → ${resumeLabel} to resume.`,
         );
         if (ceiling) console.log(ceiling.body);

@@ -305,7 +305,9 @@ import {
 } from "./stage-diagnostic.ts";
 import {
   buildStatusPayload,
+  deriveHostGuidance,
   formatWriteHealthStatusWarning,
+  type HostGuidance,
   type StatusPayload,
 } from "./status-json.ts";
 import {
@@ -7986,13 +7988,28 @@ export async function runStatus(
   // #115: parked at `needs-human` → surface the punch-list (unresolved blocking
   // count + resume steps) so the operator knows what to do, not just the bare
   // stage. Gated on the stage so every other stage's output is unchanged.
+  // #1379: resume text follows the same fingerprint-aware host_guidance as JSON.
   if (stage === "needs-human") {
-    const punchlist = needsHumanPunchlist(detail.comments);
+    const hostGuidance = deriveHostGuidance({
+      stage,
+      blocked,
+      issue: detail.number,
+      comments: detail.comments,
+    });
+    const punchlist = needsHumanPunchlist(detail.comments, {
+      hostGuidance,
+      issueNumber: detail.number,
+    });
+    const recoverPrefix =
+      hostGuidance === "recover-parked"
+        ? `Run \`pipeline recover-parked ${detail.number}\` once for the current park fingerprint. If still parked, stop and request an exact operator-supplied disposition. `
+        : `Stop and request an exact operator-supplied disposition. `;
     console.log("");
     console.log(
       punchlist ??
         `Needs human, but no ${REVIEW_CEILING_MARKER.replace(/^## /, "")} comment was found. ` +
-          `Run \`--override "<key>: <reason>"\` (auto-resumes) or fix the residual findings and relabel ` +
+          recoverPrefix +
+          `Do not invent override from the host. An operator may supply or explicitly approve \`--override "<key>: <reason>"\` (auto-resumes), or fix the residual findings and relabel ` +
           `\`pipeline:needs-human\` → \`pipeline:review-<round>\` to resume.`,
     );
     // #647: list pending human-question handoffs without replacing the punch-list.
@@ -8038,6 +8055,43 @@ export async function runStatus(
 }
 
 /**
+ * Resume bullets for the needs-human punch-list. Recovery-first text is
+ * emitted only when host-guidance is `recover-parked`; otherwise STOP.
+ */
+function needsHumanResumeLines(args: {
+  hostGuidance: HostGuidance;
+  issueNumber?: number;
+  round: number;
+}): string[] {
+  const n =
+    typeof args.issueNumber === "number" &&
+    Number.isInteger(args.issueNumber) &&
+    args.issueNumber > 0
+      ? String(args.issueNumber)
+      : "<N>";
+  const lines = ["To resume:"];
+  if (args.hostGuidance === "recover-parked") {
+    lines.push(
+      `- Run \`pipeline recover-parked ${n}\` once for the current park fingerprint.`,
+    );
+    lines.push(
+      `- If still parked, stop and request an exact operator-supplied disposition. Do not invent override from the host.`,
+    );
+  } else {
+    lines.push(
+      `- Stop and request an exact operator-supplied disposition. Do not invent override from the host.`,
+    );
+  }
+  lines.push(
+    `- An operator may supply or explicitly approve \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes. That command is the human decision path, not host authority.`,
+  );
+  lines.push(
+    `- Or fix it by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${args.round}\`.`,
+  );
+  return lines;
+}
+
+/**
  * Pure helper (#115): build the `needs-human` punch-list from the issue's
  * comments — the count of still-blocking findings, each finding line tagged
  * `RECURRING (n rounds)` / `NEW` (#133), plus the resume steps. Reads only
@@ -8047,9 +8101,15 @@ export async function runStatus(
  * verdict comments the tags are derived from; returns `null` when no ceiling
  * comment exists (the caller prints a graceful fallback). Total function: no
  * network, git, or subprocess calls.
+ *
+ * Resume steps follow fingerprint-aware `host_guidance` (#1379): recovery-first
+ * only for `recover-parked`; omitted for `human-disposition-required`. Unknown
+ * guidance fails closed to STOP. Issue number is interpolated into every
+ * recover-parked command.
  */
 export function needsHumanPunchlist(
   comments: { author: string; body: string; createdAt: string }[],
+  opts?: { hostGuidance?: HostGuidance; issueNumber?: number },
 ): string | null {
   // Latest ceiling comment wins (highest index): a re-run posts a fresh one.
   let ceilingIdx = -1;
@@ -8066,12 +8126,16 @@ export function needsHumanPunchlist(
   const count = findings.length;
   const noun = count === 1 ? "finding" : "findings";
   const round = ceilingRound(body) ?? 2;
+  // Fail closed: omit recover-parked unless the caller projected it.
+  const hostGuidance = opts?.hostGuidance ?? "human-disposition-required";
   return [
     `Needs human: ${count} unresolved blocking ${noun} from the review ceiling.`,
     ...reviewStage.tagCeilingFindingLines(findings, comments, ceilingIdx),
-    `To resume:`,
-    `- \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes.`,
-    `- Or fix it by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${round}\`.`,
+    ...needsHumanResumeLines({
+      hostGuidance,
+      issueNumber: opts?.issueNumber,
+      round,
+    }),
   ].join("\n");
 }
 

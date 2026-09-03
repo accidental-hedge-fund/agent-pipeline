@@ -66,7 +66,8 @@ export const OPERATION_SURFACE: readonly OperationSurfaceEntry[] = [
   }),
   operation({
     name: "override",
-    desc: "Disposition a review finding and auto-resume the advance loop",
+    desc:
+      "Operator-supplied or explicitly approved exact disposition (\"<key>: <reason>\"); auto-resumes. Not an autonomous host next action",
     usage: 'override <n> "<key>: <reason>"',
     section: "lifecycle",
     fast: false,
