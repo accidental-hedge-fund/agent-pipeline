@@ -1,4 +1,4 @@
-// Operator-authorized integrated train (#901 / #1023 / #1028 / #1063 / #1096 / #1273).
+// Operator-authorized integrated train (#901 / #1023 / #1028 / #1063 / #1096 / #1273 / #1413).
 //
 // Advance-only (`merge: false`): base-eligible frontier waves (loop recovery).
 // `--merge` / ship: **serial** — merge-first prelude merges every already-R2D
@@ -15,6 +15,17 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { parseDeclaredDependencyIds } from "../declared-dependency-grammar.ts";
+import {
+  assertDiscoveryCompleteForAdmission,
+  discoverDeclaredDependencies,
+  realWorkListDependencyDiscoverDeps,
+  type DeclaredDependencyDiscoveryResult,
+  type DeclaredEdgeProvenance,
+  type IgnoredDep,
+  type SourceObservation,
+  type WorkListDependencyDiscoverDeps,
+} from "../loop/work-list-deps.ts";
+import { isFactoryControlCheckout } from "../production-engine-pin.ts";
 import {
   getPrForIssueAnyState as ghGetPrForIssueAnyState,
   normalizeLinkedIssuePrs,
@@ -136,6 +147,10 @@ export interface TrainPlan {
   ordered_issues: number[];
   merge_first: number[];
   items: TrainPlanItem[];
+  /** Additive discovery audit (#1413). Same facts live train records on the work-list event. */
+  observations?: SourceObservation[];
+  edge_provenance?: DeclaredEdgeProvenance[];
+  ignored_deps?: IgnoredDep[];
 }
 
 export interface TrainOpts {
@@ -222,6 +237,12 @@ export interface TrainDeps {
   log(msg: string): void;
   listMilestoneIssues(milestone: string): Promise<TrainIssueSnapshot[]>;
   getIssue(issue: number): Promise<TrainIssueSnapshot>;
+  /**
+   * Shared work-list declared-dependency discovery (#1413). Production wires
+   * {@link realWorkListDependencyDiscoverDeps} (same class as fresh loop compile).
+   * Tests inject fakes. Train MUST NOT parse title/body as a second graph.
+   */
+  discoverDeps: WorkListDependencyDiscoverDeps;
   /** Injected generic run-store I/O. Tests supply an in-memory fake. */
   runStore?: RunStoreDeps;
   /** Clock for train run ids and event timestamps. */
@@ -586,12 +607,17 @@ export function isBlockedOrNeedsHumanSnapshot(s: TrainIssueSnapshot): boolean {
 /**
  * `--merge` order: already-R2D issues first (stable relative order), then the rest.
  * Declared-dep order is preserved inside each partition (#1063).
+ * When `admittedItems` is provided (train live/dry-run), order consumes the
+ * shared discovery graph rather than re-parsing snapshot title/body (#1413).
  */
 export function orderIssuesForTrain(
   snapshots: readonly TrainIssueSnapshot[],
   mergeMode: boolean,
+  admittedItems?: readonly RawContractItem[],
 ): number[] {
-  const base = orderIssuesByDeclaredDeps(snapshots);
+  const base = admittedItems
+    ? orderIssuesByAdmittedItems(snapshots, admittedItems)
+    : orderIssuesByDeclaredDeps(snapshots);
   if (!mergeMode) return base;
   const byN = new Map(snapshots.map((s) => [s.number, s]));
   const r2d: number[] = [];
@@ -604,9 +630,32 @@ export function orderIssuesForTrain(
 }
 
 /**
+ * Build a dependency-ordered issue list from admitted discovery items.
+ * Input snapshot order breaks topological ties (compileContractItems).
+ */
+export function orderIssuesByAdmittedItems(
+  snapshots: readonly TrainIssueSnapshot[],
+  admittedItems: readonly RawContractItem[],
+): number[] {
+  if (snapshots.length === 0) {
+    throw new Error("work list is empty");
+  }
+  const byId = new Map(admittedItems.map((item) => [item.id, item]));
+  const raw: RawContractItem[] = snapshots.map((s) => {
+    const id = String(s.number);
+    const item = byId.get(id);
+    if (!item) {
+      throw new Error(`discovery omitted issue #${s.number}`);
+    }
+    return item;
+  });
+  return orderRawContractItems(raw);
+}
+
+/**
  * Build a dependency-ordered issue list from snapshots.
- * Uses declared lexical deps (#905 grammar) among in-list issues only.
- * Input order breaks topological ties (compileContractItems).
+ * Lexical-only helper retained for ship freeze planning. Train live/dry-run
+ * uses {@link orderIssuesByAdmittedItems} from shared discovery (#1413).
  */
 export function orderIssuesByDeclaredDeps(
   snapshots: readonly TrainIssueSnapshot[],
@@ -621,6 +670,10 @@ export function orderIssuesByDeclaredDeps(
       .filter((id) => snapshots.some((o) => String(o.number) === id));
     return { id: String(s.number), depends_on: deps };
   });
+  return orderRawContractItems(raw);
+}
+
+function orderRawContractItems(raw: readonly RawContractItem[]): number[] {
   try {
     const ordered = compileContractItems(raw);
     return ordered.map((item) => Number(item.id));
@@ -633,20 +686,20 @@ export function orderIssuesByDeclaredDeps(
 }
 
 /**
- * Code-dependency adjacency: issue → prerequisite issue numbers.
- * Unknown edge kind fails closed as a code dependency (#1023).
+ * Code-dependency adjacency from admitted discovery items:
+ * issue → prerequisite issue numbers. Unknown edge kind fails closed (#1023).
  */
 export function codeDependencyMap(
-  snapshots: readonly TrainIssueSnapshot[],
+  items: readonly RawContractItem[],
 ): Map<number, number[]> {
-  const inList = new Set(snapshots.map((s) => s.number));
+  const inList = new Set(items.map((item) => Number(item.id)));
   const map = new Map<number, number[]>();
-  for (const s of snapshots) {
-    const text = `${s.title}\n${s.body}`;
-    const deps = parseDeclaredDependencyIds(text, String(s.number))
+  for (const item of items) {
+    const n = Number(item.id);
+    const deps = (item.depends_on ?? [])
       .map((id) => Number(id))
-      .filter((n) => Number.isSafeInteger(n) && inList.has(n));
-    map.set(s.number, deps);
+      .filter((d) => Number.isSafeInteger(d) && inList.has(d));
+    map.set(n, deps);
   }
   return map;
 }
@@ -681,10 +734,10 @@ export function computeBaseEligibleFrontier(input: {
 }
 
 /**
- * True when `issue` has no direct or transitive declared Depends-on path to any
- * held item. Reverse edges (a held item depends on `issue`) do not skip it.
- * Fail closed: {@link codeDependencyMap} already treats unknown declared edges
- * as code dependencies; this helper walks that graph.
+ * True when `issue` has no direct or transitive admitted declared-dependency
+ * path to any held item. Reverse edges (a held item depends on `issue`) do not
+ * skip it. Fail closed: {@link codeDependencyMap} already treats unknown
+ * admitted edges as code dependencies; this helper walks that graph.
  */
 export function isIndependentOfHeld(
   issue: number,
@@ -814,14 +867,27 @@ function classifyTrainIntendedAction(input: {
   return "would-advance";
 }
 
+function discoveryAuditFields(discovery: DeclaredDependencyDiscoveryResult): {
+  observations: SourceObservation[];
+  edge_provenance: DeclaredEdgeProvenance[];
+  ignored_deps?: IgnoredDep[];
+} {
+  return {
+    observations: discovery.observations,
+    edge_provenance: discovery.edge_provenance,
+    ...(discovery.ignored_deps.length > 0 ? { ignored_deps: discovery.ignored_deps } : {}),
+  };
+}
+
 async function planTrainDryRun(input: {
   ordered: readonly number[];
   byNumber: ReadonlyMap<number, TrainIssueSnapshot>;
   codeDeps: ReadonlyMap<number, readonly number[]>;
   mergeMode: boolean;
   deps: TrainDeps;
+  discovery: DeclaredDependencyDiscoveryResult;
 }): Promise<TrainPlan> {
-  const { ordered, byNumber, codeDeps, mergeMode, deps } = input;
+  const { ordered, byNumber, codeDeps, mergeMode, deps, discovery } = input;
   const linked = new Map<number, { pr: number | null; open: boolean; merged: boolean; contained: boolean }>();
   for (const n of ordered) {
     linked.set(n, await linkedPrForPlan(n, deps));
@@ -885,6 +951,7 @@ async function planTrainDryRun(input: {
     ordered_issues: [...ordered],
     merge_first: mergeFirst,
     items,
+    ...discoveryAuditFields(discovery),
   });
 }
 
@@ -898,6 +965,14 @@ function logTrainPlan(plan: TrainPlan, log: (msg: string) => void): void {
       `[train] #${item.issue}  stage=${item.stage ?? "none"}  ${prText}  ` +
         `frontier=${item.on_frontier ? "yes" : "no"}  action=${item.intended_action}${mergeFirstNote}`,
     );
+  }
+  for (const edge of plan.edge_provenance ?? []) {
+    log(
+      `[train] dep #${edge.depender} → #${edge.prerequisite} sources=${edge.sources.join(",")}`,
+    );
+  }
+  for (const ign of plan.ignored_deps ?? []) {
+    log(`[train] ignored dep #${ign.depender} → #${ign.target} reason=${ign.reason}`);
   }
   log(
     "[train] dry-run: no mutations performed (no advance, merge, push, comment, or run store)",
@@ -989,9 +1064,21 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     throw new Error("work list has no eligible issues (all pipeline:backlog or empty)");
   }
 
-  const ordered = orderIssuesForTrain(snapshots, mergeMode);
+  if (!deps.discoverDeps) {
+    throw new Error("TrainDeps requires discoverDeps (shared work-list discovery)");
+  }
+  const issueIds = snapshots.map((s) => String(s.number));
+  const discovery = await discoverDeclaredDependencies(issueIds, deps.discoverDeps);
+  assertDiscoveryCompleteForAdmission(issueIds, discovery, {
+    forceRefuse: isFactoryControlCheckout({
+      repoDir: opts.repoDir,
+      env: process.env,
+    }),
+  });
+
+  const ordered = orderIssuesForTrain(snapshots, mergeMode, discovery.items);
   const byNumber = new Map(snapshots.map((s) => [s.number, s]));
-  const codeDeps = codeDependencyMap(snapshots);
+  const codeDeps = codeDependencyMap(discovery.items);
 
   if (opts.dryRun) {
     const plan = await planTrainDryRun({
@@ -1000,6 +1087,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       codeDeps,
       mergeMode,
       deps,
+      discovery,
     });
     logTrainPlan(plan, deps.log);
     return {
@@ -1057,6 +1145,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
   await session.append("train_work_list_resolved", {
     ordered_issues: ordered,
     merge_mode: mergeMode,
+    ...discoveryAuditFields(discovery),
   });
 
   const startedIssues = new Set<number>();
@@ -1778,10 +1867,20 @@ export function realTrainDeps(opts: {
     return String(stdout).trim();
   };
 
+  const discoverCfg = {
+    repo: opts.repo,
+    repo_dir: opts.repoDir,
+    base_branch: opts.baseBranch,
+  } as PipelineConfig;
+
   return {
     log(msg) {
       console.error(msg);
     },
+
+    discoverDeps: realWorkListDependencyDiscoverDeps(discoverCfg, {
+      getRoadmapDeclaredEdges: async () => [],
+    }),
 
     async listMilestoneIssues(milestone) {
       const { stdout } = await execFileAsync(
