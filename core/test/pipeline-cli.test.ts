@@ -1301,6 +1301,119 @@ test("advanceWaveThroughLoop awaits onLoopReady inside onRunReady before the eng
   );
 });
 
+test("advanceWaveThroughLoop withholds onLoopReady when events path is missing (#1417 3.1)", async () => {
+  const { advanceWaveThroughLoop } = await import("../scripts/pipeline.ts");
+  const fakeCfg = {
+    repo_dir: "/tmp/repo",
+    repo: "o/r",
+    base_branch: "main",
+    domain: "o-r",
+  };
+  let loopReadyCalls = 0;
+  const result = await advanceWaveThroughLoop(
+    [10],
+    {
+      onLoopReady: async () => {
+        loopReadyCalls += 1;
+      },
+    },
+    async () => ({
+      number: 10,
+      title: "t",
+      body: "",
+      labels: ["pipeline:ready-to-deploy"],
+      state: "open",
+    }),
+    async (input) => {
+      await input.onRunReady!({
+        runId: "abc",
+        runDir: "/abs/state/runs/abc",
+        engine: "codex",
+        resumed: false,
+        selector: { type: "work-list", value: ["10"] },
+      });
+      return {
+        kind: "drive",
+        result: {
+          runId: "abc",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 1,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
+      };
+    },
+    () => fakeCfg as never,
+    async () => [],
+    async () => {},
+  );
+  assert.equal(loopReadyCalls, 0, "incomplete handoff must not invoke onLoopReady");
+  assert.equal(result.loopRun, undefined, "out.loopRun must not present a run id without an absolute path");
+});
+
+test("advanceWaveThroughLoop withholds onLoopReady when events path is relative (#1417 3.1)", async () => {
+  const { advanceWaveThroughLoop } = await import("../scripts/pipeline.ts");
+  const fakeCfg = {
+    repo_dir: "/tmp/repo",
+    repo: "o/r",
+    base_branch: "main",
+    domain: "o-r",
+  };
+  let loopReadyCalls = 0;
+  const result = await advanceWaveThroughLoop(
+    [10],
+    {
+      onLoopReady: async () => {
+        loopReadyCalls += 1;
+      },
+    },
+    async () => ({
+      number: 10,
+      title: "t",
+      body: "",
+      labels: ["pipeline:ready-to-deploy"],
+      state: "open",
+    }),
+    async (input) => {
+      await input.onRunReady!({
+        runId: "abc",
+        runDir: "runs/abc",
+        events: "runs/abc/events.jsonl",
+        engine: "codex",
+        resumed: false,
+        selector: { type: "work-list", value: ["10"] },
+      });
+      return {
+        kind: "drive",
+        result: {
+          runId: "abc",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 1,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
+      };
+    },
+    () => fakeCfg as never,
+    async () => [],
+    async () => {},
+  );
+  assert.equal(loopReadyCalls, 0, "relative events path must not invoke onLoopReady");
+  assert.equal(result.loopRun, undefined);
+});
+
 test("pipeline-cli: train --json stdout stays one train_status with run_id; handoff is stderr-only (#1277)", async () => {
   const { opts } = parseCli(["train", "--issues", "10,11", "--json"]);
   const trainCfg = {

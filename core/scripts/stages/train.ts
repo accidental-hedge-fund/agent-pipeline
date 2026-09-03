@@ -14,7 +14,7 @@
 
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { parseDeclaredDependencyIds } from "../declared-dependency-grammar.ts";
 import {
@@ -1154,8 +1154,15 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
 
   const startedIssues = new Set<number>();
   const announcedPrs = new Set<string>();
-  const linkedLoopIds = new Set<string>();
-  const liveLoopByWave = new Map<number, { runId: string; eventsPath?: string }>();
+  const linkedLoopIds = new Map<string, string>();
+  const linkedLoopPaths = new Map<string, string>();
+  const liveLoopByWave = new Map<number, { runId: string; eventsPath: string }>();
+  const conflictsPublishedLiveLink = (id: string, eventsPath: string): boolean => {
+    const publishedPath = linkedLoopIds.get(id);
+    if (publishedPath !== undefined) return publishedPath !== eventsPath;
+    const publishedId = linkedLoopPaths.get(eventsPath);
+    return publishedId !== undefined && publishedId !== id;
+  };
   const emitItemStarted = async (issue: number): Promise<void> => {
     if (startedIssues.has(issue)) return;
     startedIssues.add(issue);
@@ -1574,23 +1581,33 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       const publishLiveLoop = async (loopRun: LinkedLoopRun): Promise<void> => {
         if (!published) return;
         const id = loopRun.runId.trim();
-        if (!id || linkedLoopIds.has(id)) return;
+        const eventsPath =
+          typeof loopRun.eventsPath === "string" ? loopRun.eventsPath.trim() : "";
+        if (!id || !eventsPath || !isAbsolute(eventsPath)) return;
+        if (conflictsPublishedLiveLink(id, eventsPath)) {
+          eventsCoverage = "degraded";
+          return;
+        }
+        if (linkedLoopIds.has(id)) return;
+        const live = liveLoopByWave.get(waveNumber);
+        if (live && (live.runId !== id || live.eventsPath !== eventsPath)) {
+          eventsCoverage = "degraded";
+          return;
+        }
         try {
           const ok = await session.append("train_loop_linked", {
             wave: waveNumber,
             loop_run_id: id,
             logical_operation_id: session.logicalOperationId,
-            ...(loopRun.eventsPath ? { events: loopRun.eventsPath } : {}),
+            events: eventsPath,
           });
           if (!ok) {
             eventsCoverage = "degraded";
             return;
           }
-          linkedLoopIds.add(id);
-          liveLoopByWave.set(waveNumber, {
-            runId: id,
-            eventsPath: loopRun.eventsPath,
-          });
+          linkedLoopIds.set(id, eventsPath);
+          linkedLoopPaths.set(eventsPath, id);
+          liveLoopByWave.set(waveNumber, { runId: id, eventsPath });
         } catch {
           eventsCoverage = "degraded";
         }
@@ -1620,6 +1637,19 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         (later.runId !== live.runId || later.eventsPath !== live.eventsPath)
       ) {
         eventsCoverage = "degraded";
+      }
+      if (later) {
+        const laterId = later.runId.trim();
+        const laterPath =
+          typeof later.eventsPath === "string" ? later.eventsPath.trim() : "";
+        if (
+          laterId !== "" &&
+          laterPath !== "" &&
+          isAbsolute(laterPath) &&
+          conflictsPublishedLiveLink(laterId, laterPath)
+        ) {
+          eventsCoverage = "degraded";
+        }
       }
 
       for (const issue of toAdvance) {
