@@ -4,8 +4,8 @@
 
 ## What Changes
 
-- Publish `train_loop_linked` from the child loop's typed `onRunReady` handoff after the loop store and exact events path exist, and before that child can block on work. A later wave result MAY confirm the same identity. It SHALL NOT duplicate the event or replace it with a guessed run.
-- Allocate each train run ID with exclusive directory publication and a bounded collision suffix, through injected I/O and clock/ID seams. Two starts that share one clock instant SHALL receive distinct run IDs and isolated event sequences.
+- Publish `train_loop_linked` from the child loop's typed `onRunReady` handoff after the loop store and exact events path exist, and before that child can block on work. That awaited callback is the sole append site. A later wave result MAY confirm the same identity. It SHALL NOT append, duplicate, or replace the live link with a guessed run.
+- Allocate each train run ID with exclusive non-recursive `mkdir` (the claim) and a bounded `EEXIST`-only collision suffix, through injected I/O and clock/ID seams. Call `initRunDir` only on the claimed directory. Two starts that share one clock instant SHALL receive distinct run IDs and isolated event sequences.
 - When allocation is exhausted, report typed degraded or unknown train-event coverage, create no shared run store, and continue the same advance and merge mutations. Identity allocation remains observational.
 - Emit `train_merge_proven` whenever base containment is proven, including already-contained reconciliation. Distinguish `newly-merged` from `already-contained` with an additive `proof_disposition` field. Both paths still emit `train_merge_integrated`.
 - Keep `train --json` stdout as one final `train_status` object. Keep the existing early `train_run_handoff` on stderr.

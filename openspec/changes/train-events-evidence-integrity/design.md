@@ -34,7 +34,7 @@ See `proposal.md` for why. Current law and code:
 
 ### 1. Live linkage uses the existing `onRunReady` callback (primary)
 
-**Choice:** Extend the existing `advanceWave` context (`logicalOperationId` today) with an `onLoopReady` callback. Production `advanceWaveThroughLoop` **awaits** it from the current `onRunReady` handler after it has the exact `runId` and absolute `events` path, and before `runLoopEngine` returns. `runTrain` appends `train_loop_linked` there, once per loop run id, and that append SHALL complete before the await returns. After the wave returns, the same identity MAY be confirmed via `waveResult.loopRun`. That confirmation SHALL NOT append a second event and SHALL NOT replace the live identity with a guessed or latest-run id.
+**Choice:** Extend the existing `advanceWave` context (`logicalOperationId` today) with an `onLoopReady` callback. Production `advanceWaveThroughLoop` **awaits** it from the current `onRunReady` handler after it has the exact `runId` and absolute `events` path, and before `runLoopEngine` returns. `runTrain` appends `train_loop_linked` there, once per loop run id, and that append SHALL complete before the await returns. That awaited callback is the sole append site. After the wave returns, `waveResult.loopRun` MAY confirm the same identity. Same identity SHALL NOT append a second event. A mismatched later identity SHALL keep the first live link, set `events_coverage` to `degraded`, and SHALL NOT abort the wave. Wave-result `loopRun` SHALL NOT append `train_loop_linked` when `onRunReady` never fired.
 
 **Why:** The supervisor already fires `onRunReady` after exclusive lock and before dispatch (#665). `advanceWaveThroughLoop` already reads that identity. Moving the append to that callback is the first holding rung. A new bus, stdout scrape, or mtime lookup would recreate the defect FRG already forbids.
 
@@ -46,7 +46,7 @@ See `proposal.md` for why. Current law and code:
 
 ### 2. Exclusive mkdir plus bounded suffix; do not share `initRunDir` resume
 
-**Choice:** Keep `trainRunIdFor(startedAt)` as `train-<filesystem-safe UTC ms>`. Allocate by creating `.agent-pipeline/runs/<id>/` with `mkdir` and `recursive: false` (EEXIST is a collision). Retry a suffix only on `EEXIST`. The bounded set is the unsuffixed id plus `-2` … `-8` (eight exclusive attempts). A non-`EEXIST` error (for example `EACCES`) does not suffix-retry; coverage is `unknown`. After a unique directory is created, call existing `initRunDir` for `run.json` / `events.jsonl`. Do not treat a colliding train directory as idempotent re-entry of a different train. Do not write store files under a directory whose exclusive create failed. Do not change advance `initRunDir` when `run.json` already exists for the same issue-prefixed id. A later conflicting `onRunReady` / `loopRun` identity keeps the first live link, sets `events_coverage` to `degraded`, and does not abort the wave.
+**Choice:** Keep `trainRunIdFor(startedAt)` as `train-<filesystem-safe UTC ms>`. Allocate by creating `.agent-pipeline/runs/<id>/` with `mkdir` and `recursive: false` (EEXIST is a collision). Retry a suffix only on `EEXIST`. The bounded set is the unsuffixed id plus `-2` … `-8` (eight exclusive attempts). A non-`EEXIST` error (for example `EACCES`) does not suffix-retry; coverage is `unknown`. Exclusive mkdir is the claim. Only after a unique directory is created, call existing `initRunDir` for `run.json` / `events.jsonl` on that claimed path. Do not call `initRunDir` on a path whose exclusive create failed. Do not treat a colliding train directory as idempotent re-entry of a different train via `initRunDir` resume. Do not write store files under a directory whose exclusive create failed. Do not change advance `initRunDir` when `run.json` already exists for the same issue-prefixed id. A later conflicting `onRunReady` / `loopRun` identity keeps the first live link, sets `events_coverage` to `degraded`, and does not abort the wave.
 
 **Why:** Node `mkdir` without recursive is already exclusive. It is on `RunStoreDeps`. Loop `renameDirExclusive` exists to publish a staged contract+ledger atomically; train identity is one empty directory. Reusing exclusive mkdir is the first holding rung. Changing generic `initRunDir` would break advance resume.
 
@@ -70,7 +70,7 @@ See `proposal.md` for why. Current law and code:
 
 ### 4. Both contained paths emit `train_merge_proven` with `proof_disposition`
 
-**Choice:** In `emitMergeCatalog`, emit `train_merge_proven` whenever `kind === "integrated"` and containment was proven, including `merged.already`. Add `proof_disposition`: `newly-merged` or `already-contained`. Keep `train_merge_integrated` on both paths. Do not add a new event type. Non-merge trains still omit the merge catalog.
+**Choice:** In `emitMergeCatalog`, emit `train_merge_proven` whenever `kind === "integrated"` and containment was proven, including `merged.already`. Emit it only after containment is established and before `train_merge_integrated`. Payload includes issue number, linked PR when known, `proof_disposition` (`newly-merged` or `already-contained`), and the merge-result identity contained in the fetched base. Both paths share those invariants; only `proof_disposition` differs. Keep `train_merge_integrated` on both paths. Do not add a new event type. Non-merge trains still omit the merge catalog.
 
 **Why:** Containment is the proof. Event absence is not a disposition. An additive field keeps `schema_version` at `1` and keeps existing readers that ignore unknown fields.
 
@@ -88,7 +88,7 @@ See `proposal.md` for why. Current law and code:
 
 ## Risks / Trade-offs
 
-- **[Risk] Test fakes ignore `onLoopReady` and only set `loopRun` after return.** → Mitigation: post-return confirmation still emits once when nothing was linked live, so existing tests keep passing. A new test MUST call `onLoopReady` and assert the event exists before the wave promise resolves.
+- **[Risk] Test fakes ignore `onLoopReady` and only set `loopRun` after return.** → Mitigation: wave-result confirmation is not an append site. Existing tests that do not assert `train_loop_linked` keep passing. A new live-link test MUST call `onLoopReady` and assert the event exists before the wave promise resolves.
 - **[Risk] Exclusive mkdir of a suffix still races with a third train.** → Mitigation: each attempt is exclusive; the loser retries the next suffix. Exhaustion is bounded and observational.
 - **[Risk] Changing `initRunDir` by accident breaks advance resume.** → Mitigation: collision handling lives in `initTrainRunStore` only. Tests MUST NOT require exclusive create for issue-prefixed `initRunDir`.
 - **[Risk] `proof_disposition` readers that required proven-implies-attempted.** → Mitigation: already-contained still has `attempted: false`; tests cover both dispositions. Material filter already lists `train_merge_proven`.

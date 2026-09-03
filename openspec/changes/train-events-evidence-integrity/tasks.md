@@ -12,13 +12,14 @@
 
 ## 2. Exclusive train identity
 
-- [ ] 2.1 In `initTrainRunStore`, create `.agent-pipeline/runs/<id>/` with exclusive `mkdir` (`recursive: false`). On EEXIST, retry `train-<timestamp>-2` … up to 8 attempts through the injected mkdir and clock/ID seams, then call existing `initRunDir`. Verify task 1.3 now passes. Do not change advance `initRunDir` resume for issue-prefixed ids. Verify existing `trainRunIdFor` prefix tests still pass.
-- [ ] 2.2 When every exclusive attempt fails, create no run directory, skip `train_run_handoff`, omit `run_id`, set `train_status.events_coverage` to `degraded` or `unknown`, and continue `runTrain` mutations. Verify task 1.4 and that `--json` stdout is still exactly one `train_status` object (`schema_version` stays 1).
+- [ ] 2.1 In `initTrainRunStore`, create `.agent-pipeline/runs/<id>/` with exclusive `mkdir` (`recursive: false`). On EEXIST, retry `train-<timestamp>-2` … up to 8 attempts through the injected mkdir and clock/ID seams. Call existing `initRunDir` only on the directory this invocation exclusively created. Never call `initRunDir` on a path whose exclusive mkdir failed. Verify task 1.3 now passes. Do not change advance `initRunDir` resume for issue-prefixed ids. Verify existing `trainRunIdFor` prefix tests still pass.
+- [ ] 2.2 When every exclusive attempt fails, create no run directory, skip `train_run_handoff`, omit `run_id`, set `train_status.events_coverage` to `degraded` (all `EEXIST`) or `unknown` (non-`EEXIST` before any claim), and continue `runTrain` mutations. Verify task 1.4 and that `--json` stdout is still exactly one `train_status` object (`schema_version` stays 1).
+- [ ] 2.3 Pin `events_coverage` transitions: success → `ok` or omit with `run_id` set; `EEXIST` exhaustion → `degraded` omit `run_id`; non-`EEXIST` mkdir → `unknown` omit `run_id`; store-init fail after claim → `degraded` without appending into a sibling directory; live-link append fail after published store → `degraded` keep `run_id`; mismatched later wave identity → `degraded` keep first link. Verify none of these change mutations, exit status, or stdout object kind.
 
 ## 3. Live loop linkage
 
 - [ ] 3.1 Extend the existing `advanceWave` context with `onLoopReady`. Production `advanceWaveThroughLoop` SHALL **await** it from the current `onRunReady` handler after exact `runId` and events path are known and before `runLoopEngine` returns. Verify a unit test fails if the callback is fire-and-forget and passes only when `train_loop_linked` is durable before the engine result is returned.
-- [ ] 3.2 In `runTrain`, append `train_loop_linked` from `onLoopReady` once per loop run id, using the exact handoff identity. After the wave returns, confirm the same identity without a second append and without replacing it. Verify tasks 1.1 and 1.2. Keep existing per-wave `loop_run_handoff` on stderr. Keep `--json` stdout as one object.
+- [ ] 3.2 In `runTrain`, append `train_loop_linked` from `onLoopReady` once per loop run id, using the exact handoff identity. That callback is the sole append site. After the wave returns, confirm the same identity without a second append and without replacing it. A mismatched later `loopRun` keeps the first link and sets `events_coverage` to `degraded`. Wave-result `loopRun` does not append when `onRunReady` never fired. Verify tasks 1.1, 1.2, and 1.7. Keep existing per-wave `loop_run_handoff` on stderr. Keep `--json` stdout as one object.
 
 ## 4. Complete merge proof
 

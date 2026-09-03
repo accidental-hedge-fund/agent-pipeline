@@ -2,7 +2,7 @@
 
 ### Requirement: Train SHALL publish train_loop_linked from the child onRunReady handoff
 
-Train SHALL append `train_loop_linked` from the child loop's typed `onRunReady` handoff after the loop store and the exact events path exist, and before that child can block on work. Production `advanceWaveThroughLoop` SHALL await `onLoopReady` from inside the existing `onRunReady` handler so `train_loop_linked` is durably appended before `runLoopEngine` returns and before the child can block. A fire-and-forget callback SHALL NOT satisfy this requirement. The event SHALL include the train `run_id`, the wave identity, the exact child loop `run_id`, and the absolute loop `events.jsonl` path from that handoff. Train SHALL emit each live linkage once. A later wave result MAY confirm the same identity. It SHALL NOT append a second `train_loop_linked` for that identity and SHALL NOT replace the live identity with a guessed run, a latest-run lookup, or a synthetic `pipeline-loop-…` string. Train SHALL NOT scrape stdout or stderr prose to mint the link.
+Train SHALL append `train_loop_linked` from the child loop's typed `onRunReady` handoff after the loop store and the exact events path exist, and before that child can block on work. Production `advanceWaveThroughLoop` SHALL await `onLoopReady` from inside the existing `onRunReady` handler so `train_loop_linked` is durably appended before `runLoopEngine` returns and before the child can block. A fire-and-forget callback SHALL NOT satisfy this requirement. The sole append site for `train_loop_linked` SHALL be that awaited `onLoopReady` callback keyed to the child-loop handoff identity (`loop_run_id` plus absolute events path). Wave-result `loopRun` SHALL confirm the same identity or, on mismatch, keep the first live link and set `events_coverage` to `degraded`. Wave-result `loopRun` SHALL NOT append `train_loop_linked` and SHALL NOT replace the live identity with a guessed run, a latest-run lookup, or a synthetic `pipeline-loop-…` string. The event SHALL include the train `run_id`, the wave identity, the exact child loop `run_id`, and the absolute loop `events.jsonl` path from that handoff. Train SHALL emit each live linkage once. Train SHALL NOT scrape stdout or stderr prose to mint the link.
 
 #### Scenario: Live child is followable before it is terminal
 
@@ -30,15 +30,22 @@ Train SHALL append `train_loop_linked` from the child loop's typed `onRunReady` 
 #### Scenario: Conflicting later handoff degrades evidence and keeps the first link
 
 - **WHEN** train has already linked loop run `abc` and events path `E` from `onRunReady`
-- **AND** a later handoff reports a different loop run `xyz` and path `F`
+- **AND** a later wave result reports a different loop run `xyz` and path `F`
 - **THEN** the train stream SHALL keep the first `train_loop_linked` for `abc` and `E`
 - **AND** SHALL NOT append a second `train_loop_linked`
 - **AND** `train_status.events_coverage` SHALL equal `degraded`
 - **AND** the wave result, merge decisions, retry behavior, and exit status SHALL be unchanged
 
+#### Scenario: Wave result is not an append site
+
+- **WHEN** `onRunReady` never fired for a wave
+- **AND** the later wave result reports a loop run id
+- **THEN** train SHALL NOT append `train_loop_linked` from that wave result
+- **AND** train SHALL omit `train_loop_linked` when no live loop store was confirmed on `onRunReady`
+
 ### Requirement: Train SHALL allocate run identity with exclusive publication
 
-Train SHALL publish each live (non-`--dry-run`) train run directory with an exclusive create of `.agent-pipeline/runs/<train-run-id>/` using non-recursive `mkdir`. The base run ID SHALL remain `train-` plus the filesystem-safe UTC timestamp with millisecond precision. Train SHALL retry a suffix only when exclusive create fails with `EEXIST`. The suffix sequence SHALL be `train-<timestamp>-2` through `train-<timestamp>-8` (eight exclusive attempts including the unsuffixed id). Two starts that share one clock instant SHALL receive distinct run IDs and isolated `events.jsonl` sequences. Exclusive allocation and `initRunDir` SHALL remain observational. Train SHALL NOT treat a colliding train directory as idempotent re-entry of a different train. Train SHALL NOT write `run.json`, `events.jsonl`, or `write-health.json` under a directory whose exclusive create failed. Advance issue-prefixed `initRunDir` resume SHALL NOT change. A non-`EEXIST` exclusive-create error SHALL NOT retry a suffix, SHALL set `events_coverage` to `unknown`, SHALL create no store, and SHALL NOT change advance or merge mutations or exit status.
+Train SHALL publish each live (non-`--dry-run`) train run directory with an exclusive create of `.agent-pipeline/runs/<train-run-id>/` using non-recursive `mkdir`. The base run ID SHALL remain `train-` plus the filesystem-safe UTC timestamp with millisecond precision. Train SHALL retry a suffix only when exclusive create fails with `EEXIST`. The suffix sequence SHALL be `train-<timestamp>-2` through `train-<timestamp>-8` (eight exclusive attempts including the unsuffixed id). Two starts that share one clock instant SHALL receive distinct run IDs and isolated `events.jsonl` sequences. Train SHALL separate exclusive directory claim from store-file initialization. Store-file initialization (`initRunDir` writing `run.json` and `events.jsonl`) SHALL run only on a directory this invocation exclusively created. Train SHALL NOT call `initRunDir` on a path whose exclusive `mkdir` failed. Train SHALL NOT use `initRunDir` resume (existing `run.json`) to append a different train into a pre-existing `train-*` directory. Exclusive allocation and `initRunDir` SHALL remain observational. Train SHALL NOT write `run.json`, `events.jsonl`, or `write-health.json` under a directory whose exclusive create failed. Advance issue-prefixed `initRunDir` resume SHALL NOT change. A non-`EEXIST` exclusive-create error SHALL NOT retry a suffix, SHALL set `events_coverage` to `unknown`, SHALL create no store, and SHALL NOT change advance or merge mutations or exit status.
 
 #### Scenario: Same-clock trains get distinct stores
 
@@ -68,6 +75,55 @@ Train SHALL publish each live (non-`--dry-run`) train run directory with an excl
 - **AND** train SHALL create no run store
 - **AND** advance, merge, retry, and exit status SHALL be unchanged
 
+#### Scenario: Store init runs only after exclusive claim
+
+- **WHEN** exclusive create of `train-<timestamp>-2` succeeds
+- **THEN** train SHALL call store-file initialization only on `train-<timestamp>-2`
+- **AND** SHALL NOT call `initRunDir` on `train-<timestamp>` or any path whose exclusive `mkdir` failed
+
+#### Scenario: Failed claim never resumes a pre-existing train directory
+
+- **WHEN** exclusive create of `train-<timestamp>` fails with `EEXIST`
+- **AND** that directory already contains `run.json` from another train
+- **THEN** this invocation SHALL NOT call `initRunDir` on `train-<timestamp>`
+- **AND** SHALL NOT append to that directory's `events.jsonl`
+
+### Requirement: Train events_coverage SHALL follow a closed observational transition set
+
+Train SHALL publish additive `train_status.events_coverage` as one of `ok`, `degraded`, or `unknown` when coverage is known. Successful exclusive identity allocation and event-store init SHALL set `events_coverage` to `ok` or omit the field. Exhausted exclusive create where every attempt failed with `EEXIST` SHALL set `events_coverage` to `degraded` and SHALL omit `run_id`. A non-`EEXIST` exclusive-create error before any claim succeeds SHALL set `events_coverage` to `unknown` and SHALL omit `run_id`. Store-file initialization failure after an exclusive claim SHALL set `events_coverage` to `degraded` and SHALL NOT append into a directory this invocation did not exclusively create. A failed `train_loop_linked` append after a published store SHALL set `events_coverage` to `degraded` and SHALL keep `run_id`. A later wave identity that disagrees with the live link SHALL set `events_coverage` to `degraded` and SHALL keep the first live link. Coverage transitions SHALL NOT change train mutations, merge decisions, retry behavior, exit status, or `train --json` stdout object kind. The only permitted stdout change is the additive `events_coverage` field and the optional omission of `run_id`.
+
+#### Scenario: Successful claim is ok or omitted
+
+- **WHEN** exclusive identity allocation succeeds and event-store init succeeds
+- **THEN** `train_status` SHALL include `run_id` equal to the claimed train id
+- **AND** `events_coverage` SHALL equal `ok` or SHALL be omitted
+- **AND** `schema_version` SHALL remain `1`
+
+#### Scenario: EEXIST exhaustion is degraded and omits run_id
+
+- **WHEN** every exclusive create attempt fails with `EEXIST`
+- **THEN** `events_coverage` SHALL equal `degraded`
+- **AND** `train_status` SHALL omit `run_id`
+
+#### Scenario: Non-EEXIST mkdir failure is unknown and omits run_id
+
+- **WHEN** exclusive create fails with `EACCES` before any claim succeeds
+- **THEN** `events_coverage` SHALL equal `unknown`
+- **AND** `train_status` SHALL omit `run_id`
+
+#### Scenario: Store init failure after exclusive claim is degraded
+
+- **WHEN** exclusive create succeeds
+- **AND** store-file initialization then fails
+- **THEN** `events_coverage` SHALL equal `degraded`
+- **AND** train SHALL NOT append into a sibling pre-existing `train-*` directory
+
+#### Scenario: Coverage does not change stdout object kind
+
+- **WHEN** `events_coverage` is `ok`, `degraded`, or `unknown`
+- **THEN** `train --json` stdout SHALL still parse as exactly one `train_status` object
+- **AND** exit status, merge decisions, and which issues advance SHALL be unchanged
+
 ### Requirement: Exhausted train identity allocation SHALL degrade evidence and continue
 
 When exclusive allocation cannot publish a unique train run directory within the bounded retry set, train SHALL report typed train-event coverage of `degraded` or `unknown` on the existing `train_status` object, SHALL NOT create or append to an ambiguous shared store, SHALL NOT flush `train_run_handoff` for a colliding id, and SHALL continue the same advance and merge mutations it would have performed with a store. Missing events SHALL NOT grant or deny merge or advance authority.
@@ -88,7 +144,7 @@ When exclusive allocation cannot publish a unique train run directory within the
 
 ### Requirement: Train merge proof SHALL name newly-merged or already-contained disposition
 
-When merge-mode proves that a merge-result is contained in the fetched base, train SHALL append `train_merge_proven` whether the item was newly merged in this run or was already contained. That event SHALL include an additive `proof_disposition` of `newly-merged` or `already-contained`. Both paths SHALL still append `train_merge_integrated`. Event absence SHALL NOT be the only signal that the item was already contained. Non-merge trains SHALL NOT emit these merge events. `schema_version` SHALL remain `1`.
+When merge-mode proves that a merge-result is contained in the fetched base, train SHALL append `train_merge_proven` whether the item was newly merged in this run or was already contained. That event SHALL include the issue number, the linked PR number when known, an additive `proof_disposition` of `newly-merged` or `already-contained`, and the containment evidence that the merge-result identity is contained in the fetched base. Train SHALL emit `train_merge_proven` only after that containment is established. Both paths SHALL still append `train_merge_integrated`. Newly-merged and already-contained paths SHALL share those payload and ordering invariants; only `proof_disposition` SHALL differ. Event absence SHALL NOT be the only signal that the item was already contained. Non-merge trains SHALL NOT emit these merge events. `schema_version` SHALL remain `1`.
 
 #### Scenario: Newly merged item emits proven with newly-merged disposition
 
@@ -109,6 +165,14 @@ When merge-mode proves that a merge-result is contained in the fetched base, tra
 - **THEN** `train_merge_proven` SHALL appear before `train_merge_integrated` for that issue
 - **AND** `proof_disposition` SHALL be present on `train_merge_proven`
 - **AND** `proof_disposition` SHALL be absent from `train_merge_integrated`
+
+#### Scenario: Proven payload includes containment evidence on both paths
+
+- **WHEN** a `--merge` train proves containment for a newly merged item and for an already-contained item
+- **THEN** each `train_merge_proven` SHALL include issue number, `proof_disposition`, and the merge-result identity contained in the fetched base
+- **AND** the linked PR number SHALL be present when known
+- **AND** the two events SHALL differ only in `proof_disposition` (`newly-merged` versus `already-contained`)
+- **AND** neither event SHALL be emitted before containment is established
 
 ### Requirement: Train event observation failures SHALL NOT change mutations or exit status
 
@@ -243,7 +307,7 @@ Train SHALL NOT copy child loop, advance, CI, harness, or compiler stdout into t
 
 ### Requirement: Train SHALL link each confirmed wave loop run from the train stream
 
-Train SHALL append `train_loop_linked` when an advance wave is driven by the durable loop and the loop run store is confirmed by the child `onRunReady` handoff (or by a later confirmation of that same identity). That event SHALL include at least the train `run_id`, the wave identity, the real loop `run_id`, and the absolute loop `events.jsonl` path from that handoff. A host that follows only the train stream SHALL be able to invoke `pipeline loop logs <loop-run-id> --events` (or open that absolute path) without scanning state-home directories by mtime, and SHALL be able to do so while the child is still live. Synthetic `pipeline-loop-…` strings SHALL NOT be the only join key when a real loop run ID is known.
+Train SHALL append `train_loop_linked` when an advance wave is driven by the durable loop and the loop run store is confirmed by the child `onRunReady` handoff. A later wave result MAY confirm that same identity. It SHALL NOT be a second append site. That event SHALL include at least the train `run_id`, the wave identity, the real loop `run_id`, and the absolute loop `events.jsonl` path from that handoff. A host that follows only the train stream SHALL be able to invoke `pipeline loop logs <loop-run-id> --events` (or open that absolute path) without scanning state-home directories by mtime, and SHALL be able to do so while the child is still live. Synthetic `pipeline-loop-…` strings SHALL NOT be the only join key when a real loop run ID is known.
 
 #### Scenario: Host drills into the wave from train events alone
 
@@ -275,7 +339,7 @@ Train SHALL treat event emission, identity allocation, and host notify delivery 
 
 ### Requirement: Unit tests SHALL cover train events through injected seams
 
-The implementation SHALL provide unit tests that inject train, run-store, clock/ID, and wave seams (no real network, git, or subprocess) and that fail if: no train-level `events.jsonl` is written before the first wave when allocation succeeds; the published run ID is not the generic-store basename; a confirmed live `onRunReady` loop run ID is omitted from `train_loop_linked` until the child is terminal; a duplicate handoff appends a second link; two same-clock trains share one run directory or one `seq` stream; exhausted allocation writes a shared store or changes which issues advance or merge; `run_complete` is missing on a normal STOP/complete exit; `train --json` stdout contains `train_run_handoff` or extra JSON objects; `run.json` looks like a single-issue advance run; a newly merged contained item omits `train_merge_proven` with `proof_disposition` `newly-merged`; or an already-contained item omits `train_merge_proven` with `proof_disposition` `already-contained`. At least one regression SHALL fail against today's stdout-only train without the store.
+The implementation SHALL provide unit tests that inject train, run-store, clock/ID, mkdir, and wave seams (no real network, git, or subprocess) and that fail if: no train-level `events.jsonl` is written before the first wave when allocation succeeds; the published run ID is not the generic-store basename; a confirmed live `onRunReady` loop run ID is omitted from `train_loop_linked` until the child is terminal; a duplicate handoff appends a second link; a later mismatched wave result replaces the live link or aborts the wave; two same-clock trains share one run directory or one `seq` stream; an `EEXIST` collision writes the colliding directory; a non-`EEXIST` mkdir failure suffix-retries or opens a store; exhausted allocation writes a shared store or changes which issues advance or merge; store-file init after exclusive claim appends into a pre-existing sibling directory; `run_complete` is missing on a normal STOP/complete exit; `train --json` stdout contains `train_run_handoff` or extra JSON objects; `run.json` looks like a single-issue advance run; a newly merged contained item omits `train_merge_proven` with `proof_disposition` `newly-merged`; or an already-contained item omits `train_merge_proven` with `proof_disposition` `already-contained`. Newly-merged and already-contained proof-event tests SHALL assert identical payload and ordering invariants except `proof_disposition`. At least one regression SHALL fail against today's stdout-only train without the store.
 
 #### Scenario: Missing events file fails the suite
 
@@ -304,4 +368,16 @@ The implementation SHALL provide unit tests that inject train, run-store, clock/
 
 - **WHEN** a hermetic `--merge` fixture reconciles an already-contained item
 - **AND** the train stream has no `train_merge_proven` whose `proof_disposition` is `already-contained`
+- **THEN** the test SHALL fail
+
+#### Scenario: Non-EEXIST mkdir retry fails the suite
+
+- **WHEN** a hermetic mkdir seam fails exclusive create with `EACCES`
+- **AND** the fixture suffix-retries or opens a store
+- **THEN** the test SHALL fail
+
+#### Scenario: Init after failed claim fails the suite
+
+- **WHEN** a hermetic exclusive mkdir fails
+- **AND** the fixture still calls `initRunDir` on that pre-existing path
 - **THEN** the test SHALL fail
