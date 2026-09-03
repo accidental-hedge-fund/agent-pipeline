@@ -67,7 +67,8 @@ diagnostic identity, and ambiguity; SHALL NOT guess a class or infer human autho
 prose; and SHALL route the defect through the compiled bounded recovery policy before any Cooling or
 typed request. If no safe recipe exists or every applicable strategy is exhausted, the engine SHALL
 enter Cooling or an external-condition wait, not a needs-human or human-authority stop, and not a
-mechanical `run_fatal` lifecycle terminal.
+mechanical `run_fatal` lifecycle terminal. It SHALL NOT emit a terminal system-failure stop or an
+ownerless terminal.
 
 #### Scenario: An unmatched blocker becomes an engine-owned classification failure
 
@@ -88,6 +89,7 @@ mechanical `run_fatal` lifecycle terminal.
 - **THEN** the engine SHALL allow that recipe to be claimed before entering Cooling
 - **AND** it SHALL enter Cooling only after no safe permitted attempt remains
 - **AND** it SHALL NOT persist `run_fatal` as the lifecycle outcome of that exhaustion
+- **AND** it SHALL NOT record a terminal system failure or human ownership solely for that exhaustion
 
 ---
 
@@ -99,8 +101,11 @@ fingerprints. The engine SHALL count consecutive recovery attempts on an item wh
 a fingerprint identical to the item's prior block. Once that count reaches the policy's configured
 repeated-evidence limit, the engine SHALL advance the Recovery Episode strategy cursor or enter
 Cooling with a future `next_eligible_at`, even when a later applicable strategy still has remaining
-capacity. It SHALL NOT record a terminal `repeated_no_progress` stop that ends ownership. A block
-whose fingerprint differs from the prior block SHALL reset the item's repeated-evidence count.
+capacity. It SHALL NOT record a terminal `repeated_no_progress` stop that ends ownership. The engine
+SHALL name the item and the repeated fingerprint, SHALL NOT repeat the exhausted deterministic
+action indefinitely, SHALL NOT refuse independent sibling transitions, SHALL NOT grant human
+authority, and SHALL NOT record an ownerless terminal solely for that limit. A block whose
+fingerprint differs from the prior block SHALL reset the item's repeated-evidence count.
 
 #### Scenario: Identical evidence cannot consume an unbounded retry loop
 
@@ -110,6 +115,9 @@ whose fingerprint differs from the prior block SHALL reset the item's repeated-e
   and the fingerprint
 - **AND** the Logical Operation SHALL remain owned
 - **AND** the engine SHALL NOT persist `repeated_no_progress` as a lifecycle terminal stop
+- **AND** the engine SHALL NOT repeat the exhausted deterministic action indefinitely
+- **AND** independent siblings SHALL remain schedulable
+- **AND** the outcome SHALL NOT be human ownership
 
 #### Scenario: Differing evidence resets the repeat count
 
@@ -127,7 +135,7 @@ whose fingerprint differs from the prior block SHALL reset the item's repeated-e
 
 ### Requirement: Permitted recovery recipes SHALL never cross an authority gate
 
-No recovery recipe permitted by the policy SHALL perform a merge, release, credential, or deploy action, and no recipe SHALL widen an authority grant the contract does not hold. The `missing-authority` class SHALL map to a terminal human-authority outcome only for a current protected `AuthorityRequest`. The `specification-decision` class SHALL map to a terminal human-authority outcome only for an irreducible `DecisionRequest` after the shared classifier. Pipeline SHALL NOT assign either class until that classifier has run. Missing information and unavailable capability SHALL NOT use these classes. This reinforces, and never bypasses, the engine's existing authority gates. Auto-settle SHALL NOT become a block of either class.
+No recovery recipe permitted by the policy SHALL perform a merge, release, credential, or deploy action, and no recipe SHALL widen an authority grant the contract does not hold. The `missing-authority` class SHALL map to a typed-input wait only for a current protected `AuthorityRequest`. The `specification-decision` class SHALL map to a typed-input wait only for an irreducible `DecisionRequest` after the shared classifier. Those waits SHALL keep the Logical Operation owned. Pipeline SHALL NOT assign either class until that classifier has run. Missing information and unavailable capability SHALL NOT use these classes. This reinforces, and never bypasses, the engine's existing authority gates. Auto-settle SHALL NOT become a block of either class.
 
 #### Scenario: No recipe performs a gated action
 
@@ -137,20 +145,22 @@ No recovery recipe permitted by the policy SHALL perform a merge, release, crede
 #### Scenario: Missing-authority routes to a human, not a retry
 
 - **WHEN** an item blocks with class `missing-authority` after the classifier emits a protected `AuthorityRequest`
-- **THEN** the policy outcome SHALL be a terminal human-authority stop
+- **THEN** the policy outcome SHALL be a typed-input wait for that AuthorityRequest
 - **AND** no automated recovery recipe SHALL be attempted
+- **AND** the Logical Operation SHALL remain owned
 
 #### Scenario: Specification-decision routes to a human, not a retry
 
 - **WHEN** an item blocks with class `specification-decision` after the classifier emits an irreducible `DecisionRequest`
-- **THEN** the policy outcome SHALL be a terminal human-authority stop for a product decision
+- **THEN** the policy outcome SHALL be a typed-input wait for that product decision
 - **AND** no automated recovery recipe SHALL be attempted
+- **AND** the Logical Operation SHALL remain owned
 
 #### Scenario: Reversible choice is not specification-decision
 
 - **WHEN** the classifier auto-settles a reversible in-scope recommendation
 - **THEN** Pipeline SHALL NOT record `specification-decision` or `missing-authority`
-- **AND** SHALL NOT start a human-authority stop
+- **AND** SHALL NOT start a typed-input wait or human-authority stop
 
 ### Requirement: Classification, actions, evidence, and outcome SHALL be persisted and emitted
 
