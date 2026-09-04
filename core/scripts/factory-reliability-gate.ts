@@ -4253,7 +4253,9 @@ export interface FactoryGateOpts {
   /**
    * Control-host generic run-store root for unique-operation collection.
    * Defaults to `<resolveStateHome(env)>/runs` (same root factory-release
-   * uses for pack-loop scans). Tests inject a fake host store.
+   * uses for pack-loop scans). Tests inject a fake host store. Ship /
+   * release-eligible scoring does not fall back to the candidate worktree
+   * unless that path is this same root.
    */
   uniqueOperationRunsRoot?: string;
   /**
@@ -4510,15 +4512,17 @@ type ScannedUniqueOpRun = {
   summary: Record<string, unknown> | null;
 };
 
-function uniqueOperationRunsRoots(opts: FactoryGateOpts): string[] {
+/** Ship/release-eligible FRG (`hostOnly`) reads only the control-host root. */
+function uniqueOperationRunsRoots(opts: FactoryGateOpts, hostOnly = false): string[] {
   const env = opts.env ?? process.env;
   const hostRoot =
     opts.uniqueOperationRunsRoot ??
     path.join(resolveStateHome({ env, hostname: () => "unused" }), "runs");
   const worktreeRoot = path.join(opts.repoDir, ".agent-pipeline", "runs");
-  const roots = [hostRoot];
-  if (path.resolve(worktreeRoot) !== path.resolve(hostRoot)) roots.push(worktreeRoot);
-  return roots;
+  if (hostOnly || path.resolve(worktreeRoot) === path.resolve(hostRoot)) {
+    return [hostRoot];
+  }
+  return [hostRoot, worktreeRoot];
 }
 
 function executedMatrixRowsFromArtifactValue(value: unknown): ExecutedMatrixRow[] {
@@ -4965,7 +4969,7 @@ export async function runFactoryGate(
       opts.unique_operation_manifest?.candidate_sha ??
       "";
     const collected = await collectUniqueOperationsFromRunStore(
-      uniqueOperationRunsRoots(opts),
+      uniqueOperationRunsRoots(opts, inFlightShip),
       fsDeps,
       {
         candidate_sha: scoredCandidateSha,

@@ -21,6 +21,14 @@ Ship FRG unique-operation scoring SHALL collect unique-operation attempts and #1
 - **AND** release-eligible pass SHALL be refused
 - **AND** pack-issue `pipeline:ready-to-deploy` labels SHALL NOT satisfy that coverage
 
+#### Scenario: Empty control-host store remains fail-closed when candidate-worktree artifacts match
+
+- **WHEN** a ship FRG pack is scored for candidate SHA `C`
+- **AND** the control-host durable store bound to `C` has no train, loop, or merge unique-operation evidence
+- **AND** the candidate worktree `.agent-pipeline/runs` has matching unique-operation attempts and executed-matrix rows bound to `C`
+- **THEN** unique-operation coverage SHALL fail as missing required coverage
+- **AND** release-eligible pass SHALL be refused
+
 #### Scenario: Pack proofs are not unique-operation substitutes
 
 - **WHEN** factory-gate 2-item pack proofs (clean-docs, clean-openspec, hybrid v2 Layer A) pass

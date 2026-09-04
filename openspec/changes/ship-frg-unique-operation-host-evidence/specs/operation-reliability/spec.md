@@ -19,6 +19,14 @@ Unique-operation attempt collection for release-eligible Factory Reliability Gat
 - **THEN** the attempt list SHALL be empty
 - **AND** missing required coverage SHALL be greater than zero
 
+#### Scenario: Empty host store yields no attempts when the candidate worktree is populated
+
+- **WHEN** release-eligible FRG scoring collects unique-operation attempts for candidate SHA `C`
+- **AND** the control-host store has no runs bound to `C`
+- **AND** the candidate worktree `.agent-pipeline/runs` has train and merge runs bound to `C`
+- **THEN** the attempt list SHALL be empty
+- **AND** missing required coverage SHALL be greater than zero
+
 #### Scenario: Other-candidate host artifacts are omitted
 
 - **WHEN** the control-host store has train runs bound to a different candidate SHA

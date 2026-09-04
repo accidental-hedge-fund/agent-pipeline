@@ -324,6 +324,28 @@ test("empty host store remains fail-closed even with pack-ready labels (#1428)",
   assert.equal(isReleaseEligibleFrgPass(result.evidence, { requireAttestation: false }), false);
 });
 
+test("empty host store stays fail-closed when candidate worktree has matching unique-ops (#1428)", async () => {
+  const files = new Map<string, string>();
+  seedHostCoverage(files, join(CANDIDATE_REPO, ".agent-pipeline", "runs"), CANDIDATE);
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      uniqueOperationRunsRoot: HOST_RUNS,
+      inFlightShip: true,
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.equal(section.operations.length, 0);
+  assert.ok(section.integrity.missing_required_coverage > 0);
+  assert.equal(section.exclusions.length, 0);
+  assert.equal(isReleaseEligibleFrgPass(result.evidence, { requireAttestation: false }), false);
+});
+
 test("#1301 live train_loop_linked is scored from the host train stream (#1428)", async () => {
   const files = new Map<string, string>();
   seedHostCoverage(files, HOST_RUNS, CANDIDATE, { followableTrain: true });
