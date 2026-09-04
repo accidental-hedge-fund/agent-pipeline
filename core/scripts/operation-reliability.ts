@@ -169,6 +169,12 @@ export interface UniqueOperationEvidenceRef {
   candidate_sha?: string;
   /** Per-operation release binding copied from durable artifacts when present. */
   release_identity?: string;
+  /**
+   * Followable #1301 child logical id on a scored train operation. Inherited
+   * from the parent train when the `train_loop_linked` event and loaded child
+   * omit a minted id. Observing entrypoint `train` alone is not this field.
+   */
+  child_logical_operation_id?: string;
 }
 
 export interface UniqueOperationReliability {
@@ -471,6 +477,7 @@ export function aggregateUniqueOperationReliability(input: {
 
     if (terminal === "unknown") terminal = "ownerless_terminal";
 
+    const followableChild = uniqueNonEmpty(entry.child_ids)[0] ?? "";
     operations.push({
       logical_operation_id: id,
       run_ids: [...entry.run_ids],
@@ -481,10 +488,14 @@ export function aggregateUniqueOperationReliability(input: {
       manual_reinvocation: entry.manual_reinvocation,
       ...(entry.candidate_sha ? { candidate_sha: entry.candidate_sha } : {}),
       ...(entry.release_identity ? { release_identity: entry.release_identity } : {}),
+      ...(followableChild ? { child_logical_operation_id: followableChild } : {}),
     });
 
-    // Live train-link: followable child logical id from the event or loaded child.
-    if (entry.train_loop_linked && entry.child_ids.length > 0) {
+    // Live train-link: scored train operation carries a followable child
+    // logical id from a followable `train_loop_linked` join (event, loaded
+    // child, or inherited parent train identity). Observing `train` alone
+    // does not increment this cell.
+    if (entry.train_loop_linked && followableChild) {
       liveLinkage = true;
     }
 
@@ -765,7 +776,7 @@ function followableChildLogicalId(
   trainLogical: string | null,
 ): string | null {
   if (childMinted && trainLogical && childMinted !== trainLogical) return childMinted;
-  return eventLogical ?? childMinted;
+  return eventLogical ?? childMinted ?? trainLogical;
 }
 
 function attemptIsUnboundInflight(

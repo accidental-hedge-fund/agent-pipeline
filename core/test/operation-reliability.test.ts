@@ -1175,6 +1175,69 @@ test("attemptsFromRunArtifacts: duplicate run id at a different path does not hi
   }
 });
 
+test("attemptsFromRunArtifacts: parent logical id is inherited when event and child omit a minted id (#1446)", () => {
+  const childPath = "/host-state/runs/loop-1/events.jsonl";
+  const attempts = attemptsFromRunArtifacts([
+    {
+      runId: "train-T",
+      runJson: { run_id: "train-T", kind: "train", logical_operation_id: "T" },
+      events: [
+        { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+        {
+          type: "train_loop_linked",
+          loop_run_id: "loop-1",
+          events: childPath,
+        },
+      ],
+      summary: null,
+    },
+    {
+      runId: "loop-1",
+      runJson: { run_id: "loop-1", kind: "loop" },
+      events: [{ type: "run_start", entrypoint: "loop" }],
+      summary: null,
+      eventsFilePath: childPath,
+    },
+  ]);
+  const train = attempts.find((a) => a.run_id === "train-T");
+  assert.equal(train!.train_loop_linked, true);
+  assert.equal(train!.child_logical_operation_id, "T");
+  assert.equal(train!.child_run_id, "loop-1");
+  const report = aggregateUniqueOperationReliability({
+    attempts,
+    manifest: {
+      required_entrypoints: ["train"],
+      required_lifecycle_classes: [],
+      live_train_linkage_present: false,
+    },
+  });
+  const scored = report.operations.find((o) => o.entrypoints.includes("train"));
+  assert.equal(scored!.child_logical_operation_id, "T");
+  assert.equal(report.integrity.missing_required_coverage, 0);
+});
+
+test("aggregateUniqueOperationReliability: train without inherited child logical id fails #1301 (#1446)", () => {
+  const report = aggregateUniqueOperationReliability({
+    attempts: [
+      {
+        run_id: "train-T",
+        logical_operation_id: "T",
+        entrypoint: "train",
+        train_loop_linked: true,
+        child_logical_operation_id: null,
+      },
+    ],
+    manifest: {
+      required_entrypoints: ["train"],
+      required_lifecycle_classes: [],
+      live_train_linkage_present: false,
+    },
+  });
+  const scored = report.operations.find((o) => o.entrypoints.includes("train"));
+  assert.equal(scored!.child_logical_operation_id, undefined);
+  assert.ok(report.integrity.missing_required_coverage > 0);
+});
+
 test("attemptsFromRunArtifacts: child minted logical id without event logical id is followable (#1440)", () => {
   const childPath = "/host-state/runs/loop-1/events.jsonl";
   const attempts = attemptsFromRunArtifacts([

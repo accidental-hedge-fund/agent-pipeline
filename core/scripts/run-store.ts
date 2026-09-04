@@ -1187,9 +1187,43 @@ export async function initRunDir(
 }
 
 /**
+ * Write root for a public `single` / `merge` / `merge-queue` admission.
+ * Unique-operation collection scores `runsDir(resolveFactoryControlRoot(...))`
+ * plus loop state-home. Persist MUST land in that factory-control generic
+ * store when the root is known. A candidate-worktree `repoDir` that is not
+ * an approved collection root is not coverage.
+ */
+export async function resolvePublicAdmissionPersistRoot(opts: {
+  repoDir: string;
+  env?: NodeJS.ProcessEnv;
+  factoryControlDir?: string | null;
+  /**
+   * Test overlay. `undefined` resolves the live factory-control root.
+   * A non-empty string is that persist root. `null` / empty leaves `repoDir`
+   * (command still runs; unique-operation coverage stays fail-closed).
+   */
+  factoryControlRoot?: string | null;
+}): Promise<string> {
+  if (opts.factoryControlRoot !== undefined) {
+    const overlay =
+      typeof opts.factoryControlRoot === "string" ? opts.factoryControlRoot.trim() : "";
+    return overlay !== "" ? overlay : opts.repoDir;
+  }
+  const { resolveFactoryControlRoot } = await import("./production-engine-pin.ts");
+  const controlRoot = resolveFactoryControlRoot({
+    repoDir: opts.repoDir,
+    env: opts.env,
+    factoryControlDir: opts.factoryControlDir,
+  });
+  return controlRoot ?? opts.repoDir;
+}
+
+/**
  * Persist a control-host generic-store run for a public `pipeline single` /
  * `pipeline merge` / `pipeline merge-queue` admission. Uses the existing
- * {@link initRunDir} store (no second run store).
+ * {@link initRunDir} store (no second run store). Writes into
+ * `runsDir(resolveFactoryControlRoot(...))` when that factory-control root
+ * is non-null so unique-operation collection can observe the artifact.
  */
 export async function persistPublicEntrypointAdmission(
   opts: {
@@ -1200,12 +1234,21 @@ export async function persistPublicEntrypointAdmission(
     issue?: number;
     startedAt?: Date;
     logicalOperationId?: string | null;
+    env?: NodeJS.ProcessEnv;
+    factoryControlDir?: string | null;
+    factoryControlRoot?: string | null;
   },
   deps: RunStoreDeps = defaultRunStoreDeps,
 ): Promise<{ runId: RunId; runDir: string }> {
   const startedAt = opts.startedAt ?? new Date();
   const runId = publicEntrypointRunIdFor(opts.kind, startedAt);
-  const runDir = runDirPath(opts.repoDir, runId);
+  const persistRoot = await resolvePublicAdmissionPersistRoot({
+    repoDir: opts.repoDir,
+    env: opts.env,
+    factoryControlDir: opts.factoryControlDir,
+    factoryControlRoot: opts.factoryControlRoot,
+  });
+  const runDir = runDirPath(persistRoot, runId);
   await initRunDir(
     {
       runDir,

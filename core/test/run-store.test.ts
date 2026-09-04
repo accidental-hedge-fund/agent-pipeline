@@ -26,6 +26,7 @@ import {
   parseWriteHealthText,
   persistPublicEntrypointAdmission,
   publicEntrypointRunIdFor,
+  resolvePublicAdmissionPersistRoot,
   readEvents,
   readWriteHealth,
   recordWriteHealthFailure,
@@ -419,6 +420,52 @@ test("persistPublicEntrypointAdmission: writes kind and run_start.entrypoint thr
     assert.equal(events.entrypoint, kind);
     assert.equal(events.run_id, runId);
   }
+});
+
+test("persistPublicEntrypointAdmission: writes under factory-control generic store not candidate worktree (#1446)", async () => {
+  const { deps, readFile } = memRunStore();
+  const startedAt = new Date("2026-09-04T23:26:39.000Z");
+  const controlRoot = "/control-repo";
+  const candidateRepo = "/candidate-worktree";
+  for (const kind of ["single", "merge", "merge-queue"] as const) {
+    const { runId, runDir } = await persistPublicEntrypointAdmission(
+      {
+        repoDir: candidateRepo,
+        kind,
+        repo: "owner/repo",
+        profile: "codex",
+        issue: kind === "single" ? ISSUE : undefined,
+        startedAt,
+        factoryControlRoot: controlRoot,
+      },
+      deps,
+    );
+    assert.equal(runId, publicEntrypointRunIdFor(kind, startedAt));
+    assert.equal(runDir, path.join(controlRoot, ".agent-pipeline", "runs", runId));
+    assert.equal(runDir.startsWith(path.join(candidateRepo, ".agent-pipeline")), false);
+    const meta = JSON.parse(readFile(path.join(runDir, "run.json")));
+    assert.equal(meta.kind, kind);
+    const events = JSON.parse(readFile(path.join(runDir, "events.jsonl")).trim());
+    assert.equal(events.type, "run_start");
+    assert.equal(events.entrypoint, kind);
+  }
+});
+
+test("resolvePublicAdmissionPersistRoot: unknown factory-control root keeps repoDir (#1446)", async () => {
+  assert.equal(
+    await resolvePublicAdmissionPersistRoot({
+      repoDir: "/candidate-worktree",
+      factoryControlRoot: null,
+    }),
+    "/candidate-worktree",
+  );
+  assert.equal(
+    await resolvePublicAdmissionPersistRoot({
+      repoDir: "/control-repo",
+      factoryControlRoot: "/control-repo",
+    }),
+    "/control-repo",
+  );
 });
 
 test("initRunDir: train kind does not set issue to the first work-list number", async () => {

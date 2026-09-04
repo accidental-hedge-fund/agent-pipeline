@@ -944,13 +944,15 @@ test("runbook names both host roots and the in-flight missing-field keep rule (#
     join(CORE_ROOT, "..", "docs/factory-reliability-gate-runbook.md"),
     "utf8",
   );
-  assert.ok(runbook.includes("Unique-operation reliability (#1368 / #1428 / #1434 / #1440)"));
+  assert.ok(runbook.includes("Unique-operation reliability (#1368 / #1428 / #1434 / #1440 / #1446)"));
   assert.ok(runbook.includes("resolveStateHome()>/runs"));
   assert.ok(runbook.includes(".agent-pipeline/runs"));
   assert.ok(runbook.includes("injectable dual-root resolver"));
   assert.ok(runbook.includes("opts.inFlightShip === true"));
   assert.ok(runbook.includes("sourceSha"));
   assert.ok(runbook.includes("followable `train_loop_linked`"));
+  assert.match(runbook, /child\s+logical id inherited from the parent/);
+  assert.ok(runbook.includes("persist recognizable run artifacts into the same dual-root pair"));
   assert.ok(runbook.includes("single-"));
   assert.ok(runbook.includes("merge-queue-"));
   assert.ok(runbook.includes("HEAD"));
@@ -958,6 +960,7 @@ test("runbook names both host roots and the in-flight missing-field keep rule (#
     runbook.includes("Ship FRG scoring reads that evidence from the **control-host** durable store"),
     false,
   );
+  assert.match(runbook, /Observing entrypoint `train` alone does\s+not satisfy #1301/);
 });
 
 test("in-flight ship observes unbound single/merge/merge-queue prefixes as observation-only (#1440)", async () => {
