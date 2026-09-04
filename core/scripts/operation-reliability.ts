@@ -105,6 +105,12 @@ export interface UniqueOperationAttempt {
    * Preserved for diagnostics; aggregator increments contradictory_correlation.
    */
   contradictory_identity?: boolean;
+  /**
+   * How `logical_operation_id` was obtained. `"run_id_fallback"` is a
+   * physical-run identity used for entrypoint observation only. Omitted or
+   * `"minted"` is a durable logical id.
+   */
+  identity_provenance?: "minted" | "run_id_fallback";
 }
 
 export interface UniqueOperationManifest {
@@ -307,6 +313,7 @@ export function aggregateUniqueOperationReliability(input: {
       fixture_ids: string[];
       candidate_sha: string;
       release_identity: string;
+      identity_provenance: "minted" | "run_id_fallback";
     }
   >();
 
@@ -356,7 +363,11 @@ export function aggregateUniqueOperationReliability(input: {
       fixture_ids: [],
       candidate_sha: "",
       release_identity: "",
+      identity_provenance: "run_id_fallback",
     };
+    if (attempt.identity_provenance !== "run_id_fallback") {
+      entry.identity_provenance = "minted";
+    }
     if (!entry.run_ids.includes(attempt.run_id)) entry.run_ids.push(attempt.run_id);
     entry.terminals.push(classifyAttempt(attempt));
     if (attemptSha && !entry.candidate_sha) entry.candidate_sha = attemptSha;
@@ -451,8 +462,11 @@ export function aggregateUniqueOperationReliability(input: {
       liveLinkage = true;
     }
 
+    const fallbackIdentity = entry.identity_provenance === "run_id_fallback";
     if (hasFalseHuman) falseHuman += 1;
-    if (terminal === "ownerless_terminal") ownerless += 1;
+    // Fallback-identity host artifacts observe entrypoints only. They must
+    // not inflate ownerless-terminal or clean-completion SLOs.
+    if (!fallbackIdentity && terminal === "ownerless_terminal") ownerless += 1;
 
     const fixtureId = entry.fixture_ids[0] ?? null;
     const declared = fixtureId ? expectedOutcomes[fixtureId] : undefined;
@@ -461,13 +475,13 @@ export function aggregateUniqueOperationReliability(input: {
       (declared === "typed_request" && hasTyped) ||
       (declared === "cancellation" && hasCancel);
 
-    if (declaredOk && fixtureId) {
+    if (declaredOk && fixtureId && !fallbackIdentity) {
       exclusions.push({
         logical_operation_id: id,
         reason: declared,
         fixture_id: fixtureId,
       });
-    } else if (!entry.nested) {
+    } else if (!entry.nested && !fallbackIdentity) {
       cleanEligible += 1;
       if (hasVerified && !entry.manual_reinvocation && !unresolvedOwnerless) {
         cleanSuccess += 1;
@@ -705,27 +719,60 @@ function trainLinkedEventRefs(event: Record<string, unknown>): {
  * Keep only attempts bound to the scored candidate/release. Other-candidate
  * and unbound artifacts are omitted so they cannot satisfy the current gate.
  * When `candidate_sha` is empty, the list is returned unchanged (scoreboard).
- * When `release_identity` is scored, missing and mismatched identities drop.
+ * When `release_identity` is scored, missing and mismatched identities drop
+ * unless `inFlightShip` is true: then missing-field attempts are kept and
+ * present mismatches still drop.
  */
 export function filterAttemptsBoundToCandidate(
   attempts: readonly UniqueOperationAttempt[],
-  binding: { candidate_sha?: string | null; release_identity?: string | null },
+  binding: {
+    candidate_sha?: string | null;
+    release_identity?: string | null;
+    inFlightShip?: boolean;
+  },
 ): UniqueOperationAttempt[] {
   const scoredSha = (binding.candidate_sha ?? "").trim();
   const scoredRelease = (binding.release_identity ?? "").trim();
+  const inFlightShip = binding.inFlightShip === true;
   if (!scoredSha) return [...attempts];
   return attempts.filter((attempt) => {
     const sha =
       typeof attempt.candidate_sha === "string" ? attempt.candidate_sha.trim() : "";
-    if (sha !== scoredSha) return false;
+    if (inFlightShip) {
+      if (sha && sha !== scoredSha) return false;
+    } else if (sha !== scoredSha) {
+      return false;
+    }
     const release =
       typeof attempt.release_identity === "string" ? attempt.release_identity.trim() : "";
-    if (scoredRelease && release !== scoredRelease) return false;
+    if (scoredRelease) {
+      if (inFlightShip) {
+        if (release && release !== scoredRelease) return false;
+      } else if (release !== scoredRelease) {
+        return false;
+      }
+    }
     return true;
   });
 }
 
-/** Map scanned run artifacts into classifier attempts. Does not invent ids. */
+/**
+ * Map a durable run-id prefix to a required public entrypoint. `merge-queue-`
+ * and `mq-` are checked before remaining `merge-`. Unrecognized ids stay null.
+ */
+export function mapPublicEntrypointFromRunId(runId: unknown): string | null {
+  const id = nonEmptyTrimmed(runId);
+  if (!id) return null;
+  if (id.startsWith("merge-queue-") || id.startsWith("mq-")) return "merge-queue";
+  if (id.startsWith("train-")) return "train";
+  if (id.startsWith("loop-")) return "loop";
+  if (id.startsWith("merge-")) return "merge";
+  // `runIdFor`: `<issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ>`
+  if (/^\d+-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(id)) return "drive";
+  return null;
+}
+
+/** Map scanned run artifacts into classifier attempts. Does not invent minted ids. */
 export function attemptsFromRunArtifacts(
   runs: readonly ScannedRunArtifact[],
 ): UniqueOperationAttempt[] {
@@ -739,7 +786,14 @@ export function attemptsFromRunArtifacts(
       start?.logical_operation_id,
     ]);
     const contradictoryIdentity = identitySources.length > 1;
-    const logical = identitySources[0] ?? null;
+    const mintedLogical = identitySources[0] ?? null;
+    const runIdFallback = nonEmptyTrimmed(run.runId);
+    const logical = mintedLogical ?? runIdFallback;
+    const identityProvenance: UniqueOperationAttempt["identity_provenance"] = mintedLogical
+      ? "minted"
+      : runIdFallback
+        ? "run_id_fallback"
+        : undefined;
     const complete = run.events.find((e) => e.type === "run_complete");
     const parentSources = uniqueNonEmpty([
       run.runJson?.parent_logical_operation_id,
@@ -751,7 +805,9 @@ export function attemptsFromRunArtifacts(
       run.summary?.verified_completion === true ||
       run.events.some((e) => e.type === "verified_completion" || e.exact_candidate_proof === true);
     const entrypoint =
-      mapPublicEntrypoint(start?.entrypoint) ?? mapPublicEntrypoint(run.runJson?.kind);
+      mapPublicEntrypoint(start?.entrypoint) ??
+      mapPublicEntrypoint(run.runJson?.kind) ??
+      mapPublicEntrypointFromRunId(run.runId);
     let trainLinked = false;
     let childLogical: string | null = null;
     let childRunId: string | null = null;
@@ -798,6 +854,7 @@ export function attemptsFromRunArtifacts(
       release_identity: releaseIdentity,
       evidence_refs: evidenceRefs,
       contradictory_identity: contradictoryIdentity,
+      ...(identityProvenance ? { identity_provenance: identityProvenance } : {}),
     };
   });
 }

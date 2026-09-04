@@ -6064,6 +6064,7 @@ async function main(): Promise<void> {
         milestone: opts.milestone,
         json: !!opts.json,
         noClosePack,
+        env: process.env,
         scenarioOverrides: scenarioOverrides.length > 0 ? scenarioOverrides : undefined,
         compositionOverrides,
         falseHumanAuthorityCount,

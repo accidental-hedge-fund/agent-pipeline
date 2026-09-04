@@ -40,6 +40,27 @@ Unique-operation attempt mapping SHALL set a recognized public entrypoint from d
 - **AND** the run-id is not a recognized public-entrypoint prefix
 - **THEN** the attempt entrypoint SHALL NOT be `single`
 
+#### Scenario: Unrecognized kind falls through to a matching prefix
+
+- **WHEN** a run artifact has `run.json.kind` `advance`
+- **AND** `run_start.entrypoint` is absent
+- **AND** the run-id prefix is `train-`
+- **THEN** the attempt entrypoint SHALL be `train`
+
+#### Scenario: Merge-queue prefixes are checked before merge
+
+- **WHEN** a run artifact has run-id prefix `merge-queue-` or `mq-`
+- **AND** `run.json.kind` and `run_start.entrypoint` are absent
+- **THEN** the attempt entrypoint SHALL be `merge-queue`
+- **AND** the attempt entrypoint SHALL NOT be `merge`
+
+#### Scenario: Start-event entrypoint wins over kind and prefix
+
+- **WHEN** a run artifact has `run_start.entrypoint` `loop`
+- **AND** `run.json.kind` is `train`
+- **AND** the run-id prefix is `train-`
+- **THEN** the attempt entrypoint SHALL be `loop`
+
 #### Scenario: Missing logical id uses run_id as aggregation identity
 
 - **WHEN** a run artifact has no durable `logical_operation_id`
@@ -147,3 +168,9 @@ Unique-operation attempt collection for release-eligible Factory Reliability Gat
 - **AND** that child run exists in the candidate worktree
 - **THEN** that child SHALL NOT be loaded into the attempt list
 - **AND** that handoff SHALL NOT supply unique-operation coverage for `C`
+
+#### Scenario: Duplicate run ids across host roots are scored once
+
+- **WHEN** release-eligible FRG scoring collects unique-operation attempts
+- **AND** the loop state-home and the control-host generic run store both contain the same durable `run_id`
+- **THEN** the attempt list SHALL include that run at most once

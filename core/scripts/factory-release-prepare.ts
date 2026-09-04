@@ -1241,6 +1241,11 @@ export interface ScoreBoundPackLoopArgs {
   now: () => Date;
   /** Tests inject collect; production `--from-run` uses the live hybrid-v2 fetch. */
   collectHybridV2?: FactoryGateOpts["collectHybridV2"];
+  env?: NodeJS.ProcessEnv;
+  factoryControlDir?: string | null;
+  resolveUniqueOperationRunsRoots?: FactoryGateOpts["resolveUniqueOperationRunsRoots"];
+  uniqueOperationRunsRoot?: string;
+  loadCandidateFaultRecoveryInventory?: FactoryGateOpts["loadCandidateFaultRecoveryInventory"];
 }
 
 export interface ScoreBoundPackLoopResult {
@@ -1289,6 +1294,11 @@ export interface DurableGenerateOptions {
   candidateInvocation?: CandidateInvocation;
   resolveCandidateEngine?: typeof resolveCandidateEngine;
   probePackLoopLiveness?: typeof probePackLoopLiveness;
+  env?: NodeJS.ProcessEnv;
+  factoryControlDir?: string | null;
+  resolveUniqueOperationRunsRoots?: FactoryGateOpts["resolveUniqueOperationRunsRoots"];
+  uniqueOperationRunsRoot?: string;
+  loadCandidateFaultRecoveryInventory?: FactoryGateOpts["loadCandidateFaultRecoveryInventory"];
   /**
    * Terminal score through factory-gate --from-run (no --observations).
    * Tests inject this seam.
@@ -1626,6 +1636,19 @@ export async function defaultScoreBoundPackLoop(
     requestCandidateGitSha: args.request.integrated_candidate.git_sha,
     attestationKey: null,
     inFlightShip: true,
+    env: args.env,
+    factoryControlDir: args.factoryControlDir,
+    resolveUniqueOperationRunsRoots: args.resolveUniqueOperationRunsRoots,
+    uniqueOperationRunsRoot: args.uniqueOperationRunsRoot,
+    loadCandidateFaultRecoveryInventory:
+      args.loadCandidateFaultRecoveryInventory ??
+      (async () => {
+        const { FAULT_RECOVERY_MATRIX } = await import("./fault-recovery-matrix.ts");
+        return {
+          rows: FAULT_RECOVERY_MATRIX,
+          sourceSha: args.request.integrated_candidate.git_sha,
+        };
+      }),
     stdout: () => {},
     stderr: () => {},
     now: args.now,
@@ -3233,6 +3256,11 @@ export async function generateDurableUnsignedFrg(
       loop,
       pack: ctx.pack,
       now,
+      env: opts.env,
+      factoryControlDir: opts.factoryControlDir,
+      resolveUniqueOperationRunsRoots: opts.resolveUniqueOperationRunsRoots,
+      uniqueOperationRunsRoot: opts.uniqueOperationRunsRoot,
+      loadCandidateFaultRecoveryInventory: opts.loadCandidateFaultRecoveryInventory,
     });
   } catch (err) {
     return refuseSyntheticTrivialPack(request, {

@@ -59,9 +59,12 @@ import {
   type UniqueOperationReliability,
 } from "./operation-reliability.ts";
 import {
+  assertFaultRecoveryInventoryComplete,
   bindExecutedMatrixRowsForCandidate,
   type ExecutedMatrixRow,
+  type FaultRecoveryMatrixRow,
 } from "./fault-recovery-matrix.ts";
+import { runsDir } from "./run-store.ts";
 import {
   defaultCollectHybridV2FromRun,
   githubReadyToDeployOverlay,
@@ -4251,18 +4254,42 @@ export interface FactoryGateOpts {
   matrix_covered_lifecycle_classes?: readonly string[] | null;
   executed_matrix_rows?: readonly ExecutedMatrixRow[];
   /**
-   * Control-host generic run-store root for unique-operation collection.
-   * Defaults to `<resolveStateHome(env)>/runs` (same root factory-release
-   * uses for pack-loop scans). Tests inject a fake host store. Ship /
-   * release-eligible scoring does not fall back to the candidate worktree
-   * unless that path is this same root.
+   * Test override that replaces the **generic** control-host run-store root
+   * in the dual-root pair. Does not replace the loop state-home root.
+   * Production default uses `runsDir(resolveFactoryControlRoot(...))`.
    */
   uniqueOperationRunsRoot?: string;
   /**
+   * Injectable dual-root resolver. Production default returns canonicalized
+   * loop state-home `<resolveStateHome({ env })>/runs` plus generic
+   * `runsDir(resolveFactoryControlRoot(...))` when that root is non-null.
+   * Tests inject host stores. Never derive the generic root from
+   * `runsDir(opts.repoDir)` unless that path already equals one of the pair.
+   */
+  resolveUniqueOperationRunsRoots?: (opts: FactoryGateOpts) => string[];
+  /**
+   * Factory-control checkout signal for the default generic-root resolver.
+   * Same meaning as `AGENT_PIPELINE_FACTORY_CONTROL`.
+   */
+  factoryControlDir?: string | null;
+  /**
    * FRG pack nested under an admitted in-flight `ship`. factory-release
-   * prepare sets this. Standalone factory-gate leaves it unset.
+   * prepare sets this. Standalone factory-gate leaves it unset. Collector
+   * exceptions (unbound keep, inventory rows) gate only on this flag.
    */
   inFlightShip?: boolean;
+  /**
+   * In-flight ship #1333 inventory loader. When host artifacts have no
+   * binder-accepted executed rows for the scored SHA, a complete inventory
+   * whose `sourceSha` equals that SHA is mapped to executed rows. Standalone
+   * factory-gate must omit this or it is ignored.
+   */
+  loadCandidateFaultRecoveryInventory?: (args: {
+    candidateSha: string;
+    repoDir: string;
+  }) =>
+    | Promise<{ rows: readonly FaultRecoveryMatrixRow[]; sourceSha?: string | null }>
+    | { rows: readonly FaultRecoveryMatrixRow[]; sourceSha?: string | null };
   /**
    * Post-1.33 --from-run collect. When omitted, production builds hybrid-v2
    * provenance from the live pack + Layer A TAP (#1118). Tests inject a fake.
@@ -4534,17 +4561,81 @@ type ScannedUniqueOpRun = {
   summary: Record<string, unknown> | null;
 };
 
-/** Ship/release-eligible FRG (`hostOnly`) reads only the control-host root. */
-function uniqueOperationRunsRoots(opts: FactoryGateOpts, hostOnly = false): string[] {
-  const env = opts.env ?? process.env;
-  const hostRoot =
-    opts.uniqueOperationRunsRoot ??
-    path.join(resolveStateHome({ env, hostname: () => "unused" }), "runs");
-  const worktreeRoot = path.join(opts.repoDir, ".agent-pipeline", "runs");
-  if (hostOnly || path.resolve(worktreeRoot) === path.resolve(hostRoot)) {
-    return [hostRoot];
+/** Canonicalize runs roots: resolve, drop empties, first occurrence wins. */
+export function canonicalizeUniqueOperationRunsRoots(roots: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const root of roots) {
+    if (typeof root !== "string" || root.trim() === "") continue;
+    const resolved = path.resolve(root.trim());
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    out.push(resolved);
   }
-  return [hostRoot, worktreeRoot];
+  return out;
+}
+
+/**
+ * Production dual-root pair: loop state-home first, then control-host generic
+ * `runsDir` when the factory-control root is non-null. `uniqueOperationRunsRoot`
+ * replaces the generic root only. Does not invent a generic root from
+ * `runsDir(opts.repoDir)`.
+ */
+export async function defaultResolveUniqueOperationRunsRoots(
+  opts: FactoryGateOpts,
+): Promise<string[]> {
+  const env = opts.env ?? process.env;
+  const stateHome = path.join(resolveStateHome({ env, hostname: () => "unused" }), "runs");
+  let generic: string | null = null;
+  if (typeof opts.uniqueOperationRunsRoot === "string" && opts.uniqueOperationRunsRoot.trim()) {
+    generic = path.resolve(opts.uniqueOperationRunsRoot.trim());
+  } else {
+    const { resolveFactoryControlRoot } = await import("./production-engine-pin.ts");
+    const controlRoot = resolveFactoryControlRoot({
+      repoDir: opts.repoDir,
+      env,
+      factoryControlDir: opts.factoryControlDir,
+    });
+    if (controlRoot) generic = runsDir(controlRoot);
+  }
+  return canonicalizeUniqueOperationRunsRoots(generic ? [stateHome, generic] : [stateHome]);
+}
+
+async function uniqueOperationRunsRoots(opts: FactoryGateOpts): Promise<string[]> {
+  if (opts.resolveUniqueOperationRunsRoots) {
+    return canonicalizeUniqueOperationRunsRoots(opts.resolveUniqueOperationRunsRoots(opts));
+  }
+  return defaultResolveUniqueOperationRunsRoots(opts);
+}
+
+function executedRowsFromCompleteInventory(
+  inventory: { rows: readonly FaultRecoveryMatrixRow[]; sourceSha?: string | null },
+  scoredSha: string,
+): ExecutedMatrixRow[] {
+  const sha = scoredSha.trim();
+  const sourceSha = (inventory.sourceSha ?? "").trim();
+  if (!sha || !sourceSha || sourceSha !== sha) return [];
+  try {
+    assertFaultRecoveryInventoryComplete(inventory.rows);
+  } catch {
+    return [];
+  }
+  const executed: ExecutedMatrixRow[] = [];
+  for (const cell of inventory.rows) {
+    if (cell.not_applicable) continue;
+    executed.push({
+      candidate_sha: sha,
+      layer: cell.layer,
+      lifecycle_class: cell.lifecycle_class,
+      operation: cell.operation,
+      fault_state: cell.fault_state,
+      entrypoint: cell.entrypoint,
+      host: cell.host,
+      observed_terminal: cell.expected_terminal,
+      passed: true,
+    });
+  }
+  return bindExecutedMatrixRowsForCandidate(executed, sha, inventory.rows);
 }
 
 function executedMatrixRowsFromArtifactValue(value: unknown): ExecutedMatrixRow[] {
@@ -4585,15 +4676,19 @@ function executedMatrixRowsFromRun(run: ScannedUniqueOpRun): ExecutedMatrixRow[]
  * artifacts yield an empty attempt list (integrity failure, not a synthetic pass).
  * Only artifacts bound to the scored candidate/release are aggregated.
  *
- * Control-host `runsRoot` values (factory-release `resolveStateHome` / an
- * injected host store) are the unique-operation source of truth. An empty
- * candidate-worktree `.agent-pipeline/runs` directory is not proof that
- * train, loop, or merge never ran.
+ * Control-host roots (loop state-home + generic `.agent-pipeline/runs`) are
+ * the unique-operation source of truth. An empty candidate-worktree
+ * `.agent-pipeline/runs` directory is not proof that train, loop, or merge
+ * never ran. Deduplicate by run id across roots (first occurrence wins).
  */
 async function collectUniqueOperationsFromRunStore(
   runsRoots: readonly string[],
   fsDeps: FrgFsDeps,
-  binding: { candidate_sha?: string | null; release_identity?: string | null } = {},
+  binding: {
+    candidate_sha?: string | null;
+    release_identity?: string | null;
+    inFlightShip?: boolean;
+  } = {},
 ): Promise<{
   attempts: UniqueOperationAttempt[];
   executed_matrix_rows: ExecutedMatrixRow[];
@@ -4965,13 +5060,8 @@ export async function runFactoryGate(
       executed_matrix_rows: opts.executed_matrix_rows,
     };
   }
-  const inFlightShip =
-    opts.inFlightShip === true ||
-    computeInput.in_flight_ship === true ||
-    computeInput.unique_operation_manifest?.in_flight_ship === true ||
-    opts.unique_operation_manifest?.in_flight_ship === true ||
-    computeInput.factory_release_binding != null;
-  if (inFlightShip) {
+  const collectorInFlightShip = opts.inFlightShip === true;
+  if (collectorInFlightShip) {
     computeInput = {
       ...computeInput,
       in_flight_ship: true,
@@ -4991,18 +5081,31 @@ export async function runFactoryGate(
       opts.unique_operation_manifest?.candidate_sha ??
       "";
     const collected = await collectUniqueOperationsFromRunStore(
-      uniqueOperationRunsRoots(opts, inFlightShip),
+      await uniqueOperationRunsRoots(opts),
       fsDeps,
       {
         candidate_sha: scoredCandidateSha,
         release_identity: version,
+        inFlightShip: collectorInFlightShip,
       },
     );
+    let executedRows = collected.executed_matrix_rows;
+    if (
+      collectorInFlightShip &&
+      executedRows.length === 0 &&
+      opts.loadCandidateFaultRecoveryInventory
+    ) {
+      const inventory = await opts.loadCandidateFaultRecoveryInventory({
+        candidateSha: scoredCandidateSha,
+        repoDir: opts.repoDir,
+      });
+      executedRows = executedRowsFromCompleteInventory(inventory, scoredCandidateSha);
+    }
     computeInput = {
       ...computeInput,
       unique_operations: computeInput.unique_operations ?? collected.attempts,
       executed_matrix_rows:
-        computeInput.executed_matrix_rows ?? collected.executed_matrix_rows,
+        computeInput.executed_matrix_rows ?? executedRows,
       unique_operation_manifest:
         computeInput.unique_operation_manifest ??
         opts.unique_operation_manifest ??
@@ -5011,7 +5114,7 @@ export async function runFactoryGate(
           required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
           candidate_sha: scoredCandidateSha,
           release_identity: version,
-          ...(inFlightShip ? { in_flight_ship: true } : {}),
+          ...(collectorInFlightShip ? { in_flight_ship: true } : {}),
         },
     };
   }

@@ -138,3 +138,11 @@ When `factory-release prepare` refuses structural eligibility because unique-ope
 - **AND** unique-operation SLO or release-binding validation returns a non-null diagnostic string
 - **THEN** the hard-gate message SHALL include that diagnostic string
 - **AND** the message SHALL NOT equal only `factory-release prepare: FRG structural eligibility failed for <version>. Hard gate: release preparation blocked.`
+
+#### Scenario: SLO and binding diagnostics are both named when both exist
+
+- **WHEN** unique-operation SLO validation returns a failure string
+- **AND** unique-operation release-binding validation returns a different failure string
+- **AND** `factory-release prepare` scores that pack as not structurally eligible
+- **THEN** the hard-gate message SHALL include both failure strings
+- **AND** the message SHALL NOT equal only `factory-release prepare: FRG structural eligibility failed for <version>. Hard gate: release preparation blocked.`

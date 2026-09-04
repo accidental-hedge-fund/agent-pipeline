@@ -19,6 +19,13 @@ When in-flight ship Factory Reliability Gate unique-operation scoring needs #133
 - **THEN** scoring SHALL NOT attach inventory rows
 - **AND** missing required coverage SHALL increase
 
+#### Scenario: Inventory from a different SHA checkout does not cover #1333 classes
+
+- **WHEN** in-flight ship unique-operation scoring runs for candidate SHA `C`
+- **AND** the loaded matrix inventory is sourced from a tree whose SHA is not `C`
+- **THEN** scoring SHALL NOT attach inventory rows
+- **AND** missing required coverage SHALL increase
+
 #### Scenario: Helper class stamps still fail
 
 - **WHEN** a passing unique-operation helper lists every required lifecycle class as covered
