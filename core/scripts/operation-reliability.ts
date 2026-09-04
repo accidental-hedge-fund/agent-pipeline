@@ -105,6 +105,18 @@ export interface UniqueOperationAttempt {
    * Preserved for diagnostics; aggregator increments contradictory_correlation.
    */
   contradictory_identity?: boolean;
+  /**
+   * How `logical_operation_id` was obtained. `"run_id_fallback"` is a
+   * physical-run identity used for entrypoint observation only. Omitted or
+   * `"minted"` is a durable logical id.
+   */
+  identity_provenance?: "minted" | "run_id_fallback";
+  /**
+   * Candidate/release binding. `"unbound_inflight"` is a missing-field keep
+   * during in-flight ship: entrypoint observation only. Omitted or `"bound"`
+   * is a scored-candidate/release match.
+   */
+  binding_provenance?: "bound" | "unbound_inflight";
 }
 
 export interface UniqueOperationManifest {
@@ -290,6 +302,8 @@ export function aggregateUniqueOperationReliability(input: {
   );
   const claimedLifecycle = new Set<string>(manifest.covered_lifecycle_classes ?? []);
   const scoredRelease = (manifest.release_identity ?? input.release_identity ?? "").trim();
+  const deferInFlightShip =
+    input.in_flight_ship === true || manifest.in_flight_ship === true;
 
   const byId = new Map<
     string,
@@ -307,6 +321,8 @@ export function aggregateUniqueOperationReliability(input: {
       fixture_ids: string[];
       candidate_sha: string;
       release_identity: string;
+      identity_provenance: "minted" | "run_id_fallback";
+      binding_provenance: "bound" | "unbound_inflight";
     }
   >();
 
@@ -356,9 +372,25 @@ export function aggregateUniqueOperationReliability(input: {
       fixture_ids: [],
       candidate_sha: "",
       release_identity: "",
+      identity_provenance: "run_id_fallback",
+      binding_provenance: "unbound_inflight",
     };
+    if (attempt.identity_provenance !== "run_id_fallback") {
+      entry.identity_provenance = "minted";
+    }
+    const unboundInflight = attemptIsUnboundInflight(
+      attempt,
+      scoredSha,
+      scoredRelease,
+      deferInFlightShip,
+    );
+    if (!unboundInflight) entry.binding_provenance = "bound";
     if (!entry.run_ids.includes(attempt.run_id)) entry.run_ids.push(attempt.run_id);
-    entry.terminals.push(classifyAttempt(attempt));
+    // Unbound in-flight keeps are entrypoint observation only. Their terminals
+    // must not mint verified success, exclusions, or ownerless SLO numerators.
+    if (!unboundInflight) {
+      entry.terminals.push(classifyAttempt(attempt));
+    }
     if (attemptSha && !entry.candidate_sha) entry.candidate_sha = attemptSha;
     if (attemptRelease && !entry.release_identity) entry.release_identity = attemptRelease;
     // A logical operation is nested only when every physical attempt is nested.
@@ -379,13 +411,15 @@ export function aggregateUniqueOperationReliability(input: {
       entry.evidence_refs.push(`release:${attemptRelease}`);
     }
     if (attempt.manual_reinvocation === true) entry.manual_reinvocation = true;
-    if (attempt.exact_candidate_recovery === true) entry.exact_candidate_recovery.push(true);
-    if (attempt.exact_candidate_recovery === false) entry.exact_candidate_recovery.push(false);
-    if (attempt.independent_sibling_continuation === true) {
-      entry.independent_sibling_continuation.push(true);
-    }
-    if (attempt.independent_sibling_continuation === false) {
-      entry.independent_sibling_continuation.push(false);
+    if (!unboundInflight) {
+      if (attempt.exact_candidate_recovery === true) entry.exact_candidate_recovery.push(true);
+      if (attempt.exact_candidate_recovery === false) entry.exact_candidate_recovery.push(false);
+      if (attempt.independent_sibling_continuation === true) {
+        entry.independent_sibling_continuation.push(true);
+      }
+      if (attempt.independent_sibling_continuation === false) {
+        entry.independent_sibling_continuation.push(false);
+      }
     }
     if (attempt.train_loop_linked === true) entry.train_loop_linked = true;
     if (child) entry.child_ids.push(child);
@@ -451,8 +485,14 @@ export function aggregateUniqueOperationReliability(input: {
       liveLinkage = true;
     }
 
+    const fallbackIdentity = entry.identity_provenance === "run_id_fallback";
+    const observationOnly =
+      fallbackIdentity || entry.binding_provenance === "unbound_inflight";
     if (hasFalseHuman) falseHuman += 1;
-    if (terminal === "ownerless_terminal") ownerless += 1;
+    // Fallback-identity and unbound-inflight host artifacts observe
+    // entrypoints only. They must not inflate ownerless-terminal or
+    // clean-completion SLOs.
+    if (!observationOnly && terminal === "ownerless_terminal") ownerless += 1;
 
     const fixtureId = entry.fixture_ids[0] ?? null;
     const declared = fixtureId ? expectedOutcomes[fixtureId] : undefined;
@@ -461,13 +501,13 @@ export function aggregateUniqueOperationReliability(input: {
       (declared === "typed_request" && hasTyped) ||
       (declared === "cancellation" && hasCancel);
 
-    if (declaredOk && fixtureId) {
+    if (declaredOk && fixtureId && !observationOnly) {
       exclusions.push({
         logical_operation_id: id,
         reason: declared,
         fixture_id: fixtureId,
       });
-    } else if (!entry.nested) {
+    } else if (!entry.nested && !observationOnly) {
       cleanEligible += 1;
       if (hasVerified && !entry.manual_reinvocation && !unresolvedOwnerless) {
         cleanSuccess += 1;
@@ -498,8 +538,6 @@ export function aggregateUniqueOperationReliability(input: {
   // Matrix-proved classes count even when helpers no longer stamp them.
   for (const cls of matrixCovered) coveredLifecycle.add(cls);
 
-  const deferInFlightShip =
-    input.in_flight_ship === true || manifest.in_flight_ship === true;
   const missingEntrypoints = requiredEntrypoints.filter((e) => {
     if (observedEntrypoints.has(e)) return false;
     if (deferInFlightShip && e === "ship") return false;
@@ -701,31 +739,89 @@ function trainLinkedEventRefs(event: Record<string, unknown>): {
   };
 }
 
+function attemptIsUnboundInflight(
+  attempt: UniqueOperationAttempt,
+  scoredSha: string,
+  scoredRelease: string,
+  inFlightShip: boolean,
+): boolean {
+  if (attempt.binding_provenance === "unbound_inflight") return true;
+  if (attempt.binding_provenance === "bound") return false;
+  if (!inFlightShip) return false;
+  const sha =
+    typeof attempt.candidate_sha === "string" ? attempt.candidate_sha.trim() : "";
+  if (scoredSha && !sha) return true;
+  const release =
+    typeof attempt.release_identity === "string" ? attempt.release_identity.trim() : "";
+  if (scoredRelease && !release) return true;
+  return false;
+}
+
 /**
  * Keep only attempts bound to the scored candidate/release. Other-candidate
  * and unbound artifacts are omitted so they cannot satisfy the current gate.
  * When `candidate_sha` is empty, the list is returned unchanged (scoreboard).
- * When `release_identity` is scored, missing and mismatched identities drop.
+ * When `release_identity` is scored, missing and mismatched identities drop
+ * unless `inFlightShip` is true: then missing-field attempts are kept as
+ * `unbound_inflight` (entrypoint observation only) and present mismatches
+ * still drop.
  */
 export function filterAttemptsBoundToCandidate(
   attempts: readonly UniqueOperationAttempt[],
-  binding: { candidate_sha?: string | null; release_identity?: string | null },
+  binding: {
+    candidate_sha?: string | null;
+    release_identity?: string | null;
+    inFlightShip?: boolean;
+  },
 ): UniqueOperationAttempt[] {
   const scoredSha = (binding.candidate_sha ?? "").trim();
   const scoredRelease = (binding.release_identity ?? "").trim();
+  const inFlightShip = binding.inFlightShip === true;
   if (!scoredSha) return [...attempts];
-  return attempts.filter((attempt) => {
+  const kept: UniqueOperationAttempt[] = [];
+  for (const attempt of attempts) {
     const sha =
       typeof attempt.candidate_sha === "string" ? attempt.candidate_sha.trim() : "";
-    if (sha !== scoredSha) return false;
+    if (inFlightShip) {
+      if (sha && sha !== scoredSha) continue;
+    } else if (sha !== scoredSha) {
+      continue;
+    }
     const release =
       typeof attempt.release_identity === "string" ? attempt.release_identity.trim() : "";
-    if (scoredRelease && release !== scoredRelease) return false;
-    return true;
-  });
+    if (scoredRelease) {
+      if (inFlightShip) {
+        if (release && release !== scoredRelease) continue;
+      } else if (release !== scoredRelease) {
+        continue;
+      }
+    }
+    const unbound = inFlightShip && (!sha || (scoredRelease !== "" && !release));
+    kept.push({
+      ...attempt,
+      binding_provenance: unbound ? "unbound_inflight" : "bound",
+    });
+  }
+  return kept;
 }
 
-/** Map scanned run artifacts into classifier attempts. Does not invent ids. */
+/**
+ * Map a durable run-id prefix to a required public entrypoint. `merge-queue-`
+ * and `mq-` are checked before remaining `merge-`. Unrecognized ids stay null.
+ */
+export function mapPublicEntrypointFromRunId(runId: unknown): string | null {
+  const id = nonEmptyTrimmed(runId);
+  if (!id) return null;
+  if (id.startsWith("merge-queue-") || id.startsWith("mq-")) return "merge-queue";
+  if (id.startsWith("train-")) return "train";
+  if (id.startsWith("loop-")) return "loop";
+  if (id.startsWith("merge-")) return "merge";
+  // `runIdFor`: `<issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ>`
+  if (/^\d+-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(id)) return "drive";
+  return null;
+}
+
+/** Map scanned run artifacts into classifier attempts. Does not invent minted ids. */
 export function attemptsFromRunArtifacts(
   runs: readonly ScannedRunArtifact[],
 ): UniqueOperationAttempt[] {
@@ -739,7 +835,14 @@ export function attemptsFromRunArtifacts(
       start?.logical_operation_id,
     ]);
     const contradictoryIdentity = identitySources.length > 1;
-    const logical = identitySources[0] ?? null;
+    const mintedLogical = identitySources[0] ?? null;
+    const runIdFallback = nonEmptyTrimmed(run.runId);
+    const logical = mintedLogical ?? runIdFallback;
+    const identityProvenance: UniqueOperationAttempt["identity_provenance"] = mintedLogical
+      ? "minted"
+      : runIdFallback
+        ? "run_id_fallback"
+        : undefined;
     const complete = run.events.find((e) => e.type === "run_complete");
     const parentSources = uniqueNonEmpty([
       run.runJson?.parent_logical_operation_id,
@@ -751,7 +854,9 @@ export function attemptsFromRunArtifacts(
       run.summary?.verified_completion === true ||
       run.events.some((e) => e.type === "verified_completion" || e.exact_candidate_proof === true);
     const entrypoint =
-      mapPublicEntrypoint(start?.entrypoint) ?? mapPublicEntrypoint(run.runJson?.kind);
+      mapPublicEntrypoint(start?.entrypoint) ??
+      mapPublicEntrypoint(run.runJson?.kind) ??
+      mapPublicEntrypointFromRunId(run.runId);
     let trainLinked = false;
     let childLogical: string | null = null;
     let childRunId: string | null = null;
@@ -798,6 +903,7 @@ export function attemptsFromRunArtifacts(
       release_identity: releaseIdentity,
       evidence_refs: evidenceRefs,
       contradictory_identity: contradictoryIdentity,
+      ...(identityProvenance ? { identity_provenance: identityProvenance } : {}),
     };
   });
 }

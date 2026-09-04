@@ -449,7 +449,7 @@ test("host train handoff into a candidate-worktree child remains ineligible (#14
   assert.equal(isReleaseEligibleFrgPass(result.evidence, { requireAttestation: false }), false);
 });
 
-test("candidate-matching host artifacts without release identity remain ineligible (#1428)", async () => {
+test("standalone factory-gate drops candidate-matching host artifacts without release identity (#1428 / #1434)", async () => {
   const files = new Map<string, string>();
   seedHostCoverage(files, HOST_RUNS, CANDIDATE);
   const result = await runFactoryGate(
@@ -457,8 +457,16 @@ test("candidate-matching host artifacts without release identity remain ineligib
       version: "1.29.1",
       repoDir: CANDIDATE_REPO,
       uniqueOperationRunsRoot: HOST_RUNS,
-      inFlightShip: true,
-      scoreInput: scoreInput(),
+      scoreInput: {
+        ...scoreInput(),
+        unique_operation_manifest: {
+          ...passingUniqueOperationManifest({
+            release_identity: "1.29.1",
+            candidate_sha: CANDIDATE,
+          }),
+          live_train_linkage_present: false,
+        },
+      },
       stdout: () => {},
       stderr: () => {},
     },

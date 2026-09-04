@@ -123,23 +123,47 @@ pipeline doctor
 4. `pipeline doctor` reports pin target, installed version, and track coherence
    (`install:engine-track`). Run evidence records `engine.track` at run start.
 
-## Unique-operation reliability (#1368 / #1428)
+## Unique-operation reliability (#1368 / #1428 / #1434)
 
 Release-eligible FRG evidence with `pass: true` includes a versioned
 `operation_reliability` section. That section is the unique-operation contract.
-Ship FRG scoring reads that evidence from the **control-host** durable store
-(`AGENT_PIPELINE_STATE_HOME` / `resolveStateHome` → `<state-home>/runs`, the
-same root `factory-release prepare` uses for pack-loop scans), bound to the
-scored candidate SHA. An empty candidate-worktree `.agent-pipeline/runs`
-directory is not proof that train, loop, or merge never ran. GitHub labels,
-comment prose, and factory-gate 2-item pack proofs are not unique-operation
-proof.
+Ship FRG scoring reads that evidence from **two control-host durable roots**
+through an injectable dual-root resolver:
+
+1. Loop state-home `<resolveStateHome()>/runs` (`AGENT_PIPELINE_STATE_HOME` /
+   `XDG_STATE_HOME`, the same root `factory-release prepare` uses for pack-loop
+   scans).
+2. Control-repo generic `<control-repo>/.agent-pipeline/runs`
+   (`runsDir(resolveFactoryControlRoot(...))` from
+   `AGENT_PIPELINE_FACTORY_CONTROL` / factory-plane `REPO_DIR`).
+
+An empty candidate-worktree `.agent-pipeline/runs` directory is not proof that
+train, loop, or merge never ran. Collection does not derive the generic root
+from the candidate worktree `runsDir`. Followable `train_loop_linked` child
+run, event, and handoff paths must resolve inside those two control-host
+roots; a path that escapes into the candidate worktree is not loaded. The
+same durable `run_id` in both roots is scored once. GitHub labels, comment
+prose, and factory-gate 2-item pack proofs are not unique-operation proof.
 
 When Factory Reliability Gate unique-operation scoring runs as a phase of an
-admitted in-flight `ship`, missing entrypoint `ship` is not missing required
-coverage for that pack. A completed prior `ship` still counts as observed
-coverage. The in-flight ship is not verified unique-operation success and is
-not a stable exclusion. Other required entrypoints stay fail-closed.
+admitted in-flight `ship` (`opts.inFlightShip === true`):
+
+- Missing-field host artifacts that lack `candidate_sha` (and, when absent,
+  release identity) are kept as entrypoint coverage. Other-candidate SHAs and
+  present mismatched release identities still drop. Standalone `factory-gate`
+  still omits unbound artifacts.
+- Missing entrypoint `ship` is not missing required coverage for that pack. A
+  completed prior `ship` still counts as observed coverage. The in-flight ship
+  is not verified unique-operation success and is not a stable exclusion.
+- When host artifacts have no binder-accepted executed matrix rows for the
+  scored SHA, a complete candidate-tree `FAULT_RECOVERY_MATRIX` inventory whose
+  `sourceSha` matches that SHA is attached as `executed_matrix_rows` through
+  the existing binder. An incomplete inventory or a host-checkout SHA that
+  does not match does not attach. Helper `covered_lifecycle_classes` stamps
+  still fail.
+
+Other required entrypoints stay fail-closed. An empty generic store **and**
+empty loop state-home fail closed as missing required coverage.
 
 `factory-release prepare` structural-eligibility hard-gate text names the
 `uniqueOperationSloFailure` / `uniqueOperationReleaseBindingFailure` string

@@ -281,7 +281,7 @@ test("aggregator: applicable exact-candidate recovery at 100%", () => {
   assert.equal(report.exact_candidate_recovery.ratio, 1);
 });
 
-test("attemptsFromRunArtifacts: does not invent a logical id", () => {
+test("attemptsFromRunArtifacts: missing minted id uses run_id fallback identity", () => {
   const attempts = attemptsFromRunArtifacts([
     {
       runId: "old",
@@ -290,7 +290,20 @@ test("attemptsFromRunArtifacts: does not invent a logical id", () => {
       summary: { finalState: "ready-to-deploy" },
     },
   ]);
-  assert.equal(attempts[0]!.logical_operation_id, null);
+  assert.equal(attempts[0]!.logical_operation_id, "old");
+  assert.equal(attempts[0]!.identity_provenance, "run_id_fallback");
+  const report = aggregateUniqueOperationReliability({
+    attempts,
+    manifest: {
+      required_entrypoints: [],
+      required_lifecycle_classes: [],
+      live_train_linkage_present: true,
+    },
+  });
+  assert.equal(report.integrity.missing_correlation, 0);
+  assert.equal(report.clean_completion.numerator, 0);
+  assert.equal(report.clean_completion.denominator, 0);
+  assert.equal(report.ownerless_terminal.numerator, 0);
 });
 
 test("attemptsFromRunArtifacts: contradictory identity sources increment contradictory_correlation", () => {
@@ -387,6 +400,148 @@ test("attemptsFromRunArtifacts: uses run_start.entrypoint and does not coerce ot
     },
   ]);
   assert.equal(train[0]!.entrypoint, "train");
+});
+
+test("attemptsFromRunArtifacts: start-event wins over kind and prefix (#1434)", () => {
+  const attempts = attemptsFromRunArtifacts([
+    {
+      runId: "train-1",
+      runJson: { run_id: "train-1", kind: "train" },
+      events: [{ type: "run_start", entrypoint: "loop" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(attempts[0]!.entrypoint, "loop");
+});
+
+test("attemptsFromRunArtifacts: kind wins over prefix (#1434)", () => {
+  const attempts = attemptsFromRunArtifacts([
+    {
+      runId: "train-1",
+      runJson: { run_id: "train-1", kind: "merge" },
+      events: [{ type: "run_start" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(attempts[0]!.entrypoint, "merge");
+});
+
+test("attemptsFromRunArtifacts: advance kind is not single and falls through to prefix (#1434)", () => {
+  const prefixTrain = attemptsFromRunArtifacts([
+    {
+      runId: "train-abc",
+      runJson: { run_id: "train-abc", kind: "advance" },
+      events: [{ type: "run_start" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(prefixTrain[0]!.entrypoint, "train");
+  assert.notEqual(prefixTrain[0]!.entrypoint, "single");
+
+  const noPrefix = attemptsFromRunArtifacts([
+    {
+      runId: "adv",
+      runJson: { run_id: "adv", kind: "advance" },
+      events: [{ type: "run_start" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(noPrefix[0]!.entrypoint, null);
+  assert.notEqual(noPrefix[0]!.entrypoint, "single");
+});
+
+test("attemptsFromRunArtifacts: merge-queue prefixes are checked before merge (#1434)", () => {
+  const mq = attemptsFromRunArtifacts([
+    { runId: "mq-1", runJson: { run_id: "mq-1" }, events: [], summary: null },
+  ]);
+  assert.equal(mq[0]!.entrypoint, "merge-queue");
+
+  const mergeQueue = attemptsFromRunArtifacts([
+    {
+      runId: "merge-queue-1",
+      runJson: { run_id: "merge-queue-1" },
+      events: [],
+      summary: null,
+    },
+  ]);
+  assert.equal(mergeQueue[0]!.entrypoint, "merge-queue");
+  assert.notEqual(mergeQueue[0]!.entrypoint, "merge");
+
+  const merge = attemptsFromRunArtifacts([
+    { runId: "merge-1", runJson: { run_id: "merge-1" }, events: [], summary: null },
+  ]);
+  assert.equal(merge[0]!.entrypoint, "merge");
+});
+
+test("attemptsFromRunArtifacts: numeric drive prefix maps when kind and start event are absent (#1434)", () => {
+  const attempts = attemptsFromRunArtifacts([
+    {
+      runId: "1434-2026-09-04T18-24-39-123Z",
+      runJson: { run_id: "1434-2026-09-04T18-24-39-123Z" },
+      events: [],
+      summary: null,
+    },
+  ]);
+  assert.equal(attempts[0]!.entrypoint, "drive");
+});
+
+test("filterAttemptsBoundToCandidate: in-flight ship keeps missing SHA and missing release (#1434)", () => {
+  const scored = "a".repeat(40);
+  const kept = filterAttemptsBoundToCandidate(
+    [
+      { run_id: "unbound", logical_operation_id: "L", entrypoint: "train" },
+      { run_id: "match", logical_operation_id: "L2", candidate_sha: scored, release_identity: "1.40.1" },
+      { run_id: "other", logical_operation_id: "L3", candidate_sha: "b".repeat(40) },
+      {
+        run_id: "mismatch-release",
+        logical_operation_id: "L4",
+        candidate_sha: scored,
+        release_identity: "1.39.0",
+      },
+    ],
+    { candidate_sha: scored, release_identity: "1.40.1", inFlightShip: true },
+  );
+  assert.deepEqual(kept.map((a) => a.run_id), ["unbound", "match"]);
+  assert.equal(kept[0]!.binding_provenance, "unbound_inflight");
+  assert.equal(kept[1]!.binding_provenance, "bound");
+});
+
+test("aggregator: unbound inflight minted id with verified completion is observation-only (#1434)", () => {
+  const scored = "a".repeat(40);
+  const kept = filterAttemptsBoundToCandidate(
+    [
+      {
+        run_id: "train-host",
+        logical_operation_id: "lop-minted-unbound",
+        entrypoint: "train",
+        nested: false,
+        postcondition_proof: true,
+        terminal: "verified_success",
+        identity_provenance: "minted",
+      },
+    ],
+    { candidate_sha: scored, release_identity: "1.40.1", inFlightShip: true },
+  );
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0]!.binding_provenance, "unbound_inflight");
+  const report = aggregateUniqueOperationReliability({
+    attempts: kept,
+    manifest: {
+      required_entrypoints: ["train"],
+      required_lifecycle_classes: [],
+      live_train_linkage_present: true,
+      in_flight_ship: true,
+    },
+    candidate_sha: scored,
+    release_identity: "1.40.1",
+    in_flight_ship: true,
+  });
+  assert.ok(report.entrypoint_coverage.observed.includes("train"));
+  assert.equal(report.clean_completion.numerator, 0);
+  assert.equal(report.clean_completion.denominator, 0);
+  assert.equal(report.ownerless_terminal.numerator, 0);
+  assert.equal(report.exclusions.length, 0);
+  assert.equal(report.integrity.missing_correlation, 0);
 });
 
 test("computeFrgEvidence: writes operation_reliability from durable fakes", () => {

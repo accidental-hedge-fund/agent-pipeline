@@ -253,7 +253,7 @@ test("scoreboard unique-operation section: two physical runs of one completed L 
   assert.equal(report.totals.included_runs, 3, "attempt metrics still count physical runs");
 });
 
-test("scoreboard unique-operation: historical run without logical id is missing correlation", async () => {
+test("scoreboard unique-operation: historical run without minted id uses run_id fallback", async () => {
   const files: Record<string, string> = {};
   addRun(files, "old-run", {
     runJson: { started_at: "2026-06-10T00:00:00Z", issue: 9, run_id: "old-run" },
@@ -269,8 +269,10 @@ test("scoreboard unique-operation: historical run without logical id is missing 
   );
   assert.equal(typeof report, "object");
   assert.ok(report.unique_operation_reliability);
-  assert.equal(report.unique_operation_reliability.integrity.missing_correlation, 1);
+  assert.equal(report.unique_operation_reliability.integrity.missing_correlation, 0);
+  assert.equal(report.unique_operation_reliability.clean_completion.numerator, 0);
   assert.equal(report.unique_operation_reliability.clean_completion.denominator, 0);
+  assert.equal(report.unique_operation_reliability.ownerless_terminal.numerator, 0);
 });
 
 test("scoreboard unique-operation: label-only ready-to-deploy is not verified success", async () => {
