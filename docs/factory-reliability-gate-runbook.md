@@ -123,7 +123,7 @@ pipeline doctor
 4. `pipeline doctor` reports pin target, installed version, and track coherence
    (`install:engine-track`). Run evidence records `engine.track` at run start.
 
-## Unique-operation reliability (#1368 / #1428 / #1434)
+## Unique-operation reliability (#1368 / #1428 / #1434 / #1440)
 
 Release-eligible FRG evidence with `pass: true` includes a versioned
 `operation_reliability` section. That section is the unique-operation contract.
@@ -145,6 +145,22 @@ roots; a path that escapes into the candidate worktree is not loaded. The
 same durable `run_id` in both roots is scored once. GitHub labels, comment
 prose, and factory-gate 2-item pack proofs are not unique-operation proof.
 
+Public `pipeline single`, `pipeline merge`, and `pipeline merge-queue`
+admissions persist recognizable control-host run artifacts through the existing
+generic store: `run.json.kind`, `run_start.entrypoint`, and a documented
+run-id prefix (`single-`, `merge-`, `merge-queue-` / `mq-`). Numeric drive
+ids stay `drive`. `kind: "advance"` is not `single`. Nested `train_merge_*`
+events and `merge-queue-repair-pr-*` helper ids are not public `merge` /
+`merge-queue` coverage. Collection does not invent those entrypoints when the
+artifacts are absent.
+
+#1301 live train-link increments from a followable `train_loop_linked` event
+on the control-host train stream: nonempty child loop run id, an absolute
+events path that loads inside the approved control-host roots, and a child
+logical id from that event or the loaded child. A `train` entrypoint without
+that followable child does not count. The join does not require the child's
+`run_id` fallback identity to equal the train minted id.
+
 When Factory Reliability Gate unique-operation scoring runs as a phase of an
 admitted in-flight `ship` (`opts.inFlightShip === true`):
 
@@ -156,11 +172,12 @@ admitted in-flight `ship` (`opts.inFlightShip === true`):
   completed prior `ship` still counts as observed coverage. The in-flight ship
   is not verified unique-operation success and is not a stable exclusion.
 - When host artifacts have no binder-accepted executed matrix rows for the
-  scored SHA, a complete candidate-tree `FAULT_RECOVERY_MATRIX` inventory whose
-  `sourceSha` matches that SHA is attached as `executed_matrix_rows` through
-  the existing binder. An incomplete inventory or a host-checkout SHA that
-  does not match does not attach. Helper `covered_lifecycle_classes` stamps
-  still fail.
+  scored SHA, a complete commit-bound inventory blob at that SHA is attached
+  as `executed_matrix_rows` through the existing binder (`sourceSha` equals
+  the scored SHA). Checkout HEAD of the scoring worktree MAY differ from that
+  SHA; a HEAD mismatch does not refuse a valid blob at the scored SHA. An
+  incomplete inventory or a blob sourced from a different SHA does not attach.
+  Helper `covered_lifecycle_classes` stamps still fail.
 
 Other required entrypoints stay fail-closed. An empty generic store **and**
 empty loop state-home fail closed as missing required coverage.

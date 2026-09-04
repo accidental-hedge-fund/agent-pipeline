@@ -83,6 +83,18 @@ export function trainRunIdFor(startedAt: Date): RunId {
   return `train-${filesystemSafeUtcTimestamp(startedAt)}`;
 }
 
+/** Public unique-operation entrypoints that persist through `initRunDir`. */
+export type PublicEntrypointKind = "single" | "merge" | "merge-queue";
+
+/** Produce a public-entrypoint run-id (`single-` / `merge-` / `merge-queue-`
+ *  plus the same filesystem-safe UTC timestamp as {@link trainRunIdFor}). */
+export function publicEntrypointRunIdFor(
+  kind: PublicEntrypointKind,
+  startedAt: Date,
+): RunId {
+  return `${kind}-${filesystemSafeUtcTimestamp(startedAt)}`;
+}
+
 /** Root directory that holds all run subdirectories for a repo. */
 export function runsDir(repoDir: string): string {
   return artifactSubdir(repoDir, RUNS_ARTIFACT);
@@ -127,6 +139,11 @@ export interface RunStartEvent extends RunEventBase {
   run_id: RunId;
   /** Omitted on train runs — a train is not a one-issue advance. */
   issue?: number;
+  /**
+   * Public admission entrypoint when this run is `single` / `merge` /
+   * `merge-queue`. Omitted on historical advance runs.
+   */
+  entrypoint?: PublicEntrypointKind;
   repo: string;
   /**
    * Outer-host session identity when known (#784). Independent of implementer
@@ -975,7 +992,7 @@ export interface RunEngineIdentity {
   commit_sha?: string | null;
 }
 
-export type RunKind = "advance" | "train";
+export type RunKind = "advance" | "train" | PublicEntrypointKind;
 
 export interface TrainRunSelector {
   issues?: number[];
@@ -1029,10 +1046,14 @@ export interface InitRunDirOpts {
   runId: RunId;
   /**
    * Required for advance runs. Train runs (`kind: "train"`) omit this so
-   * `run.json` is not a fake single-issue advance record.
+   * `run.json` is not a fake single-issue advance record. `single` may set
+   * it; `merge` / `merge-queue` omit it.
    */
   issue?: number;
-  /** When `"train"`, write train identity (selector, merge mode, ordered issues). */
+  /**
+   * When `"train"`, write train identity (selector, merge mode, ordered issues).
+   * When `"single"` / `"merge"` / `"merge-queue"`, persist that public kind.
+   */
   kind?: RunKind;
   mergeMode?: boolean;
   selector?: TrainRunSelector;
@@ -1095,6 +1116,10 @@ export async function initRunDir(
           ? undefined
           : "live-run";
     const isTrain = opts.kind === "train";
+    const publicKind: PublicEntrypointKind | undefined =
+      opts.kind === "single" || opts.kind === "merge" || opts.kind === "merge-queue"
+        ? opts.kind
+        : undefined;
     const logicalOperationId = resolveLogicalOperationId({
       parent: opts.logicalOperationId,
       mint: opts.mintLogicalOperationId ?? mintLogicalOperationId,
@@ -1113,7 +1138,12 @@ export async function initRunDir(
             ...(opts.selector ? { selector: opts.selector } : {}),
             ...(opts.orderedIssues ? { ordered_issues: [...opts.orderedIssues] } : {}),
           }
-        : { issue: opts.issue }),
+        : publicKind
+          ? {
+              kind: publicKind,
+              ...(opts.issue != null ? { issue: opts.issue } : {}),
+            }
+          : { issue: opts.issue }),
       ...(opts.engine ? { engine: opts.engine } : {}),
       ...(outerHost ? { outer_host: outerHost } : {}),
       ...(discoveryChannel ? { discovery_channel: discoveryChannel } : {}),
@@ -1142,8 +1172,9 @@ export async function initRunDir(
         at: opts.startedAt,
         run_id: opts.runId,
         logical_operation_id: logicalOperationId,
-        issue: opts.issue,
         repo: opts.repo,
+        ...(opts.issue != null ? { issue: opts.issue } : {}),
+        ...(publicKind ? { entrypoint: publicKind } : {}),
         ...(outerHost ? { outer_host: outerHost } : {}),
       };
       await appendEvent(opts.runDir, event, deps);
@@ -1153,6 +1184,42 @@ export async function initRunDir(
       `[pipeline] run-store: initRunDir failed (non-fatal): ${(err as Error).message}`,
     );
   }
+}
+
+/**
+ * Persist a control-host generic-store run for a public `pipeline single` /
+ * `pipeline merge` / `pipeline merge-queue` admission. Uses the existing
+ * {@link initRunDir} store (no second run store).
+ */
+export async function persistPublicEntrypointAdmission(
+  opts: {
+    repoDir: string;
+    kind: PublicEntrypointKind;
+    repo: string;
+    profile?: string | null;
+    issue?: number;
+    startedAt?: Date;
+    logicalOperationId?: string | null;
+  },
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<{ runId: RunId; runDir: string }> {
+  const startedAt = opts.startedAt ?? new Date();
+  const runId = publicEntrypointRunIdFor(opts.kind, startedAt);
+  const runDir = runDirPath(opts.repoDir, runId);
+  await initRunDir(
+    {
+      runDir,
+      runId,
+      kind: opts.kind,
+      issue: opts.issue,
+      repo: opts.repo,
+      profile: opts.profile ?? null,
+      startedAt: startedAt.toISOString(),
+      logicalOperationId: opts.logicalOperationId,
+    },
+    deps,
+  );
+  return { runId, runDir };
 }
 
 /** Resolve the engine identity a dispatch should pin, respecting `initRunDir`'s

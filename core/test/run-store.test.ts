@@ -24,6 +24,8 @@ import {
   latestSummaryForIssue,
   listRunIds,
   parseWriteHealthText,
+  persistPublicEntrypointAdmission,
+  publicEntrypointRunIdFor,
   readEvents,
   readWriteHealth,
   recordWriteHealthFailure,
@@ -66,6 +68,13 @@ test("trainRunIdFor: train- prefix cannot collide with <issue>-… advance ids",
   assert.equal(trainId, "train-2026-08-28T17-28-03-000Z");
   assert.notEqual(trainId, advanceId);
   assert.ok(!/^\d+-/.test(trainId));
+});
+
+test("publicEntrypointRunIdFor: single/merge/merge-queue prefixes use the train timestamp helper (#1440)", () => {
+  const d = new Date("2026-08-28T17:28:03.000Z");
+  assert.equal(publicEntrypointRunIdFor("single", d), "single-2026-08-28T17-28-03-000Z");
+  assert.equal(publicEntrypointRunIdFor("merge", d), "merge-2026-08-28T17-28-03-000Z");
+  assert.equal(publicEntrypointRunIdFor("merge-queue", d), "merge-queue-2026-08-28T17-28-03-000Z");
 });
 
 // Regression: two dispatches starting in the same second must produce different run directories.
@@ -384,6 +393,34 @@ test("initRunDir: non-fatal on I/O error (no throw)", async () => {
 
 // Regression: calling initRunDir twice for the same run-id must not overwrite
 // run.json or truncate events.jsonl — both are written-once / append-only.
+test("persistPublicEntrypointAdmission: writes kind and run_start.entrypoint through the existing store (#1440)", async () => {
+  const { deps, readFile } = memRunStore();
+  const startedAt = new Date("2026-08-28T17:28:03.000Z");
+  for (const kind of ["single", "merge", "merge-queue"] as const) {
+    const { runId, runDir } = await persistPublicEntrypointAdmission(
+      {
+        repoDir: REPO_DIR,
+        kind,
+        repo: "owner/repo",
+        profile: "codex",
+        issue: kind === "single" ? ISSUE : undefined,
+        startedAt,
+      },
+      deps,
+    );
+    assert.equal(runId, publicEntrypointRunIdFor(kind, startedAt));
+    const meta = JSON.parse(readFile(path.join(runDir, "run.json")));
+    assert.equal(meta.kind, kind);
+    assert.equal(meta.run_id, runId);
+    if (kind === "single") assert.equal(meta.issue, ISSUE);
+    else assert.equal(meta.issue, undefined);
+    const events = JSON.parse(readFile(path.join(runDir, "events.jsonl")).trim());
+    assert.equal(events.type, "run_start");
+    assert.equal(events.entrypoint, kind);
+    assert.equal(events.run_id, runId);
+  }
+});
+
 test("initRunDir: train kind does not set issue to the first work-list number", async () => {
   const { deps, readFile } = memRunStore();
   const runId = "train-2026-08-28T17-28-03-000Z";

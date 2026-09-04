@@ -4739,8 +4739,29 @@ async function collectUniqueOperationsFromRunStore(
       executed.push(...executedMatrixRowsFromRun(child));
     }
   }
+  const attempts = filterAttemptsBoundToCandidate(attemptsFromRunArtifacts(runs), binding).map(
+    (attempt) => {
+      if (attempt.train_loop_linked !== true) return attempt;
+      const eventsPath =
+        typeof attempt.child_events_path === "string" ? attempt.child_events_path.trim() : "";
+      if (
+        !eventsPath ||
+        !path.isAbsolute(eventsPath) ||
+        !pathInsideApprovedRunsRoot(eventsPath, runsRoots)
+      ) {
+        return {
+          ...attempt,
+          train_loop_linked: false,
+          child_logical_operation_id: null,
+          child_run_id: null,
+          child_events_path: null,
+        };
+      }
+      return attempt;
+    },
+  );
   return {
-    attempts: filterAttemptsBoundToCandidate(attemptsFromRunArtifacts(runs), binding),
+    attempts,
     // Raw artifact rows. The in-flight inventory fallback binds these against
     // the scored SHA before deciding whether a complete candidate inventory
     // may attach.

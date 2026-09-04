@@ -139,6 +139,7 @@ import {
   latestSummaryForIssue,
   listRunIds,
   parseWriteHealthText,
+  persistPublicEntrypointAdmission,
   runDirPath,
   runIdFor,
   runsDir,
@@ -3506,6 +3507,7 @@ export interface SingleIssueCommandDeps {
   resolveIssueNumber: typeof resolveIssueNumber;
   runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult>;
   writeStdoutLine: (line: string) => void | Promise<void>;
+  persistPublicAdmission?: typeof persistPublicEntrypointAdmission;
 }
 
 const defaultSingleIssueCommandDeps: SingleIssueCommandDeps = {
@@ -3521,6 +3523,12 @@ export interface SingleIssueCommandOutput {
    * machine-readable commands disable this so they retain one JSON document.
    */
   emitMachineOutput?: boolean;
+  /**
+   * Persist a control-host `single-*` admission artifact. `pipeline single`
+   * sets this. Numeric drive and train nested single omit it so those paths
+   * stay `drive` / nested loop.
+   */
+  persistPublicAdmission?: boolean;
 }
 
 /**
@@ -3576,6 +3584,17 @@ export async function runSingleIssueCommand(
     console.error(`pipeline single: ${(err as Error).message}`);
     process.exitCode = 1;
     return { exitCode: 1, engineMessage: (err as Error).message };
+  }
+
+  if (output.persistPublicAdmission === true) {
+    const persist = deps.persistPublicAdmission ?? persistPublicEntrypointAdmission;
+    await persist({
+      repoDir: cfg.repo_dir,
+      kind: "single",
+      repo: cfg.repo,
+      profile: opts.profile ?? null,
+      issue: issueNumber,
+    });
   }
 
   const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
@@ -6805,7 +6824,7 @@ async function main(): Promise<void> {
   }
 
   if (isSingleCommand) {
-    await runSingleIssueCommand(cmd.args[1], opts);
+    await runSingleIssueCommand(cmd.args[1], opts, undefined, { persistPublicAdmission: true });
     return;
   }
 
@@ -6878,6 +6897,12 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     try {
+      await persistPublicEntrypointAdmission({
+        repoDir: mergeCfg.repo_dir,
+        kind: "merge",
+        repo: mergeCfg.repo,
+        profile: opts.profile ?? null,
+      });
       const mergeDeps = realMergeDeps(mergeCfg.repo);
       await mergePr(prNumber, {
         ...mergeDeps,
@@ -6920,6 +6945,12 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     try {
+      await persistPublicEntrypointAdmission({
+        repoDir: mqCfg.repo_dir,
+        kind: "merge-queue",
+        repo: mqCfg.repo,
+        profile: opts.profile ?? null,
+      });
       const result = await runMergeQueue(
         {
           milestone: String(opts.milestone).trim(),

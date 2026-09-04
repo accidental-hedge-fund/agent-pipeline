@@ -6,6 +6,7 @@
 // or scheduler.
 
 import * as crypto from "node:crypto";
+import * as path from "node:path";
 import { coveredLifecycleClassesFromExecutedRows, type ExecutedMatrixRow } from "./fault-recovery-matrix.ts";
 
 function stableFingerprint(value: unknown): string {
@@ -188,6 +189,11 @@ export interface UniqueOperationReliability {
   exclusions: UniqueOperationExclusion[];
   integrity: UniqueOperationIntegrityCounts;
   operations: UniqueOperationEvidenceRef[];
+  /**
+   * Binder-accepted executed matrix rows that fed #1333 coverage for this
+   * scored SHA. Omitted when no rows were attached.
+   */
+  executed_matrix_rows?: ExecutedMatrixRow[];
 }
 
 function rate(numerator: number, denominator: number): UniqueOperationRate {
@@ -560,6 +566,9 @@ export function aggregateUniqueOperationReliability(input: {
     required_lifecycle_classes: requiredLifecycle,
   });
 
+  const boundExecutedRows = (input.executed_matrix_rows ?? []).filter(
+    (row) => typeof row.candidate_sha === "string" && row.candidate_sha.trim() === scoredSha,
+  );
   return {
     schema_version: UNIQUE_OPERATION_SCHEMA_VERSION,
     candidate_sha: candidateSha,
@@ -582,6 +591,7 @@ export function aggregateUniqueOperationReliability(input: {
       missing_required_coverage: missingRequiredCoverage,
     },
     operations,
+    ...(boundExecutedRows.length > 0 ? { executed_matrix_rows: boundExecutedRows } : {}),
   };
 }
 
@@ -807,14 +817,17 @@ export function filterAttemptsBoundToCandidate(
 
 /**
  * Map a durable run-id prefix to a required public entrypoint. `merge-queue-`
- * and `mq-` are checked before remaining `merge-`. Unrecognized ids stay null.
+ * and `mq-` are checked before remaining `merge-`. `merge-queue-repair-pr-*`
+ * helper ids are not public `merge-queue`. Unrecognized ids stay null.
  */
 export function mapPublicEntrypointFromRunId(runId: unknown): string | null {
   const id = nonEmptyTrimmed(runId);
   if (!id) return null;
+  if (id.startsWith("merge-queue-repair-pr-")) return null;
   if (id.startsWith("merge-queue-") || id.startsWith("mq-")) return "merge-queue";
   if (id.startsWith("train-")) return "train";
   if (id.startsWith("loop-")) return "loop";
+  if (id.startsWith("single-")) return "single";
   if (id.startsWith("merge-")) return "merge";
   // `runIdFor`: `<issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ>`
   if (/^\d+-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(id)) return "drive";
@@ -865,10 +878,14 @@ export function attemptsFromRunArtifacts(
       if (event.type !== "train_loop_linked") continue;
       const refs = trainLinkedEventRefs(event);
       if (!refs.loopRunId || !refs.eventsPath) continue;
+      if (!path.isAbsolute(refs.eventsPath)) continue;
       const child = byId.get(refs.loopRunId);
       if (!child) continue;
-      const childId = artifactLogicalId(child);
-      if (!logical || !childId || childId !== logical) continue;
+      const eventLogical = nonEmptyTrimmed(event.logical_operation_id);
+      const childMinted = artifactLogicalId(child);
+      const childId =
+        childMinted && logical && childMinted === logical ? childMinted : eventLogical;
+      if (!logical || !childId) continue;
       trainLinked = true;
       childLogical = childId;
       childRunId = refs.loopRunId;
