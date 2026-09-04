@@ -4741,10 +4741,10 @@ async function collectUniqueOperationsFromRunStore(
   }
   return {
     attempts: filterAttemptsBoundToCandidate(attemptsFromRunArtifacts(runs), binding),
-    executed_matrix_rows: bindExecutedMatrixRowsForCandidate(
-      executed,
-      (binding.candidate_sha ?? "").trim(),
-    ),
+    // Raw artifact rows. The in-flight inventory fallback binds these against
+    // the scored SHA before deciding whether a complete candidate inventory
+    // may attach.
+    executed_matrix_rows: executed,
   };
 }
 
@@ -5089,10 +5089,14 @@ export async function runFactoryGate(
         inFlightShip: collectorInFlightShip,
       },
     );
-    let executedRows = collected.executed_matrix_rows;
+    const boundHostRows = bindExecutedMatrixRowsForCandidate(
+      collected.executed_matrix_rows,
+      scoredCandidateSha,
+    );
+    let executedRows = boundHostRows;
     if (
       collectorInFlightShip &&
-      executedRows.length === 0 &&
+      boundHostRows.length === 0 &&
       opts.loadCandidateFaultRecoveryInventory
     ) {
       const inventory = await opts.loadCandidateFaultRecoveryInventory({

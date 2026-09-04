@@ -28,7 +28,10 @@ import {
   runFactoryGate,
   type FrgFsDeps,
 } from "../scripts/factory-reliability-gate.ts";
-import { defaultScoreBoundPackLoop } from "../scripts/factory-release-prepare.ts";
+import {
+  defaultLoadCandidateFaultRecoveryInventory,
+  defaultScoreBoundPackLoop,
+} from "../scripts/factory-release-prepare.ts";
 
 const CANDIDATE = "c".repeat(40);
 const OTHER = "d".repeat(40);
@@ -544,6 +547,100 @@ test("in-flight complete inventory covers all five #1333 classes for the scored 
   assert.equal(after, 1, "only #1301 live train-loop linkage should remain missing");
 });
 
+test("other-candidate host executed rows do not suppress inventory fallback (#1434)", async () => {
+  const files = new Map<string, string>();
+  seedPrefixCoverage(files, GENERIC);
+  writeBoundRun(files, GENERIC, {
+    runId: "train-other-matrix",
+    entrypoint: "train",
+    sha: OTHER,
+    release: "1.29.1",
+    executed_matrix_rows: executedRowsForSha(OTHER),
+  });
+  const withoutInventory = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const withInventory = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      loadCandidateFaultRecoveryInventory: async () => ({
+        rows: FAULT_RECOVERY_MATRIX,
+        sourceSha: CANDIDATE,
+      }),
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const before = withoutInventory.evidence.operation_reliability!.integrity.missing_required_coverage;
+  const after = withInventory.evidence.operation_reliability!.integrity.missing_required_coverage;
+  assert.equal(after, before - REQUIRED_LIFECYCLE_CLASSES_1333.length);
+  assert.equal(after, 1, "only #1301 live train-loop linkage should remain missing");
+});
+
+test("binder-rejected host executed rows do not suppress inventory fallback (#1434)", async () => {
+  const files = new Map<string, string>();
+  seedPrefixCoverage(files, GENERIC);
+  const cell = FAULT_RECOVERY_MATRIX.find((row) => !row.not_applicable);
+  assert.ok(cell);
+  writeBoundRun(files, GENERIC, {
+    runId: "train-rejected-matrix",
+    entrypoint: "train",
+    sha: CANDIDATE,
+    release: "1.29.1",
+    executed_matrix_rows: [
+      {
+        candidate_sha: CANDIDATE,
+        layer: cell.layer,
+        lifecycle_class: cell.lifecycle_class,
+        operation: cell.operation,
+        fault_state: cell.fault_state,
+        entrypoint: cell.entrypoint,
+        host: cell.host,
+        observed_terminal:
+          cell.expected_terminal === "verified_success"
+            ? "ownerless_terminal"
+            : "verified_success",
+        passed: true,
+      },
+    ],
+  });
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      loadCandidateFaultRecoveryInventory: async () => ({
+        rows: FAULT_RECOVERY_MATRIX,
+        sourceSha: CANDIDATE,
+      }),
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  assert.equal(
+    result.evidence.operation_reliability!.integrity.missing_required_coverage,
+    1,
+    "only #1301 live train-loop linkage should remain missing",
+  );
+});
+
 test("inventory from a different SHA does not populate #1333 coverage (#1434)", async () => {
   const files = new Map<string, string>();
   seedPrefixCoverage(files, GENERIC);
@@ -681,9 +778,65 @@ test("defaultScoreBoundPackLoop sets inFlightShip and uses the dual-root resolve
   const src = readFileSync(join(CORE_ROOT, "scripts/factory-release-prepare.ts"), "utf8");
   assert.match(src, /inFlightShip: true/);
   assert.match(src, /resolveUniqueOperationRunsRoots: args\.resolveUniqueOperationRunsRoots/);
-  assert.match(src, /loadCandidateFaultRecoveryInventory/);
+  assert.match(src, /loadCandidateFaultRecoveryInventory:\s*\n\s*args\.loadCandidateFaultRecoveryInventory \?\?\s*\n\s*defaultLoadCandidateFaultRecoveryInventory/s);
+  assert.equal(src.includes('await import("./fault-recovery-matrix.ts")'), false);
+  assert.equal(
+    /sourceSha:\s*args\.request\.integrated_candidate\.git_sha/.test(src),
+    false,
+  );
   assert.match(src, /isReleaseEligibleFrgPass\(scored, \{ requireAttestation: false \}\)/);
   assert.match(src, /isReleaseEligibleFrgPass\(evidence, \{ requireAttestation: true \}\)/);
+});
+
+test("default inventory loader does not claim control-checkout rows for another SHA (#1434)", async () => {
+  let loadCalls = 0;
+  const loaded = await defaultLoadCandidateFaultRecoveryInventory(
+    { candidateSha: CANDIDATE, repoDir: CANDIDATE_REPO },
+    {
+      resolveCheckoutSha: () => OTHER,
+      loadMatrixRows: async () => {
+        loadCalls += 1;
+        return FAULT_RECOVERY_MATRIX;
+      },
+    },
+  );
+  assert.equal(loaded.rows.length, 0);
+  assert.equal(loadCalls, 0);
+  assert.equal(loaded.sourceSha, OTHER);
+});
+
+test("default inventory loader returns the candidate-tree rows when HEAD matches (#1434)", async () => {
+  const incomplete: FaultRecoveryMatrixRow[] = FAULT_RECOVERY_MATRIX.filter(
+    (row) => row.fault_state !== "unseen_provider_error_shape",
+  );
+  assert.ok(incomplete.length < FAULT_RECOVERY_MATRIX.length);
+  const loaded = await defaultLoadCandidateFaultRecoveryInventory(
+    { candidateSha: CANDIDATE, repoDir: CANDIDATE_REPO },
+    {
+      resolveCheckoutSha: () => CANDIDATE,
+      loadMatrixRows: async () => incomplete,
+    },
+  );
+  assert.equal(loaded.rows, incomplete);
+  assert.equal(loaded.sourceSha, CANDIDATE);
+  assert.notEqual(loaded.rows.length, FAULT_RECOVERY_MATRIX.length);
+});
+
+test("default inventory loader returns no rows when checkout SHA is unreadable (#1434)", async () => {
+  let loadCalls = 0;
+  const loaded = await defaultLoadCandidateFaultRecoveryInventory(
+    { candidateSha: CANDIDATE, repoDir: CANDIDATE_REPO },
+    {
+      resolveCheckoutSha: () => null,
+      loadMatrixRows: async () => {
+        loadCalls += 1;
+        return FAULT_RECOVERY_MATRIX;
+      },
+    },
+  );
+  assert.equal(loaded.rows.length, 0);
+  assert.equal(loadCalls, 0);
+  assert.equal(loaded.sourceSha, null);
 });
 
 test("CLI factory-gate runFactoryGate call passes env and does not set inFlightShip (#1434)", () => {

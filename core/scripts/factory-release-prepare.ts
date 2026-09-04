@@ -24,6 +24,7 @@ import * as crypto from "node:crypto";
 import { existsSync, realpathSync as fsRealpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
   artifactSubdir,
@@ -87,6 +88,7 @@ import {
   type PackLoopLivenessStatus,
 } from "./loop/pack-loop-liveness.ts";
 import { parseExactGitSha } from "./ship-end-identity.ts";
+import type { FaultRecoveryMatrixRow } from "./fault-recovery-matrix.ts";
 import {
   defaultResolveCandidateEngineDeps,
   resolveCandidateEngine,
@@ -1601,6 +1603,79 @@ export async function defaultStartBoundPackLoop(
   });
 }
 
+export interface LoadCandidateFaultRecoveryInventoryDeps {
+  /**
+   * Resolve `git rev-parse HEAD` for the scored checkout. Tests inject this
+   * so unit tests never spawn git.
+   */
+  resolveCheckoutSha?: (repoDir: string) => string | null | Promise<string | null>;
+  /**
+   * Load `FAULT_RECOVERY_MATRIX` from the scored checkout. Tests inject this
+   * so unit tests never import the control-checkout module as candidate rows.
+   */
+  loadMatrixRows?: (
+    repoDir: string,
+  ) => Promise<readonly FaultRecoveryMatrixRow[] | null>;
+}
+
+async function defaultResolveCandidateCheckoutSha(
+  repoDir: string,
+): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", repoDir, "rev-parse", "HEAD"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    return parseExactGitSha(String(stdout).trim());
+  } catch {
+    return null;
+  }
+}
+
+async function defaultLoadCandidateMatrixRows(
+  repoDir: string,
+): Promise<readonly FaultRecoveryMatrixRow[] | null> {
+  try {
+    const matrixPath = path.resolve(repoDir, "core/scripts/fault-recovery-matrix.ts");
+    const mod = (await import(pathToFileURL(matrixPath).href)) as {
+      FAULT_RECOVERY_MATRIX?: unknown;
+    };
+    return Array.isArray(mod.FAULT_RECOVERY_MATRIX)
+      ? (mod.FAULT_RECOVERY_MATRIX as FaultRecoveryMatrixRow[])
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Production in-flight inventory loader. Reads the candidate checkout at
+ * `repoDir`, verifies that checkout's HEAD equals `candidateSha`, and only
+ * then returns that tree's matrix rows. A control-checkout matrix is never
+ * labeled with the request SHA. SHA mismatch, unreadable HEAD, or a missing
+ * matrix yields no inventory rows.
+ */
+export async function defaultLoadCandidateFaultRecoveryInventory(
+  args: { candidateSha: string; repoDir: string },
+  deps: LoadCandidateFaultRecoveryInventoryDeps = {},
+): Promise<{ rows: readonly FaultRecoveryMatrixRow[]; sourceSha?: string | null }> {
+  const candidateSha = parseExactGitSha(args.candidateSha);
+  const repoDir = typeof args.repoDir === "string" ? args.repoDir.trim() : "";
+  if (!candidateSha || !repoDir) return { rows: [], sourceSha: null };
+
+  const resolveSha = deps.resolveCheckoutSha ?? defaultResolveCandidateCheckoutSha;
+  const checkoutSha = parseExactGitSha(await resolveSha(repoDir));
+  if (!checkoutSha || checkoutSha !== candidateSha) {
+    return { rows: [], sourceSha: checkoutSha };
+  }
+
+  const loadRows = deps.loadMatrixRows ?? defaultLoadCandidateMatrixRows;
+  const rows = await loadRows(repoDir);
+  if (!rows) return { rows: [], sourceSha: null };
+  return { rows, sourceSha: checkoutSha };
+}
+
 /**
  * In-process equivalent of `pipeline factory-gate --for <ver> --from-run <id>`.
  * Never accepts --observations / scenarioOverrides / a work-directory file.
@@ -1642,13 +1717,7 @@ export async function defaultScoreBoundPackLoop(
     uniqueOperationRunsRoot: args.uniqueOperationRunsRoot,
     loadCandidateFaultRecoveryInventory:
       args.loadCandidateFaultRecoveryInventory ??
-      (async () => {
-        const { FAULT_RECOVERY_MATRIX } = await import("./fault-recovery-matrix.ts");
-        return {
-          rows: FAULT_RECOVERY_MATRIX,
-          sourceSha: args.request.integrated_candidate.git_sha,
-        };
-      }),
+      defaultLoadCandidateFaultRecoveryInventory,
     stdout: () => {},
     stderr: () => {},
     now: args.now,

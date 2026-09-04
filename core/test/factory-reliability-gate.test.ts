@@ -2022,6 +2022,7 @@ test("defaultScoreBoundPackLoop overlays GitHub R2D over recovery_exhausted bloc
     pack,
     now: () => new Date("2026-08-29T19:00:00.000Z"),
     collectHybridV2: async () => collected,
+    loadCandidateFaultRecoveryInventory: async () => ({ rows: [], sourceSha: null }),
   });
   const throughput = scored.evidence.scenarios.find((s) => s.id === "clean-item-throughput");
   assert.equal(scored.evidence.scoreboard.ready_clean_count, 2);
