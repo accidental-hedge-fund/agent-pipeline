@@ -3,6 +3,8 @@
 - [x] 1.1 Point `collectUniqueOperationsFromRunStore` (or its caller in `runFactoryGate`) at the control-host generic run-store root used by factory-release pack-loop scans (`resolveStateHome`), not `repoDir/.agent-pipeline/runs` of the candidate worktree, and verify a hermetic test collects train/merge attempts from an injected host store when the candidate worktree runs directory is empty
 - [x] 1.2 Keep `filterAttemptsBoundToCandidate` as the binding filter, and verify other-candidate host runs do not satisfy the scored candidate
 - [x] 1.3 Keep fail-closed behavior when the host store is empty or has no candidate-bound train/loop/merge events, and verify `missing_required_coverage > 0` and `isReleaseEligibleFrgPass` is false
+- [x] 1.4 Contain followable child event/handoff paths to the approved control-host runs roots, and verify a host train that points at a candidate-worktree child remains ineligible
+- [x] 1.5 Require durable release identity on attempts when the collection binding includes a scored release identity, and verify candidate-only and mismatched-identity host artifacts cannot authorize that release
 
 ## 2. In-flight ship coverage deferral
 

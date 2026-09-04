@@ -693,6 +693,36 @@ test("filterAttemptsBoundToCandidate: drops unbound and other-candidate artifact
   assert.deepEqual(kept.map((a) => a.run_id), ["match"]);
 });
 
+test("filterAttemptsBoundToCandidate: drops missing and mismatched release identity when scored", () => {
+  const scored = "a".repeat(40);
+  const kept = filterAttemptsBoundToCandidate(
+    [
+      {
+        run_id: "match",
+        logical_operation_id: "L",
+        candidate_sha: scored,
+        release_identity: "1.40.1",
+        postcondition_proof: true,
+      },
+      {
+        run_id: "mismatch",
+        logical_operation_id: "L2",
+        candidate_sha: scored,
+        release_identity: "1.39.0",
+        postcondition_proof: true,
+      },
+      {
+        run_id: "absent",
+        logical_operation_id: "L3",
+        candidate_sha: scored,
+        postcondition_proof: true,
+      },
+    ],
+    { candidate_sha: scored, release_identity: "1.40.1" },
+  );
+  assert.deepEqual(kept.map((a) => a.run_id), ["match"]);
+});
+
 test("attemptsFromRunArtifacts: extracts candidate binding into evidence refs", () => {
   const sha = "c".repeat(40);
   const attempts = attemptsFromRunArtifacts([

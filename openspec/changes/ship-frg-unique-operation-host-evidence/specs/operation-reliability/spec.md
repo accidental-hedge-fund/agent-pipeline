@@ -2,13 +2,13 @@
 
 ### Requirement: Unique-operation attempts for release-eligible FRG SHALL come from the control-host store bound to the scored candidate
 
-Unique-operation attempt collection for release-eligible Factory Reliability Gate scoring SHALL read the control-host durable run, event, loop-store, and handoff store and SHALL keep only attempts bound to the scored candidate SHA and release identity. An empty candidate-worktree `.agent-pipeline/runs` directory SHALL NOT produce an empty attempt list when a bound control-host store contains those attempts. An empty control-host store, or a store whose remaining attempts are unbound or bound to another candidate, SHALL yield an empty attempt list and SHALL fail as missing required coverage. Collection SHALL NOT invent logical identities from pack-issue labels, latest-run lookup, or comment prose.
+Unique-operation attempt collection for release-eligible Factory Reliability Gate scoring SHALL read the control-host durable run, event, loop-store, and handoff store and SHALL keep only attempts bound to the scored candidate SHA and release identity. Followable `train_loop_linked` child run, event, and handoff paths SHALL resolve inside that same control-host store; a path that escapes into the candidate worktree SHALL NOT be loaded. An empty candidate-worktree `.agent-pipeline/runs` directory SHALL NOT produce an empty attempt list when a bound control-host store contains those attempts. An empty control-host store, or a store whose remaining attempts are unbound, bound to another candidate, missing the scored release identity, or bound to a different release identity, SHALL yield an empty attempt list and SHALL fail as missing required coverage. Collection SHALL NOT invent logical identities from pack-issue labels, latest-run lookup, or comment prose.
 
 #### Scenario: Control-host train and merge attempts are collected when the worktree store is empty
 
-- **WHEN** release-eligible FRG scoring collects unique-operation attempts for candidate SHA `C`
+- **WHEN** release-eligible FRG scoring collects unique-operation attempts for candidate SHA `C` and release identity `R`
 - **AND** the candidate worktree `.agent-pipeline/runs` is empty
-- **AND** the control-host store has train and merge runs bound to `C`
+- **AND** the control-host store has train and merge runs bound to `C` and `R`
 - **THEN** the attempt list SHALL include those train and merge attempts
 - **AND** entrypoint coverage SHALL observe `train` and `merge`
 
@@ -32,6 +32,27 @@ Unique-operation attempt collection for release-eligible Factory Reliability Gat
 - **WHEN** the control-host store has train runs bound to a different candidate SHA
 - **AND** scored candidate SHA `C` has no bound attempts
 - **THEN** those other-candidate runs SHALL NOT satisfy unique-operation coverage for `C`
+
+#### Scenario: Candidate-only artifacts without release identity are omitted
+
+- **WHEN** release-eligible FRG scoring collects unique-operation attempts for candidate SHA `C` and release identity `R`
+- **AND** the control-host store has train and merge runs bound to `C` with no durable release identity
+- **THEN** those runs SHALL NOT satisfy unique-operation coverage for `R`
+- **AND** the attempt list SHALL omit them
+
+#### Scenario: Mismatched release identity artifacts are omitted
+
+- **WHEN** release-eligible FRG scoring collects unique-operation attempts for candidate SHA `C` and release identity `R`
+- **AND** the control-host store has train runs bound to `C` and a different release identity
+- **THEN** those runs SHALL NOT satisfy unique-operation coverage for `R`
+
+#### Scenario: Followable child handoff outside the control-host store is omitted
+
+- **WHEN** release-eligible FRG scoring collects unique-operation attempts for candidate SHA `C`
+- **AND** a control-host train run bound to `C` carries `train_loop_linked` whose events path resolves outside the control-host runs root
+- **AND** that child run exists in the candidate worktree
+- **THEN** that child SHALL NOT be loaded into the attempt list
+- **AND** that handoff SHALL NOT supply unique-operation coverage for `C`
 
 ---
 

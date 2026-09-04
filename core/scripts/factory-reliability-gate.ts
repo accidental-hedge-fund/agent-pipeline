@@ -4477,22 +4477,44 @@ function mergeChildIdentity(
   return Object.keys(out).length > 0 ? out : primary;
 }
 
+function pathInsideApprovedRunsRoot(
+  candidate: string,
+  approvedRoots: readonly string[],
+): boolean {
+  const resolved = path.resolve(candidate);
+  for (const root of approvedRoots) {
+    if (!root) continue;
+    const parent = path.resolve(root);
+    const prefix = parent.endsWith(path.sep) ? parent : parent + path.sep;
+    if (resolved === parent || resolved.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
 async function loadFollowableChildRun(
   fsDeps: FrgFsDeps,
   loopRunId: string,
   eventsPath: string,
+  approvedRoots: readonly string[],
 ): Promise<{
   runId: string;
   runJson: Record<string, unknown> | null;
   events: Record<string, unknown>[];
   summary: Record<string, unknown> | null;
 } | null> {
-  const dir = path.dirname(eventsPath);
+  const resolvedEvents = path.resolve(eventsPath);
+  const dir = path.dirname(resolvedEvents);
+  if (
+    !pathInsideApprovedRunsRoot(resolvedEvents, approvedRoots) ||
+    !pathInsideApprovedRunsRoot(dir, approvedRoots)
+  ) {
+    return null;
+  }
   const [runJson, contract, handoff, events, summary] = await Promise.all([
     readJsonObjectOrNull(fsDeps, path.join(dir, "run.json")),
     readJsonObjectOrNull(fsDeps, path.join(dir, "contract.json")),
     readJsonObjectOrNull(fsDeps, path.join(dir, "loop-run-handoff.json")),
-    readJsonlObjects(fsDeps, eventsPath),
+    readJsonlObjects(fsDeps, resolvedEvents),
     readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
   ]);
   const merged = mergeChildIdentity(runJson, [contract, handoff]);
@@ -4615,7 +4637,7 @@ async function collectUniqueOperationsFromRunStore(
             ? event.events_path.trim()
             : "";
       if (!loopRunId || !eventsPath || seen.has(loopRunId)) continue;
-      const child = await loadFollowableChildRun(fsDeps, loopRunId, eventsPath);
+      const child = await loadFollowableChildRun(fsDeps, loopRunId, eventsPath, runsRoots);
       if (!child) continue;
       seen.add(loopRunId);
       runs.push(child);

@@ -114,6 +114,7 @@ function writeHostRun(
     sha: string;
     logical?: string;
     nested?: boolean;
+    release?: string;
     trainChild?: { loopRunId: string; eventsPath: string };
     executed_matrix_rows?: ExecutedMatrixRow[];
     parentOnlyTrainLink?: boolean;
@@ -121,6 +122,10 @@ function writeHostRun(
 ): void {
   const dir = `${root}/${opts.runId}`;
   const logical = opts.logical ?? "lop-host";
+  const releaseFields =
+    opts.release != null && opts.release.trim() !== ""
+      ? { release_identity: opts.release, release_version: opts.release }
+      : {};
   files.set(
     `${dir}/run.json`,
     JSON.stringify({
@@ -129,11 +134,17 @@ function writeHostRun(
       logical_operation_id: logical,
       candidate_sha: opts.sha,
       nested_logical_operation: opts.nested === true,
+      ...releaseFields,
       ...(opts.executed_matrix_rows ? { executed_matrix_rows: opts.executed_matrix_rows } : {}),
     }),
   );
   const events: Record<string, unknown>[] = [
-    { type: "run_start", entrypoint: opts.entrypoint, logical_operation_id: logical },
+    {
+      type: "run_start",
+      entrypoint: opts.entrypoint,
+      logical_operation_id: logical,
+      ...releaseFields,
+    },
     { type: "verified_completion", exact_candidate_proof: true },
   ];
   if (opts.parentOnlyTrainLink) {
@@ -153,6 +164,7 @@ function writeHostRun(
       verified_completion: true,
       logical_operation_id: logical,
       candidate_sha: opts.sha,
+      ...releaseFields,
     }),
   );
 }
@@ -163,8 +175,13 @@ function writeFollowableChild(
   eventsPath: string,
   sha: string,
   logical = "lop-host",
+  release?: string,
 ): void {
   const dir = eventsPath.replace(/\/events\.jsonl$/, "");
+  const releaseFields =
+    release != null && release.trim() !== ""
+      ? { release_identity: release, release_version: release }
+      : {};
   files.set(
     `${dir}/run.json`,
     JSON.stringify({
@@ -173,12 +190,19 @@ function writeFollowableChild(
       logical_operation_id: logical,
       candidate_sha: sha,
       nested_logical_operation: true,
+      ...releaseFields,
     }),
   );
   files.set(
     `${dir}/events.jsonl`,
     [
-      { type: "run_start", entrypoint: "loop", logical_operation_id: logical, nested: true },
+      {
+        type: "run_start",
+        entrypoint: "loop",
+        logical_operation_id: logical,
+        nested: true,
+        ...releaseFields,
+      },
       { type: "verified_completion", exact_candidate_proof: true },
     ]
       .map((e) => JSON.stringify(e))
@@ -192,6 +216,7 @@ function writeFollowableChild(
       events: eventsPath,
       logical_operation_id: logical,
       candidate_sha: sha,
+      ...releaseFields,
     }),
   );
 }
@@ -204,10 +229,17 @@ function seedHostCoverage(
   files: Map<string, string>,
   root: string,
   sha: string,
-  opts: { includeShip?: boolean; followableTrain?: boolean; parentOnlyTrain?: boolean } = {},
+  opts: {
+    includeShip?: boolean;
+    followableTrain?: boolean;
+    parentOnlyTrain?: boolean;
+    release?: string;
+    trainChildRoot?: string;
+  } = {},
 ): void {
   const childId = "loop-host-child";
-  const childEvents = `${root}/${childId}/events.jsonl`;
+  const childRoot = opts.trainChildRoot ?? root;
+  const childEvents = `${childRoot}/${childId}/events.jsonl`;
   const entrypoints = opts.includeShip
     ? [...REQUIRED_PUBLIC_ENTRYPOINTS]
     : requiredEntrypointsExceptShip();
@@ -216,6 +248,7 @@ function seedHostCoverage(
       runId: `host-${entrypoint}`,
       entrypoint,
       sha,
+      release: opts.release,
       nested: entrypoint !== "train",
       trainChild:
         entrypoint === "train" && opts.followableTrain !== false && !opts.parentOnlyTrain
@@ -226,7 +259,7 @@ function seedHostCoverage(
     });
   }
   if (opts.followableTrain !== false && !opts.parentOnlyTrain) {
-    writeFollowableChild(files, childId, childEvents, sha);
+    writeFollowableChild(files, childId, childEvents, sha, "lop-host", opts.release);
   }
 }
 
@@ -257,7 +290,7 @@ function scoreInput(over: Record<string, unknown> = {}) {
 
 test("host store train/merge are collected when candidate worktree runs are empty (#1428)", async () => {
   const files = new Map<string, string>();
-  seedHostCoverage(files, HOST_RUNS, CANDIDATE);
+  seedHostCoverage(files, HOST_RUNS, CANDIDATE, { release: "1.29.1" });
   const result = await runFactoryGate(
     {
       version: "1.29.1",
@@ -284,7 +317,7 @@ test("host store train/merge are collected when candidate worktree runs are empt
 
 test("other-candidate host runs do not satisfy the scored candidate (#1428)", async () => {
   const files = new Map<string, string>();
-  seedHostCoverage(files, HOST_RUNS, OTHER);
+  seedHostCoverage(files, HOST_RUNS, OTHER, { release: "1.29.1" });
   const result = await runFactoryGate(
     {
       version: "1.29.1",
@@ -326,7 +359,9 @@ test("empty host store remains fail-closed even with pack-ready labels (#1428)",
 
 test("empty host store stays fail-closed when candidate worktree has matching unique-ops (#1428)", async () => {
   const files = new Map<string, string>();
-  seedHostCoverage(files, join(CANDIDATE_REPO, ".agent-pipeline", "runs"), CANDIDATE);
+  seedHostCoverage(files, join(CANDIDATE_REPO, ".agent-pipeline", "runs"), CANDIDATE, {
+    release: "1.29.1",
+  });
   const result = await runFactoryGate(
     {
       version: "1.29.1",
@@ -348,7 +383,7 @@ test("empty host store stays fail-closed when candidate worktree has matching un
 
 test("#1301 live train_loop_linked is scored from the host train stream (#1428)", async () => {
   const files = new Map<string, string>();
-  seedHostCoverage(files, HOST_RUNS, CANDIDATE, { followableTrain: true });
+  seedHostCoverage(files, HOST_RUNS, CANDIDATE, { followableTrain: true, release: "1.29.1" });
   const result = await runFactoryGate(
     {
       version: "1.29.1",
@@ -370,7 +405,7 @@ test("#1301 live train_loop_linked is scored from the host train stream (#1428)"
 
 test("#1301 parent-only train_loop_linked is not followable child linkage (#1428)", async () => {
   const files = new Map<string, string>();
-  seedHostCoverage(files, HOST_RUNS, CANDIDATE, { parentOnlyTrain: true });
+  seedHostCoverage(files, HOST_RUNS, CANDIDATE, { parentOnlyTrain: true, release: "1.29.1" });
   const result = await runFactoryGate(
     {
       version: "1.29.1",
@@ -389,9 +424,76 @@ test("#1301 parent-only train_loop_linked is not followable child linkage (#1428
   assert.equal(isReleaseEligibleFrgPass(result.evidence, { requireAttestation: false }), false);
 });
 
-test("#1333 executed rows from host evidence feed coverage; helper stamps still fail (#1428)", async () => {
+test("host train handoff into a candidate-worktree child remains ineligible (#1428)", async () => {
+  const files = new Map<string, string>();
+  seedHostCoverage(files, HOST_RUNS, CANDIDATE, {
+    followableTrain: true,
+    release: "1.29.1",
+    trainChildRoot: join(CANDIDATE_REPO, ".agent-pipeline", "runs"),
+  });
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      uniqueOperationRunsRoot: HOST_RUNS,
+      inFlightShip: true,
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.ok(section.integrity.missing_required_coverage > 0);
+  assert.equal(section.exclusions.length, 0);
+  assert.equal(isReleaseEligibleFrgPass(result.evidence, { requireAttestation: false }), false);
+});
+
+test("candidate-matching host artifacts without release identity remain ineligible (#1428)", async () => {
   const files = new Map<string, string>();
   seedHostCoverage(files, HOST_RUNS, CANDIDATE);
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      uniqueOperationRunsRoot: HOST_RUNS,
+      inFlightShip: true,
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.equal(section.operations.length, 0);
+  assert.ok(section.integrity.missing_required_coverage > 0);
+  assert.equal(isReleaseEligibleFrgPass(result.evidence, { requireAttestation: false }), false);
+});
+
+test("mismatched release identity host artifacts remain ineligible (#1428)", async () => {
+  const files = new Map<string, string>();
+  seedHostCoverage(files, HOST_RUNS, CANDIDATE, { release: "1.28.0" });
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      uniqueOperationRunsRoot: HOST_RUNS,
+      inFlightShip: true,
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.equal(section.operations.length, 0);
+  assert.ok(section.integrity.missing_required_coverage > 0);
+  assert.equal(isReleaseEligibleFrgPass(result.evidence, { requireAttestation: false }), false);
+});
+
+test("#1333 executed rows from host evidence feed coverage; helper stamps still fail (#1428)", async () => {
+  const files = new Map<string, string>();
+  seedHostCoverage(files, HOST_RUNS, CANDIDATE, { release: "1.29.1" });
   const withRows = await runFactoryGate(
     {
       version: "1.29.1",
@@ -456,12 +558,13 @@ test("absent #1333 executed rows fail as missing required coverage, not an exclu
       runId: `host-${entrypoint}`,
       entrypoint,
       sha: CANDIDATE,
+      release: "1.29.1",
       nested: entrypoint !== "train",
       trainChild:
         entrypoint === "train" ? { loopRunId: childId, eventsPath: childEvents } : undefined,
     });
   }
-  writeFollowableChild(files, childId, childEvents, CANDIDATE);
+  writeFollowableChild(files, childId, childEvents, CANDIDATE, "lop-host", "1.29.1");
   const result = await runFactoryGate(
     {
       version: "1.29.1",
@@ -584,7 +687,7 @@ test("hybrid v2 pack proofs + host unique-ops without this ship pass structurall
   const loopRunId = observations.pack_provenance!.loop_run_id;
   const issueIds = observations.pack_provenance!.issues.map((issue) => String(issue.issue_number));
   const files = new Map<string, string>();
-  seedHostCoverage(files, HOST_RUNS, CANDIDATE);
+  seedHostCoverage(files, HOST_RUNS, CANDIDATE, { release: "1.40.1" });
   const result = await runFactoryGate(
     {
       version: "1.40.1",

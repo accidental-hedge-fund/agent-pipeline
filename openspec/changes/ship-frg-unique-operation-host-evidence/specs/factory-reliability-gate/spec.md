@@ -2,7 +2,7 @@
 
 ### Requirement: Ship FRG unique-operation scoring SHALL use control-host durable evidence bound to the scored candidate
 
-Ship FRG unique-operation scoring SHALL collect unique-operation attempts and #1301 live train-loop linkage from the control-host durable run, event, loop-store, and handoff store bound to the scored candidate. It SHALL NOT treat an empty candidate-worktree `.agent-pipeline/runs` directory as proof that train, loop, merge, or merge-queue never ran. It SHALL pass candidate-bound #1333 executed matrix rows through the existing unique-operation coverage seam from that same control-host or engine evidence. GitHub pack-issue labels, comment prose, and factory-gate 2-item pack proofs (clean-docs, clean-openspec, hybrid v2 Layer A) SHALL NOT substitute for unique-operation coverage. When the control-host store bound to the scored candidate is empty of train, loop, and merge evidence, unique-operation coverage SHALL fail closed as missing required coverage. This capability SHALL NOT add a second unique-operation aggregator, Factory Reliability Gate runner, or scheduler.
+Ship FRG unique-operation scoring SHALL collect unique-operation attempts and #1301 live train-loop linkage from the control-host durable run, event, loop-store, and handoff store bound to the scored candidate and release identity. Followable `train_loop_linked` child run, event, and handoff paths SHALL resolve inside that control-host store; a path that escapes into the candidate worktree SHALL NOT be loaded as unique-operation evidence. It SHALL NOT treat an empty candidate-worktree `.agent-pipeline/runs` directory as proof that train, loop, merge, or merge-queue never ran. It SHALL pass candidate-bound #1333 executed matrix rows through the existing unique-operation coverage seam from that same control-host or engine evidence. GitHub pack-issue labels, comment prose, and factory-gate 2-item pack proofs (clean-docs, clean-openspec, hybrid v2 Layer A) SHALL NOT substitute for unique-operation coverage. When the control-host store bound to the scored candidate is empty of train, loop, and merge evidence, unique-operation coverage SHALL fail closed as missing required coverage. This capability SHALL NOT add a second unique-operation aggregator, Factory Reliability Gate runner, or scheduler.
 
 #### Scenario: Empty candidate-worktree run-store does not fail a host-proven ship
 
@@ -43,6 +43,22 @@ Ship FRG unique-operation scoring SHALL collect unique-operation attempts and #1
 - **THEN** those rows SHALL feed #1333 `covered_lifecycle_classes` through the existing binder
 - **AND** helper stamps and pack labels SHALL NOT populate that coverage
 - **AND** absence of bound executed rows SHALL fail as missing required coverage
+
+#### Scenario: Candidate-worktree child handoff does not satisfy host #1301 linkage
+
+- **WHEN** a ship FRG pack is scored for candidate SHA `C`
+- **AND** the control-host train stream bound to `C` carries `train_loop_linked` whose events path resolves in the candidate worktree
+- **AND** that child run exists only in the candidate worktree
+- **THEN** that child SHALL NOT be loaded as unique-operation evidence
+- **AND** #1301 live train-loop linkage SHALL NOT be treated as present from that handoff
+- **AND** release-eligible pass SHALL be refused
+
+#### Scenario: Candidate-only host artifacts without release identity remain fail-closed
+
+- **WHEN** a ship FRG pack is scored for candidate SHA `C` and release identity `R`
+- **AND** the control-host store has unique-operation artifacts bound to `C` with no durable release identity
+- **THEN** unique-operation coverage SHALL fail as missing required coverage
+- **AND** release-eligible pass SHALL be refused
 
 ---
 

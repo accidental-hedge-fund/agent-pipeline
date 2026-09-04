@@ -705,6 +705,7 @@ function trainLinkedEventRefs(event: Record<string, unknown>): {
  * Keep only attempts bound to the scored candidate/release. Other-candidate
  * and unbound artifacts are omitted so they cannot satisfy the current gate.
  * When `candidate_sha` is empty, the list is returned unchanged (scoreboard).
+ * When `release_identity` is scored, missing and mismatched identities drop.
  */
 export function filterAttemptsBoundToCandidate(
   attempts: readonly UniqueOperationAttempt[],
@@ -719,7 +720,7 @@ export function filterAttemptsBoundToCandidate(
     if (sha !== scoredSha) return false;
     const release =
       typeof attempt.release_identity === "string" ? attempt.release_identity.trim() : "";
-    if (scoredRelease && release && release !== scoredRelease) return false;
+    if (scoredRelease && release !== scoredRelease) return false;
     return true;
   });
 }
