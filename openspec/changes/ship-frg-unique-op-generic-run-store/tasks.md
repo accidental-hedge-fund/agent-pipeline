@@ -15,6 +15,7 @@
 - [x] 2.4 Extend `attemptsFromRunArtifacts` with precedence: recognized `run_start.entrypoint`, then recognized `run.json.kind`, then prefixes (`merge-queue-`/`mq-` before remaining `merge-`; `train-`; `loop-`; numeric drive). Verify: start-event wins over kind; kind wins over prefix; `kind: "advance"` is not coerced to `single` and falls through to prefix; `mq-1` maps `merge-queue`; `merge-1` maps `merge`
 - [x] 2.5 Use `run_id` as aggregation identity with `identity_provenance: "run_id_fallback"` when the artifact has no `logical_operation_id`, and verify that fallback does not count as verified unique-operation success
 - [x] 2.6 Treat in-flight kept fallback-identity host artifacts as entrypoint coverage observation so they do not increment `missing_correlation` or `ownerless_terminal` solely for a missing minted id / missing postcondition proof, and verify a regression fails if those counts rise for prefix-only unbound train/loop artifacts under `inFlightShip`
+- [x] 2.7 Stamp kept missing-field in-flight attempts as `unbound_inflight` and exclude them from clean-completion success, stable exclusions, and ownerless-terminal numerators even when they carry a minted logical id and verified completion; verify a regression with that shape
 
 ## 3. In-flight #1333 inventory rows
 
@@ -23,6 +24,7 @@
 - [x] 3.3 Do not stamp `passingUniqueOperationManifest().covered_lifecycle_classes`, and verify helper stamps still fail promotion
 - [x] 3.4 Leave #1333 fail-closed when the inventory-completeness guard fails, and verify that case separately from the complete-inventory case
 - [x] 3.5 Leave #1333 fail-closed for standalone factory-gate without durable executed rows, and verify scoring does not mint inventory rows when `opts.inFlightShip` is not true
+- [x] 3.6 Load candidate inventory from a commit-bound data blob (`git show <candidateSha>:<inventory.json>`) with a non-executing parser; do not dynamically import candidate-tree TypeScript. Verify dirty-worktree and hostile-top-level-code regressions
 
 ## 4. Hard-gate text and release-eligibility regression
 

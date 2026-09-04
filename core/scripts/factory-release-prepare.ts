@@ -24,7 +24,6 @@ import * as crypto from "node:crypto";
 import { existsSync, realpathSync as fsRealpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
   artifactSubdir,
@@ -52,6 +51,7 @@ import {
   type ShipPathFromRunResolution,
 } from "./factory-reliability-gate.ts";
 import {
+  UNIQUE_OPERATION_TERMINALS,
   uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
 } from "./operation-reliability.ts";
@@ -88,7 +88,15 @@ import {
   type PackLoopLivenessStatus,
 } from "./loop/pack-loop-liveness.ts";
 import { parseExactGitSha } from "./ship-end-identity.ts";
-import type { FaultRecoveryMatrixRow } from "./fault-recovery-matrix.ts";
+import {
+  MATRIX_COVERAGE_LAYERS,
+  MATRIX_FAULT_STATES,
+  MATRIX_LIFECYCLE_CLASSES,
+  MATRIX_NOT_APPLICABLE_REASONS,
+  MATRIX_SHIP_MODELS,
+  SEMVER_ONLY_PHASES,
+  type FaultRecoveryMatrixRow,
+} from "./fault-recovery-matrix.ts";
 import {
   defaultResolveCandidateEngineDeps,
   resolveCandidateEngine,
@@ -1603,6 +1611,12 @@ export async function defaultStartBoundPackLoop(
   });
 }
 
+/** Commit-bound data artifact for candidate-tree inventory. Never executed. */
+export const CANDIDATE_FAULT_RECOVERY_INVENTORY_REL =
+  "core/scripts/fault-recovery-matrix.inventory.json";
+
+const CANDIDATE_INVENTORY_SCHEMA_VERSION = 1 as const;
+
 export interface LoadCandidateFaultRecoveryInventoryDeps {
   /**
    * Resolve `git rev-parse HEAD` for the scored checkout. Tests inject this
@@ -1610,12 +1624,107 @@ export interface LoadCandidateFaultRecoveryInventoryDeps {
    */
   resolveCheckoutSha?: (repoDir: string) => string | null | Promise<string | null>;
   /**
-   * Load `FAULT_RECOVERY_MATRIX` from the scored checkout. Tests inject this
-   * so unit tests never import the control-checkout module as candidate rows.
+   * Load matrix rows from the scored checkout. Tests inject this so unit
+   * tests never spawn git. Production uses the commit blob at
+   * {@link CANDIDATE_FAULT_RECOVERY_INVENTORY_REL}.
    */
   loadMatrixRows?: (
     repoDir: string,
   ) => Promise<readonly FaultRecoveryMatrixRow[] | null>;
+  /**
+   * Read a path from the candidate commit (`git show <sha>:<path>`). Tests
+   * inject this so unit tests never spawn git.
+   */
+  showCandidateBlob?: (
+    repoDir: string,
+    sha: string,
+    relPath: string,
+  ) => Promise<string | null>;
+}
+
+function allowlistedValue<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+): T | null {
+  if (typeof value !== "string") return null;
+  return (allowed as readonly string[]).includes(value) ? (value as T) : null;
+}
+
+function optionalNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function parseFaultRecoveryInventoryRow(value: unknown): FaultRecoveryMatrixRow | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const o = value as Record<string, unknown>;
+  if (typeof o.operation !== "string" || !o.operation.trim()) return null;
+  if (typeof o.entrypoint !== "string" || !o.entrypoint.trim()) return null;
+  if (typeof o.host !== "string" || !o.host.trim()) return null;
+  const fault_state = allowlistedValue(o.fault_state, MATRIX_FAULT_STATES);
+  const layer = allowlistedValue(o.layer, MATRIX_COVERAGE_LAYERS);
+  const lifecycle_class = allowlistedValue(o.lifecycle_class, MATRIX_LIFECYCLE_CLASSES);
+  const expected_terminal = allowlistedValue(o.expected_terminal, UNIQUE_OPERATION_TERMINALS);
+  if (!fault_state || !layer || !lifecycle_class || !expected_terminal) return null;
+  const row: FaultRecoveryMatrixRow = {
+    operation: o.operation.trim(),
+    fault_state,
+    entrypoint: o.entrypoint.trim(),
+    host: o.host.trim(),
+    layer,
+    lifecycle_class,
+    expected_terminal,
+  };
+  const covering_module = optionalNonEmptyString(o.covering_module);
+  if (covering_module) row.covering_module = covering_module;
+  const covering_test = optionalNonEmptyString(o.covering_test_name_substring);
+  if (covering_test) row.covering_test_name_substring = covering_test;
+  if (o.not_applicable !== undefined) {
+    const na = allowlistedValue(o.not_applicable, MATRIX_NOT_APPLICABLE_REASONS);
+    if (!na) return null;
+    row.not_applicable = na;
+  }
+  if (o.ship_model !== undefined) {
+    const ship_model = allowlistedValue(o.ship_model, MATRIX_SHIP_MODELS);
+    if (!ship_model) return null;
+    row.ship_model = ship_model;
+  }
+  if (o.ship_phase !== undefined) {
+    const ship_phase = allowlistedValue(o.ship_phase, SEMVER_ONLY_PHASES);
+    if (!ship_phase) return null;
+    row.ship_phase = ship_phase;
+  }
+  const notes = optionalNonEmptyString(o.notes);
+  if (notes) row.notes = notes;
+  return row;
+}
+
+/**
+ * Non-executing parser for the commit-bound inventory blob. TypeScript,
+ * functions, and other non-JSON input yield null.
+ */
+export function parseFaultRecoveryInventoryJson(
+  text: string | null | undefined,
+): FaultRecoveryMatrixRow[] | null {
+  if (typeof text !== "string" || !text.trim()) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const o = parsed as Record<string, unknown>;
+  if (o.schema_version !== CANDIDATE_INVENTORY_SCHEMA_VERSION) return null;
+  if (!Array.isArray(o.rows) || o.rows.length === 0) return null;
+  const rows: FaultRecoveryMatrixRow[] = [];
+  for (const item of o.rows) {
+    const row = parseFaultRecoveryInventoryRow(item);
+    if (!row) return null;
+    rows.push(row);
+  }
+  return rows;
 }
 
 async function defaultResolveCandidateCheckoutSha(
@@ -1633,28 +1742,39 @@ async function defaultResolveCandidateCheckoutSha(
   }
 }
 
-async function defaultLoadCandidateMatrixRows(
+async function defaultShowCandidateBlob(
   repoDir: string,
-): Promise<readonly FaultRecoveryMatrixRow[] | null> {
+  sha: string,
+  relPath: string,
+): Promise<string | null> {
   try {
-    const matrixPath = path.resolve(repoDir, "core/scripts/fault-recovery-matrix.ts");
-    const mod = (await import(pathToFileURL(matrixPath).href)) as {
-      FAULT_RECOVERY_MATRIX?: unknown;
-    };
-    return Array.isArray(mod.FAULT_RECOVERY_MATRIX)
-      ? (mod.FAULT_RECOVERY_MATRIX as FaultRecoveryMatrixRow[])
-      : null;
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", repoDir, "show", `${sha}:${relPath}`],
+      { encoding: "utf8", timeout: 15_000, maxBuffer: 20 * 1024 * 1024 },
+    );
+    return String(stdout);
   } catch {
     return null;
   }
 }
 
+async function defaultLoadCandidateMatrixRows(
+  repoDir: string,
+  candidateSha: string,
+  showBlob: LoadCandidateFaultRecoveryInventoryDeps["showCandidateBlob"],
+): Promise<readonly FaultRecoveryMatrixRow[] | null> {
+  const show = showBlob ?? defaultShowCandidateBlob;
+  const blob = await show(repoDir, candidateSha, CANDIDATE_FAULT_RECOVERY_INVENTORY_REL);
+  return parseFaultRecoveryInventoryJson(blob);
+}
+
 /**
- * Production in-flight inventory loader. Reads the candidate checkout at
- * `repoDir`, verifies that checkout's HEAD equals `candidateSha`, and only
- * then returns that tree's matrix rows. A control-checkout matrix is never
- * labeled with the request SHA. SHA mismatch, unreadable HEAD, or a missing
- * matrix yields no inventory rows.
+ * Production in-flight inventory loader. Verifies checkout HEAD equals
+ * `candidateSha`, then loads the commit blob at that SHA. A dirty worktree
+ * cannot replace the blob. Candidate TypeScript is never imported or
+ * executed. SHA mismatch, unreadable HEAD, or invalid inventory data
+ * yields no inventory rows.
  */
 export async function defaultLoadCandidateFaultRecoveryInventory(
   args: { candidateSha: string; repoDir: string },
@@ -1670,7 +1790,10 @@ export async function defaultLoadCandidateFaultRecoveryInventory(
     return { rows: [], sourceSha: checkoutSha };
   }
 
-  const loadRows = deps.loadMatrixRows ?? defaultLoadCandidateMatrixRows;
+  const loadRows =
+    deps.loadMatrixRows ??
+    ((dir: string) =>
+      defaultLoadCandidateMatrixRows(dir, candidateSha, deps.showCandidateBlob));
   const rows = await loadRows(repoDir);
   if (!rows) return { rows: [], sourceSha: null };
   return { rows, sourceSha: checkoutSha };

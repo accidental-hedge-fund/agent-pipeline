@@ -502,6 +502,46 @@ test("filterAttemptsBoundToCandidate: in-flight ship keeps missing SHA and missi
     { candidate_sha: scored, release_identity: "1.40.1", inFlightShip: true },
   );
   assert.deepEqual(kept.map((a) => a.run_id), ["unbound", "match"]);
+  assert.equal(kept[0]!.binding_provenance, "unbound_inflight");
+  assert.equal(kept[1]!.binding_provenance, "bound");
+});
+
+test("aggregator: unbound inflight minted id with verified completion is observation-only (#1434)", () => {
+  const scored = "a".repeat(40);
+  const kept = filterAttemptsBoundToCandidate(
+    [
+      {
+        run_id: "train-host",
+        logical_operation_id: "lop-minted-unbound",
+        entrypoint: "train",
+        nested: false,
+        postcondition_proof: true,
+        terminal: "verified_success",
+        identity_provenance: "minted",
+      },
+    ],
+    { candidate_sha: scored, release_identity: "1.40.1", inFlightShip: true },
+  );
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0]!.binding_provenance, "unbound_inflight");
+  const report = aggregateUniqueOperationReliability({
+    attempts: kept,
+    manifest: {
+      required_entrypoints: ["train"],
+      required_lifecycle_classes: [],
+      live_train_linkage_present: true,
+      in_flight_ship: true,
+    },
+    candidate_sha: scored,
+    release_identity: "1.40.1",
+    in_flight_ship: true,
+  });
+  assert.ok(report.entrypoint_coverage.observed.includes("train"));
+  assert.equal(report.clean_completion.numerator, 0);
+  assert.equal(report.clean_completion.denominator, 0);
+  assert.equal(report.ownerless_terminal.numerator, 0);
+  assert.equal(report.exclusions.length, 0);
+  assert.equal(report.integrity.missing_correlation, 0);
 });
 
 test("computeFrgEvidence: writes operation_reliability from durable fakes", () => {

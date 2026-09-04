@@ -103,6 +103,15 @@ When unique-operation scoring runs for an in-flight ship's Factory Reliability G
 - **AND** ownerless-terminal count SHALL NOT increase solely for that missing postcondition proof
 - **AND** those attempts SHALL NOT count as verified unique-operation success
 
+#### Scenario: Unbound minted-id verified completion is observation-only
+
+- **WHEN** unique-operation scoring runs for an in-flight ship's FRG pack
+- **AND** a kept control-host attempt has a durable logical_operation_id and verified completion
+- **AND** that attempt lacks candidate_sha
+- **THEN** that attempt SHALL NOT count as verified unique-operation success
+- **AND** that attempt SHALL NOT be recorded as a stable exclusion
+- **AND** entrypoint coverage SHALL still observe that attempt's mapped public entrypoint
+
 ## MODIFIED Requirements
 
 ### Requirement: Unique-operation attempts for release-eligible FRG SHALL come from the control-host store bound to the scored candidate

@@ -29,8 +29,10 @@ import {
   type FrgFsDeps,
 } from "../scripts/factory-reliability-gate.ts";
 import {
+  CANDIDATE_FAULT_RECOVERY_INVENTORY_REL,
   defaultLoadCandidateFaultRecoveryInventory,
   defaultScoreBoundPackLoop,
+  parseFaultRecoveryInventoryJson,
 } from "../scripts/factory-release-prepare.ts";
 
 const CANDIDATE = "c".repeat(40);
@@ -780,6 +782,10 @@ test("defaultScoreBoundPackLoop sets inFlightShip and uses the dual-root resolve
   assert.match(src, /resolveUniqueOperationRunsRoots: args\.resolveUniqueOperationRunsRoots/);
   assert.match(src, /loadCandidateFaultRecoveryInventory:\s*\n\s*args\.loadCandidateFaultRecoveryInventory \?\?\s*\n\s*defaultLoadCandidateFaultRecoveryInventory/s);
   assert.equal(src.includes('await import("./fault-recovery-matrix.ts")'), false);
+  assert.equal(src.includes("pathToFileURL"), false);
+  assert.equal(src.includes('path.resolve(repoDir, "core/scripts/fault-recovery-matrix.ts")'), false);
+  assert.match(src, /CANDIDATE_FAULT_RECOVERY_INVENTORY_REL/);
+  assert.match(src, /\["-C", repoDir, "show", `\$\{sha\}:\$\{relPath\}`\]/);
   assert.equal(
     /sourceSha:\s*args\.request\.integrated_candidate\.git_sha/.test(src),
     false,
@@ -837,6 +843,89 @@ test("default inventory loader returns no rows when checkout SHA is unreadable (
   assert.equal(loaded.rows.length, 0);
   assert.equal(loadCalls, 0);
   assert.equal(loaded.sourceSha, null);
+});
+
+test("inventory JSON parser does not execute candidate TypeScript (#1434)", () => {
+  const hostile = [
+    'import { writeFileSync } from "node:fs";',
+    'writeFileSync("/tmp/pipeline-1434-pwned", "executed");',
+    "export const FAULT_RECOVERY_MATRIX = [];",
+    "throw new Error('hostile top-level');",
+  ].join("\n");
+  assert.equal(parseFaultRecoveryInventoryJson(hostile), null);
+  assert.equal(
+    parseFaultRecoveryInventoryJson("process.exit(1); export const FAULT_RECOVERY_MATRIX = [];"),
+    null,
+  );
+});
+
+test("dirty worktree does not replace commit-bound inventory blob (#1434)", async () => {
+  let blobPath: string | null = null;
+  let blobSha: string | null = null;
+  const loaded = await defaultLoadCandidateFaultRecoveryInventory(
+    { candidateSha: CANDIDATE, repoDir: CANDIDATE_REPO },
+    {
+      resolveCheckoutSha: () => CANDIDATE,
+      showCandidateBlob: async (_repoDir, sha, relPath) => {
+        blobSha = sha;
+        blobPath = relPath;
+        return JSON.stringify({ schema_version: 1, rows: FAULT_RECOVERY_MATRIX });
+      },
+    },
+  );
+  assert.equal(blobSha, CANDIDATE);
+  assert.equal(blobPath, CANDIDATE_FAULT_RECOVERY_INVENTORY_REL);
+  assert.equal(loaded.sourceSha, CANDIDATE);
+  assert.equal(loaded.rows.length, FAULT_RECOVERY_MATRIX.length);
+});
+
+test("hostile candidate TypeScript blob attaches no inventory rows (#1434)", async () => {
+  const loaded = await defaultLoadCandidateFaultRecoveryInventory(
+    { candidateSha: CANDIDATE, repoDir: CANDIDATE_REPO },
+    {
+      resolveCheckoutSha: () => CANDIDATE,
+      showCandidateBlob: async () =>
+        'import fs from "node:fs"; fs.writeFileSync("/tmp/pwned", "x"); export const FAULT_RECOVERY_MATRIX = [];',
+    },
+  );
+  assert.equal(loaded.rows.length, 0);
+  assert.equal(loaded.sourceSha, null);
+});
+
+test("commit-bound inventory JSON stays fresh with FAULT_RECOVERY_MATRIX (#1434)", () => {
+  const blob = readFileSync(
+    join(CORE_ROOT, "scripts/fault-recovery-matrix.inventory.json"),
+    "utf8",
+  );
+  const parsed = parseFaultRecoveryInventoryJson(blob);
+  assert.ok(parsed);
+  assert.deepEqual(parsed, JSON.parse(JSON.stringify(FAULT_RECOVERY_MATRIX)));
+});
+
+test("unbound minted-id verified host run is observation-only under in-flight ship (#1434)", async () => {
+  const files = new Map<string, string>();
+  writeBoundRun(files, GENERIC, {
+    runId: "train-minted-unbound",
+    entrypoint: "train",
+    logical: "lop-minted-unbound",
+  });
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.ok(section.entrypoint_coverage.observed.includes("train"));
+  assert.equal(section.clean_completion.numerator, 0);
+  assert.equal(section.exclusions.length, 0);
+  assert.equal(section.ownerless_terminal.numerator, 0);
 });
 
 test("CLI factory-gate runFactoryGate call passes env and does not set inFlightShip (#1434)", () => {

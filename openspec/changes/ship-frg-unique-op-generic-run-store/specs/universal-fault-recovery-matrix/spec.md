@@ -32,3 +32,23 @@ When in-flight ship Factory Reliability Gate unique-operation scoring needs #133
 - **AND** no binder-accepted executed rows exist for the scored candidate
 - **THEN** those helper stamps SHALL NOT populate `covered_lifecycle_classes`
 - **AND** unique-operation SLO validation SHALL fail
+
+---
+
+### Requirement: In-flight ship inventory load SHALL use a commit-bound data blob and SHALL NOT execute candidate-tree code
+
+When the in-flight ship Factory Reliability Gate loader reads the candidate tree's fault-recovery matrix inventory, it SHALL load a data-only inventory from a git object bound to the scored candidate SHA. It SHALL parse that blob with a non-executing data parser. It SHALL NOT dynamically import or otherwise execute TypeScript, JavaScript, or other candidate-checkout code in the release-control process. A dirty candidate worktree SHALL NOT replace the commit-bound blob. A blob that is not valid inventory data SHALL NOT attach rows.
+
+#### Scenario: Dirty worktree does not replace the commit-bound inventory
+
+- **WHEN** in-flight ship unique-operation scoring loads inventory for candidate SHA `C`
+- **AND** the candidate worktree file for the matrix source differs from the blob at `C`
+- **THEN** scoring SHALL use the commit-bound blob at `C`
+- **AND** scoring SHALL NOT import or execute the dirty worktree file
+
+#### Scenario: Hostile candidate TypeScript is not executed
+
+- **WHEN** in-flight ship unique-operation scoring loads inventory for candidate SHA `C`
+- **AND** the candidate tree contains TypeScript whose top-level code would execute on import
+- **THEN** the release-control process SHALL NOT execute that TypeScript
+- **AND** scoring SHALL attach inventory rows only from a valid data-only blob bound to `C`
