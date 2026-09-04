@@ -115,6 +115,13 @@ export interface UniqueOperationManifest {
   live_train_linkage_present?: boolean;
   candidate_sha?: string;
   release_identity?: string;
+  /**
+   * When true, aggregation is scoring an FRG pack nested under an admitted
+   * in-flight `ship`. Missing entrypoint `ship` is not missing required
+   * coverage and is not a stable exclusion. A completed prior `ship` still
+   * counts as observed coverage. Not part of the manifest fingerprint.
+   */
+  in_flight_ship?: boolean;
 }
 
 export interface UniqueOperationRate {
@@ -261,6 +268,11 @@ export function aggregateUniqueOperationReliability(input: {
   matrix_covered_lifecycle_classes?: readonly string[] | null;
   /** Executed matrix-row records keyed to candidate SHA and coverage layer. */
   executed_matrix_rows?: readonly ExecutedMatrixRow[];
+  /**
+   * FRG pack nested under an admitted in-flight `ship`. Same rule as
+   * `manifest.in_flight_ship`.
+   */
+  in_flight_ship?: boolean;
 }): UniqueOperationReliability {
   const manifest = input.manifest ?? {};
   const requiredEntrypoints = [...(manifest.required_entrypoints ?? REQUIRED_PUBLIC_ENTRYPOINTS)];
@@ -486,7 +498,13 @@ export function aggregateUniqueOperationReliability(input: {
   // Matrix-proved classes count even when helpers no longer stamp them.
   for (const cls of matrixCovered) coveredLifecycle.add(cls);
 
-  const missingEntrypoints = requiredEntrypoints.filter((e) => !observedEntrypoints.has(e));
+  const deferInFlightShip =
+    input.in_flight_ship === true || manifest.in_flight_ship === true;
+  const missingEntrypoints = requiredEntrypoints.filter((e) => {
+    if (observedEntrypoints.has(e)) return false;
+    if (deferInFlightShip && e === "ship") return false;
+    return true;
+  });
   const missingLifecycle = requiredLifecycle.filter((c) => !coveredLifecycle.has(c));
   let missingRequiredCoverage = 0;
   if (missingEntrypoints.length > 0) missingRequiredCoverage += missingEntrypoints.length;
@@ -687,6 +705,7 @@ function trainLinkedEventRefs(event: Record<string, unknown>): {
  * Keep only attempts bound to the scored candidate/release. Other-candidate
  * and unbound artifacts are omitted so they cannot satisfy the current gate.
  * When `candidate_sha` is empty, the list is returned unchanged (scoreboard).
+ * When `release_identity` is scored, missing and mismatched identities drop.
  */
 export function filterAttemptsBoundToCandidate(
   attempts: readonly UniqueOperationAttempt[],
@@ -701,7 +720,7 @@ export function filterAttemptsBoundToCandidate(
     if (sha !== scoredSha) return false;
     const release =
       typeof attempt.release_identity === "string" ? attempt.release_identity.trim() : "";
-    if (scoredRelease && release && release !== scoredRelease) return false;
+    if (scoredRelease && release !== scoredRelease) return false;
     return true;
   });
 }

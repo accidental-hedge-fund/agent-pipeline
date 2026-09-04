@@ -51,6 +51,10 @@ import {
   type ShipPathFromRunResolution,
 } from "./factory-reliability-gate.ts";
 import {
+  uniqueOperationReleaseBindingFailure,
+  uniqueOperationSloFailure,
+} from "./operation-reliability.ts";
+import {
   defaultFrgPackRoot,
   FRG_HYBRID_PILOT_VERSION,
   loadFrgPack,
@@ -1621,6 +1625,7 @@ export async function defaultScoreBoundPackLoop(
     // caller-authored pack provenance. Hybrid v2 inside the scorer applies.
     requestCandidateGitSha: args.request.integrated_candidate.git_sha,
     attestationKey: null,
+    inFlightShip: true,
     stdout: () => {},
     stderr: () => {},
     now: args.now,
@@ -3346,6 +3351,12 @@ export async function generateDurableUnsignedFrg(
   };
 
   if (!eligible) {
+    const slo = uniqueOperationSloFailure(scored.operation_reliability ?? null);
+    const binding = uniqueOperationReleaseBindingFailure(scored.operation_reliability ?? null, {
+      candidate_sha:
+        scored.pack_provenance?.candidate_git_sha ?? request.integrated_candidate.git_sha,
+      release_identity: request.target_version,
+    });
     return {
       frg,
       structurally_eligible: false,
@@ -3361,6 +3372,8 @@ export async function generateDurableUnsignedFrg(
               .filter((s) => s.status !== "pass" && s.status !== "warn")
               .map((s) => `${s.id}=${s.status}`)
               .join(", ")})`) +
+        (slo ? ` (${slo})` : "") +
+        (binding && binding !== slo ? ` (${binding})` : "") +
         `. Hard gate: release preparation blocked.`,
     };
   }
