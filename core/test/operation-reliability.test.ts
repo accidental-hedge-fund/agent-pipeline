@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   REQUIRED_LIFECYCLE_CLASSES_1333,
+  REQUIRED_PUBLIC_ENTRYPOINTS,
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
   filterAttemptsBoundToCandidate,
@@ -962,4 +963,80 @@ test("runFactoryGate: stale-candidate run-store artifacts cannot pass the curren
   assert.equal(result.evidence.operation_reliability!.operations.length, 0);
   assert.ok(result.evidence.operation_reliability!.integrity.missing_required_coverage > 0);
   assert.equal(isReleaseEligibleFrgPass(result.evidence), false);
+});
+
+function attemptsWithoutShip(sha = "a".repeat(40)): ReturnType<typeof passingUniqueOperationAttempts> {
+  return passingUniqueOperationAttempts()
+    .filter((a) => a.entrypoint !== "ship")
+    .map((a) => ({ ...a, candidate_sha: sha }));
+}
+
+test("aggregator: in-flight ship is not missing coverage and is not an exclusion (#1428)", () => {
+  assert.ok(REQUIRED_PUBLIC_ENTRYPOINTS.includes("ship"));
+  const report = aggregateUniqueOperationReliability({
+    attempts: attemptsWithoutShip(),
+    manifest: {
+      ...passingUniqueOperationManifest({ release_identity: "1.40.1" }),
+      in_flight_ship: true,
+    },
+    candidate_sha: "a".repeat(40),
+    release_identity: "1.40.1",
+    matrix_covered_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+    in_flight_ship: true,
+  });
+  assert.ok(!report.entrypoint_coverage.missing.includes("ship"));
+  assert.ok(report.entrypoint_coverage.required.includes("ship"));
+  assert.ok(!report.entrypoint_coverage.observed.includes("ship"));
+  assert.equal(report.exclusions.length, 0);
+  assert.equal(report.operations.some((op) => op.entrypoints.includes("ship")), false);
+  assert.equal(uniqueOperationSloFailure(report), null);
+});
+
+test("aggregator: completed prior ship is observed coverage, not in-flight success (#1428)", () => {
+  const priorShip = {
+    run_id: "run-prior-ship",
+    logical_operation_id: "lop-prior-ship",
+    parent_logical_operation_id: "lop-prior-ship",
+    entrypoint: "ship",
+    nested: false,
+    postcondition_proof: true,
+    terminal: "verified_success" as const,
+    candidate_sha: "a".repeat(40),
+  };
+  const report = aggregateUniqueOperationReliability({
+    attempts: [...attemptsWithoutShip(), priorShip],
+    manifest: {
+      ...passingUniqueOperationManifest({ release_identity: "1.40.1" }),
+      in_flight_ship: true,
+    },
+    candidate_sha: "a".repeat(40),
+    release_identity: "1.40.1",
+    matrix_covered_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+    in_flight_ship: true,
+  });
+  assert.ok(report.entrypoint_coverage.observed.includes("ship"));
+  assert.ok(!report.entrypoint_coverage.missing.includes("ship"));
+  const shipOps = report.operations.filter((op) => op.entrypoints.includes("ship"));
+  assert.equal(shipOps.length, 1);
+  assert.equal(shipOps[0]!.logical_operation_id, "lop-prior-ship");
+  assert.notEqual(shipOps[0]!.logical_operation_id, "lop-frg-required-coverage");
+});
+
+test("aggregator: missing train still increments coverage during in-flight ship FRG (#1428)", () => {
+  const report = aggregateUniqueOperationReliability({
+    attempts: attemptsWithoutShip().filter((a) => a.entrypoint !== "train"),
+    manifest: {
+      ...passingUniqueOperationManifest({ release_identity: "1.40.1" }),
+      in_flight_ship: true,
+    },
+    candidate_sha: "a".repeat(40),
+    release_identity: "1.40.1",
+    matrix_covered_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+    in_flight_ship: true,
+  });
+  assert.ok(report.entrypoint_coverage.missing.includes("train"));
+  assert.ok(!report.entrypoint_coverage.missing.includes("ship"));
+  assert.ok(report.integrity.missing_required_coverage > 0);
+  assert.equal(report.exclusions.length, 0);
+  assert.match(uniqueOperationSloFailure(report) ?? "", /missing required coverage/);
 });

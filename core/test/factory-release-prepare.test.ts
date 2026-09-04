@@ -78,6 +78,11 @@ import {
   type LoadedFrgPack,
 } from "../scripts/frg-pack-observations.ts";
 import { frgPassUniqueOperations } from "./frg-pass-unique-operations.ts";
+import {
+  passingUniqueOperationManifest,
+  uniqueOperationReleaseBindingFailure,
+  uniqueOperationSloFailure,
+} from "../scripts/operation-reliability.ts";
 
 const MANIFEST_SHA = "a".repeat(64);
 const CANDIDATE = "b".repeat(40);
@@ -158,6 +163,32 @@ function unsignedEligibleScoreEvidence(
     isReleaseEligibleFrgPass(evidence, { requireAttestation: false }),
     true,
     "omitted HMAC must still be structurally eligible",
+  );
+  return evidence;
+}
+
+function uniqueOpFailScoreEvidence(
+  loopRunId: string,
+): import("../scripts/factory-reliability-gate.ts").FrgEvidence {
+  const evidence = computeFrgEvidence({
+    version: "1.29.1",
+    run_id: "frg-uop-fail",
+    loop_run_id: loopRunId,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: null,
+    unique_operations: [],
+    unique_operation_manifest: passingUniqueOperationManifest({ release_identity: "1.29.1" }),
+  });
+  assert.equal(evidence.pass, false);
+  assert.equal(
+    isReleaseEligibleFrgPass(evidence, { requireAttestation: false }),
+    false,
   );
   return evidence;
 }
@@ -1657,6 +1688,95 @@ test("terminal score uses --from-run and does not pass --observations; fail stay
   assert.ok(latestPath, "fail MAY write latest.json");
   const latest = JSON.parse(files.get(latestPath!)!);
   assert.equal(latest.pass, false);
+});
+
+test("structural eligibility hard gate names unique-operation SLO failure (#1428)", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-uop-slo";
+  const scored = uniqueOpFailScoreEvidence("loop-uop-slo");
+  const slo = uniqueOperationSloFailure(scored.operation_reliability ?? null);
+  assert.ok(slo);
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: fakePack(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: async (p, body) => {
+        files.set(p, body);
+      },
+      mkdir: async () => {},
+      readFile: async (p) => {
+        const v = files.get(p);
+        if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return v;
+      },
+      fileExists: async (p) => files.has(p),
+      reconcilePackLoop: async () =>
+        boundLoopArtifacts({ loop_run_id: "loop-uop-slo", item_state: "ready" }),
+      scoreBoundPackLoop: async () => ({
+        evidence: scored,
+        evidencePath: null,
+        latestPath: null,
+      }),
+    },
+  );
+  assert.equal(result.structurally_eligible, false);
+  assert.equal(result.defect_class, "frg_not_eligible");
+  assert.match(result.message ?? "", /FRG structural eligibility failed/);
+  assert.match(result.message ?? "", new RegExp(slo.replace(/[()]/g, "\\$&")));
+  assert.notEqual(
+    result.message,
+    `factory-release prepare: FRG structural eligibility failed for ${request.target_version}. Hard gate: release preparation blocked.`,
+  );
+});
+
+test("structural eligibility hard gate names unique-operation binding failure (#1428)", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-uop-bind";
+  const scored = uniqueOpFailScoreEvidence("loop-uop-bind");
+  const binding = uniqueOperationReleaseBindingFailure(scored.operation_reliability ?? null, {
+    candidate_sha: request.integrated_candidate.git_sha,
+    release_identity: request.target_version,
+  });
+  assert.ok(binding);
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: fakePack(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: async (p, body) => {
+        files.set(p, body);
+      },
+      mkdir: async () => {},
+      readFile: async (p) => {
+        const v = files.get(p);
+        if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return v;
+      },
+      fileExists: async (p) => files.has(p),
+      reconcilePackLoop: async () =>
+        boundLoopArtifacts({ loop_run_id: "loop-uop-bind", item_state: "ready" }),
+      scoreBoundPackLoop: async () => ({
+        evidence: scored,
+        evidencePath: null,
+        latestPath: null,
+      }),
+    },
+  );
+  assert.equal(result.structurally_eligible, false);
+  assert.match(result.message ?? "", new RegExp(binding.replace(/[()]/g, "\\$&")));
 });
 
 test("omitted HMAC on structurally eligible terminal pack is awaiting, not frg_not_eligible (#1147)", async () => {

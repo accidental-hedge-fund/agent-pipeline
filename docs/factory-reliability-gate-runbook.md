@@ -123,12 +123,28 @@ pipeline doctor
 4. `pipeline doctor` reports pin target, installed version, and track coherence
    (`install:engine-track`). Run evidence records `engine.track` at run start.
 
-## Unique-operation reliability (#1368)
+## Unique-operation reliability (#1368 / #1428)
 
 Release-eligible FRG evidence with `pass: true` includes a versioned
 `operation_reliability` section. That section is the unique-operation contract.
-It is computed from durable run, event, loop-store, and handoff evidence.
-GitHub labels and comment prose are not unique-operation proof.
+Ship FRG scoring reads that evidence from the **control-host** durable store
+(`AGENT_PIPELINE_STATE_HOME` / `resolveStateHome` → `<state-home>/runs`, the
+same root `factory-release prepare` uses for pack-loop scans), bound to the
+scored candidate SHA. An empty candidate-worktree `.agent-pipeline/runs`
+directory is not proof that train, loop, or merge never ran. GitHub labels,
+comment prose, and factory-gate 2-item pack proofs are not unique-operation
+proof.
+
+When Factory Reliability Gate unique-operation scoring runs as a phase of an
+admitted in-flight `ship`, missing entrypoint `ship` is not missing required
+coverage for that pack. A completed prior `ship` still counts as observed
+coverage. The in-flight ship is not verified unique-operation success and is
+not a stable exclusion. Other required entrypoints stay fail-closed.
+
+`factory-release prepare` structural-eligibility hard-gate text names the
+`uniqueOperationSloFailure` / `uniqueOperationReleaseBindingFailure` string
+when unique-operation validation is the defect. HMAC attestation stays
+required on the tag and promote path.
 
 The section names:
 
@@ -141,7 +157,7 @@ The section names:
 | **Exact-candidate recovery** | Applicable recovery that re-proves the authorized candidate. Target: 100% when required. |
 | **Independent-sibling continuation** | Applicable continuation after a contained peer failure. Target: 100% when required. |
 | **Stable exclusions** | Typed request, external wait, or cancellation only when the versioned pack manifest declares that expected outcome. They stay separately counted. |
-| **Integrity counts** | Missing correlation, contradictory parent/child identities, missing required entry-point coverage, missing #1301 live train linkage, missing #1333 lifecycle coverage. These are never exclusions. |
+| **Integrity counts** | Missing correlation, contradictory parent/child identities, missing required entry-point coverage, missing #1301 live train linkage, missing #1333 lifecycle coverage. These are never exclusions. An in-flight `ship` whose own FRG pack is being scored is not missing `ship` coverage and is not an exclusion. |
 
 `covered_lifecycle_classes` come from executed universal-fault-recovery-matrix
 rows on the adapter-contract, installed-CLI, and host-conformance layers.
@@ -153,8 +169,9 @@ and not a terminal supervisor STOP.
 Verified completion requires exact-candidate postcondition proof. Process exit,
 `run_complete`, and issue closure are not success.
 
-Missing `logical_operation_id`, missing required public entry-point coverage,
-or an unmet SLO fails FRG promotion and factory-release prepare.
+Missing `logical_operation_id`, missing required public entry-point coverage
+(except in-flight `ship` on that ship's FRG pack), or an unmet SLO fails FRG
+promotion and factory-release prepare.
 
 HMAC attestation binds `operation_reliability`. Mutating a unique-operation
 count after mint fails verification even when public fingerprints stay intact.

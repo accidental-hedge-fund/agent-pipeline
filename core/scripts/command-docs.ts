@@ -85,7 +85,8 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
     section: "lifecycle",
   },
   "factory-gate": {
-    summary: "Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)",
+    summary:
+      "Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags). Unique-operation SLOs read the control-host run store bound to the scored candidate; an in-flight ship is not missing ship coverage for that pack",
     usage:
       "factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass]",
     documented: true,
@@ -93,7 +94,7 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   "factory-release": {
     summary:
-      "Durable post-pilot FRG generation + prepare-only release handoff (in_progress → awaiting_frg_attestation → complete; never merges/tags)",
+      "Durable post-pilot FRG generation + prepare-only release handoff (in_progress → awaiting_frg_attestation → complete; never merges/tags). Structural eligibility names unique-operation SLO or binding failure; HMAC stays required on tag/promote",
     usage:
       "factory-release prepare --request <absolute-off-repo-request.json> --json",
     documented: true,

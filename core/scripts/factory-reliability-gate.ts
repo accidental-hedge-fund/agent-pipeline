@@ -58,12 +58,16 @@ import {
   type UniqueOperationManifest,
   type UniqueOperationReliability,
 } from "./operation-reliability.ts";
-import type { ExecutedMatrixRow } from "./fault-recovery-matrix.ts";
+import {
+  bindExecutedMatrixRowsForCandidate,
+  type ExecutedMatrixRow,
+} from "./fault-recovery-matrix.ts";
 import {
   defaultCollectHybridV2FromRun,
   githubReadyToDeployOverlay,
   type HybridV2FromRunArgs,
 } from "./frg-hybrid-v2-from-run.ts";
+import { resolveStateHome } from "./loop/store.ts";
 
 // ---------------------------------------------------------------------------
 // Schema + thresholds
@@ -3577,6 +3581,11 @@ export interface ComputeFrgInput {
   /** Executed matrix-row records keyed to candidate SHA and coverage layer. */
   executed_matrix_rows?: readonly ExecutedMatrixRow[];
   /**
+   * FRG pack nested under an admitted in-flight `ship`. Missing entrypoint
+   * `ship` is not missing required coverage for this pack.
+   */
+  in_flight_ship?: boolean;
+  /**
    * Ignored on the production/release-eligible path. The section is always
    * derived from durable `unique_operations` (or the test-only fixture below).
    * A caller-supplied precomputed report cannot mint release-eligible evidence.
@@ -3757,6 +3766,9 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       release_identity: version,
       matrix_covered_lifecycle_classes: input.matrix_covered_lifecycle_classes,
       executed_matrix_rows: input.executed_matrix_rows,
+      in_flight_ship:
+        input.in_flight_ship === true ||
+        input.unique_operation_manifest?.in_flight_ship === true,
     });
   let integrity = buildFrgIntegrity(scoreboard, composition, packProvenance);
 
@@ -4239,6 +4251,17 @@ export interface FactoryGateOpts {
   matrix_covered_lifecycle_classes?: readonly string[] | null;
   executed_matrix_rows?: readonly ExecutedMatrixRow[];
   /**
+   * Control-host generic run-store root for unique-operation collection.
+   * Defaults to `<resolveStateHome(env)>/runs` (same root factory-release
+   * uses for pack-loop scans). Tests inject a fake host store.
+   */
+  uniqueOperationRunsRoot?: string;
+  /**
+   * FRG pack nested under an admitted in-flight `ship`. factory-release
+   * prepare sets this. Standalone factory-gate leaves it unset.
+   */
+  inFlightShip?: boolean;
+  /**
    * Post-1.33 --from-run collect. When omitted, production builds hybrid-v2
    * provenance from the live pack + Layer A TAP (#1118). Tests inject a fake.
    */
@@ -4480,41 +4503,101 @@ async function loadFollowableChildRun(
   };
 }
 
+type ScannedUniqueOpRun = {
+  runId: string;
+  runJson: Record<string, unknown> | null;
+  events: Record<string, unknown>[];
+  summary: Record<string, unknown> | null;
+};
+
+function uniqueOperationRunsRoots(opts: FactoryGateOpts): string[] {
+  const env = opts.env ?? process.env;
+  const hostRoot =
+    opts.uniqueOperationRunsRoot ??
+    path.join(resolveStateHome({ env, hostname: () => "unused" }), "runs");
+  const worktreeRoot = path.join(opts.repoDir, ".agent-pipeline", "runs");
+  const roots = [hostRoot];
+  if (path.resolve(worktreeRoot) !== path.resolve(hostRoot)) roots.push(worktreeRoot);
+  return roots;
+}
+
+function executedMatrixRowsFromArtifactValue(value: unknown): ExecutedMatrixRow[] {
+  if (!Array.isArray(value)) return [];
+  const out: ExecutedMatrixRow[] = [];
+  for (const row of value) {
+    if (row === null || typeof row !== "object" || Array.isArray(row)) continue;
+    const o = row as Record<string, unknown>;
+    if (typeof o.candidate_sha !== "string" || o.candidate_sha.trim() === "") continue;
+    if (typeof o.layer !== "string" || typeof o.lifecycle_class !== "string") continue;
+    if (typeof o.operation !== "string" || typeof o.fault_state !== "string") continue;
+    if (typeof o.entrypoint !== "string" || typeof o.host !== "string") continue;
+    if (typeof o.observed_terminal !== "string" || typeof o.passed !== "boolean") continue;
+    out.push({
+      candidate_sha: o.candidate_sha,
+      layer: o.layer as ExecutedMatrixRow["layer"],
+      lifecycle_class: o.lifecycle_class as ExecutedMatrixRow["lifecycle_class"],
+      operation: o.operation,
+      fault_state: o.fault_state as ExecutedMatrixRow["fault_state"],
+      entrypoint: o.entrypoint,
+      host: o.host as ExecutedMatrixRow["host"],
+      observed_terminal: o.observed_terminal as ExecutedMatrixRow["observed_terminal"],
+      passed: o.passed,
+    });
+  }
+  return out;
+}
+
+function executedMatrixRowsFromRun(run: ScannedUniqueOpRun): ExecutedMatrixRow[] {
+  return [
+    ...executedMatrixRowsFromArtifactValue(run.runJson?.executed_matrix_rows),
+    ...executedMatrixRowsFromArtifactValue(run.summary?.executed_matrix_rows),
+  ];
+}
+
 /**
  * Classify durable run/event/summary artifacts. Missing store or unreadable
  * artifacts yield an empty attempt list (integrity failure, not a synthetic pass).
  * Only artifacts bound to the scored candidate/release are aggregated.
+ *
+ * Control-host `runsRoot` values (factory-release `resolveStateHome` / an
+ * injected host store) are the unique-operation source of truth. An empty
+ * candidate-worktree `.agent-pipeline/runs` directory is not proof that
+ * train, loop, or merge never ran.
  */
 async function collectUniqueOperationsFromRunStore(
-  repoDir: string,
+  runsRoots: readonly string[],
   fsDeps: FrgFsDeps,
   binding: { candidate_sha?: string | null; release_identity?: string | null } = {},
-): Promise<UniqueOperationAttempt[]> {
-  if (!fsDeps.readdir) return [];
-  const root = path.join(repoDir, ".agent-pipeline", "runs");
-  let entries: Array<{ name: string; isDirectory(): boolean }>;
-  try {
-    entries = await fsDeps.readdir(root);
-  } catch {
-    return [];
-  }
-  const runs: Array<{
-    runId: string;
-    runJson: Record<string, unknown> | null;
-    events: Record<string, unknown>[];
-    summary: Record<string, unknown> | null;
-  }> = [];
+): Promise<{
+  attempts: UniqueOperationAttempt[];
+  executed_matrix_rows: ExecutedMatrixRow[];
+}> {
+  if (!fsDeps.readdir) return { attempts: [], executed_matrix_rows: [] };
+  const runs: ScannedUniqueOpRun[] = [];
   const seen = new Set<string>();
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const dir = path.join(root, entry.name);
-    seen.add(entry.name);
-    runs.push({
-      runId: entry.name,
-      runJson: await readJsonObjectOrNull(fsDeps, path.join(dir, "run.json")),
-      events: await readJsonlObjects(fsDeps, path.join(dir, "events.jsonl")),
-      summary: await readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
-    });
+  const executed: ExecutedMatrixRow[] = [];
+  for (const root of runsRoots) {
+    if (!root) continue;
+    let entries: Array<{ name: string; isDirectory(): boolean }>;
+    try {
+      entries = await fsDeps.readdir(root);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (seen.has(entry.name)) continue;
+      const dir = path.join(root, entry.name);
+      seen.add(entry.name);
+      const run: ScannedUniqueOpRun = {
+        runId: entry.name,
+        runJson: await readJsonObjectOrNull(fsDeps, path.join(dir, "run.json")),
+        events: await readJsonlObjects(fsDeps, path.join(dir, "events.jsonl")),
+        summary: await readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
+      };
+      runs.push(run);
+      executed.push(...executedMatrixRowsFromRun(run));
+    }
   }
   for (const run of [...runs]) {
     for (const event of run.events) {
@@ -4532,9 +4615,16 @@ async function collectUniqueOperationsFromRunStore(
       if (!child) continue;
       seen.add(loopRunId);
       runs.push(child);
+      executed.push(...executedMatrixRowsFromRun(child));
     }
   }
-  return filterAttemptsBoundToCandidate(attemptsFromRunArtifacts(runs), binding);
+  return {
+    attempts: filterAttemptsBoundToCandidate(attemptsFromRunArtifacts(runs), binding),
+    executed_matrix_rows: bindExecutedMatrixRowsForCandidate(
+      executed,
+      (binding.candidate_sha ?? "").trim(),
+    ),
+  };
 }
 
 /**
@@ -4849,19 +4939,44 @@ export async function runFactoryGate(
       executed_matrix_rows: opts.executed_matrix_rows,
     };
   }
-  if (computeInput.unique_operations === undefined) {
+  const inFlightShip =
+    opts.inFlightShip === true ||
+    computeInput.in_flight_ship === true ||
+    computeInput.unique_operation_manifest?.in_flight_ship === true ||
+    opts.unique_operation_manifest?.in_flight_ship === true ||
+    computeInput.factory_release_binding != null;
+  if (inFlightShip) {
+    computeInput = {
+      ...computeInput,
+      in_flight_ship: true,
+      unique_operation_manifest: {
+        ...(computeInput.unique_operation_manifest ?? opts.unique_operation_manifest ?? {}),
+        in_flight_ship: true,
+      },
+    };
+  }
+  if (
+    computeInput.unique_operations === undefined ||
+    computeInput.executed_matrix_rows === undefined
+  ) {
     const scoredCandidateSha =
       computeInput.pack_provenance?.candidate_git_sha ??
       computeInput.unique_operation_manifest?.candidate_sha ??
       opts.unique_operation_manifest?.candidate_sha ??
       "";
-    const collected = await collectUniqueOperationsFromRunStore(opts.repoDir, fsDeps, {
-      candidate_sha: scoredCandidateSha,
-      release_identity: version,
-    });
+    const collected = await collectUniqueOperationsFromRunStore(
+      uniqueOperationRunsRoots(opts),
+      fsDeps,
+      {
+        candidate_sha: scoredCandidateSha,
+        release_identity: version,
+      },
+    );
     computeInput = {
       ...computeInput,
-      unique_operations: collected,
+      unique_operations: computeInput.unique_operations ?? collected.attempts,
+      executed_matrix_rows:
+        computeInput.executed_matrix_rows ?? collected.executed_matrix_rows,
       unique_operation_manifest:
         computeInput.unique_operation_manifest ??
         opts.unique_operation_manifest ??
@@ -4870,6 +4985,7 @@ export async function runFactoryGate(
           required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
           candidate_sha: scoredCandidateSha,
           release_identity: version,
+          ...(inFlightShip ? { in_flight_ship: true } : {}),
         },
     };
   }
