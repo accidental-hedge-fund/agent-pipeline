@@ -4518,6 +4518,22 @@ function pathInsideApprovedRunsRoot(
   return false;
 }
 
+function canonicalChildEventsPath(
+  loopRunId: string,
+  eventsPath: string,
+  approvedRoots: readonly string[],
+): string | null {
+  if (!loopRunId || !eventsPath || !path.isAbsolute(eventsPath)) return null;
+  const resolvedEvents = path.resolve(eventsPath);
+  for (const root of approvedRoots) {
+    if (!root) continue;
+    if (path.resolve(path.join(root, loopRunId, "events.jsonl")) === resolvedEvents) {
+      return resolvedEvents;
+    }
+  }
+  return null;
+}
+
 async function loadFollowableChildRun(
   fsDeps: FrgFsDeps,
   loopRunId: string,
@@ -4528,8 +4544,10 @@ async function loadFollowableChildRun(
   runJson: Record<string, unknown> | null;
   events: Record<string, unknown>[];
   summary: Record<string, unknown> | null;
+  eventsFilePath: string;
 } | null> {
-  const resolvedEvents = path.resolve(eventsPath);
+  const resolvedEvents = canonicalChildEventsPath(loopRunId, eventsPath, approvedRoots);
+  if (!resolvedEvents) return null;
   const dir = path.dirname(resolvedEvents);
   if (
     !pathInsideApprovedRunsRoot(resolvedEvents, approvedRoots) ||
@@ -4551,6 +4569,7 @@ async function loadFollowableChildRun(
     runJson: merged,
     events,
     summary,
+    eventsFilePath: resolvedEvents,
   };
 }
 
@@ -4559,6 +4578,7 @@ type ScannedUniqueOpRun = {
   runJson: Record<string, unknown> | null;
   events: Record<string, unknown>[];
   summary: Record<string, unknown> | null;
+  eventsFilePath?: string | null;
 };
 
 /** Canonicalize runs roots: resolve, drop empties, first occurrence wins. */
@@ -4679,7 +4699,9 @@ function executedMatrixRowsFromRun(run: ScannedUniqueOpRun): ExecutedMatrixRow[]
  * Control-host roots (loop state-home + generic `.agent-pipeline/runs`) are
  * the unique-operation source of truth. An empty candidate-worktree
  * `.agent-pipeline/runs` directory is not proof that train, loop, or merge
- * never ran. Deduplicate by run id across roots (first occurrence wins).
+ * never ran. Deduplicate by run id across roots (first occurrence wins) for
+ * aggregation. Train-link child resolution uses the event's canonical
+ * events path and is not first-occurrence run-id.
  */
 async function collectUniqueOperationsFromRunStore(
   runsRoots: readonly string[],
@@ -4696,6 +4718,7 @@ async function collectUniqueOperationsFromRunStore(
   if (!fsDeps.readdir) return { attempts: [], executed_matrix_rows: [] };
   const runs: ScannedUniqueOpRun[] = [];
   const seen = new Set<string>();
+  const seenEventsPaths = new Set<string>();
   const executed: ExecutedMatrixRow[] = [];
   for (const root of runsRoots) {
     if (!root) continue;
@@ -4710,12 +4733,15 @@ async function collectUniqueOperationsFromRunStore(
       if (seen.has(entry.name)) continue;
       const dir = path.join(root, entry.name);
       seen.add(entry.name);
+      const eventsFilePath = path.resolve(path.join(dir, "events.jsonl"));
       const run: ScannedUniqueOpRun = {
         runId: entry.name,
         runJson: await readJsonObjectOrNull(fsDeps, path.join(dir, "run.json")),
-        events: await readJsonlObjects(fsDeps, path.join(dir, "events.jsonl")),
+        events: await readJsonlObjects(fsDeps, eventsFilePath),
         summary: await readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
+        eventsFilePath,
       };
+      seenEventsPaths.add(eventsFilePath);
       runs.push(run);
       executed.push(...executedMatrixRowsFromRun(run));
     }
@@ -4731,16 +4757,57 @@ async function collectUniqueOperationsFromRunStore(
           : typeof event.events_path === "string"
             ? event.events_path.trim()
             : "";
-      if (!loopRunId || !eventsPath || seen.has(loopRunId)) continue;
+      const resolvedEvents = canonicalChildEventsPath(loopRunId, eventsPath, runsRoots);
+      if (!loopRunId || !eventsPath || !resolvedEvents) continue;
+      if (seenEventsPaths.has(resolvedEvents)) continue;
       const child = await loadFollowableChildRun(fsDeps, loopRunId, eventsPath, runsRoots);
       if (!child) continue;
-      seen.add(loopRunId);
+      seenEventsPaths.add(child.eventsFilePath);
       runs.push(child);
       executed.push(...executedMatrixRowsFromRun(child));
     }
   }
+  const attempts = filterAttemptsBoundToCandidate(attemptsFromRunArtifacts(runs), binding).map(
+    (attempt) => {
+      if (attempt.train_loop_linked !== true) return attempt;
+      const eventsPath =
+        typeof attempt.child_events_path === "string" ? attempt.child_events_path.trim() : "";
+      const childRunId =
+        typeof attempt.child_run_id === "string" ? attempt.child_run_id.trim() : "";
+      const child =
+        childRunId && eventsPath
+          ? runs.find(
+              (r) =>
+                r.runId === childRunId &&
+                typeof r.eventsFilePath === "string" &&
+                path.resolve(r.eventsFilePath) === path.resolve(eventsPath),
+            )
+          : undefined;
+      const childEventsPath =
+        typeof child?.eventsFilePath === "string" ? child.eventsFilePath.trim() : "";
+      const pathLoadsLinkedChild =
+        eventsPath !== "" &&
+        childEventsPath !== "" &&
+        path.isAbsolute(eventsPath) &&
+        path.isAbsolute(childEventsPath) &&
+        path.resolve(eventsPath) === path.resolve(childEventsPath);
+      if (
+        !pathLoadsLinkedChild ||
+        !pathInsideApprovedRunsRoot(eventsPath, runsRoots)
+      ) {
+        return {
+          ...attempt,
+          train_loop_linked: false,
+          child_logical_operation_id: null,
+          child_run_id: null,
+          child_events_path: null,
+        };
+      }
+      return attempt;
+    },
+  );
   return {
-    attempts: filterAttemptsBoundToCandidate(attemptsFromRunArtifacts(runs), binding),
+    attempts,
     // Raw artifact rows. The in-flight inventory fallback binds these against
     // the scored SHA before deciding whether a complete candidate inventory
     // may attach.

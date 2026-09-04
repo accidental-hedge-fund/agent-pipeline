@@ -8,6 +8,7 @@ import {
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
   filterAttemptsBoundToCandidate,
+  mapPublicEntrypointFromRunId,
   passingUniqueOperationAttempts,
   passingUniqueOperationManifest,
   reconcileCompletedSideEffect,
@@ -448,6 +449,14 @@ test("attemptsFromRunArtifacts: advance kind is not single and falls through to 
   ]);
   assert.equal(noPrefix[0]!.entrypoint, null);
   assert.notEqual(noPrefix[0]!.entrypoint, "single");
+});
+
+test("mapPublicEntrypointFromRunId: single/merge/merge-queue prefixes (#1440)", () => {
+  assert.equal(mapPublicEntrypointFromRunId("single-1"), "single");
+  assert.equal(mapPublicEntrypointFromRunId("mq-1"), "merge-queue");
+  assert.equal(mapPublicEntrypointFromRunId("merge-queue-1"), "merge-queue");
+  assert.equal(mapPublicEntrypointFromRunId("merge-1"), "merge");
+  assert.equal(mapPublicEntrypointFromRunId("merge-queue-repair-pr-42"), null);
 });
 
 test("attemptsFromRunArtifacts: merge-queue prefixes are checked before merge (#1434)", () => {
@@ -988,6 +997,7 @@ test("attemptsFromRunArtifacts: train_loop_linked without followable child is no
       runJson: { run_id: "loop-child", kind: "loop", logical_operation_id: "lop-train" },
       events: [{ type: "run_start", entrypoint: "loop", logical_operation_id: "lop-train" }],
       summary: { logical_operation_id: "lop-train" },
+      eventsFilePath: "/state/runs/loop-child/events.jsonl",
     },
   ]);
   assert.equal(followable[0]!.train_loop_linked, true);
@@ -999,6 +1009,218 @@ test("attemptsFromRunArtifacts: train_loop_linked without followable child is no
     manifest: { required_entrypoints: ["train"], required_lifecycle_classes: [], live_train_linkage_present: false },
   });
   assert.ok(report.integrity.missing_required_coverage > 0);
+});
+
+test("attemptsFromRunArtifacts: child run_id fallback mismatch still counts as live train-link (#1440)", () => {
+  const attempts = attemptsFromRunArtifacts([
+    {
+      runId: "train-T",
+      runJson: { run_id: "train-T", kind: "train", logical_operation_id: "T" },
+      events: [
+        { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+        {
+          type: "train_loop_linked",
+          logical_operation_id: "T",
+          loop_run_id: "loop-1",
+          events: "/host-state/runs/loop-1/events.jsonl",
+        },
+      ],
+      summary: null,
+    },
+    {
+      runId: "loop-1",
+      runJson: { run_id: "loop-1", kind: "loop" },
+      events: [{ type: "run_start", entrypoint: "loop" }],
+      summary: null,
+      eventsFilePath: "/host-state/runs/loop-1/events.jsonl",
+    },
+  ]);
+  const train = attempts.find((a) => a.run_id === "train-T");
+  assert.equal(train!.train_loop_linked, true);
+  assert.equal(train!.child_logical_operation_id, "T");
+  assert.equal(train!.child_run_id, "loop-1");
+  assert.equal(train!.identity_provenance, "minted");
+  const child = attempts.find((a) => a.run_id === "loop-1");
+  assert.equal(child!.identity_provenance, "run_id_fallback");
+  assert.equal(child!.logical_operation_id, "loop-1");
+  const report = aggregateUniqueOperationReliability({
+    attempts,
+    manifest: {
+      required_entrypoints: ["train", "loop"],
+      required_lifecycle_classes: [],
+      live_train_linkage_present: false,
+    },
+  });
+  assert.equal(report.integrity.contradictory_correlation, 0);
+  assert.equal(report.entrypoint_coverage.missing.includes("train"), false);
+  assert.ok(report.integrity.missing_required_coverage === 0 || !report.entrypoint_coverage.missing.includes("train"));
+});
+
+test("attemptsFromRunArtifacts: relative train_loop_linked events path is not followable (#1440)", () => {
+  const attempts = attemptsFromRunArtifacts([
+    {
+      runId: "train-rel",
+      runJson: { run_id: "train-rel", kind: "train", logical_operation_id: "T" },
+      events: [
+        {
+          type: "train_loop_linked",
+          logical_operation_id: "T",
+          loop_run_id: "loop-1",
+          events: "runs/loop-1/events.jsonl",
+        },
+      ],
+      summary: null,
+    },
+    {
+      runId: "loop-1",
+      runJson: { run_id: "loop-1" },
+      events: [{ type: "run_start", entrypoint: "loop" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(attempts[0]!.train_loop_linked, false);
+});
+
+test("attemptsFromRunArtifacts: unrelated in-root events path is not followable (#1440)", () => {
+  const childPath = "/host-state/runs/loop-1/events.jsonl";
+  const unrelated = "/host-state/runs/other/events.jsonl";
+  const mismatched = attemptsFromRunArtifacts([
+    {
+      runId: "train-T",
+      runJson: { run_id: "train-T", kind: "train", logical_operation_id: "T" },
+      events: [
+        {
+          type: "train_loop_linked",
+          logical_operation_id: "T",
+          loop_run_id: "loop-1",
+          events: unrelated,
+        },
+      ],
+      summary: null,
+    },
+    {
+      runId: "loop-1",
+      runJson: { run_id: "loop-1", kind: "loop", logical_operation_id: "T" },
+      events: [{ type: "run_start", entrypoint: "loop", logical_operation_id: "T" }],
+      summary: null,
+      eventsFilePath: childPath,
+    },
+  ]);
+  assert.equal(mismatched[0]!.train_loop_linked, false);
+
+  const missingPath = attemptsFromRunArtifacts([
+    {
+      runId: "train-T2",
+      runJson: { run_id: "train-T2", kind: "train", logical_operation_id: "T" },
+      events: [
+        {
+          type: "train_loop_linked",
+          logical_operation_id: "T",
+          loop_run_id: "loop-1",
+          events: childPath,
+        },
+      ],
+      summary: null,
+    },
+    {
+      runId: "loop-1",
+      runJson: { run_id: "loop-1", kind: "loop", logical_operation_id: "T" },
+      events: [{ type: "run_start", entrypoint: "loop", logical_operation_id: "T" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(missingPath[0]!.train_loop_linked, false);
+});
+
+test("attemptsFromRunArtifacts: duplicate run id at a different path does not hide the event-referenced child (#1440)", () => {
+  const stalePath = "/host-state/runs/loop-1/events.jsonl";
+  const linkedPath = "/control-repo/.agent-pipeline/runs/loop-1/events.jsonl";
+  const train = {
+    runId: "train-T",
+    runJson: { run_id: "train-T", kind: "train", logical_operation_id: "T" },
+    events: [
+      { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+      {
+        type: "train_loop_linked",
+        logical_operation_id: "T",
+        loop_run_id: "loop-1",
+        events: linkedPath,
+      },
+    ],
+    summary: null,
+  };
+  const stale = {
+    runId: "loop-1",
+    runJson: { run_id: "loop-1", kind: "loop" },
+    events: [{ type: "run_start", entrypoint: "loop" }],
+    summary: null,
+    eventsFilePath: stalePath,
+  };
+  const linked = {
+    runId: "loop-1",
+    runJson: { run_id: "loop-1", kind: "loop" },
+    events: [{ type: "run_start", entrypoint: "loop" }],
+    summary: null,
+    eventsFilePath: linkedPath,
+  };
+  for (const runs of [
+    [train, stale, linked],
+    [train, linked, stale],
+  ]) {
+    const attempts = attemptsFromRunArtifacts(runs);
+    const found = attempts.find((a) => a.run_id === "train-T");
+    assert.equal(found!.train_loop_linked, true);
+    assert.equal(found!.child_run_id, "loop-1");
+    assert.equal(found!.child_events_path, linkedPath);
+  }
+});
+
+test("attemptsFromRunArtifacts: child minted logical id without event logical id is followable (#1440)", () => {
+  const childPath = "/host-state/runs/loop-1/events.jsonl";
+  const attempts = attemptsFromRunArtifacts([
+    {
+      runId: "train-T",
+      runJson: { run_id: "train-T", kind: "train", logical_operation_id: "T" },
+      events: [
+        { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+        {
+          type: "train_loop_linked",
+          loop_run_id: "loop-1",
+          events: childPath,
+        },
+      ],
+      summary: null,
+    },
+    {
+      runId: "loop-1",
+      runJson: { run_id: "loop-1", kind: "loop", logical_operation_id: "C" },
+      events: [{ type: "run_start", entrypoint: "loop", logical_operation_id: "C" }],
+      summary: { logical_operation_id: "C" },
+      eventsFilePath: childPath,
+    },
+  ]);
+  const train = attempts.find((a) => a.run_id === "train-T");
+  assert.equal(train!.train_loop_linked, true);
+  assert.equal(train!.child_logical_operation_id, "C");
+  assert.equal(train!.child_run_id, "loop-1");
+  const report = aggregateUniqueOperationReliability({
+    attempts,
+    manifest: {
+      required_entrypoints: ["train", "loop"],
+      required_lifecycle_classes: [],
+      live_train_linkage_present: false,
+    },
+  });
+  assert.equal(report.integrity.contradictory_correlation, 0);
+  assert.equal(report.entrypoint_coverage.missing.includes("train"), false);
+  assert.equal(report.integrity.missing_required_coverage, 0);
+});
+
+test("attemptsFromRunArtifacts: single prefix maps when kind and start event are absent (#1440)", () => {
+  const attempts = attemptsFromRunArtifacts([
+    { runId: "single-1", runJson: { run_id: "single-1" }, events: [], summary: null },
+  ]);
+  assert.equal(attempts[0]!.entrypoint, "single");
 });
 
 test("computeFrgEvidence: caller-supplied operation_reliability is not durable proof", () => {

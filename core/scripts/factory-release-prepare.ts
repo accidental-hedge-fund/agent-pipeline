@@ -1619,8 +1619,8 @@ const CANDIDATE_INVENTORY_SCHEMA_VERSION = 1 as const;
 
 export interface LoadCandidateFaultRecoveryInventoryDeps {
   /**
-   * Resolve `git rev-parse HEAD` for the scored checkout. Tests inject this
-   * so unit tests never spawn git.
+   * Optional checkout SHA probe. Not a gate: a HEAD mismatch does not refuse
+   * a valid commit-bound blob at the scored SHA. Tests may still inject it.
    */
   resolveCheckoutSha?: (repoDir: string) => string | null | Promise<string | null>;
   /**
@@ -1727,21 +1727,6 @@ export function parseFaultRecoveryInventoryJson(
   return rows;
 }
 
-async function defaultResolveCandidateCheckoutSha(
-  repoDir: string,
-): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["-C", repoDir, "rev-parse", "HEAD"],
-      { encoding: "utf8", timeout: 5_000 },
-    );
-    return parseExactGitSha(String(stdout).trim());
-  } catch {
-    return null;
-  }
-}
-
 async function defaultShowCandidateBlob(
   repoDir: string,
   sha: string,
@@ -1770,11 +1755,11 @@ async function defaultLoadCandidateMatrixRows(
 }
 
 /**
- * Production in-flight inventory loader. Verifies checkout HEAD equals
- * `candidateSha`, then loads the commit blob at that SHA. A dirty worktree
+ * Production in-flight inventory loader. Loads the commit-bound inventory
+ * blob at `candidateSha`. Checkout HEAD MAY differ from that SHA; a HEAD
+ * mismatch does not refuse a valid blob at the scored SHA. A dirty worktree
  * cannot replace the blob. Candidate TypeScript is never imported or
- * executed. SHA mismatch, unreadable HEAD, or invalid inventory data
- * yields no inventory rows.
+ * executed. Invalid inventory data yields no inventory rows.
  */
 export async function defaultLoadCandidateFaultRecoveryInventory(
   args: { candidateSha: string; repoDir: string },
@@ -1784,19 +1769,13 @@ export async function defaultLoadCandidateFaultRecoveryInventory(
   const repoDir = typeof args.repoDir === "string" ? args.repoDir.trim() : "";
   if (!candidateSha || !repoDir) return { rows: [], sourceSha: null };
 
-  const resolveSha = deps.resolveCheckoutSha ?? defaultResolveCandidateCheckoutSha;
-  const checkoutSha = parseExactGitSha(await resolveSha(repoDir));
-  if (!checkoutSha || checkoutSha !== candidateSha) {
-    return { rows: [], sourceSha: checkoutSha };
-  }
-
   const loadRows =
     deps.loadMatrixRows ??
     ((dir: string) =>
       defaultLoadCandidateMatrixRows(dir, candidateSha, deps.showCandidateBlob));
   const rows = await loadRows(repoDir);
   if (!rows) return { rows: [], sourceSha: null };
-  return { rows, sourceSha: checkoutSha };
+  return { rows, sourceSha: candidateSha };
 }
 
 /**

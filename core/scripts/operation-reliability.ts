@@ -6,6 +6,7 @@
 // or scheduler.
 
 import * as crypto from "node:crypto";
+import * as path from "node:path";
 import { coveredLifecycleClassesFromExecutedRows, type ExecutedMatrixRow } from "./fault-recovery-matrix.ts";
 
 function stableFingerprint(value: unknown): string {
@@ -188,6 +189,11 @@ export interface UniqueOperationReliability {
   exclusions: UniqueOperationExclusion[];
   integrity: UniqueOperationIntegrityCounts;
   operations: UniqueOperationEvidenceRef[];
+  /**
+   * Binder-accepted executed matrix rows that fed #1333 coverage for this
+   * scored SHA. Omitted when no rows were attached.
+   */
+  executed_matrix_rows?: ExecutedMatrixRow[];
 }
 
 function rate(numerator: number, denominator: number): UniqueOperationRate {
@@ -355,9 +361,6 @@ export function aggregateUniqueOperationReliability(input: {
     const child = typeof attempt.child_logical_operation_id === "string"
       ? attempt.child_logical_operation_id.trim()
       : "";
-    if (attempt.train_loop_linked === true && child && child !== id) {
-      contradictoryCorrelation += 1;
-    }
     const entry = byId.get(uniqueOpKey(id)) ?? {
       run_ids: [],
       terminals: [],
@@ -480,8 +483,8 @@ export function aggregateUniqueOperationReliability(input: {
       ...(entry.release_identity ? { release_identity: entry.release_identity } : {}),
     });
 
-    // Live train linkage requires a followable child that inherited this id.
-    if (entry.train_loop_linked && entry.child_ids.includes(id)) {
+    // Live train-link: followable child logical id from the event or loaded child.
+    if (entry.train_loop_linked && entry.child_ids.length > 0) {
       liveLinkage = true;
     }
 
@@ -560,6 +563,9 @@ export function aggregateUniqueOperationReliability(input: {
     required_lifecycle_classes: requiredLifecycle,
   });
 
+  const boundExecutedRows = (input.executed_matrix_rows ?? []).filter(
+    (row) => typeof row.candidate_sha === "string" && row.candidate_sha.trim() === scoredSha,
+  );
   return {
     schema_version: UNIQUE_OPERATION_SCHEMA_VERSION,
     candidate_sha: candidateSha,
@@ -582,6 +588,7 @@ export function aggregateUniqueOperationReliability(input: {
       missing_required_coverage: missingRequiredCoverage,
     },
     operations,
+    ...(boundExecutedRows.length > 0 ? { executed_matrix_rows: boundExecutedRows } : {}),
   };
 }
 
@@ -692,6 +699,8 @@ type ScannedRunArtifact = {
   runJson: Record<string, unknown> | null;
   events: readonly Record<string, unknown>[];
   summary: Record<string, unknown> | null;
+  /** Absolute events.jsonl path this artifact was loaded from, when known. */
+  eventsFilePath?: string | null;
 };
 
 function artifactLogicalId(run: ScannedRunArtifact): string | null {
@@ -737,6 +746,26 @@ function trainLinkedEventRefs(event: Record<string, unknown>): {
     loopRunId: nonEmptyTrimmed(event.loop_run_id),
     eventsPath: nonEmptyTrimmed(event.events) ?? nonEmptyTrimmed(event.events_path),
   };
+}
+
+function sameAbsoluteEventsPath(
+  eventPath: string | null | undefined,
+  artifactPath: string | null | undefined,
+): boolean {
+  const left = nonEmptyTrimmed(eventPath);
+  const right = nonEmptyTrimmed(artifactPath);
+  if (!left || !right) return false;
+  if (!path.isAbsolute(left) || !path.isAbsolute(right)) return false;
+  return path.resolve(left) === path.resolve(right);
+}
+
+function followableChildLogicalId(
+  childMinted: string | null,
+  eventLogical: string | null,
+  trainLogical: string | null,
+): string | null {
+  if (childMinted && trainLogical && childMinted !== trainLogical) return childMinted;
+  return eventLogical ?? childMinted;
 }
 
 function attemptIsUnboundInflight(
@@ -807,26 +836,37 @@ export function filterAttemptsBoundToCandidate(
 
 /**
  * Map a durable run-id prefix to a required public entrypoint. `merge-queue-`
- * and `mq-` are checked before remaining `merge-`. Unrecognized ids stay null.
+ * and `mq-` are checked before remaining `merge-`. `merge-queue-repair-pr-*`
+ * helper ids are not public `merge-queue`. Unrecognized ids stay null.
  */
 export function mapPublicEntrypointFromRunId(runId: unknown): string | null {
   const id = nonEmptyTrimmed(runId);
   if (!id) return null;
+  if (id.startsWith("merge-queue-repair-pr-")) return null;
   if (id.startsWith("merge-queue-") || id.startsWith("mq-")) return "merge-queue";
   if (id.startsWith("train-")) return "train";
   if (id.startsWith("loop-")) return "loop";
+  if (id.startsWith("single-")) return "single";
   if (id.startsWith("merge-")) return "merge";
   // `runIdFor`: `<issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ>`
   if (/^\d+-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(id)) return "drive";
   return null;
 }
 
+function findLinkedChildByEventsPath(
+  runs: readonly ScannedRunArtifact[],
+  loopRunId: string,
+  eventsPath: string,
+): ScannedRunArtifact | undefined {
+  return runs.find(
+    (r) => r.runId === loopRunId && sameAbsoluteEventsPath(eventsPath, r.eventsFilePath),
+  );
+}
+
 /** Map scanned run artifacts into classifier attempts. Does not invent minted ids. */
 export function attemptsFromRunArtifacts(
   runs: readonly ScannedRunArtifact[],
 ): UniqueOperationAttempt[] {
-  const byId = new Map<string, ScannedRunArtifact>();
-  for (const run of runs) byId.set(run.runId, run);
   return runs.map((run) => {
     const start = run.events.find((e) => e.type === "run_start");
     const identitySources = uniqueNonEmpty([
@@ -865,10 +905,13 @@ export function attemptsFromRunArtifacts(
       if (event.type !== "train_loop_linked") continue;
       const refs = trainLinkedEventRefs(event);
       if (!refs.loopRunId || !refs.eventsPath) continue;
-      const child = byId.get(refs.loopRunId);
+      if (!path.isAbsolute(refs.eventsPath)) continue;
+      const child = findLinkedChildByEventsPath(runs, refs.loopRunId, refs.eventsPath);
       if (!child) continue;
-      const childId = artifactLogicalId(child);
-      if (!logical || !childId || childId !== logical) continue;
+      const eventLogical = nonEmptyTrimmed(event.logical_operation_id);
+      const childMinted = artifactLogicalId(child);
+      const childId = followableChildLogicalId(childMinted, eventLogical, logical);
+      if (!logical || !childId) continue;
       trainLinked = true;
       childLogical = childId;
       childRunId = refs.loopRunId;

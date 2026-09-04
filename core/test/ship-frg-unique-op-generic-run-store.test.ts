@@ -794,7 +794,7 @@ test("defaultScoreBoundPackLoop sets inFlightShip and uses the dual-root resolve
   assert.match(src, /isReleaseEligibleFrgPass\(evidence, \{ requireAttestation: true \}\)/);
 });
 
-test("default inventory loader does not claim control-checkout rows for another SHA (#1434)", async () => {
+test("default inventory loader attaches complete blob at C when HEAD is not C (#1440)", async () => {
   let loadCalls = 0;
   const loaded = await defaultLoadCandidateFaultRecoveryInventory(
     { candidateSha: CANDIDATE, repoDir: CANDIDATE_REPO },
@@ -806,9 +806,9 @@ test("default inventory loader does not claim control-checkout rows for another 
       },
     },
   );
-  assert.equal(loaded.rows.length, 0);
-  assert.equal(loadCalls, 0);
-  assert.equal(loaded.sourceSha, OTHER);
+  assert.equal(loadCalls, 1);
+  assert.equal(loaded.rows.length, FAULT_RECOVERY_MATRIX.length);
+  assert.equal(loaded.sourceSha, CANDIDATE);
 });
 
 test("default inventory loader returns the candidate-tree rows when HEAD matches (#1434)", async () => {
@@ -828,7 +828,7 @@ test("default inventory loader returns the candidate-tree rows when HEAD matches
   assert.notEqual(loaded.rows.length, FAULT_RECOVERY_MATRIX.length);
 });
 
-test("default inventory loader returns no rows when checkout SHA is unreadable (#1434)", async () => {
+test("default inventory loader still loads the scored SHA when HEAD is unreadable (#1440)", async () => {
   let loadCalls = 0;
   const loaded = await defaultLoadCandidateFaultRecoveryInventory(
     { candidateSha: CANDIDATE, repoDir: CANDIDATE_REPO },
@@ -840,9 +840,9 @@ test("default inventory loader returns no rows when checkout SHA is unreadable (
       },
     },
   );
-  assert.equal(loaded.rows.length, 0);
-  assert.equal(loadCalls, 0);
-  assert.equal(loaded.sourceSha, null);
+  assert.equal(loadCalls, 1);
+  assert.equal(loaded.rows.length, FAULT_RECOVERY_MATRIX.length);
+  assert.equal(loaded.sourceSha, CANDIDATE);
 });
 
 test("inventory JSON parser does not execute candidate TypeScript (#1434)", () => {
@@ -944,14 +944,431 @@ test("runbook names both host roots and the in-flight missing-field keep rule (#
     join(CORE_ROOT, "..", "docs/factory-reliability-gate-runbook.md"),
     "utf8",
   );
-  assert.ok(runbook.includes("Unique-operation reliability (#1368 / #1428 / #1434)"));
+  assert.ok(runbook.includes("Unique-operation reliability (#1368 / #1428 / #1434 / #1440)"));
   assert.ok(runbook.includes("resolveStateHome()>/runs"));
   assert.ok(runbook.includes(".agent-pipeline/runs"));
   assert.ok(runbook.includes("injectable dual-root resolver"));
   assert.ok(runbook.includes("opts.inFlightShip === true"));
   assert.ok(runbook.includes("sourceSha"));
+  assert.ok(runbook.includes("followable `train_loop_linked`"));
+  assert.ok(runbook.includes("single-"));
+  assert.ok(runbook.includes("merge-queue-"));
+  assert.ok(runbook.includes("HEAD"));
   assert.equal(
     runbook.includes("Ship FRG scoring reads that evidence from the **control-host** durable store"),
     false,
   );
+});
+
+test("in-flight ship observes unbound single/merge/merge-queue prefixes as observation-only (#1440)", async () => {
+  const files = new Map<string, string>();
+  writeUnboundPrefixRun(files, GENERIC, "single-1");
+  writeUnboundPrefixRun(files, GENERIC, "merge-1");
+  writeUnboundPrefixRun(files, GENERIC, "merge-queue-1");
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.ok(section.entrypoint_coverage.observed.includes("single"));
+  assert.ok(section.entrypoint_coverage.observed.includes("merge"));
+  assert.ok(section.entrypoint_coverage.observed.includes("merge-queue"));
+  assert.equal(section.clean_completion.numerator, 0);
+  assert.equal(section.exclusions.length, 0);
+});
+
+test("train-only plus numeric-drive host store stays fail-closed for single/merge/merge-queue (#1440)", async () => {
+  const files = new Map<string, string>();
+  writeUnboundPrefixRun(files, GENERIC, "train-host");
+  writeUnboundPrefixRun(files, GENERIC, "1434-2026-09-04T18-24-39-123Z");
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const missing = result.evidence.operation_reliability!.entrypoint_coverage.missing;
+  assert.ok(missing.includes("single"));
+  assert.ok(missing.includes("merge"));
+  assert.ok(missing.includes("merge-queue"));
+  assert.match(
+    uniqueOperationSloFailure(result.evidence.operation_reliability!) ?? "",
+    /missing required coverage/,
+  );
+});
+
+test("nested train_merge events are not public merge coverage (#1440)", async () => {
+  const files = new Map<string, string>();
+  const dir = `${GENERIC}/train-nested-merge`;
+  files.set(
+    `${dir}/run.json`,
+    JSON.stringify({ run_id: "train-nested-merge", kind: "train" }),
+  );
+  files.set(
+    `${dir}/events.jsonl`,
+    [
+      { type: "run_start", entrypoint: "train" },
+      { type: "train_merge_attempted", issue: 10, pr: 20 },
+      { type: "train_merge_proven", issue: 10, pr: 20 },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n"),
+  );
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const observed = result.evidence.operation_reliability!.entrypoint_coverage.observed;
+  assert.ok(observed.includes("train"));
+  assert.ok(!observed.includes("merge"));
+  assert.ok(!observed.includes("merge-queue"));
+});
+
+test("merge-queue-repair-pr helper ids are not public merge-queue coverage (#1440)", async () => {
+  const files = new Map<string, string>();
+  writeUnboundPrefixRun(files, GENERIC, "merge-queue-repair-pr-42");
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const observed = result.evidence.operation_reliability!.entrypoint_coverage.observed;
+  assert.ok(!observed.includes("merge-queue"));
+  assert.ok(!observed.includes("merge"));
+});
+
+test("followable control-host train_loop_linked with child run_id fallback satisfies #1301 (#1440)", async () => {
+  const files = new Map<string, string>();
+  const childEvents = `${GENERIC}/loop-1/events.jsonl`;
+  files.set(
+    `${GENERIC}/train-T/run.json`,
+    JSON.stringify({ run_id: "train-T", kind: "train", logical_operation_id: "T" }),
+  );
+  files.set(
+    `${GENERIC}/train-T/events.jsonl`,
+    [
+      { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+      {
+        type: "train_loop_linked",
+        logical_operation_id: "T",
+        loop_run_id: "loop-1",
+        events: childEvents,
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n"),
+  );
+  files.set(`${GENERIC}/loop-1/run.json`, JSON.stringify({ run_id: "loop-1", kind: "loop" }));
+  files.set(
+    `${GENERIC}/loop-1/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop" }) + "\n",
+  );
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      loadCandidateFaultRecoveryInventory: async () => ({
+        rows: FAULT_RECOVERY_MATRIX,
+        sourceSha: CANDIDATE,
+      }),
+      scoreInput: scoreInput({
+        unique_operation_manifest: {
+          ...passingUniqueOperationManifest({
+            release_identity: "1.29.1",
+            candidate_sha: CANDIDATE,
+          }),
+          required_entrypoints: ["train", "loop"],
+          required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+          live_train_linkage_present: false,
+          in_flight_ship: true,
+        },
+      }),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.equal(section.integrity.contradictory_correlation, 0);
+  assert.equal(section.integrity.missing_required_coverage, 0);
+});
+
+test("duplicate stale child id in an earlier approved root does not drop a path-matched train link (#1440)", async () => {
+  const files = new Map<string, string>();
+  const linkedEvents = `${GENERIC}/loop-1/events.jsonl`;
+  files.set(
+    `${STATE_HOME}/loop-1/run.json`,
+    JSON.stringify({ run_id: "loop-1", kind: "loop" }),
+  );
+  files.set(
+    `${STATE_HOME}/loop-1/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop", stale: true }) + "\n",
+  );
+  files.set(
+    `${GENERIC}/train-T/run.json`,
+    JSON.stringify({ run_id: "train-T", kind: "train", logical_operation_id: "T" }),
+  );
+  files.set(
+    `${GENERIC}/train-T/events.jsonl`,
+    [
+      { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+      {
+        type: "train_loop_linked",
+        logical_operation_id: "T",
+        loop_run_id: "loop-1",
+        events: linkedEvents,
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n"),
+  );
+  files.set(`${GENERIC}/loop-1/run.json`, JSON.stringify({ run_id: "loop-1", kind: "loop" }));
+  files.set(
+    `${GENERIC}/loop-1/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop" }) + "\n",
+  );
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      loadCandidateFaultRecoveryInventory: async () => ({
+        rows: FAULT_RECOVERY_MATRIX,
+        sourceSha: CANDIDATE,
+      }),
+      scoreInput: scoreInput({
+        unique_operation_manifest: {
+          ...passingUniqueOperationManifest({
+            release_identity: "1.29.1",
+            candidate_sha: CANDIDATE,
+          }),
+          required_entrypoints: ["train", "loop"],
+          required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+          live_train_linkage_present: false,
+          in_flight_ship: true,
+        },
+      }),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.equal(section.integrity.contradictory_correlation, 0);
+  assert.equal(section.integrity.missing_required_coverage, 0);
+});
+
+test("unrelated in-root train_loop_linked events path does not satisfy #1301 (#1440)", async () => {
+  const files = new Map<string, string>();
+  const unrelated = `${GENERIC}/other/events.jsonl`;
+  files.set(
+    `${GENERIC}/train-T/run.json`,
+    JSON.stringify({ run_id: "train-T", kind: "train", logical_operation_id: "T" }),
+  );
+  files.set(
+    `${GENERIC}/train-T/events.jsonl`,
+    [
+      { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+      {
+        type: "train_loop_linked",
+        logical_operation_id: "T",
+        loop_run_id: "loop-1",
+        events: unrelated,
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n"),
+  );
+  files.set(`${GENERIC}/loop-1/run.json`, JSON.stringify({ run_id: "loop-1", kind: "loop" }));
+  files.set(
+    `${GENERIC}/loop-1/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop" }) + "\n",
+  );
+  files.set(`${GENERIC}/other/run.json`, JSON.stringify({ run_id: "other", kind: "loop" }));
+  files.set(
+    `${GENERIC}/other/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop" }) + "\n",
+  );
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      scoreInput: scoreInput({
+        unique_operation_manifest: {
+          ...passingUniqueOperationManifest({
+            release_identity: "1.29.1",
+            candidate_sha: CANDIDATE,
+          }),
+          required_entrypoints: ["train", "loop"],
+          required_lifecycle_classes: [],
+          live_train_linkage_present: false,
+          in_flight_ship: true,
+        },
+      }),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.ok(section.integrity.missing_required_coverage > 0);
+});
+
+test("child minted logical id without event logical id satisfies #1301 (#1440)", async () => {
+  const files = new Map<string, string>();
+  const childEvents = `${GENERIC}/loop-1/events.jsonl`;
+  files.set(
+    `${GENERIC}/train-T/run.json`,
+    JSON.stringify({ run_id: "train-T", kind: "train", logical_operation_id: "T" }),
+  );
+  files.set(
+    `${GENERIC}/train-T/events.jsonl`,
+    [
+      { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+      {
+        type: "train_loop_linked",
+        loop_run_id: "loop-1",
+        events: childEvents,
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n"),
+  );
+  files.set(
+    `${GENERIC}/loop-1/run.json`,
+    JSON.stringify({ run_id: "loop-1", kind: "loop", logical_operation_id: "C" }),
+  );
+  files.set(
+    `${GENERIC}/loop-1/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop", logical_operation_id: "C" }) + "\n",
+  );
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      loadCandidateFaultRecoveryInventory: async () => ({
+        rows: FAULT_RECOVERY_MATRIX,
+        sourceSha: CANDIDATE,
+      }),
+      scoreInput: scoreInput({
+        unique_operation_manifest: {
+          ...passingUniqueOperationManifest({
+            release_identity: "1.29.1",
+            candidate_sha: CANDIDATE,
+          }),
+          required_entrypoints: ["train", "loop"],
+          required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+          live_train_linkage_present: false,
+          in_flight_ship: true,
+        },
+      }),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.equal(section.integrity.contradictory_correlation, 0);
+  assert.equal(section.integrity.missing_required_coverage, 0);
+});
+
+test("single parent plus nested loop child observes both entrypoints (#1440)", async () => {
+  const files = new Map<string, string>();
+  writeUnboundPrefixRun(files, GENERIC, "single-parent", { kind: "single" });
+  writeUnboundPrefixRun(files, GENERIC, "loop-child", { kind: "loop" });
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const observed = result.evidence.operation_reliability!.entrypoint_coverage.observed;
+  assert.ok(observed.includes("single"));
+  assert.ok(observed.includes("loop"));
+});
+
+test("pipeline single/merge/merge-queue persist public admission through initRunDir (#1440)", () => {
+  const src = readFileSync(join(CORE_ROOT, "scripts/pipeline.ts"), "utf8");
+  assert.match(src, /persistPublicAdmission:\s*true/);
+  const mergeDispatch = src.slice(src.indexOf("// Early merge dispatch"));
+  const persistMerge = mergeDispatch.indexOf("await persistPublicEntrypointAdmission");
+  const mergePr = mergeDispatch.indexOf("await mergePr");
+  const persistQueue = mergeDispatch.lastIndexOf("await persistPublicEntrypointAdmission");
+  const runQueue = mergeDispatch.indexOf("await runMergeQueue");
+  assert.ok(persistMerge >= 0 && persistMerge < mergePr);
+  assert.ok(persistQueue >= 0 && persistQueue < runQueue);
+  assert.match(mergeDispatch, /kind:\s*"merge"/);
+  assert.match(mergeDispatch, /kind:\s*"merge-queue"/);
+});
+
+test("HEAD mismatch with complete inventory covers all five #1333 classes (#1440)", async () => {
+  const files = new Map<string, string>();
+  seedPrefixCoverage(files, GENERIC);
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      loadCandidateFaultRecoveryInventory: async () => ({
+        rows: FAULT_RECOVERY_MATRIX,
+        sourceSha: CANDIDATE,
+      }),
+      scoreInput: scoreInput(),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.ok((section.executed_matrix_rows ?? []).length > 0);
+  assert.ok((section.executed_matrix_rows ?? []).every((row) => row.candidate_sha === CANDIDATE));
+  for (const cls of REQUIRED_LIFECYCLE_CLASSES_1333) {
+    assert.ok(
+      (section.executed_matrix_rows ?? []).some((row) => row.lifecycle_class === cls),
+      `missing lifecycle class ${cls}`,
+    );
+  }
 });
