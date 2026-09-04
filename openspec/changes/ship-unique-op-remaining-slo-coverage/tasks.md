@@ -20,6 +20,7 @@
 - [x] 3.4 Keep refusing a `train_loop_linked` events path that escapes the approved roots, and verify that path is not loaded and does not count as live train-link
 - [x] 3.5 Require the event events path to equal the loaded child's events-file path, and verify an unrelated in-root path is not live train-link
 - [x] 3.6 Use the child's minted logical id when it differs from the train identity and the event has none, and verify live train-link increments without contradictory correlation
+- [x] 3.7 Resolve the train-link child by the event's validated absolute events path before run-id aggregation, and verify a dual-root fixture where a stale same-id child in the first approved root does not drop the event-referenced child in a later root
 
 ## 4. Commit-bound #1333 attach on live from-run
 

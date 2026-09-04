@@ -23,7 +23,7 @@ When Factory Reliability Gate unique-operation scoring runs as a phase of an adm
 
 ### Requirement: In-flight ship FRG scoring SHALL count followable control-host train_loop_linked as #1301 live train-link
 
-When Factory Reliability Gate unique-operation scoring runs as a phase of an admitted in-flight `ship`, #1301 live train-link SHALL be present when the control-host train stream contains a followable `train_loop_linked` event (nonempty child loop run id, absolute events path that loads the linked child inside the approved control-host roots, and a child logical id from that event or the loaded child). The factory-gate pack loop store SHALL NOT be the only allowed source. A `train` entrypoint without that followable child SHALL NOT satisfy #1301. This requirement SHALL NOT invent `train_loop_linked`.
+When Factory Reliability Gate unique-operation scoring runs as a phase of an admitted in-flight `ship`, #1301 live train-link SHALL be present when the control-host train stream contains a followable `train_loop_linked` event (nonempty child loop run id, absolute events path that loads the linked child inside the approved control-host roots, and a child logical id from that event or the loaded child). The join SHALL resolve that child by the event's validated absolute events path. First-occurrence run-id deduplication across approved roots SHALL NOT choose the child used for train-link validation. The factory-gate pack loop store SHALL NOT be the only allowed source. A `train` entrypoint without that followable child SHALL NOT satisfy #1301. This requirement SHALL NOT invent `train_loop_linked`.
 
 #### Scenario: Followable control-host train_loop_linked satisfies #1301 on in-flight ship
 
@@ -39,6 +39,15 @@ When Factory Reliability Gate unique-operation scoring runs as a phase of an adm
 - **AND** no followable `train_loop_linked` event exists on the control-host train stream
 - **THEN** missing required coverage SHALL increase for #1301 live train-link
 - **AND** release-eligible pass SHALL be refused
+
+#### Scenario: Duplicate run id in an earlier approved root does not drop a followable control-host train link
+
+- **WHEN** in-flight ship FRG scoring runs for candidate SHA `C`
+- **AND** a control-host train stream contains a followable `train_loop_linked` event
+- **AND** an earlier approved root contains a different artifact with the same child run id
+- **AND** that event's absolute events path loads the linked child inside a later approved root
+- **THEN** #1301 live train-link SHALL be treated as present
+- **AND** missing required coverage SHALL NOT increase for that live train-link cell
 
 ---
 

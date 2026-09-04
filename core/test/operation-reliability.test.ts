@@ -1132,6 +1132,49 @@ test("attemptsFromRunArtifacts: unrelated in-root events path is not followable 
   assert.equal(missingPath[0]!.train_loop_linked, false);
 });
 
+test("attemptsFromRunArtifacts: duplicate run id at a different path does not hide the event-referenced child (#1440)", () => {
+  const stalePath = "/host-state/runs/loop-1/events.jsonl";
+  const linkedPath = "/control-repo/.agent-pipeline/runs/loop-1/events.jsonl";
+  const train = {
+    runId: "train-T",
+    runJson: { run_id: "train-T", kind: "train", logical_operation_id: "T" },
+    events: [
+      { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+      {
+        type: "train_loop_linked",
+        logical_operation_id: "T",
+        loop_run_id: "loop-1",
+        events: linkedPath,
+      },
+    ],
+    summary: null,
+  };
+  const stale = {
+    runId: "loop-1",
+    runJson: { run_id: "loop-1", kind: "loop" },
+    events: [{ type: "run_start", entrypoint: "loop" }],
+    summary: null,
+    eventsFilePath: stalePath,
+  };
+  const linked = {
+    runId: "loop-1",
+    runJson: { run_id: "loop-1", kind: "loop" },
+    events: [{ type: "run_start", entrypoint: "loop" }],
+    summary: null,
+    eventsFilePath: linkedPath,
+  };
+  for (const runs of [
+    [train, stale, linked],
+    [train, linked, stale],
+  ]) {
+    const attempts = attemptsFromRunArtifacts(runs);
+    const found = attempts.find((a) => a.run_id === "train-T");
+    assert.equal(found!.train_loop_linked, true);
+    assert.equal(found!.child_run_id, "loop-1");
+    assert.equal(found!.child_events_path, linkedPath);
+  }
+});
+
 test("attemptsFromRunArtifacts: child minted logical id without event logical id is followable (#1440)", () => {
   const childPath = "/host-state/runs/loop-1/events.jsonl";
   const attempts = attemptsFromRunArtifacts([

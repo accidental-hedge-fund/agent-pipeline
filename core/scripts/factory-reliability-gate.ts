@@ -4518,6 +4518,22 @@ function pathInsideApprovedRunsRoot(
   return false;
 }
 
+function canonicalChildEventsPath(
+  loopRunId: string,
+  eventsPath: string,
+  approvedRoots: readonly string[],
+): string | null {
+  if (!loopRunId || !eventsPath || !path.isAbsolute(eventsPath)) return null;
+  const resolvedEvents = path.resolve(eventsPath);
+  for (const root of approvedRoots) {
+    if (!root) continue;
+    if (path.resolve(path.join(root, loopRunId, "events.jsonl")) === resolvedEvents) {
+      return resolvedEvents;
+    }
+  }
+  return null;
+}
+
 async function loadFollowableChildRun(
   fsDeps: FrgFsDeps,
   loopRunId: string,
@@ -4530,7 +4546,8 @@ async function loadFollowableChildRun(
   summary: Record<string, unknown> | null;
   eventsFilePath: string;
 } | null> {
-  const resolvedEvents = path.resolve(eventsPath);
+  const resolvedEvents = canonicalChildEventsPath(loopRunId, eventsPath, approvedRoots);
+  if (!resolvedEvents) return null;
   const dir = path.dirname(resolvedEvents);
   if (
     !pathInsideApprovedRunsRoot(resolvedEvents, approvedRoots) ||
@@ -4682,7 +4699,9 @@ function executedMatrixRowsFromRun(run: ScannedUniqueOpRun): ExecutedMatrixRow[]
  * Control-host roots (loop state-home + generic `.agent-pipeline/runs`) are
  * the unique-operation source of truth. An empty candidate-worktree
  * `.agent-pipeline/runs` directory is not proof that train, loop, or merge
- * never ran. Deduplicate by run id across roots (first occurrence wins).
+ * never ran. Deduplicate by run id across roots (first occurrence wins) for
+ * aggregation. Train-link child resolution uses the event's canonical
+ * events path and is not first-occurrence run-id.
  */
 async function collectUniqueOperationsFromRunStore(
   runsRoots: readonly string[],
@@ -4699,6 +4718,7 @@ async function collectUniqueOperationsFromRunStore(
   if (!fsDeps.readdir) return { attempts: [], executed_matrix_rows: [] };
   const runs: ScannedUniqueOpRun[] = [];
   const seen = new Set<string>();
+  const seenEventsPaths = new Set<string>();
   const executed: ExecutedMatrixRow[] = [];
   for (const root of runsRoots) {
     if (!root) continue;
@@ -4721,6 +4741,7 @@ async function collectUniqueOperationsFromRunStore(
         summary: await readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
         eventsFilePath,
       };
+      seenEventsPaths.add(eventsFilePath);
       runs.push(run);
       executed.push(...executedMatrixRowsFromRun(run));
     }
@@ -4736,10 +4757,12 @@ async function collectUniqueOperationsFromRunStore(
           : typeof event.events_path === "string"
             ? event.events_path.trim()
             : "";
-      if (!loopRunId || !eventsPath || seen.has(loopRunId)) continue;
+      const resolvedEvents = canonicalChildEventsPath(loopRunId, eventsPath, runsRoots);
+      if (!loopRunId || !eventsPath || !resolvedEvents) continue;
+      if (seenEventsPaths.has(resolvedEvents)) continue;
       const child = await loadFollowableChildRun(fsDeps, loopRunId, eventsPath, runsRoots);
       if (!child) continue;
-      seen.add(loopRunId);
+      seenEventsPaths.add(child.eventsFilePath);
       runs.push(child);
       executed.push(...executedMatrixRowsFromRun(child));
     }
@@ -4751,7 +4774,15 @@ async function collectUniqueOperationsFromRunStore(
         typeof attempt.child_events_path === "string" ? attempt.child_events_path.trim() : "";
       const childRunId =
         typeof attempt.child_run_id === "string" ? attempt.child_run_id.trim() : "";
-      const child = childRunId ? runs.find((r) => r.runId === childRunId) : undefined;
+      const child =
+        childRunId && eventsPath
+          ? runs.find(
+              (r) =>
+                r.runId === childRunId &&
+                typeof r.eventsFilePath === "string" &&
+                path.resolve(r.eventsFilePath) === path.resolve(eventsPath),
+            )
+          : undefined;
       const childEventsPath =
         typeof child?.eventsFilePath === "string" ? child.eventsFilePath.trim() : "";
       const pathLoadsLinkedChild =

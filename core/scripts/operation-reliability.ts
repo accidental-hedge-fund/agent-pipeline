@@ -853,12 +853,20 @@ export function mapPublicEntrypointFromRunId(runId: unknown): string | null {
   return null;
 }
 
+function findLinkedChildByEventsPath(
+  runs: readonly ScannedRunArtifact[],
+  loopRunId: string,
+  eventsPath: string,
+): ScannedRunArtifact | undefined {
+  return runs.find(
+    (r) => r.runId === loopRunId && sameAbsoluteEventsPath(eventsPath, r.eventsFilePath),
+  );
+}
+
 /** Map scanned run artifacts into classifier attempts. Does not invent minted ids. */
 export function attemptsFromRunArtifacts(
   runs: readonly ScannedRunArtifact[],
 ): UniqueOperationAttempt[] {
-  const byId = new Map<string, ScannedRunArtifact>();
-  for (const run of runs) byId.set(run.runId, run);
   return runs.map((run) => {
     const start = run.events.find((e) => e.type === "run_start");
     const identitySources = uniqueNonEmpty([
@@ -898,9 +906,8 @@ export function attemptsFromRunArtifacts(
       const refs = trainLinkedEventRefs(event);
       if (!refs.loopRunId || !refs.eventsPath) continue;
       if (!path.isAbsolute(refs.eventsPath)) continue;
-      const child = byId.get(refs.loopRunId);
+      const child = findLinkedChildByEventsPath(runs, refs.loopRunId, refs.eventsPath);
       if (!child) continue;
-      if (!sameAbsoluteEventsPath(refs.eventsPath, child.eventsFilePath)) continue;
       const eventLogical = nonEmptyTrimmed(event.logical_operation_id);
       const childMinted = artifactLogicalId(child);
       const childId = followableChildLogicalId(childMinted, eventLogical, logical);

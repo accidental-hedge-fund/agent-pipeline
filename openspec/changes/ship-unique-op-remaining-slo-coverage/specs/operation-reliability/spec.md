@@ -37,7 +37,7 @@ Public-command admission of `pipeline single`, `pipeline merge`, and `pipeline m
 
 ### Requirement: Live train-link SHALL increment from a followable train_loop_linked event
 
-Unique-operation aggregation SHALL treat #1301 live train-link as present when a control-host train attempt has a `train_loop_linked` event that is followable. Followable SHALL mean: a nonempty child loop run id, a nonempty absolute events path that loads the linked child inside the approved control-host runs roots, and a child logical id from that event or from the loaded child. The join SHALL require that absolute events path to equal the loaded child's events-file path. The join SHALL use the loaded child's minted logical id when that minted id differs from the train identity. The join SHALL use the event's `logical_operation_id` as the inherited child logical id when the child artifact has no minted logical id or when the child's minted id equals the train identity. The join SHALL NOT require the child's `run_id` fallback identity to equal the train minted id. A distinct child minted id SHALL NOT increment contradictory correlation solely as a failed train-link join. A `train` entrypoint without a followable child SHALL NOT count as live train-link. A path that escapes the approved roots SHALL NOT count. Collection SHALL NOT invent `train_loop_linked`.
+Unique-operation aggregation SHALL treat #1301 live train-link as present when a control-host train attempt has a `train_loop_linked` event that is followable. Followable SHALL mean: a nonempty child loop run id, a nonempty absolute events path that loads the linked child inside the approved control-host runs roots, and a child logical id from that event or from the loaded child. The join SHALL resolve the linked child by that event's validated absolute events path. First-occurrence run-id deduplication across approved roots SHALL NOT choose the child used for train-link validation. The join SHALL require that absolute events path to equal the loaded child's events-file path. The join SHALL use the loaded child's minted logical id when that minted id differs from the train identity. The join SHALL use the event's `logical_operation_id` as the inherited child logical id when the child artifact has no minted logical id or when the child's minted id equals the train identity. The join SHALL NOT require the child's `run_id` fallback identity to equal the train minted id. A distinct child minted id SHALL NOT increment contradictory correlation solely as a failed train-link join. A `train` entrypoint without a followable child SHALL NOT count as live train-link. A path that escapes the approved roots SHALL NOT count. Collection SHALL NOT invent `train_loop_linked`.
 
 #### Scenario: Followable train_loop_linked increments live train-link
 
@@ -72,6 +72,15 @@ Unique-operation aggregation SHALL treat #1301 live train-link as present when a
 - **WHEN** a train `train_loop_linked` event names an absolute events path inside the approved roots
 - **AND** a child artifact exists for that `loop_run_id` at a different events-file path
 - **THEN** that event SHALL NOT count as live train-link
+
+#### Scenario: Duplicate run id in an earlier approved root does not drop a path-matched child
+
+- **WHEN** a control-host train run has a `train_loop_linked` event with nonempty `loop_run_id` `L`
+- **AND** an earlier approved root contains a different artifact with run id `L`
+- **AND** that event's absolute events path loads the linked child inside a later approved root
+- **AND** the event or loaded child supplies a child logical id
+- **THEN** live train-link SHALL be present
+- **AND** missing required coverage SHALL NOT increase for #1301 live train-link
 
 #### Scenario: Child minted logical id without event logical id still counts
 
