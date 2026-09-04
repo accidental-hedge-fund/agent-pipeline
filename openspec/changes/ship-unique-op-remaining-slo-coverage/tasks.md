@@ -18,6 +18,8 @@
 - [x] 3.2 Do not require the child's `run_id` fallback identity to equal the train minted id, and verify a train minted id `T` plus child fallback `loop-1` still counts as live train-link and does not increment contradictory correlation solely for that fallback mismatch
 - [x] 3.3 Leave #1301 fail-closed when `train` is observed without a followable child, and verify missing required coverage increases in that case
 - [x] 3.4 Keep refusing a `train_loop_linked` events path that escapes the approved roots, and verify that path is not loaded and does not count as live train-link
+- [x] 3.5 Require the event events path to equal the loaded child's events-file path, and verify an unrelated in-root path is not live train-link
+- [x] 3.6 Use the child's minted logical id when it differs from the train identity and the event has none, and verify live train-link increments without contradictory correlation
 
 ## 4. Commit-bound #1333 attach on live from-run
 

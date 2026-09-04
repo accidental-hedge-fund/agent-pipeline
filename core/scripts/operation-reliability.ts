@@ -361,9 +361,6 @@ export function aggregateUniqueOperationReliability(input: {
     const child = typeof attempt.child_logical_operation_id === "string"
       ? attempt.child_logical_operation_id.trim()
       : "";
-    if (attempt.train_loop_linked === true && child && child !== id) {
-      contradictoryCorrelation += 1;
-    }
     const entry = byId.get(uniqueOpKey(id)) ?? {
       run_ids: [],
       terminals: [],
@@ -486,8 +483,8 @@ export function aggregateUniqueOperationReliability(input: {
       ...(entry.release_identity ? { release_identity: entry.release_identity } : {}),
     });
 
-    // Live train linkage requires a followable child that inherited this id.
-    if (entry.train_loop_linked && entry.child_ids.includes(id)) {
+    // Live train-link: followable child logical id from the event or loaded child.
+    if (entry.train_loop_linked && entry.child_ids.length > 0) {
       liveLinkage = true;
     }
 
@@ -702,6 +699,8 @@ type ScannedRunArtifact = {
   runJson: Record<string, unknown> | null;
   events: readonly Record<string, unknown>[];
   summary: Record<string, unknown> | null;
+  /** Absolute events.jsonl path this artifact was loaded from, when known. */
+  eventsFilePath?: string | null;
 };
 
 function artifactLogicalId(run: ScannedRunArtifact): string | null {
@@ -747,6 +746,26 @@ function trainLinkedEventRefs(event: Record<string, unknown>): {
     loopRunId: nonEmptyTrimmed(event.loop_run_id),
     eventsPath: nonEmptyTrimmed(event.events) ?? nonEmptyTrimmed(event.events_path),
   };
+}
+
+function sameAbsoluteEventsPath(
+  eventPath: string | null | undefined,
+  artifactPath: string | null | undefined,
+): boolean {
+  const left = nonEmptyTrimmed(eventPath);
+  const right = nonEmptyTrimmed(artifactPath);
+  if (!left || !right) return false;
+  if (!path.isAbsolute(left) || !path.isAbsolute(right)) return false;
+  return path.resolve(left) === path.resolve(right);
+}
+
+function followableChildLogicalId(
+  childMinted: string | null,
+  eventLogical: string | null,
+  trainLogical: string | null,
+): string | null {
+  if (childMinted && trainLogical && childMinted !== trainLogical) return childMinted;
+  return eventLogical ?? childMinted;
 }
 
 function attemptIsUnboundInflight(
@@ -881,10 +900,10 @@ export function attemptsFromRunArtifacts(
       if (!path.isAbsolute(refs.eventsPath)) continue;
       const child = byId.get(refs.loopRunId);
       if (!child) continue;
+      if (!sameAbsoluteEventsPath(refs.eventsPath, child.eventsFilePath)) continue;
       const eventLogical = nonEmptyTrimmed(event.logical_operation_id);
       const childMinted = artifactLogicalId(child);
-      const childId =
-        childMinted && logical && childMinted === logical ? childMinted : eventLogical;
+      const childId = followableChildLogicalId(childMinted, eventLogical, logical);
       if (!logical || !childId) continue;
       trainLinked = true;
       childLogical = childId;

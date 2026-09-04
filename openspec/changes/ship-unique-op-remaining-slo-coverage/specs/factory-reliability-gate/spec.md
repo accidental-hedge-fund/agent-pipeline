@@ -23,7 +23,7 @@ When Factory Reliability Gate unique-operation scoring runs as a phase of an adm
 
 ### Requirement: In-flight ship FRG scoring SHALL count followable control-host train_loop_linked as #1301 live train-link
 
-When Factory Reliability Gate unique-operation scoring runs as a phase of an admitted in-flight `ship`, #1301 live train-link SHALL be present when the control-host train stream contains a followable `train_loop_linked` event (nonempty child loop run id, absolute events path that loads inside the approved control-host roots, and a child logical id from that event or the loaded child). The factory-gate pack loop store SHALL NOT be the only allowed source. A `train` entrypoint without that followable child SHALL NOT satisfy #1301. This requirement SHALL NOT invent `train_loop_linked`.
+When Factory Reliability Gate unique-operation scoring runs as a phase of an admitted in-flight `ship`, #1301 live train-link SHALL be present when the control-host train stream contains a followable `train_loop_linked` event (nonempty child loop run id, absolute events path that loads the linked child inside the approved control-host roots, and a child logical id from that event or the loaded child). The factory-gate pack loop store SHALL NOT be the only allowed source. A `train` entrypoint without that followable child SHALL NOT satisfy #1301. This requirement SHALL NOT invent `train_loop_linked`.
 
 #### Scenario: Followable control-host train_loop_linked satisfies #1301 on in-flight ship
 

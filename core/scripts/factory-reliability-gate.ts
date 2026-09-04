@@ -4528,6 +4528,7 @@ async function loadFollowableChildRun(
   runJson: Record<string, unknown> | null;
   events: Record<string, unknown>[];
   summary: Record<string, unknown> | null;
+  eventsFilePath: string;
 } | null> {
   const resolvedEvents = path.resolve(eventsPath);
   const dir = path.dirname(resolvedEvents);
@@ -4551,6 +4552,7 @@ async function loadFollowableChildRun(
     runJson: merged,
     events,
     summary,
+    eventsFilePath: resolvedEvents,
   };
 }
 
@@ -4559,6 +4561,7 @@ type ScannedUniqueOpRun = {
   runJson: Record<string, unknown> | null;
   events: Record<string, unknown>[];
   summary: Record<string, unknown> | null;
+  eventsFilePath?: string | null;
 };
 
 /** Canonicalize runs roots: resolve, drop empties, first occurrence wins. */
@@ -4710,11 +4713,13 @@ async function collectUniqueOperationsFromRunStore(
       if (seen.has(entry.name)) continue;
       const dir = path.join(root, entry.name);
       seen.add(entry.name);
+      const eventsFilePath = path.resolve(path.join(dir, "events.jsonl"));
       const run: ScannedUniqueOpRun = {
         runId: entry.name,
         runJson: await readJsonObjectOrNull(fsDeps, path.join(dir, "run.json")),
-        events: await readJsonlObjects(fsDeps, path.join(dir, "events.jsonl")),
+        events: await readJsonlObjects(fsDeps, eventsFilePath),
         summary: await readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
+        eventsFilePath,
       };
       runs.push(run);
       executed.push(...executedMatrixRowsFromRun(run));
@@ -4744,9 +4749,19 @@ async function collectUniqueOperationsFromRunStore(
       if (attempt.train_loop_linked !== true) return attempt;
       const eventsPath =
         typeof attempt.child_events_path === "string" ? attempt.child_events_path.trim() : "";
+      const childRunId =
+        typeof attempt.child_run_id === "string" ? attempt.child_run_id.trim() : "";
+      const child = childRunId ? runs.find((r) => r.runId === childRunId) : undefined;
+      const childEventsPath =
+        typeof child?.eventsFilePath === "string" ? child.eventsFilePath.trim() : "";
+      const pathLoadsLinkedChild =
+        eventsPath !== "" &&
+        childEventsPath !== "" &&
+        path.isAbsolute(eventsPath) &&
+        path.isAbsolute(childEventsPath) &&
+        path.resolve(eventsPath) === path.resolve(childEventsPath);
       if (
-        !eventsPath ||
-        !path.isAbsolute(eventsPath) ||
+        !pathLoadsLinkedChild ||
         !pathInsideApprovedRunsRoot(eventsPath, runsRoots)
       ) {
         return {

@@ -747,6 +747,7 @@ export async function buildScoreboardReport(
           runJson: r.runJson,
           events: r.events,
           summary: r.summary,
+          eventsFilePath: r.eventsPath,
         })),
       ),
       manifest: {

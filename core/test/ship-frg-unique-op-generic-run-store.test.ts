@@ -1124,6 +1124,124 @@ test("followable control-host train_loop_linked with child run_id fallback satis
   assert.equal(section.integrity.missing_required_coverage, 0);
 });
 
+test("unrelated in-root train_loop_linked events path does not satisfy #1301 (#1440)", async () => {
+  const files = new Map<string, string>();
+  const unrelated = `${GENERIC}/other/events.jsonl`;
+  files.set(
+    `${GENERIC}/train-T/run.json`,
+    JSON.stringify({ run_id: "train-T", kind: "train", logical_operation_id: "T" }),
+  );
+  files.set(
+    `${GENERIC}/train-T/events.jsonl`,
+    [
+      { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+      {
+        type: "train_loop_linked",
+        logical_operation_id: "T",
+        loop_run_id: "loop-1",
+        events: unrelated,
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n"),
+  );
+  files.set(`${GENERIC}/loop-1/run.json`, JSON.stringify({ run_id: "loop-1", kind: "loop" }));
+  files.set(
+    `${GENERIC}/loop-1/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop" }) + "\n",
+  );
+  files.set(`${GENERIC}/other/run.json`, JSON.stringify({ run_id: "other", kind: "loop" }));
+  files.set(
+    `${GENERIC}/other/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop" }) + "\n",
+  );
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      scoreInput: scoreInput({
+        unique_operation_manifest: {
+          ...passingUniqueOperationManifest({
+            release_identity: "1.29.1",
+            candidate_sha: CANDIDATE,
+          }),
+          required_entrypoints: ["train", "loop"],
+          required_lifecycle_classes: [],
+          live_train_linkage_present: false,
+          in_flight_ship: true,
+        },
+      }),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.ok(section.integrity.missing_required_coverage > 0);
+});
+
+test("child minted logical id without event logical id satisfies #1301 (#1440)", async () => {
+  const files = new Map<string, string>();
+  const childEvents = `${GENERIC}/loop-1/events.jsonl`;
+  files.set(
+    `${GENERIC}/train-T/run.json`,
+    JSON.stringify({ run_id: "train-T", kind: "train", logical_operation_id: "T" }),
+  );
+  files.set(
+    `${GENERIC}/train-T/events.jsonl`,
+    [
+      { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+      {
+        type: "train_loop_linked",
+        loop_run_id: "loop-1",
+        events: childEvents,
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n"),
+  );
+  files.set(
+    `${GENERIC}/loop-1/run.json`,
+    JSON.stringify({ run_id: "loop-1", kind: "loop", logical_operation_id: "C" }),
+  );
+  files.set(
+    `${GENERIC}/loop-1/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop", logical_operation_id: "C" }) + "\n",
+  );
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: CANDIDATE_REPO,
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => dualRoots(),
+      loadCandidateFaultRecoveryInventory: async () => ({
+        rows: FAULT_RECOVERY_MATRIX,
+        sourceSha: CANDIDATE,
+      }),
+      scoreInput: scoreInput({
+        unique_operation_manifest: {
+          ...passingUniqueOperationManifest({
+            release_identity: "1.29.1",
+            candidate_sha: CANDIDATE,
+          }),
+          required_entrypoints: ["train", "loop"],
+          required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+          live_train_linkage_present: false,
+          in_flight_ship: true,
+        },
+      }),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.equal(section.integrity.contradictory_correlation, 0);
+  assert.equal(section.integrity.missing_required_coverage, 0);
+});
+
 test("single parent plus nested loop child observes both entrypoints (#1440)", async () => {
   const files = new Map<string, string>();
   writeUnboundPrefixRun(files, GENERIC, "single-parent", { kind: "single" });
