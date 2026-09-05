@@ -14,11 +14,13 @@ import {
   classifyPublishableUnpublishedStageCommit,
   executePublishUnpublishedStageCommit,
   inspectPublishableUnpublishedStageCommit,
+  isExactImplementationDeliverable,
   isManagedIssueBranch,
   isPostPrResidualReviewStage,
   isPrePrEngineDefectPark,
   isUnguardedTimeoutParkSource,
   PUBLISH_UNPUBLISHED_STAGE_COMMIT,
+  observeImplementDeliverablePaths,
   resolveTimeoutParkForUnpublishedCommit,
   SALVAGE_SUBJECT_PREFIX,
 } from "../scripts/unpublished-stage-commit.ts";
@@ -56,7 +58,18 @@ function facts(overrides: Partial<Parameters<typeof classifyPublishableUnpublish
     linkedOpenPr: false,
     tipSubject: salvageSubject(268),
     tipBody: salvageBody("implement"),
+    headSha: "a".repeat(40),
     ...overrides,
+  };
+}
+
+function implementationObservation(sha = "a".repeat(40)) {
+  return {
+    present: true,
+    role: "implementation" as const,
+    artifact_id: "sha256:implementation",
+    candidate_sha: sha,
+    candidate_epoch: sha,
   };
 }
 
@@ -275,7 +288,7 @@ test("executor: does not force-push, does not triage or raw issue-edit, transiti
     setBlocked: async () => {
       throw new Error("executor must not setBlocked on success");
     },
-    probeImplementDeliverable: async () => ({ present: true }),
+    probeImplementDeliverable: async () => implementationObservation(),
   });
   assert.equal(result.succeeded, true, result.error ?? result.evidence);
   assert.ok(!pushArgs.some((a) => a.includes("--force") || a.includes("--force-with-lease")));
@@ -302,7 +315,7 @@ test("executor: push failure parks as harness-failure and does not mint needs-hu
     setBlocked: async (_c, _n, _reason, _stage, kind) => {
       kinds.push(kind);
     },
-    probeImplementDeliverable: async () => ({ present: true }),
+    probeImplementDeliverable: async () => implementationObservation(),
   });
   assert.equal(result.succeeded, false);
   assert.ok(kinds.includes("harness-failure") || /harness-failure/.test(result.error ?? ""));
@@ -340,11 +353,67 @@ test("executor: unsatisfied deliverable does not publish", async () => {
       resumed++;
       return { advanced: true, from: "implementing", to: "review-1", summary: "no" };
     },
-    probeImplementDeliverable: async () => ({ present: false }),
+    probeImplementDeliverable: async () => ({
+      present: false,
+      role: "unknown",
+      artifact_id: null,
+      candidate_sha: "a".repeat(40),
+      candidate_epoch: "a".repeat(40),
+    }),
   });
   assert.equal(result.succeeded, false);
   assert.equal(resumed, 0);
   assert.match(result.error ?? "", /deliverable unsatisfied/);
+});
+
+test("implement deliverable observer keeps planning identity distinct and invalidates moved candidates (#1454)", () => {
+  const sha1 = "a".repeat(40);
+  const sha2 = "b".repeat(40);
+  const planning = observeImplementDeliverablePaths({
+    paths: ["openspec/changes/durable-admission-recovery/proposal.md"],
+    candidateSha: sha1,
+    acceptedPlanningIds: ["durable-admission-recovery"],
+  });
+  assert.equal(planning.role, "planning");
+  assert.equal(isExactImplementationDeliverable(planning, sha1), false);
+
+  const implementation = observeImplementDeliverablePaths({
+    paths: [
+      "openspec/changes/durable-admission-recovery/proposal.md",
+      "core/scripts/run-store.ts",
+    ],
+    candidateSha: sha1,
+    acceptedPlanningIds: ["durable-admission-recovery"],
+  });
+  assert.equal(implementation.role, "implementation");
+  assert.equal(isExactImplementationDeliverable(implementation, sha1), true);
+  assert.equal(isExactImplementationDeliverable(implementation, sha2), false);
+});
+
+test("executor: planning-only salvage cannot enter publication or design gate (#1454)", async () => {
+  let resumed = 0;
+  const sha = "a".repeat(40);
+  const result = await executePublishUnpublishedStageCommit(cfg(), 268, {
+    inspect: async () => ({
+      facts: facts({ headSha: sha }),
+      classification: { publishable: true as const, tipKind: "salvage" as const },
+      worktree: { path: "/wt/268", slug: "268-x", branch: "pipeline/268-x" },
+    }),
+    probeImplementDeliverable: async () => ({
+      present: true,
+      role: "planning",
+      artifact_id: "sha256:planning",
+      candidate_sha: sha,
+      candidate_epoch: sha,
+    }),
+    resumeFromImplementing: async () => {
+      resumed += 1;
+      return { advanced: true, from: "implementing", to: "design-gate", summary: "wrong" };
+    },
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(resumed, 0);
+  assert.match(result.error ?? "", /role=planning/);
 });
 
 test("inspect: injectable git/gh, no network", async () => {
@@ -462,7 +531,7 @@ test("realExecuteRecovery: publish_unpublished_stage_commit succeeds without rep
         to: "design-gate",
         summary: "PR #9",
       }),
-      probeImplementDeliverable: async () => ({ present: true }),
+      probeImplementDeliverable: async () => implementationObservation(),
     },
   });
   const result = await execute(mechanicalInput());
@@ -494,7 +563,7 @@ test("realExecuteRecovery: fix-round unpublished timeout claims the same recipe 
         to: "review-1",
         summary: "PR #9",
       }),
-      probeImplementDeliverable: async () => ({ present: true }),
+      probeImplementDeliverable: async () => implementationObservation(),
     },
   });
   const result = await execute({ ...mechanicalInput(), diagnostic });

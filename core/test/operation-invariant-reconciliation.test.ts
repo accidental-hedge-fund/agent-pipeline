@@ -54,6 +54,10 @@ function identity(overrides: Partial<LoopExternalIdentity> = {}): LoopExternalId
     checks_conclusion: "success",
     pipeline_stage: "fix-2",
     observed_at: "2026-09-01T00:00:00.000Z",
+    integration_certainty: "known_complete",
+    artifact_role: "implementation",
+    artifact_identity: `pr:42:${"a".repeat(40)}`,
+    candidate_epoch: "a".repeat(40),
     ...overrides,
   };
 }
@@ -74,6 +78,14 @@ function fakeObserve(overrides: Partial<ReconcileObserveDeps> = {}): ReconcileOb
     },
     async getPrChecks() {
       return [];
+    },
+    async getPrArtifactBinding(pr, detail) {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${pr}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+      };
     },
     async getLocalHead() {
       return null;
@@ -186,7 +198,16 @@ test("3.4 hold-for-human still requires current typed-request evidence", () => {
 
 test("4.1 later open PR does not hide a prior merged-and-contained PR", () => {
   const certainty = integrationSideEffectCertainty([
-    { number: 10, state: "merged", merge_commit_sha: "c".repeat(40), contained: true },
+    {
+      number: 10,
+      state: "merged",
+      merge_commit_sha: "c".repeat(40),
+      contained: true,
+      artifact_role: "implementation",
+      artifact_identity: "pr:10:head",
+      candidate_sha: "a".repeat(40),
+      candidate_epoch: "a".repeat(40),
+    },
     { number: 99, state: "open", merge_commit_sha: null, contained: null },
   ]);
   assert.equal(certainty, "known_complete");
@@ -209,7 +230,7 @@ test("4.1 truncated linked-PR scan is uncertain, never known_absent", () => {
       [{ number: 10, state: "merged", merge_commit_sha: "c".repeat(40), contained: true }],
       { truncated: true },
     ),
-    "known_complete",
+    "uncertain",
   );
 });
 
@@ -289,7 +310,16 @@ test("4.1 failed linked-PR detail reads are uncertain, never known_absent", asyn
   );
   assert.equal(
     integrationSideEffectCertainty(
-      [{ number: 10, state: "merged", merge_commit_sha: "c".repeat(40), contained: true }],
+      [{
+        number: 10,
+        state: "merged",
+        merge_commit_sha: "c".repeat(40),
+        contained: true,
+        artifact_role: "implementation",
+        artifact_identity: "pr:10:head",
+        candidate_sha: "a".repeat(40),
+        candidate_epoch: "a".repeat(40),
+      }],
       { incompleteDetails: true },
     ),
     "known_complete",
@@ -492,7 +522,15 @@ test("6.4 contradictory labels, remote/local drift, stale evidence, remote mutat
   );
   assert.equal(
     integrationSideEffectCertainty([
-      { number: 10, state: "merged", contained: true },
+      {
+        number: 10,
+        state: "merged",
+        contained: true,
+        artifact_role: "implementation",
+        artifact_identity: "pr:10:head",
+        candidate_sha: "a".repeat(40),
+        candidate_epoch: "a".repeat(40),
+      },
       { number: 99, state: "open" },
     ]),
     "known_complete",

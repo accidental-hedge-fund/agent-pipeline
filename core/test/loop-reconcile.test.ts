@@ -182,6 +182,15 @@ function fakeObserveDeps(overrides: Partial<ReconcileObserveDeps> = {}): { deps:
       calls.push(`getPrChecks:${prNumber}`);
       return [];
     },
+    async getPrArtifactBinding(prNumber, detail) {
+      calls.push(`getPrArtifactBinding:${prNumber}`);
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+      };
+    },
     async getLocalHead(issueNumber) {
       calls.push(`getLocalHead:${issueNumber}`);
       return null;
@@ -197,21 +206,27 @@ function fakeObserveDeps(overrides: Partial<ReconcileObserveDeps> = {}): { deps:
 }
 
 function openPrIdentity(overrides: Partial<LoopExternalIdentity> = {}): LoopExternalIdentity {
+  const headSha = overrides.head_sha ?? "abc123";
+  const prState = overrides.pr_state ?? "open";
   return {
     issue_number: 100,
     issue_open: true,
     ready_label_present: false,
     blocked_label_present: false,
     pr_number: 12,
-    pr_state: "open",
+    pr_state: prState,
     head_branch: "pipeline/100-fix",
-    head_sha: "abc123",
+    head_sha: headSha,
     merge_commit_sha: null,
     checks_conclusion: "success",
     // Default null stage preserves #511 crash-after-PR-open catch-up when tests
     // do not override. Mid-flight gate tests set pipeline_stage explicitly.
     pipeline_stage: null,
     observed_at: "2026-07-23T00:00:00.000Z",
+    integration_certainty: prState === "merged" ? "known_complete" : "known_absent",
+    artifact_role: "implementation",
+    artifact_identity: `pr:12:${headSha}`,
+    candidate_epoch: headSha,
     ...overrides,
   };
 }
@@ -714,6 +729,56 @@ test("reconcile: a crash before recording implemented -> merged repairs all the 
   assert.equal(ledger.items["100"].state, "merged");
 });
 
+test("reconcile: reopened pipeline:ready with an older merged planning PR remains actionable (#1454)", async () => {
+  const { deps, token } = await setup("pending");
+  const planningSha = "d".repeat(40);
+  const { deps: observeDeps } = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:ready"] };
+    },
+    async findPrForIssue() {
+      return 10;
+    },
+    async listLinkedPrs() {
+      return [10];
+    },
+    async getPrDetail() {
+      return {
+        state: "merged",
+        head_ref: "pipeline/100-plan",
+        head_sha: planningSha,
+        merge_commit_sha: "e".repeat(40),
+      };
+    },
+    async baseBranchContainsSha() {
+      return true;
+    },
+    async getPrArtifactBinding() {
+      return {
+        role: "planning",
+        artifactIdentity: `pr:10:${planningSha}`,
+        candidateSha: planningSha,
+        candidateEpoch: planningSha,
+      };
+    },
+  });
+
+  const result = await reconcile(deps, observeDeps, {
+    runId: "run-1",
+    token,
+    engine: "claude",
+  });
+  const ledger = await readLedger(deps, "run-1");
+  assert.notEqual(ledger.items["100"].state, "merged");
+  assert.equal(ledger.items["100"].state, "pending");
+  assert.equal(result.observed["100"].pipeline_stage, "ready");
+  assert.equal(result.observed["100"].artifact_role, "planning");
+  assert.equal(result.observed["100"].integration_certainty, "uncertain");
+  assert.notEqual(result.next_actions["100"], "repair-forward");
+  assert.equal(ledger.lifecycle?.owner, "RecoverySupervisor");
+  assert.equal(ledger.lifecycle?.complete, false);
+});
+
 test("reconcile: an over-claim (ledger-ahead) is reconstructed locally without remote mutation", async () => {
   const { deps, files, token } = await setup("merged");
   const { deps: observeDeps, calls } = fakeObserveDeps({
@@ -733,7 +798,7 @@ test("reconcile: an over-claim (ledger-ahead) is reconstructed locally without r
   const ledger = await readLedger(deps, "run-1");
   assert.notEqual(ledger.items["100"].state, "merged");
   assert.match(ledger.items["100"].history.at(-1)?.note ?? "", /reconstructed local state/);
-  assert.ok(calls.every((c) => /^(getIssueStateAndLabels|findPrForIssue|listLinkedPrs|getPrDetail|getPrChecks|getLocalHead|baseBranchContainsSha):/.test(c)));
+  assert.ok(calls.every((c) => /^(getIssueStateAndLabels|findPrForIssue|listLinkedPrs|getPrDetail|getPrChecks|getPrArtifactBinding|getLocalHead|baseBranchContainsSha):/.test(c)));
   void files;
 });
 
@@ -796,7 +861,7 @@ test("reconcile: identity-mismatch on waiting/paused/blocked reconstructs identi
     assert.equal(ledger.items["100"].last_verified_identity?.local_head_sha, "ondisk-sha", state);
     assert.equal(ledger.items["100"].last_verified_identity?.rebase_in_progress, true, state);
     assert.match(ledger.items["100"].history.at(-1)?.note ?? "", /reconstructed local state/, state);
-    assert.ok(calls.every((c) => /^(getIssueStateAndLabels|findPrForIssue|listLinkedPrs|getPrDetail|getPrChecks|getLocalHead|baseBranchContainsSha):/.test(c)), state);
+    assert.ok(calls.every((c) => /^(getIssueStateAndLabels|findPrForIssue|listLinkedPrs|getPrDetail|getPrChecks|getPrArtifactBinding|getLocalHead|baseBranchContainsSha):/.test(c)), state);
     void files;
   }
 });

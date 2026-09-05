@@ -25,12 +25,14 @@ import {
   getIssueStateAndLabels,
   getPrChecks,
   getPrDetail,
+  getPrDiff,
   getPrForIssueAnyState,
   listPrsForIssueAnyState,
   normalizeLinkedIssuePrs,
   parseChecksAggregate,
   type LinkedIssuePrs,
 } from "../gh.ts";
+import { diffFilePaths } from "../stages/review-parsing.ts";
 import { getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
 import { isAdvanceStillNeeded, isBlockedInLabels, pipelineStageFromLabels } from "./precondition.ts";
 import {
@@ -144,6 +146,18 @@ export interface ReconcileObserveDeps {
     merge_commit_sha: string | null;
   } | null>;
   getPrChecks(prNumber: number): Promise<{ bucket: string }[]>;
+  /** Exact PR role/candidate observer. Missing or ambiguous bindings fail closed. */
+  getPrArtifactBinding?(prNumber: number, detail: {
+    state: "open" | "closed" | "merged";
+    head_ref: string;
+    head_sha: string;
+    merge_commit_sha: string | null;
+  }): Promise<{
+    role: "planning" | "implementation" | "unknown";
+    artifactIdentity: string | null;
+    candidateSha: string | null;
+    candidateEpoch: string | null;
+  }>;
   /** Local worktree fallback used only when no PR exists yet — reads the
    *  on-disk branch/head for the issue with zero GitHub calls. */
   getLocalHead(issueNumber: number): Promise<{
@@ -205,6 +219,38 @@ export function defaultReconcileObserveDeps(cfg: PipelineConfig): ReconcileObser
         return await getPrChecks(cfg, prNumber);
       } catch {
         return [];
+      }
+    },
+    async getPrArtifactBinding(prNumber, detail) {
+      try {
+        const paths = diffFilePaths(await getPrDiff(cfg, prNumber));
+        const productPaths = paths.filter(
+          (filePath) => !/^openspec\/changes\/(?:archive\/)?[^/]+\//.test(filePath),
+        );
+        const planningPaths = paths.filter(
+          (filePath) => /^openspec\/changes\/(?:archive\/)?[^/]+\//.test(filePath),
+        );
+        const role = productPaths.length > 0
+          ? "implementation"
+          : planningPaths.length > 0
+            ? "planning"
+            : "unknown";
+        const candidateSha = detail.head_sha.trim().toLowerCase() || null;
+        return {
+          role,
+          artifactIdentity: role === "unknown" || !candidateSha
+            ? null
+            : `pr:${prNumber}:${candidateSha}`,
+          candidateSha,
+          candidateEpoch: candidateSha,
+        };
+      } catch {
+        return {
+          role: "unknown",
+          artifactIdentity: null,
+          candidateSha: null,
+          candidateEpoch: null,
+        };
       }
     },
     async getLocalHead(issueNumber) {
@@ -332,11 +378,23 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
     if (detail.state === "merged" && detail.merge_commit_sha) {
       contained = await deps.baseBranchContainsSha(detail.merge_commit_sha);
     }
+    const artifact = deps.getPrArtifactBinding
+      ? await deps.getPrArtifactBinding(n, detail)
+      : {
+          role: "unknown" as const,
+          artifactIdentity: null,
+          candidateSha: null,
+          candidateEpoch: null,
+        };
     linkedFacts.push({
       number: n,
       state: detail.state,
       merge_commit_sha: detail.merge_commit_sha,
       contained,
+      artifact_role: artifact.role,
+      artifact_identity: artifact.artifactIdentity,
+      candidate_sha: artifact.candidateSha,
+      candidate_epoch: artifact.candidateEpoch,
     });
   }
   integration_certainty = integrationSideEffectCertainty(linkedFacts, {
@@ -393,6 +451,9 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
     product_dirt: local?.product_dirt === true,
     integration_certainty,
     linked_pr_numbers,
+    artifact_role: authoritative?.artifact_role ?? "unknown",
+    artifact_identity: authoritative?.artifact_identity ?? null,
+    candidate_epoch: authoritative?.candidate_epoch ?? null,
   };
 }
 
@@ -475,8 +536,18 @@ export function repairShaMismatchIsHumanStop(input: {
  *
  *  Checks conclusion never influences this target. */
 export function verifiedForwardTarget(identity: LoopExternalIdentity): LoopItemState | null {
-  if (identity.pr_state === "merged") return "merged";
+  const exactImplementation =
+    identity.artifact_role === "implementation" &&
+    Boolean(identity.artifact_identity?.trim()) &&
+    Boolean(identity.head_sha.trim()) &&
+    identity.candidate_epoch?.trim().toLowerCase() === identity.head_sha.trim().toLowerCase();
+  if (
+    identity.pr_state === "merged" &&
+    identity.integration_certainty === "known_complete" &&
+    exactImplementation
+  ) return "merged";
   if (identity.pr_number !== null && identity.pr_state === "open") {
+    if (!exactImplementation) return null;
     if (identity.ready_label_present) return "ready";
     // Advance-still-needed open PR is expected during advance (intake-ready,
     // mid-flight, crash-after-PR-open residual). It is not remote proof that the
@@ -519,7 +590,12 @@ export function classifyDrift(
   // Forward catch-up always wins first: the external truth already reached a
   // state strictly ahead of what the ledger claims. Merged and ready-label
   // catch-up both win over the advance-still-needed open-PR gate (#712 / #1068).
-  if (state !== "merged" && state !== "released" && state !== "deployed" && identity.pr_state === "merged") {
+  if (
+    state !== "merged" &&
+    state !== "released" &&
+    state !== "deployed" &&
+    verifiedForwardTarget(identity) === "merged"
+  ) {
     return "ledger-behind";
   }
   if (state === "pr_opened" && identity.pr_state === "open" && identity.ready_label_present) {
@@ -558,7 +634,7 @@ export function classifyDrift(
     case "merged":
     case "released":
     case "deployed":
-      if (identity.pr_state !== "merged") return "ledger-ahead";
+      if (verifiedForwardTarget(identity) !== "merged") return "ledger-ahead";
       return null;
     default:
       return null;

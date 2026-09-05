@@ -70,6 +70,13 @@ test("dispatchResume: worktree exists + commits ahead → calls resumeFromImplem
   const deps: DispatchResumeDeps = {
     getForIssue: async () => wt,
     hasCommitsAhead: async () => true,
+    probeImplementDeliverable: async () => ({
+      present: true,
+      role: "implementation",
+      artifact_id: "sha256:implementation",
+      candidate_sha: "a".repeat(40),
+      candidate_epoch: "a".repeat(40),
+    }),
     getIssueDetail: async () => ({ title: "Fix the bug", body: "" } as any),
     resumeFromImplementing: async () => {
       resumeCalled = true;

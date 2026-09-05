@@ -942,6 +942,13 @@ test("dispatchResume: commits-ahead without interrupted leftovers still resumes 
       isLivePlanningActive: () => false,
       getForIssue: async () => ({ path: "/wt", branch: "pipeline/175", slug: "x" }),
       hasCommitsAhead: async () => true,
+      probeImplementDeliverable: async () => ({
+        present: true,
+        role: "implementation",
+        artifact_id: "sha256:implementation",
+        candidate_sha: "a".repeat(40),
+        candidate_epoch: "a".repeat(40),
+      }),
       getIssueDetail: async () => ({ title: "ok", body: "" }) as never,
       resumeFromImplementing: async () => {
         resumeCalled = true;
@@ -975,6 +982,13 @@ test("4.4 checkpointed leftovers with satisfied deliverable continue post-implem
       isLivePlanningActive: () => false,
       getForIssue: async () => ({ path: "/wt", branch: "pipeline/758", slug: "x" }),
       hasCommitsAhead: async () => true,
+      probeImplementDeliverable: async () => ({
+        present: true,
+        role: "implementation",
+        artifact_id: "sha256:implementation",
+        candidate_sha: "a".repeat(40),
+        candidate_epoch: "a".repeat(40),
+      }),
       getIssueDetail: async () => ({ title: "ok", body: "" }) as never,
       resumeFromImplementing: async () => {
         resumeCalled = true;

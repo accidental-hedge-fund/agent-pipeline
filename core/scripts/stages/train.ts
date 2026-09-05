@@ -17,6 +17,7 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { parseDeclaredDependencyIds } from "../declared-dependency-grammar.ts";
+import { mintLogicalOperationId } from "../logical-operation.ts";
 import {
   assertDiscoveryCompleteForAdmission,
   discoverDeclaredDependencies,
@@ -37,7 +38,12 @@ import {
 } from "../gh.ts";
 import { compileContractItems, type RawContractItem } from "../loop/dependencies.ts";
 import { LoopError } from "../loop/types.ts";
-import type { RunStoreDeps } from "../run-store.ts";
+import {
+  persistPublicEntrypointAdmission,
+  resolvePublicAdmissionPersistRoot,
+  type PublicAdmissionStoreDeps,
+  type RunStoreDeps,
+} from "../run-store.ts";
 import {
   flushTrainRunHandoff,
   initTrainRunStore,
@@ -48,6 +54,9 @@ import type { PipelineConfig } from "../types.ts";
 import { pipelineStageFromLabels } from "../loop/precondition.ts";
 import {
   integrationSideEffectCertainty,
+  reportMechanicalFault,
+  reportPublicEntrypointAdmissionFailure,
+  type ReportOperationObservation,
   type LinkedPrIntegrationFact,
 } from "../operation-observation.ts";
 import {
@@ -249,6 +258,12 @@ export interface TrainDeps {
   discoverDeps: WorkListDependencyDiscoverDeps;
   /** Injected generic run-store I/O. Tests supply an in-memory fake. */
   runStore?: RunStoreDeps;
+  /** Strict public-admission I/O for train-nested merge records. */
+  publicAdmissionStore?: PublicAdmissionStoreDeps;
+  persistPublicAdmission?: typeof persistPublicEntrypointAdmission;
+  /** Production resolves factory-control; tests bind an explicit approved root. */
+  resolveApprovedControlRoot?: () => Promise<string | null>;
+  reportOperationObservation?: ReportOperationObservation;
   /** Clock for train run ids and event timestamps. */
   now?: () => Date;
   /** Early `train_run_handoff` JSON line (stderr in production). */
@@ -396,7 +411,7 @@ export async function mergeReadyToDeployItem(
     | "baseTip"
     | "isAncestor"
     | "log"
-  >,
+  > & { admitMergeSubmission?: (issue: number, pr: number) => Promise<string | null> },
 ): Promise<MergeReadyToDeployResult> {
   const pr = await deps.getPrForIssue(issue);
   if (pr == null) {
@@ -446,6 +461,18 @@ export async function mergeReadyToDeployItem(
   let obs = await deps.observePr(pr);
   let attempted = false;
   if (obs.state !== "merged") {
+    const admissionFailure = await deps.admitMergeSubmission?.(issue, pr);
+    if (admissionFailure) {
+      return {
+        kind: "hold",
+        blocker: admissionFailure,
+        pr,
+        mergeCommitOid: obs.mergeCommitOid,
+        attempted: false,
+        fault: "uncertain_merge_response",
+        lifecycle: "cooling",
+      };
+    }
     deps.log(`[train] #${issue}: merging PR #${pr}…`);
     try {
       await deps.mergeIssuePr(pr);
@@ -831,6 +858,10 @@ async function linkedPrForPlan(
       state: obs.state,
       merge_commit_sha: obs.mergeCommitOid,
       contained,
+      artifact_role: "implementation",
+      artifact_identity: obs.headRefOid ? `pr:${n}:${obs.headRefOid}` : null,
+      candidate_sha: obs.headRefOid,
+      candidate_epoch: obs.headRefOid,
     });
   }
   const certainty = integrationSideEffectCertainty(facts, { truncated: listed.truncated });
@@ -1117,8 +1148,45 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
   deps.log(formatTrainOrderedIssuesLine(ordered, mergeMode, mergeFirst));
 
   const startedAt = deps.now?.() ?? new Date();
+  const outerLogicalOperationId = mintLogicalOperationId();
+  let trainStoreRoot = opts.repoDir;
+  if (mergeMode) {
+    try {
+      trainStoreRoot =
+        (await (deps.resolveApprovedControlRoot ?? (() => resolvePublicAdmissionPersistRoot({ repoDir: opts.repoDir })))()) ?? "";
+    } catch {
+      trainStoreRoot = "";
+    }
+    if (!trainStoreRoot) {
+      reportMechanicalFault(deps.reportOperationObservation, {
+        operation: "train",
+        form_id: "public-admission:train",
+        message: "approved factory-control root is unavailable",
+        domain: opts.pipelineConfig?.domain ?? opts.repo,
+        logical_operation_id: outerLogicalOperationId,
+        repository: opts.repo,
+        run_id: null,
+        fault: "admission.approved_root_unavailable",
+        certainty: "known_absent",
+      });
+      return {
+        exitCode: 1,
+        status: buildTrainStatus({
+          ordered_issues: ordered,
+          current_issue: ordered[0] ?? null,
+          current_index: 0,
+          next_action: "stopped",
+          merge_mode: true,
+          items: [],
+          blocker: "train merge admission refused: approved factory-control root is unavailable",
+          complete: false,
+          events_coverage: "unknown",
+        }),
+      };
+    }
+  }
   const storeInit = await initTrainRunStore({
-    repoDir: opts.repoDir,
+    repoDir: trainStoreRoot,
     repo: opts.repo,
     startedAt,
     mergeMode,
@@ -1131,9 +1199,37 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     },
     store: deps.runStore,
     now: deps.now,
+    logicalOperationId: outerLogicalOperationId,
   });
   let eventsCoverage = storeInit.eventsCoverage;
   const published = storeInit.session;
+  if (mergeMode && !published) {
+    reportMechanicalFault(deps.reportOperationObservation, {
+      operation: "train",
+      form_id: "public-admission:train",
+      message: "outer train session was not durably published and verified",
+      domain: opts.pipelineConfig?.domain ?? opts.repo,
+      logical_operation_id: outerLogicalOperationId,
+      repository: opts.repo,
+      run_id: null,
+      fault: "admission.persistence_failure",
+      certainty: "known_absent",
+    });
+    return {
+      exitCode: 1,
+      status: buildTrainStatus({
+        ordered_issues: ordered,
+        current_issue: ordered[0] ?? null,
+        current_index: 0,
+        next_action: "stopped",
+        merge_mode: true,
+        items: [],
+        blocker: "train merge admission refused: outer session persistence was not acknowledged",
+        complete: false,
+        events_coverage: storeInit.eventsCoverage,
+      }),
+    };
+  }
   const session: TrainEventSession = published ?? {
     runId: "",
     runDir: "",
@@ -1203,6 +1299,25 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       pr: merged.pr,
       merge_result_oid: merged.mergeCommitOid,
     });
+  };
+  const admitNestedMergeSubmission = async (issue: number, pr: number): Promise<string | null> => {
+    const admission = await (deps.persistPublicAdmission ?? persistPublicEntrypointAdmission)(
+      {
+        repoDir: opts.repoDir,
+        factoryControlRoot: trainStoreRoot,
+        kind: "merge",
+        repo: opts.repo,
+        domain: opts.pipelineConfig?.domain ?? opts.repo,
+        issue,
+        runId: `merge-${session.runId}-${issue}-${pr}`,
+        logicalOperationId: session.logicalOperationId,
+        admissionMode: "nested",
+      },
+      deps.publicAdmissionStore,
+    );
+    if (admission.acknowledged) return null;
+    reportPublicEntrypointAdmissionFailure(deps.reportOperationObservation, admission);
+    return `nested merge admission refused (${admission.failure.kind}): ${admission.failure.diagnostic}`;
   };
 
   let result: TrainResult | undefined;
@@ -1364,7 +1479,10 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       currentIndex = ordered.indexOf(issue);
       nextAction = "merge";
       await emitItemStarted(issue);
-      const merged = await mergeReadyToDeployItem(issue, opts.baseBranch, deps);
+      const merged = await mergeReadyToDeployItem(issue, opts.baseBranch, {
+        ...deps,
+        admitMergeSubmission: admitNestedMergeSubmission,
+      });
       await emitMergeCatalog(issue, merged);
       if (merged.kind === "integrated") {
         await parkReleaseAfterProvenMerge(issue, merged.verifiedMergeProof, opts, deps);
@@ -1929,6 +2047,7 @@ export function realTrainDeps(opts: {
     discoverDeps: realWorkListDependencyDiscoverDeps(discoverCfg, {
       getRoadmapDeclaredEdges: async () => loadRoadmapDeclaredEdges(opts.repoDir),
     }),
+    resolveApprovedControlRoot: () => resolvePublicAdmissionPersistRoot({ repoDir: opts.repoDir }),
 
     async listMilestoneIssues(milestone) {
       const { stdout } = await execFileAsync(

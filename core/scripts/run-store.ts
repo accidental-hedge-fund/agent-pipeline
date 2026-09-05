@@ -20,6 +20,7 @@
 import * as fsp from "node:fs/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash, randomBytes } from "node:crypto";
 import {
   ISSUE_HISTORY_SCHEMA_VERSION,
   type EvidenceBundle,
@@ -52,7 +53,7 @@ import {
   stampTrustedSurfaceDecision,
   type TrustedSurfaceDecision,
 } from "./trusted-surface.ts";
-import { mintLogicalOperationId, resolveLogicalOperationId } from "./logical-operation.ts";
+import { isLogicalOperationId, mintLogicalOperationId, resolveLogicalOperationId } from "./logical-operation.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
 
@@ -85,6 +86,21 @@ export function trainRunIdFor(startedAt: Date): RunId {
 
 /** Public unique-operation entrypoints that persist through `initRunDir`. */
 export type PublicEntrypointKind = "single" | "merge" | "merge-queue";
+
+export const PUBLIC_ADMISSION_STAMP_VERSION = "public-admission.v1" as const;
+
+export interface PublicAdmissionStamp {
+  schema_version: typeof PUBLIC_ADMISSION_STAMP_VERSION;
+  logical_operation_id: string;
+  physical_run_id: RunId;
+  entrypoint: PublicEntrypointKind;
+  repository: string;
+  domain: string;
+  issue: number | null;
+  approved_root: string;
+  started_at: string;
+  binding_sha256: string;
+}
 
 /** Produce a public-entrypoint run-id (`single-` / `merge-` / `merge-queue-`
  *  plus the same filesystem-safe UTC timestamp as {@link trainRunIdFor}). */
@@ -155,6 +171,8 @@ export interface RunStartEvent extends RunEventBase {
    * `schema_version` stays 1. Distinct from physical `run_id`.
    */
   logical_operation_id?: string;
+  /** Crash-durable public admission proof. Presence is not completion. */
+  admission_stamp?: PublicAdmissionStamp;
 }
 export type RunCompleteStopReason = "iteration-budget-exhausted";
 
@@ -1039,6 +1057,8 @@ export interface RunMeta {
    * first init. Distinct from physical `run_id`. Historical artifacts omit it.
    */
   logical_operation_id?: string;
+  /** Crash-durable public admission proof. Presence is not completion. */
+  admission_stamp?: PublicAdmissionStamp;
 }
 
 export interface InitRunDirOpts {
@@ -1190,8 +1210,8 @@ export async function initRunDir(
  * Write root for a public `single` / `merge` / `merge-queue` admission.
  * Unique-operation collection scores `runsDir(resolveFactoryControlRoot(...))`
  * plus loop state-home. Persist MUST land in that factory-control generic
- * store when the root is known. A candidate-worktree `repoDir` that is not
- * an approved collection root is not coverage.
+ * store. A candidate-worktree `repoDir` is never a fallback: inability to
+ * resolve the approved control root is an admission refusal.
  */
 export async function resolvePublicAdmissionPersistRoot(opts: {
   repoDir: string;
@@ -1199,15 +1219,15 @@ export async function resolvePublicAdmissionPersistRoot(opts: {
   factoryControlDir?: string | null;
   /**
    * Test overlay. `undefined` resolves the live factory-control root.
-   * A non-empty string is that persist root. `null` / empty leaves `repoDir`
-   * (command still runs; unique-operation coverage stays fail-closed).
+   * A non-empty string is that approved persist root. `null` / empty means
+   * there is no approved root and admission must fail closed.
    */
   factoryControlRoot?: string | null;
-}): Promise<string> {
+}): Promise<string | null> {
   if (opts.factoryControlRoot !== undefined) {
     const overlay =
       typeof opts.factoryControlRoot === "string" ? opts.factoryControlRoot.trim() : "";
-    return overlay !== "" ? overlay : opts.repoDir;
+    return overlay !== "" ? overlay : null;
   }
   const { resolveFactoryControlRoot } = await import("./production-engine-pin.ts");
   const controlRoot = resolveFactoryControlRoot({
@@ -1215,15 +1235,178 @@ export async function resolvePublicAdmissionPersistRoot(opts: {
     env: opts.env,
     factoryControlDir: opts.factoryControlDir,
   });
-  return controlRoot ?? opts.repoDir;
+  return controlRoot;
+}
+
+export type PublicAdmissionFailureKind =
+  | "invalid_binding"
+  | "approved_root_unavailable"
+  | "approved_root_mismatch"
+  | "persistence_failure"
+  | "verification_failure"
+  | "identity_conflict";
+
+export interface PublicAdmissionIdentity {
+  kind: PublicEntrypointKind;
+  runId: RunId;
+  logicalOperationId: string;
+  repository: string;
+  domain: string;
+  issue: number | null;
+  startedAt: string;
+}
+
+export interface PublicAdmissionBinding extends PublicAdmissionIdentity {
+  approvedRoot: string;
+  runDir: string;
+  stamp: PublicAdmissionStamp;
+}
+
+export type PublicAdmissionResult =
+  | ({ acknowledged: true; binding: PublicAdmissionBinding } & PublicAdmissionBinding)
+  | ({
+      acknowledged: false;
+      binding: PublicAdmissionIdentity & { approvedRoot: string | null; runDir: string | null };
+      failure: { kind: PublicAdmissionFailureKind; step: string; diagnostic: string };
+    } & PublicAdmissionIdentity & { approvedRoot: string | null; runDir: string | null });
+
+/** Strict I/O required for an acknowledged public admission. */
+export interface PublicAdmissionStoreDeps extends RunStoreDeps {
+  fsyncFile: (p: string) => Promise<void>;
+  fsyncDirectory: (p: string) => Promise<void>;
+  realpath: (p: string) => Promise<string>;
+}
+
+export const defaultPublicAdmissionStoreDeps: PublicAdmissionStoreDeps = {
+  ...defaultRunStoreDeps,
+  fsyncFile: async (p) => {
+    const handle = await fsp.open(p, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  },
+  fsyncDirectory: async (p) => {
+    const handle = await fsp.open(p, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  },
+  realpath: (p) => fsp.realpath(p),
+};
+
+function publicAdmissionBindingDigest(
+  input: Omit<PublicAdmissionStamp, "schema_version" | "binding_sha256">,
+): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(input)).digest("hex")}`;
+}
+
+function boundedAdmissionDiagnostic(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return sanitize(message).slice(0, 1000) || "unknown admission failure";
+}
+
+function publicAdmissionFailure(
+  identity: PublicAdmissionIdentity,
+  root: string | null,
+  runDir: string | null,
+  kind: PublicAdmissionFailureKind,
+  step: string,
+  err: unknown,
+): PublicAdmissionResult {
+  const common = { ...identity, approvedRoot: root, runDir };
+  return {
+    acknowledged: false,
+    ...common,
+    binding: common,
+    failure: { kind, step, diagnostic: boundedAdmissionDiagnostic(err) },
+  };
+}
+
+function parseAdmissionDocuments(
+  runRaw: string,
+  eventsRaw: string,
+): { meta: RunMeta; event: RunStartEvent } {
+  const meta = JSON.parse(runRaw) as RunMeta;
+  const lines = eventsRaw.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length !== 1) throw new Error("events.jsonl must contain exactly one admission event");
+  return { meta, event: JSON.parse(lines[0]!) as RunStartEvent };
+}
+
+function verifyPublicAdmissionDocuments(
+  binding: PublicAdmissionBinding,
+  runRaw: string,
+  eventsRaw: string,
+): void {
+  const { meta, event } = parseAdmissionDocuments(runRaw, eventsRaw);
+  const expectedStamp = JSON.stringify(binding.stamp);
+  const checks: Array<[boolean, string]> = [
+    [meta.schema_version === RUN_SCHEMA_VERSION, "run schema"],
+    [meta.run_id === binding.runId, "run id"],
+    [meta.logical_operation_id === binding.logicalOperationId, "logical operation id"],
+    [meta.kind === binding.kind, "entrypoint kind"],
+    [meta.repo === binding.repository, "repository"],
+    [(meta.issue ?? null) === binding.issue, "issue"],
+    [JSON.stringify(meta.admission_stamp) === expectedStamp, "run admission stamp"],
+    [event.schema_version === RUN_SCHEMA_VERSION && event.type === "run_start", "event schema/type"],
+    [event.run_id === binding.runId, "event run id"],
+    [event.logical_operation_id === binding.logicalOperationId, "event logical operation id"],
+    [event.entrypoint === binding.kind, "event entrypoint"],
+    [event.repo === binding.repository, "event repository"],
+    [(event.issue ?? null) === binding.issue, "event issue"],
+    [JSON.stringify(event.admission_stamp) === expectedStamp, "event admission stamp"],
+  ];
+  const failed = checks.find(([ok]) => !ok);
+  if (failed) throw new Error(`admission read-back ${failed[1]} mismatch`);
+}
+
+async function readExistingPublicAdmission(
+  binding: PublicAdmissionBinding,
+  deps: PublicAdmissionStoreDeps,
+): Promise<"absent" | "matching"> {
+  const runPath = path.join(binding.runDir, "run.json");
+  const eventsPath = path.join(binding.runDir, "events.jsonl");
+  const readOptional = async (filePath: string): Promise<string | null> => {
+    try {
+      return await deps.readFile(filePath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  };
+  const [runRaw, eventsRaw] = await Promise.all([
+    readOptional(runPath),
+    readOptional(eventsPath),
+  ]);
+  if (runRaw === null && eventsRaw === null) return "absent";
+  if (runRaw === null || eventsRaw === null) {
+    throw new Error("partial existing admission artifact");
+  }
+  verifyPublicAdmissionDocuments(binding, runRaw, eventsRaw);
+  return "matching";
+}
+
+async function atomicallyPublishAdmissionFile(
+  target: string,
+  contents: string,
+  deps: PublicAdmissionStoreDeps,
+): Promise<void> {
+  const suffix = randomBytes(8).toString("hex");
+  const temp = `${target}.tmp-${process.pid}-${suffix}`;
+  await deps.writeFile(temp, contents);
+  await deps.fsyncFile(temp);
+  await deps.rename(temp, target);
+  await deps.fsyncFile(target);
 }
 
 /**
  * Persist a control-host generic-store run for a public `pipeline single` /
  * `pipeline merge` / `pipeline merge-queue` admission. Uses the existing
- * {@link initRunDir} store (no second run store). Writes into
- * `runsDir(resolveFactoryControlRoot(...))` when that factory-control root
- * is non-null so unique-operation collection can observe the artifact.
+ * the existing generic-store schema (no second run store). Protected work may
+ * start only after this function returns `acknowledged: true`.
  */
 export async function persistPublicEntrypointAdmission(
   opts: {
@@ -1234,35 +1417,175 @@ export async function persistPublicEntrypointAdmission(
     issue?: number;
     startedAt?: Date;
     logicalOperationId?: string | null;
+    /** Direct admissions mint; nested/resume admissions must reuse this id. */
+    admissionMode?: "direct" | "nested" | "resume";
+    domain?: string;
+    runId?: RunId;
+    mintLogicalOperationId?: () => string;
     env?: NodeJS.ProcessEnv;
     factoryControlDir?: string | null;
     factoryControlRoot?: string | null;
   },
-  deps: RunStoreDeps = defaultRunStoreDeps,
-): Promise<{ runId: RunId; runDir: string }> {
+  deps: PublicAdmissionStoreDeps = defaultPublicAdmissionStoreDeps,
+): Promise<PublicAdmissionResult> {
   const startedAt = opts.startedAt ?? new Date();
-  const runId = publicEntrypointRunIdFor(opts.kind, startedAt);
+  const runId = opts.runId ?? publicEntrypointRunIdFor(opts.kind, startedAt);
+  const suppliedLogicalId = opts.logicalOperationId?.trim() || null;
+  const mode = opts.admissionMode ?? "direct";
+  const logicalOperationId = suppliedLogicalId ??
+    (mode === "direct" ? (opts.mintLogicalOperationId ?? mintLogicalOperationId)() : "");
+  const identity: PublicAdmissionIdentity = {
+    kind: opts.kind,
+    runId,
+    logicalOperationId,
+    repository: opts.repo,
+    domain: opts.domain?.trim() || opts.repo,
+    issue: opts.issue ?? null,
+    startedAt: startedAt.toISOString(),
+  };
+  if (!isLogicalOperationId(logicalOperationId)) {
+    return publicAdmissionFailure(
+      identity,
+      null,
+      null,
+      "invalid_binding",
+      "bind_identity",
+      mode === "direct"
+        ? "logical operation mint returned an invalid identity"
+        : `${mode} admission requires an existing Logical Operation identity`,
+    );
+  }
   const persistRoot = await resolvePublicAdmissionPersistRoot({
     repoDir: opts.repoDir,
     env: opts.env,
     factoryControlDir: opts.factoryControlDir,
     factoryControlRoot: opts.factoryControlRoot,
   });
-  const runDir = runDirPath(persistRoot, runId);
-  await initRunDir(
-    {
+  if (!persistRoot) {
+    return publicAdmissionFailure(
+      identity,
+      null,
+      null,
+      "approved_root_unavailable",
+      "resolve_approved_root",
+      "approved factory-control root is unavailable",
+    );
+  }
+  const requestedRoot = path.resolve(persistRoot);
+  let approvedRoot: string;
+  try {
+    approvedRoot = await deps.realpath(requestedRoot);
+  } catch (err) {
+    return publicAdmissionFailure(
+      identity,
+      requestedRoot,
+      null,
+      "approved_root_unavailable",
+      "canonicalize_approved_root",
+      err,
+    );
+  }
+  if (approvedRoot !== requestedRoot) {
+    return publicAdmissionFailure(
+      identity,
+      approvedRoot,
+      null,
+      "approved_root_mismatch",
+      "verify_approved_root",
+      `approved root resolved to ${approvedRoot}, expected ${requestedRoot}`,
+    );
+  }
+  const runDir = runDirPath(approvedRoot, runId);
+  const stampInput = {
+    logical_operation_id: logicalOperationId,
+    physical_run_id: runId,
+    entrypoint: opts.kind,
+    repository: identity.repository,
+    domain: identity.domain,
+    issue: identity.issue,
+    approved_root: approvedRoot,
+    started_at: identity.startedAt,
+  };
+  const stamp: PublicAdmissionStamp = {
+    schema_version: PUBLIC_ADMISSION_STAMP_VERSION,
+    ...stampInput,
+    binding_sha256: publicAdmissionBindingDigest(stampInput),
+  };
+  const binding: PublicAdmissionBinding = { ...identity, approvedRoot, runDir, stamp };
+  const meta: RunMeta = {
+    schema_version: RUN_SCHEMA_VERSION,
+    run_id: runId,
+    logical_operation_id: logicalOperationId,
+    kind: opts.kind,
+    ...(identity.issue !== null ? { issue: identity.issue } : {}),
+    repo: identity.repository,
+    profile: opts.profile ?? null,
+    started_at: identity.startedAt,
+    discovery_channel: "live-run",
+    admission_stamp: stamp,
+  };
+  const event: RunStartEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "run_start",
+    at: identity.startedAt,
+    run_id: runId,
+    logical_operation_id: logicalOperationId,
+    entrypoint: opts.kind,
+    repo: identity.repository,
+    ...(identity.issue !== null ? { issue: identity.issue } : {}),
+    admission_stamp: stamp,
+  };
+  try {
+    const existing = await readExistingPublicAdmission(binding, deps);
+    if (existing === "matching") return { acknowledged: true, ...binding, binding };
+  } catch (err) {
+    return publicAdmissionFailure(
+      identity,
+      approvedRoot,
       runDir,
-      runId,
-      kind: opts.kind,
-      issue: opts.issue,
-      repo: opts.repo,
-      profile: opts.profile ?? null,
-      startedAt: startedAt.toISOString(),
-      logicalOperationId: opts.logicalOperationId,
-    },
-    deps,
-  );
-  return { runId, runDir };
+      "identity_conflict",
+      "verify_existing",
+      err,
+    );
+  }
+  const parentRunsDir = runsDir(approvedRoot);
+  try {
+    await deps.mkdir(parentRunsDir, { recursive: true });
+    await deps.mkdir(runDir, { recursive: true });
+    await atomicallyPublishAdmissionFile(
+      path.join(runDir, "run.json"),
+      `${JSON.stringify(meta, null, 2)}\n`,
+      deps,
+    );
+    await atomicallyPublishAdmissionFile(
+      path.join(runDir, "events.jsonl"),
+      `${JSON.stringify(event)}\n`,
+      deps,
+    );
+    await deps.fsyncDirectory(runDir);
+    await deps.fsyncDirectory(parentRunsDir);
+  } catch (err) {
+    return publicAdmissionFailure(
+      identity,
+      approvedRoot,
+      runDir,
+      "persistence_failure",
+      "publish_stamp",
+      err,
+    );
+  }
+  try {
+    const [runRaw, eventsRaw] = await Promise.all([
+      deps.readFile(path.join(runDir, "run.json")),
+      deps.readFile(path.join(runDir, "events.jsonl")),
+    ]);
+    verifyPublicAdmissionDocuments(binding, runRaw, eventsRaw);
+  } catch (err) {
+    const message = boundedAdmissionDiagnostic(err);
+    const kind = message.includes("mismatch") ? "identity_conflict" : "verification_failure";
+    return publicAdmissionFailure(identity, approvedRoot, runDir, kind, "read_back", err);
+  }
+  return { acknowledged: true, ...binding, binding };
 }
 
 /** Resolve the engine identity a dispatch should pin, respecting `initRunDir`'s

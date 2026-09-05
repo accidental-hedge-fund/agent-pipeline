@@ -11,6 +11,7 @@
  * injectable deps (no module-level gh/git/network in tests).
  */
 
+import { createHash } from "node:crypto";
 import { getIssueDetail, getPrForIssue, getPrForIssueAnyState, getPrDetail, createPr, setBlocked, clearBlocked, transition } from "./gh.ts";
 import * as openspec from "./openspec.ts";
 import { ISSUE_TRAILER_KEY, RUN_TRAILER_KEY } from "./traceability.ts";
@@ -40,6 +41,8 @@ export interface PublishableUnpublishedFacts {
   prLookupFailed?: boolean;
   tipSubject: string;
   tipBody?: string;
+  /** Exact candidate observed by inspect immediately before publication. */
+  headSha?: string;
   /**
    * Same-process authorship when git log is stubbed or checkpoint already
    * authored the tip. Recover-parked inspect leaves this unset so unmarked
@@ -234,6 +237,8 @@ export async function inspectPublishableUnpublishedStageCommit(
   }
   const headBranchR = await git(wt.path, ["rev-parse", "--abbrev-ref", "HEAD"], { ignoreFailure: true });
   const headBranch = (headBranchR.stdout.trim() || branch).replace(/^heads\//, "");
+  const headShaR = await git(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+  const headSha = headShaR.code === 0 ? headShaR.stdout.trim().toLowerCase() : "";
   const logR = await git(wt.path, ["log", "-1", "--format=%s%n%n%b"], { ignoreFailure: true });
   const logText = logR.code === 0 ? logR.stdout : "";
   const nl = logText.indexOf("\n");
@@ -268,6 +273,7 @@ export async function inspectPublishableUnpublishedStageCommit(
     prLookupFailed,
     tipSubject,
     tipBody,
+    ...(headSha ? { headSha } : {}),
   };
   return {
     facts,
@@ -304,8 +310,81 @@ export interface PublishUnpublishedExecutorDeps {
   probeImplementDeliverable?: (
     wtPath: string,
     issueNumber: number,
-  ) => Promise<{ present: boolean; description?: string }>;
+  ) => Promise<ImplementDeliverableObservation>;
   pipelineRunId?: string;
+}
+
+export type DeliverableArtifactRole = "planning" | "implementation" | "unknown";
+
+/** Closed, candidate-bound observation used by every implementing completion path. */
+export interface ImplementDeliverableObservation {
+  present: boolean;
+  role: DeliverableArtifactRole;
+  artifact_id: string | null;
+  candidate_sha: string | null;
+  candidate_epoch: string | null;
+  description?: string;
+}
+
+export function isExactImplementationDeliverable(
+  observation: ImplementDeliverableObservation,
+  expectedCandidateSha?: string | null,
+): boolean {
+  if (!observation.present || observation.role !== "implementation") return false;
+  const sha = observation.candidate_sha?.trim().toLowerCase() ?? "";
+  const epoch = observation.candidate_epoch?.trim().toLowerCase() ?? "";
+  const artifactId = observation.artifact_id?.trim() ?? "";
+  const expected = expectedCandidateSha?.trim().toLowerCase() ?? sha;
+  return sha.length > 0 && epoch === sha && artifactId.length > 0 && expected === sha;
+}
+
+function deliverableArtifactId(paths: readonly string[]): string {
+  const canonical = [...paths].map((p) => p.trim()).filter(Boolean).sort().join("\n");
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
+function isPlanningArtifactPath(filePath: string): boolean {
+  return /^openspec\/changes\/(?:archive\/)?[^/]+\//.test(filePath);
+}
+
+export function observeImplementDeliverablePaths(input: {
+  paths: readonly string[];
+  candidateSha: string | null | undefined;
+  acceptedPlanningIds?: readonly string[];
+}): ImplementDeliverableObservation {
+  const candidateSha = input.candidateSha?.trim().toLowerCase() ?? "";
+  const paths = input.paths.map((filePath) => filePath.trim()).filter(Boolean);
+  if (!candidateSha) {
+    return {
+      present: false,
+      role: "unknown",
+      artifact_id: null,
+      candidate_sha: null,
+      candidate_epoch: null,
+    };
+  }
+  const productPaths = paths.filter((filePath) => !isPlanningArtifactPath(filePath));
+  if (productPaths.length > 0) {
+    return {
+      present: true,
+      role: "implementation",
+      artifact_id: deliverableArtifactId(productPaths),
+      candidate_sha: candidateSha,
+      candidate_epoch: candidateSha,
+      description: `product implementation at ${candidateSha.slice(0, 12)} (${productPaths.length} changed product path(s))`,
+    };
+  }
+  const accepted = input.acceptedPlanningIds ?? [];
+  return {
+    present: accepted.length > 0,
+    role: accepted.length > 0 ? "planning" : "unknown",
+    artifact_id: paths.length > 0 ? deliverableArtifactId(paths) : null,
+    candidate_sha: candidateSha,
+    candidate_epoch: candidateSha,
+    description: accepted.length > 0
+      ? `planning-only OpenSpec artifact(s) at HEAD: ${accepted.join(", ")}`
+      : undefined,
+  };
 }
 
 function failedPublish(error: string): { succeeded: false; evidence: string; error: string } {
@@ -327,12 +406,22 @@ export function createDefaultImplementDeliverableProbe(
   git: typeof gitInWorktree = gitInWorktree,
 ): NonNullable<PublishUnpublishedExecutorDeps["probeImplementDeliverable"]> {
   return async (wtPath, _issueNumber) => {
+    const head = await git(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true });
+    const candidateSha = head.code === 0 ? head.stdout.trim().toLowerCase() : "";
     const result = await git(
       wtPath,
       ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
       { ignoreFailure: true },
     );
-    if (result.code !== 0) return { present: false };
+    if (result.code !== 0 || !candidateSha) {
+      return {
+        present: false,
+        role: "unknown",
+        artifact_id: null,
+        candidate_sha: candidateSha || null,
+        candidate_epoch: candidateSha || null,
+      };
+    }
     const branchPaths = result.stdout
       .split("\n")
       .map((s) => s.trim())
@@ -343,11 +432,11 @@ export function createDefaultImplementDeliverableProbe(
     const acceptedIds = branchChangeIds.filter(
       (id) => openspec.readChangeFile(wtPath, id, "proposal.md") !== null,
     );
-    if (acceptedIds.length === 0) return { present: false };
-    return {
-      present: true,
-      description: `branch-introduced OpenSpec deliverable(s) at HEAD: ${acceptedIds.join(", ")}`,
-    };
+    return observeImplementDeliverablePaths({
+      paths: branchPaths,
+      candidateSha,
+      acceptedPlanningIds: acceptedIds,
+    });
   };
 }
 
@@ -374,9 +463,10 @@ export async function executePublishUnpublishedStageCommit(
     );
   }
   const deliverable = await probe(inspected.worktree.path, issueNumber);
-  if (!deliverable.present) {
+  if (!isExactImplementationDeliverable(deliverable, inspected.facts?.headSha)) {
     return failedPublish(
-      "publish_unpublished_stage_commit: implement deliverable unsatisfied — completeness/re-invoke, not review-1",
+      `publish_unpublished_stage_commit: exact current implementation deliverable unsatisfied` +
+        ` (role=${deliverable.role}, candidate=${deliverable.candidate_sha ?? "unknown"}) — completeness/re-invoke, not review-1`,
     );
   }
   const resume =

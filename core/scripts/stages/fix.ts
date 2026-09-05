@@ -50,6 +50,7 @@ import {
   createDefaultImplementDeliverableProbe,
   executePublishUnpublishedStageCommit,
   resolveTimeoutParkForUnpublishedCommit,
+  type ImplementDeliverableObservation,
 } from "../unpublished-stage-commit.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import {
@@ -292,7 +293,7 @@ export interface AdvanceFixDeps {
   probeImplementDeliverable?: (
     wtPath: string,
     issueNumber: number,
-  ) => Promise<{ present: boolean; description?: string }>;
+  ) => Promise<ImplementDeliverableObservation>;
 }
 
 // ---------------------------------------------------------------------------

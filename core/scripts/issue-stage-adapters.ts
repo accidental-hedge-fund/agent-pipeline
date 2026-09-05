@@ -22,6 +22,7 @@ import {
   reportOwnedOperation,
   treatmentForSideEffectCertainty,
   type ObservationLifecycleState,
+  type ArtifactEvidenceRole,
   type OperationObservation,
   type ReportOperationObservation,
   type SideEffectCertainty,
@@ -298,6 +299,30 @@ export function candidateEpochChanged(previous: string | null | undefined, next:
   return a !== b;
 }
 
+export const CANDIDATE_BOUND_EVIDENCE_CLASSES = [
+  "implementation",
+  "test",
+  "review",
+  "design",
+  "eval",
+  "shipcheck",
+  "decision",
+  "authority_request",
+  "authority_grant",
+  "completion",
+] as const;
+
+/** Every candidate-bound fact is invalid after movement; callers must re-prove it. */
+export function candidateBoundEvidenceAfterMovement(
+  previous: string | null | undefined,
+  next: string | null | undefined,
+): Record<(typeof CANDIDATE_BOUND_EVIDENCE_CLASSES)[number], boolean> {
+  const remainsValid = !candidateEpochChanged(previous, next) && Boolean(previous && next);
+  return Object.fromEntries(
+    CANDIDATE_BOUND_EVIDENCE_CLASSES.map((kind) => [kind, remainsValid]),
+  ) as Record<(typeof CANDIDATE_BOUND_EVIDENCE_CLASSES)[number], boolean>;
+}
+
 /** Candidate-bound evidence is valid only when it names the current epoch SHA. */
 export function isCandidateBoundEvidenceValid(
   evidenceSha: string | null | undefined,
@@ -466,10 +491,35 @@ export interface AdapterAttemptInput {
   issue?: number | null;
   run_id?: string | null;
   candidateSha?: string | null;
+  candidateEpoch?: string | null;
+  evidenceRole?: ArtifactEvidenceRole | string | null;
+  artifactIdentity?: string | null;
   exitCode?: number | null;
   postconditionProven?: boolean;
   outcome?: Outcome;
   error?: unknown;
+}
+
+export function requiredEvidenceRoleForStage(stage: DeliveryStage): ArtifactEvidenceRole {
+  return stage === "planning" || stage === "plan-review" || stage === "pre-code-attestation"
+    ? "planning"
+    : "implementation";
+}
+
+export function completingEvidenceBindingFailure(input: Pick<
+  AdapterAttemptInput,
+  "stage" | "candidateSha" | "candidateEpoch" | "evidenceRole" | "artifactIdentity"
+>): string | null {
+  const expectedRole = requiredEvidenceRoleForStage(input.stage);
+  if (input.evidenceRole !== expectedRole) {
+    return `required ${expectedRole} evidence role, observed ${input.evidenceRole ?? "missing"}`;
+  }
+  if (!input.artifactIdentity?.trim()) return "artifact identity is missing";
+  const candidate = input.candidateSha?.trim().toLowerCase() ?? "";
+  const epoch = input.candidateEpoch?.trim().toLowerCase() ?? "";
+  if (!candidate || !epoch) return "candidate and Candidate epoch bindings are required";
+  if (candidate !== epoch) return `prior or conflicting Candidate epoch ${epoch} for ${candidate}`;
+  return null;
 }
 
 function formIdForStage(stage: DeliveryStage): string {
@@ -492,7 +542,17 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
   }
   const outcome = input.outcome;
   const exitZero = input.exitCode === 0;
-  const proven = input.postconditionProven === true;
+  const bindingFailure = input.postconditionProven === true
+    ? completingEvidenceBindingFailure(input)
+    : null;
+  const proven = input.postconditionProven === true && bindingFailure === null;
+  const evidenceFields = {
+    ...(input.candidateEpoch?.trim() ? { candidate_epoch: input.candidateEpoch.trim().toLowerCase() } : {}),
+    ...(input.evidenceRole === "planning" || input.evidenceRole === "implementation"
+      ? { evidence_role: input.evidenceRole }
+      : {}),
+    ...(input.artifactIdentity?.trim() ? { artifact_identity: input.artifactIdentity.trim() } : {}),
+  };
   if (exitZero && !proven) {
     return {
       ...ownedAdmissionObservation({
@@ -504,6 +564,7 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
       certainty: "uncertain",
       complete: false,
       process_exit_is_completion: false,
+      ...evidenceFields,
     };
   }
   if (!outcome) {
@@ -512,6 +573,7 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
       form_id,
       message: input.message ?? "adapter attempt produced no outcome",
       ...identity,
+      ...evidenceFields,
       certainty: "uncertain",
     });
   }
@@ -522,6 +584,7 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
       operation: invariant.operation,
       form_id,
       ...identity,
+      ...evidenceFields,
       certainty,
       lifecycle: proven ? "complete" : "active",
       human_owned: false,
@@ -530,7 +593,9 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
       process_exit_is_completion: false,
       owned: true,
       fault: null,
-      message: input.message ?? outcome.summary,
+      message: input.message ?? (bindingFailure
+        ? `${outcome.summary}; completion evidence rejected: ${bindingFailure}`
+        : outcome.summary),
       capability_request: null,
     };
   }
@@ -554,6 +619,7 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
     operation: invariant.operation,
     form_id,
     ...identity,
+    ...evidenceFields,
     certainty: "uncertain",
     lifecycle,
     human_owned: false,
@@ -656,6 +722,9 @@ export interface RunDeliveryStageAdapterInput {
   logicalOperationId?: string | null;
   reportObservation?: ReportOperationObservation;
   candidateSha?: string | null;
+  candidateEpoch?: string | null;
+  evidenceRole?: ArtifactEvidenceRole | string | null;
+  artifactIdentity?: string | null;
   postconditionProven?: boolean;
   attempt: () => Promise<Outcome>;
 }
@@ -669,6 +738,9 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
     issue: input.issueNumber,
     run_id: input.pipelineRunId ?? null,
     candidateSha: input.candidateSha,
+    candidateEpoch: input.candidateEpoch,
+    evidenceRole: input.evidenceRole,
+    artifactIdentity: input.artifactIdentity,
   };
   try {
     const outcome = await input.attempt();
@@ -679,6 +751,13 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
     });
     const reported = reportOwnedOperation(input.reportObservation, obs);
     if (!reported.complete) consumeReportedOwned(reported);
+    if (input.postconditionProven === true && outcome.advanced && !reported.complete) {
+      return {
+        advanced: false,
+        status: "waiting",
+        reason: reported.message,
+      };
+    }
     const decision = reconcileIssueStageObservation(reported, outcome);
     if (
       decision.treatment === "re-entry" &&

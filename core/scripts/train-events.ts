@@ -5,7 +5,7 @@
 
 import * as path from "node:path";
 import { writeFlushedStdoutLine } from "./loop/handoff.ts";
-import { mintLogicalOperationId } from "./logical-operation.ts";
+import { isLogicalOperationId, mintLogicalOperationId } from "./logical-operation.ts";
 import {
   RUN_SCHEMA_VERSION,
   appendEvent,
@@ -161,7 +161,7 @@ async function openClaimedTrainStore(input: {
   selector: TrainRunSelector;
   store: RunStoreDeps;
   now?: () => Date;
-  logicalOperationId?: string | null;
+  logicalOperationId: string;
   runId: string;
   runDir: string;
 }): Promise<TrainEventSession | null> {
@@ -180,29 +180,23 @@ async function openClaimedTrainStore(input: {
     },
     input.store,
   );
+  const logicalOperationId = input.logicalOperationId.trim();
+  if (!isLogicalOperationId(logicalOperationId)) return null;
   try {
-    await input.store.readFile(path.join(input.runDir, "run.json"));
+    const runRaw = await input.store.readFile(path.join(input.runDir, "run.json"));
     await input.store.readFile(path.join(input.runDir, "events.jsonl"));
+    const meta = JSON.parse(runRaw) as Record<string, unknown>;
+    if (
+      meta.run_id !== input.runId ||
+      meta.logical_operation_id !== logicalOperationId ||
+      meta.kind !== "train" ||
+      meta.repo !== input.repo ||
+      meta.merge_mode !== input.mergeMode ||
+      JSON.stringify(meta.ordered_issues) !== JSON.stringify(input.orderedIssues) ||
+      JSON.stringify(meta.selector) !== JSON.stringify(input.selector)
+    ) return null;
   } catch {
     return null;
-  }
-  let logicalOperationId =
-    typeof input.logicalOperationId === "string" && input.logicalOperationId.trim()
-      ? input.logicalOperationId.trim()
-      : "";
-  if (!logicalOperationId) {
-    try {
-      const raw = await input.store.readFile(path.join(input.runDir, "run.json"));
-      const meta = JSON.parse(raw) as { logical_operation_id?: unknown };
-      if (typeof meta.logical_operation_id === "string" && meta.logical_operation_id.trim()) {
-        logicalOperationId = meta.logical_operation_id.trim();
-      }
-    } catch {
-      /* initRunDir is non-fatal; mint below if unreadable */
-    }
-  }
-  if (!logicalOperationId) {
-    logicalOperationId = mintLogicalOperationId();
   }
   const session = createTrainEventSession({
     runDir: input.runDir,
@@ -217,6 +211,20 @@ async function openClaimedTrainStore(input: {
     logical_operation_id: logicalOperationId,
   });
   if (!started) return null;
+  try {
+    const eventsRaw = await input.store.readFile(path.join(input.runDir, "events.jsonl"));
+    const lines = eventsRaw.split(/\r?\n/).filter((line) => line.trim());
+    const event = JSON.parse(lines.at(-1) ?? "null") as Record<string, unknown> | null;
+    if (
+      !event ||
+      event.type !== "run_start" ||
+      event.run_id !== input.runId ||
+      event.logical_operation_id !== logicalOperationId ||
+      event.merge_mode !== input.mergeMode
+    ) return null;
+  } catch {
+    return null;
+  }
   return session;
 }
 
@@ -230,8 +238,16 @@ export async function initTrainRunStore(input: {
   store?: RunStoreDeps;
   now?: () => Date;
   logicalOperationId?: string | null;
+  mintLogicalOperationId?: () => string;
 }): Promise<TrainRunStoreInit> {
   const store = input.store ?? defaultRunStoreDeps;
+  const logicalOperationId =
+    typeof input.logicalOperationId === "string" && input.logicalOperationId.trim()
+      ? input.logicalOperationId.trim()
+      : (input.mintLogicalOperationId ?? mintLogicalOperationId)();
+  if (!isLogicalOperationId(logicalOperationId)) {
+    return { session: null, eventsCoverage: "degraded" };
+  }
   try {
     await store.mkdir(runsDir(input.repoDir), { recursive: true });
   } catch (err) {
@@ -253,6 +269,7 @@ export async function initTrainRunStore(input: {
     }
     const session = await openClaimedTrainStore({
       ...input,
+      logicalOperationId,
       store,
       runId,
       runDir,

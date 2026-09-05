@@ -17,6 +17,9 @@ import {
   type PrepareCandidateEngineDeps,
 } from "../scripts/candidate-engine-readiness.ts";
 import {
+  CANDIDATE_ENGINE_CONSUMERS,
+  assertCandidateEngineConsumerInventoryComplete,
+  candidateEngineConsumerInventoryGaps,
   resolveAndPrepareCandidateEngine,
   resolveCandidateEngine,
   type ResolveAndPrepareCandidateEngineDeps,
@@ -33,6 +36,24 @@ const DIGEST_V2 = "d2-lock";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
+
+test("candidate-engine consumer inventory is exact and hard-gated (#1454)", () => {
+  assert.doesNotThrow(() => assertCandidateEngineConsumerInventoryComplete());
+  assert.deepEqual(candidateEngineConsumerInventoryGaps(), []);
+  assert.throws(
+    () => assertCandidateEngineConsumerInventoryComplete(
+      CANDIDATE_ENGINE_CONSUMERS.filter((row) => row.consumer !== "factory-release.pack-loop"),
+    ),
+    /missing consumer factory-release\.pack-loop/,
+  );
+  const bypass = CANDIDATE_ENGINE_CONSUMERS.map((row) =>
+    row.consumer === "ship.stage-adapter" ? { ...row, revalidate_before_spawn: false } : row,
+  ) as never;
+  assert.throws(
+    () => assertCandidateEngineConsumerInventoryComplete(bypass),
+    /ship\.stage-adapter missing revalidate_before_spawn/,
+  );
+});
 
 type RootState = {
   head: string | null;
@@ -975,11 +996,17 @@ test("seam source does not call detectAndInstall or honor setup_command", () => 
     "utf8",
   );
   const seam = fs.readFileSync(path.join(repoRoot, "core/scripts/ship-end-candidate.ts"), "utf8");
+  const factoryRelease = fs.readFileSync(
+    path.join(repoRoot, "core/scripts/factory-release-prepare.ts"),
+    "utf8",
+  );
   assert.doesNotMatch(readiness, /detectAndInstall/);
   assert.doesNotMatch(readiness, /setup_command/);
   assert.doesNotMatch(seam, /detectAndInstall/);
   assert.match(seam, /resolveAndPrepareCandidateEngine/);
   assert.match(seam, /resolveCandidateEngine\(/);
+  assert.match(factoryRelease, /resolveAndPrepareCandidateEngine/);
+  assert.doesNotMatch(factoryRelease, /defaultResolveCandidateEngineDeps/);
 });
 
 test("default state writes refuse shared /tmp and follow no attacker entries", () => {

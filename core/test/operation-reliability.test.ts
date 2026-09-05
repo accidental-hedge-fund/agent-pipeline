@@ -5,6 +5,9 @@ import assert from "node:assert/strict";
 import {
   REQUIRED_LIFECYCLE_CLASSES_1333,
   REQUIRED_PUBLIC_ENTRYPOINTS,
+  REQUIRED_ADMISSION_ROUTES,
+  admissionRouteInventoryGaps,
+  assertAdmissionRouteInventoryComplete,
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
   filterAttemptsBoundToCandidate,
@@ -15,6 +18,7 @@ import {
   uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
 } from "../scripts/operation-reliability.ts";
+
 import {
   computeFrgEvidence,
   FRG_PACK_MANIFEST,
@@ -27,6 +31,28 @@ import {
   verifyFrgAttestation,
   type FrgFsDeps,
 } from "../scripts/factory-reliability-gate.ts";
+
+test("required admission route inventory is exact and hard-gated (#1454)", () => {
+  assert.doesNotThrow(() => assertAdmissionRouteInventoryComplete());
+  assert.deepEqual(admissionRouteInventoryGaps(), []);
+
+  const missing = REQUIRED_ADMISSION_ROUTES.filter((row) => row.route !== "merge.train-nested");
+  assert.throws(() => assertAdmissionRouteInventoryComplete(missing), /missing route merge\.train-nested/);
+
+  const duplicate = [...REQUIRED_ADMISSION_ROUTES, REQUIRED_ADMISSION_ROUTES[0]!];
+  assert.throws(() => assertAdmissionRouteInventoryComplete(duplicate), /duplicate route drive\.numeric/);
+
+  const unknown = [
+    ...REQUIRED_ADMISSION_ROUTES,
+    { route: "invented", entrypoint: "invented", class: "direct", boundary: "public-admission" },
+  ] as never;
+  assert.throws(() => assertAdmissionRouteInventoryComplete(unknown), /unknown route invented.*unknown entrypoint invented/);
+
+  const nameOnly = REQUIRED_ADMISSION_ROUTES.map((row) =>
+    row.route === "single.direct" ? { ...row, boundary: "" } : row,
+  ) as never;
+  assert.throws(() => assertAdmissionRouteInventoryComplete(nameOnly), /bypasses admission/);
+});
 
 function packInput(over: Record<string, unknown> = {}) {
   return {

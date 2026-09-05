@@ -27,6 +27,72 @@ export interface CandidateEngine {
   commitSha: string;
 }
 
+export interface CandidateEngineConsumerRoute {
+  consumer: string;
+  gate: "resolve-and-prepare";
+  exact_sha: true;
+  approved_canonical_root: true;
+  sha_lockfile_readiness: true;
+  clean_before_bootstrap: true;
+  clean_after_bootstrap: true;
+  revalidate_before_spawn: true;
+}
+
+const EXPECTED_CANDIDATE_ENGINE_CONSUMERS = [
+  "factory-release.pack-loop",
+  "factory-gate.hybrid-v2",
+  "ship.stage-adapter",
+  "pipeline.candidate-leaf",
+] as const;
+
+export const CANDIDATE_ENGINE_CONSUMERS: readonly CandidateEngineConsumerRoute[] =
+  EXPECTED_CANDIDATE_ENGINE_CONSUMERS.map((consumer) => ({
+    consumer,
+    gate: "resolve-and-prepare" as const,
+    exact_sha: true as const,
+    approved_canonical_root: true as const,
+    sha_lockfile_readiness: true as const,
+    clean_before_bootstrap: true as const,
+    clean_after_bootstrap: true as const,
+    revalidate_before_spawn: true as const,
+  }));
+
+export function candidateEngineConsumerInventoryGaps(
+  routes: readonly CandidateEngineConsumerRoute[] = CANDIDATE_ENGINE_CONSUMERS,
+): string[] {
+  const gaps: string[] = [];
+  const seen = new Set<string>();
+  for (const route of routes) {
+    if (seen.has(route.consumer)) gaps.push(`duplicate consumer ${route.consumer}`);
+    seen.add(route.consumer);
+    if (!(EXPECTED_CANDIDATE_ENGINE_CONSUMERS as readonly string[]).includes(route.consumer)) {
+      gaps.push(`unknown consumer ${route.consumer}`);
+    }
+    for (const proof of [
+      "exact_sha",
+      "approved_canonical_root",
+      "sha_lockfile_readiness",
+      "clean_before_bootstrap",
+      "clean_after_bootstrap",
+      "revalidate_before_spawn",
+    ] as const) {
+      if (route[proof] !== true) gaps.push(`${route.consumer} missing ${proof}`);
+    }
+    if (route.gate !== "resolve-and-prepare") gaps.push(`${route.consumer} bypasses resolve-and-prepare`);
+  }
+  for (const consumer of EXPECTED_CANDIDATE_ENGINE_CONSUMERS) {
+    if (!seen.has(consumer)) gaps.push(`missing consumer ${consumer}`);
+  }
+  return gaps;
+}
+
+export function assertCandidateEngineConsumerInventoryComplete(
+  routes: readonly CandidateEngineConsumerRoute[] = CANDIDATE_ENGINE_CONSUMERS,
+): void {
+  const gaps = candidateEngineConsumerInventoryGaps(routes);
+  if (gaps.length) throw new Error(`candidate-engine consumer inventory invalid: ${gaps.join("; ")}`);
+}
+
 export type CandidateEngineFailureKind = "identity" | "readiness" | "lock";
 
 export type CandidateEngineResult =

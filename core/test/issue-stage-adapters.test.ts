@@ -20,6 +20,7 @@ import {
   assertNoSuperviseAdvanceCommand,
   canStartFixReentry,
   candidateEpochChanged,
+  candidateBoundEvidenceAfterMovement,
   candidateEpochFromSha,
   collectForbiddenAdapterTreatments,
   collectForbiddenLifecycleRetries,
@@ -34,6 +35,7 @@ import {
   observationFromAdapterAttempt,
   reconcileIssueStageObservation,
   remainingFixTimeoutSec,
+  requiredEvidenceRoleForStage,
   runDeliveryStageAdapter,
   runOwnedFixAttempts,
   scanDeliveryStageAdapterContracts,
@@ -565,6 +567,48 @@ test("4.1 prior-epoch review verdict cannot authorize advancement at the new HEA
   assert.equal(candidateEpochChanged(prior.sha, next.sha), true);
   assert.equal(isCandidateBoundEvidenceValid(prior.sha, next.sha), false);
   assert.equal(isCandidateBoundEvidenceValid(next.sha, next.sha), true);
+  const invalidated = candidateBoundEvidenceAfterMovement(prior.sha, next.sha);
+  assert.ok(Object.values(invalidated).every((valid) => valid === false));
+});
+
+test("4.1 completing observations require the exact role, artifact, candidate, and epoch (#1454)", () => {
+  const sha = "a".repeat(40);
+  const complete = observationFromAdapterAttempt({
+    stage: "implementing",
+    domain: "test",
+    logical_operation_id: "lop-role-exact",
+    candidateSha: sha,
+    candidateEpoch: sha,
+    evidenceRole: "implementation",
+    artifactIdentity: "sha256:product-delta",
+    postconditionProven: true,
+    outcome: { advanced: true, from: "implementing", to: "design-gate", summary: "proved" },
+  });
+  assert.equal(complete.complete, true);
+  assert.equal(complete.evidence_role, "implementation");
+  assert.equal(complete.candidate_epoch, sha);
+
+  for (const fixture of [
+    {},
+    { evidenceRole: "unknown" },
+    { evidenceRole: "planning", artifactIdentity: "sha256:plan", candidateEpoch: sha },
+    { evidenceRole: "implementation", artifactIdentity: "sha256:impl", candidateEpoch: "b".repeat(40) },
+  ]) {
+    const rejected = observationFromAdapterAttempt({
+      stage: "implementing",
+      domain: "test",
+      logical_operation_id: "lop-role-rejected",
+      candidateSha: sha,
+      postconditionProven: true,
+      outcome: { advanced: true, from: "implementing", to: "design-gate", summary: "claimed" },
+      ...fixture,
+    });
+    assert.equal(rejected.complete, false);
+    assert.equal(rejected.certainty, "uncertain");
+    assert.match(rejected.message, /completion evidence rejected/);
+  }
+  assert.equal(requiredEvidenceRoleForStage("planning"), "planning");
+  assert.equal(requiredEvidenceRoleForStage("review-1"), "implementation");
 });
 
 test("4.2 stale authority hold is not preserved by a leftover blocked label", () => {

@@ -887,6 +887,10 @@ export interface LoopExternalIdentity {
   product_dirt?: boolean;
   /** Certainty that a linked PR is merged and contained in the fetched base. */
   integration_certainty?: "known_complete" | "known_absent" | "uncertain";
+  /** Role-exact artifact binding selected from all linked PR observations. */
+  artifact_role?: "planning" | "implementation" | "unknown";
+  artifact_identity?: string | null;
+  candidate_epoch?: string | null;
   /** Every linked PR number consulted for integration completeness. */
   linked_pr_numbers?: number[];
 }

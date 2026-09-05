@@ -103,8 +103,11 @@ import {
   type OwnershipDeps,
 } from "../harness-mutation-ownership.ts";
 import {
+  createDefaultImplementDeliverableProbe,
   executePublishUnpublishedStageCommit,
+  isExactImplementationDeliverable,
   resolveTimeoutParkForUnpublishedCommit,
+  type ImplementDeliverableObservation,
   type InspectUnpublishedDeps,
 } from "../unpublished-stage-commit.ts";
 import {
@@ -505,7 +508,7 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
     probeImplementDeliverable?: (
       wtPath: string,
       issueNumber: number,
-    ) => Promise<{ present: boolean; description?: string }>;
+    ) => Promise<ImplementDeliverableObservation>;
     /** Override planning-facts observation. Tests inject counters and fakes. */
     observePlanningFacts?: typeof observePlanningFacts;
     /** Seams forwarded into the default observer (trusted blob, spawn, clock). */
@@ -713,6 +716,8 @@ export async function runPlanningPhases(
   const doGitInWorktree = deps.gitInWorktree ?? gitInWorktree;
   const doTrySalvage = deps.trySalvageUncommittedWork ?? trySalvageUncommittedWork;
   const doListChangeDirs = deps.listChangeDirs ?? openspec.listChangeDirs;
+  const doProbeImplementDeliverable =
+    deps.probeImplementDeliverable ?? createDefaultImplementDeliverableProbe(cfg, doGitInWorktree);
 
   const primary: Harness = cfg.harnesses.implementer;
   const reviewer: string = cfg.harnesses.reviewer;
@@ -1417,7 +1422,7 @@ export async function runPlanningPhases(
     // #758 / #588: shared harness-round clean no-new-commit hook → noop-advance.
     // Invoked only when salvageFoundNothing is already confirmed by harness-round.
     onCleanNoNewCommit: async ({ headBefore, headAfter }) => {
-      const activeChanges = doListChangeDirs(wt.path);
+      const observation = await doProbeImplementDeliverable(wt.path, issueNumber);
       return evaluatePostHarnessNoNewCommit({
         headBefore,
         headAfter,
@@ -1427,15 +1432,12 @@ export async function runPlanningPhases(
         issueNumber,
         goalCheck: () =>
           implementDeliverablePresentGoalCheck({
-            deliverablePresent: activeChanges.length > 0,
+            deliverablePresent: isExactImplementationDeliverable(observation, headAfter),
             worktreeClean: true,
             // Gates run in post-implement steps after this advance; do not
             // pre-certify them here. Fail closed if the path cannot run gates.
             gatesGreen: true,
-            deliverableDescription:
-              activeChanges.length > 0
-                ? `OpenSpec change(s) already present at HEAD: ${activeChanges.join(", ")}`
-                : undefined,
+            deliverableDescription: observation.description,
           }),
       });
     },
@@ -1545,8 +1547,8 @@ export async function runPlanningPhases(
           return blockedOutcome("PR linkage is indeterminate", "harness-failure");
         }
         if (timeoutPark.action === "publish") {
-          const activeChanges = doListChangeDirs(wt.path);
-          if (activeChanges.length === 0) {
+          const deliverable = await doProbeImplementDeliverable(wt.path, issueNumber);
+          if (!isExactImplementationDeliverable(deliverable)) {
             console.log(
               `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) ` +
                 `but left a publishable unpublished commit with unsatisfied deliverable — re-invoking implementer`,
@@ -1608,16 +1610,7 @@ export async function runPlanningPhases(
               transition: doTransition,
             },
             probeImplementDeliverable:
-              deps.probeImplementDeliverable ??
-              (async (wtPath) => {
-                const ids = doListChangeDirs(wtPath);
-                return ids.length > 0
-                  ? {
-                      present: true,
-                      description: `OpenSpec change(s) already present at HEAD: ${ids.join(", ")}`,
-                    }
-                  : { present: false };
-              }),
+              doProbeImplementDeliverable,
           });
           if (published.succeeded) {
             await completePlanningLifecycle(
@@ -1730,7 +1723,7 @@ export async function runPlanningPhases(
       // salvageFoundNothing). Never synthesize "unknown" heads or relax
       // cleanliness because a change directory exists (#758 R1 finding 2).
       if (!noopResult && cleanNoNewImplement) {
-        const activeChanges = doListChangeDirs(wt.path);
+        const observation = await doProbeImplementDeliverable(wt.path, issueNumber);
         noopResult = await evaluatePostHarnessNoNewCommit({
           headBefore: implHeadBefore,
           headAfter: ctx.headAfter,
@@ -1740,13 +1733,13 @@ export async function runPlanningPhases(
           issueNumber,
           goalCheck: () =>
             implementDeliverablePresentGoalCheck({
-              deliverablePresent: activeChanges.length > 0,
+              deliverablePresent: isExactImplementationDeliverable(
+                observation,
+                ctx.headAfter,
+              ),
               worktreeClean: true,
               gatesGreen: true,
-              deliverableDescription:
-                activeChanges.length > 0
-                  ? `OpenSpec change(s) already present at HEAD: ${activeChanges.join(", ")}`
-                  : undefined,
+              deliverableDescription: observation.description,
             }),
         });
       }
@@ -2865,10 +2858,11 @@ export interface DispatchResumeDeps {
   transition?: typeof transition;
   planningAdvance?: typeof advance;
   recoverInterruptedImplement?: typeof defaultRecoverInterruptedImplement;
+  gitInWorktree?: typeof gitInWorktree;
   probeImplementDeliverable?: (
     wtPath: string,
     issueNumber: number,
-  ) => Promise<{ present: boolean }>;
+  ) => Promise<ImplementDeliverableObservation>;
   ownershipDeps?: OwnershipDeps;
   setBlocked?: typeof setBlocked;
 }
@@ -2899,6 +2893,9 @@ export async function dispatchResume(
   const recoverInterrupted =
     deps.recoverInterruptedImplement ?? defaultRecoverInterruptedImplement;
   const blocker = deps.setBlocked ?? setBlocked;
+  const probeImplementDeliverable =
+    deps.probeImplementDeliverable ??
+    createDefaultImplementDeliverableProbe(cfg, deps.gitInWorktree ?? gitInWorktree);
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would resume from implementing: check gate + push + PR + review-1`);
@@ -2917,11 +2914,10 @@ export async function dispatchResume(
 
   const wt = await getWt(cfg, issueNumber);
   const pipelineRunIdEarly = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
+  let currentDeliverable: ImplementDeliverableObservation | null = null;
   if (wt) {
-    const probe = deps.probeImplementDeliverable;
-    const deliverablePresent = probe
-      ? (await probe(wt.path, issueNumber)).present
-      : false;
+    currentDeliverable = await probeImplementDeliverable(wt.path, issueNumber);
+    const deliverablePresent = isExactImplementationDeliverable(currentDeliverable);
     let recovered: Awaited<ReturnType<typeof recoverInterrupted>> = {
       action: "none",
       classified: { scratch: [], ownedLeftover: [], unknownProduct: [] },
@@ -3002,6 +2998,22 @@ export async function dispatchResume(
       stateDir: opts.stateDir,
       runDir: opts.runDir,
       runStoreDeps: opts.runStoreDeps,
+    });
+  }
+
+  if (!currentDeliverable || !isExactImplementationDeliverable(currentDeliverable)) {
+    console.log(
+      `[pipeline] #${issueNumber}: commits ahead are provenance only; exact implementation proof is absent ` +
+        `(role=${currentDeliverable?.role ?? "unknown"}) — resuming implementation`,
+    );
+    return planningAdvance(cfg, issueNumber, {
+      dryRun: opts.dryRun,
+      model: opts.model,
+      pipelineRunId: pipelineRunIdEarly,
+      stateDir: opts.stateDir,
+      runDir: opts.runDir,
+      runStoreDeps: opts.runStoreDeps,
+      resumeImplementing: true,
     });
   }
 

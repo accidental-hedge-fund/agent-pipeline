@@ -50,6 +50,7 @@ import {
   defaultRecoverySupervisorReport,
   mintObservationIdentity,
   reportMechanicalFault,
+  reportPublicEntrypointAdmissionFailure,
   type ReportOperationObservation,
 } from "./operation-observation.ts";
 import { fulfillTypedRequestAndValidateResume } from "./typed-request-resume.ts";
@@ -108,7 +109,10 @@ import {
 } from "./harness-mutation-ownership.ts";
 import {
   executePublishUnpublishedStageCommit,
+  isExactImplementationDeliverable,
+  observeImplementDeliverablePaths,
   PUBLISH_UNPUBLISHED_STAGE_COMMIT,
+  type ImplementDeliverableObservation,
   type PublishUnpublishedExecutorDeps,
 } from "./unpublished-stage-commit.ts";
 import { resolveEngineCommitSha } from "./engine-attribution.ts";
@@ -145,6 +149,8 @@ import {
   runsDir,
   startTerminalLogTee,
   writeHealthTextForReadFailure,
+  type PublicAdmissionResult,
+  type PublicEntrypointKind,
   type RunEventsSummary,
   type RunStoreDeps,
   type TerminalLogTee,
@@ -1994,7 +2000,7 @@ export interface RealExecuteRecoveryDeps {
   probeImplementDeliverable?: (
     wtPath: string,
     issueNumber: number,
-  ) => Promise<{ present: boolean; description?: string }>;
+  ) => Promise<ImplementDeliverableObservation>;
   /**
    * Applicable format/test gates at the claimed HEAD. Must not be hard-coded
    * true — recovery certifies implement-deliverable-present only when this
@@ -2081,19 +2087,18 @@ export function realExecuteRecovery(
     deps.probeImplementDeliverable ??
     (async (wtPath: string, _issueNumber: number) => {
       const branchPaths = await listBranchChangedPaths(wtPath);
+      const headSha = await gitHead(wtPath);
       const branchChangeIds = openspec
         .changeIdsFromPaths(branchPaths)
         .filter((id) => openspec.changeDirExists(wtPath, id));
       const acceptedIds = branchChangeIds.filter((id) =>
         changeHasDeliverableArtifacts(wtPath, id),
       );
-      if (acceptedIds.length === 0) {
-        return { present: false as const };
-      }
-      return {
-        present: true as const,
-        description: `branch-introduced OpenSpec deliverable(s) at HEAD: ${acceptedIds.join(", ")}`,
-      };
+      return observeImplementDeliverablePaths({
+        paths: branchPaths,
+        candidateSha: headSha,
+        acceptedPlanningIds: acceptedIds,
+      });
     });
   // Applicable gates at claimed HEAD — never hard-code true (#758 R2).
   // Format is checked non-mutating (auto_fix forced off). Test gate runs with
@@ -2179,7 +2184,7 @@ export function realExecuteRecovery(
         const deliverable = await probeImplementDeliverable(wt.path, issueNumber);
         const gatesGreen = await probeGatesGreen(wt.path, issueNumber);
         return implementDeliverablePresentGoalCheck({
-          deliverablePresent: deliverable.present,
+          deliverablePresent: isExactImplementationDeliverable(deliverable, headSha),
           worktreeClean: true,
           gatesGreen,
           deliverableDescription: deliverable.description,
@@ -3508,6 +3513,46 @@ export interface SingleIssueCommandDeps {
   runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult>;
   writeStdoutLine: (line: string) => void | Promise<void>;
   persistPublicAdmission?: typeof persistPublicEntrypointAdmission;
+  reportObservation?: ReportOperationObservation;
+}
+
+export interface PublicAdmissionGateDeps {
+  persistPublicAdmission?: typeof persistPublicEntrypointAdmission;
+  reportObservation?: ReportOperationObservation;
+}
+
+/** One fail-closed boundary shared by direct public command routes. */
+export async function admitPublicOperation(
+  input: {
+    repoDir: string;
+    repo: string;
+    domain: string;
+    kind: PublicEntrypointKind;
+    profile?: string | null;
+    issue?: number;
+    logicalOperationId?: string;
+    admissionMode?: "direct" | "nested" | "resume";
+  },
+  deps: PublicAdmissionGateDeps = {},
+): Promise<PublicAdmissionResult> {
+  const admission = await (deps.persistPublicAdmission ?? persistPublicEntrypointAdmission)(input);
+  if (!admission.acknowledged) {
+    reportPublicEntrypointAdmissionFailure(deps.reportObservation, admission);
+  }
+  return admission;
+}
+
+export async function executeAfterPublicAdmission<T>(
+  input: Parameters<typeof admitPublicOperation>[0],
+  protectedOperation: (admission: Extract<PublicAdmissionResult, { acknowledged: true }>) => Promise<T>,
+  deps: PublicAdmissionGateDeps = {},
+): Promise<
+  | { ok: true; value: T; admission: Extract<PublicAdmissionResult, { acknowledged: true }> }
+  | { ok: false; admission: Extract<PublicAdmissionResult, { acknowledged: false }> }
+> {
+  const admission = await admitPublicOperation(input, deps);
+  if (!admission.acknowledged) return { ok: false, admission };
+  return { ok: true, value: await protectedOperation(admission), admission };
 }
 
 const defaultSingleIssueCommandDeps: SingleIssueCommandDeps = {
@@ -3586,15 +3631,23 @@ export async function runSingleIssueCommand(
     return { exitCode: 1, engineMessage: (err as Error).message };
   }
 
+  let admittedLogicalOperationId: string | undefined;
   if (output.persistPublicAdmission === true) {
-    const persist = deps.persistPublicAdmission ?? persistPublicEntrypointAdmission;
-    await persist({
+    const admission = await admitPublicOperation({
       repoDir: cfg.repo_dir,
       kind: "single",
       repo: cfg.repo,
+      domain: cfg.domain,
       profile: opts.profile ?? null,
       issue: issueNumber,
-    });
+    }, deps);
+    if (!admission.acknowledged) {
+      const message = `admission refused (${admission.failure.kind}): ${admission.failure.diagnostic}`;
+      console.error(`pipeline single: ${message}`);
+      process.exitCode = 1;
+      return { exitCode: 1, engineMessage: message };
+    }
+    admittedLogicalOperationId = admission.logicalOperationId;
   }
 
   const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
@@ -3602,6 +3655,7 @@ export async function runSingleIssueCommand(
     engine,
     engineTrack: opts.engineTrack === "pinned" || opts.engineTrack === "candidate" ? opts.engineTrack : undefined,
     selector: { type: "work-list", value: [String(issueNumber)] },
+    ...(admittedLogicalOperationId ? { logicalOperationId: admittedLogicalOperationId } : {}),
     audit: false,
     autoSupersedeTerminal: true,
     repoDir: cfg.repo_dir,
@@ -6897,24 +6951,30 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     try {
-      await persistPublicEntrypointAdmission({
-        repoDir: mergeCfg.repo_dir,
-        kind: "merge",
-        repo: mergeCfg.repo,
-        profile: opts.profile ?? null,
-      });
       const mergeDeps = realMergeDeps(mergeCfg.repo);
-      await mergePr(prNumber, {
-        ...mergeDeps,
-        supervision: realMergeSupervision({
-          repo: mergeCfg.repo,
-          base: mergeCfg.base_branch,
+      const executed = await executeAfterPublicAdmission(
+        {
           repoDir: mergeCfg.repo_dir,
-          envelope: "pipeline merge",
-          actionIdentity: `pipeline merge ${prNumber}`,
-          mergeDeps,
+          kind: "merge",
+          repo: mergeCfg.repo,
+          domain: mergeCfg.domain,
+          profile: opts.profile ?? null,
+        },
+        async () => mergePr(prNumber, {
+          ...mergeDeps,
+          supervision: realMergeSupervision({
+            repo: mergeCfg.repo,
+            base: mergeCfg.base_branch,
+            repoDir: mergeCfg.repo_dir,
+            envelope: "pipeline merge",
+            actionIdentity: `pipeline merge ${prNumber}`,
+            mergeDeps,
+          }),
         }),
-      });
+      );
+      if (!executed.ok) {
+        throw new Error(`admission refused (${executed.admission.failure.kind}): ${executed.admission.failure.diagnostic}`);
+      }
     } catch (err) {
       console.error(`pipeline merge: ${(err as Error).message}`);
       process.exit(1);
@@ -6945,12 +7005,20 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     try {
-      await persistPublicEntrypointAdmission({
-        repoDir: mqCfg.repo_dir,
-        kind: "merge-queue",
-        repo: mqCfg.repo,
-        profile: opts.profile ?? null,
-      });
+      // Default / explicit dry-run is read-only. Admission is required only for
+      // the operator-authorized apply route and precedes merge or repair work.
+      if (!!opts.apply && !opts.dryRun) {
+        const admission = await admitPublicOperation({
+          repoDir: mqCfg.repo_dir,
+          kind: "merge-queue",
+          repo: mqCfg.repo,
+          domain: mqCfg.domain,
+          profile: opts.profile ?? null,
+        });
+        if (!admission.acknowledged) throw new Error(
+          `admission refused (${admission.failure.kind}): ${admission.failure.diagnostic}`,
+        );
+      }
       const result = await runMergeQueue(
         {
           milestone: String(opts.milestone).trim(),

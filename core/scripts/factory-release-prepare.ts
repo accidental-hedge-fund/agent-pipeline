@@ -98,8 +98,9 @@ import {
   type FaultRecoveryMatrixRow,
 } from "./fault-recovery-matrix.ts";
 import {
-  defaultResolveCandidateEngineDeps,
-  resolveCandidateEngine,
+  defaultResolveAndPrepareDeps,
+  resolveAndPrepareCandidateEngine,
+  type ResolveAndPrepareCandidateEngineDeps,
 } from "./ship-end-candidate.ts";
 import {
   runRelease,
@@ -1302,7 +1303,7 @@ export interface DurableGenerateOptions {
   spawnDeps?: SpawnCandidateLoopDeps;
   /** Typed candidate invocation for pack-loop spawn. Tests inject; production resolves. */
   candidateInvocation?: CandidateInvocation;
-  resolveCandidateEngine?: typeof resolveCandidateEngine;
+  resolveCandidateEngine?: typeof resolveAndPrepareCandidateEngine;
   probePackLoopLiveness?: typeof probePackLoopLiveness;
   env?: NodeJS.ProcessEnv;
   factoryControlDir?: string | null;
@@ -2540,7 +2541,8 @@ export async function productionDispatchPackLoop(
     persistBinding?: (loop_run_id: string, state?: FactoryReleaseLoopDispatchState) => Promise<void>;
     markDispatched?: (loop_run_id: string) => Promise<void>;
     fileExists?: (p: string) => boolean;
-    resolveCandidate?: typeof resolveCandidateEngine;
+    resolveCandidate?: typeof resolveAndPrepareCandidateEngine;
+    resolveCandidateDeps?: ResolveAndPrepareCandidateEngineDeps;
     env?: NodeJS.ProcessEnv;
     spawnDeps?: SpawnCandidateLoopDeps;
   } = {},
@@ -2578,13 +2580,13 @@ export async function productionDispatchPackLoop(
   const fileExists = deps.fileExists ?? defaultFileExistsSync;
   let invocation = input.candidateInvocation;
   if (!invocation) {
-    const resolved = (deps.resolveCandidate ?? resolveCandidateEngine)(
+    const resolved = await (deps.resolveCandidate ?? resolveAndPrepareCandidateEngine)(
       {
         repoDir: input.repoDir,
         candidateSha: input.request.integrated_candidate.git_sha,
         candidateEngineRootEnv: (deps.env ?? process.env).PIPELINE_CANDIDATE_ENGINE_ROOT,
       },
-      defaultResolveCandidateEngineDeps(),
+      deps.resolveCandidateDeps ?? defaultResolveAndPrepareDeps(),
     );
     if (!resolved.ok) {
       throw new Error(`pack-loop dispatch: ${resolved.error}`);
