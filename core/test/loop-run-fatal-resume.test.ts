@@ -118,19 +118,25 @@ function fakeDeps(): { deps: LoopStoreDeps; files: Map<string, string> } {
 }
 
 function identity(overrides: Partial<LoopExternalIdentity> = {}): LoopExternalIdentity {
+  const headSha = overrides.head_sha ?? "abc123";
+  const prState = overrides.pr_state ?? null;
   return {
     issue_number: 1253,
     issue_open: true,
     ready_label_present: false,
     blocked_label_present: false,
     pr_number: null,
-    pr_state: null,
+    pr_state: prState,
     head_branch: "pipeline/1253-fix",
-    head_sha: "abc123",
+    head_sha: headSha,
     merge_commit_sha: null,
     checks_conclusion: "none",
     pipeline_stage: "ready",
     observed_at: "2026-08-27T16:00:00.000Z",
+    integration_certainty: prState === "merged" ? "known_complete" : "known_absent",
+    artifact_role: "implementation",
+    artifact_identity: `pr:${overrides.pr_number ?? "none"}:${headSha}`,
+    candidate_epoch: headSha,
     ...overrides,
   };
 }
@@ -209,6 +215,14 @@ function coordinatedFakes(outcomeFor: (itemId: string) => LoopExecutionResponse[
     },
     async getPrChecks() {
       return [{ bucket: "pass" }];
+    },
+    async getPrArtifactBinding(prNumber, detail) {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+      };
     },
     async getLocalHead() {
       return null;
@@ -707,11 +721,22 @@ function observeWithIdentities(byId: Record<string, LoopExternalIdentity>): Reco
     async getPrChecks() {
       return [{ bucket: "pass" }];
     },
+    async getPrArtifactBinding(prNumber, detail) {
+      const row = byPr.get(prNumber);
+      return {
+        role: row?.artifact_role ?? "unknown",
+        artifactIdentity: row?.artifact_identity ?? null,
+        candidateSha: row?.head_sha ?? detail.head_sha,
+        candidateEpoch: row?.candidate_epoch ?? null,
+      };
+    },
     async getLocalHead() {
       return null;
     },
-    async baseBranchContainsSha() {
-      return null;
+    async baseBranchContainsSha(sha) {
+      return [...byPr.values()].some(
+        (row) => row.merge_commit_sha === sha && row.integration_certainty === "known_complete",
+      );
     },
     async getLabelEvents() {
       return [];

@@ -197,7 +197,7 @@ function fakeObserveDeps(overrides: Partial<ReconcileObserveDeps> = {}): { deps:
     },
     async baseBranchContainsSha(sha) {
       calls.push(`baseBranchContainsSha:${sha}`);
-      return null;
+      return true;
     },
     now: () => new Date("2026-07-23T00:00:00.000Z"),
     ...overrides,
@@ -730,7 +730,17 @@ test("reconcile: a crash before recording implemented -> merged repairs all the 
 });
 
 test("reconcile: reopened pipeline:ready with an older merged planning PR remains actionable (#1454)", async () => {
-  const { deps, token } = await setup("pending");
+  const logicalOperationId = "lop-reopened-planning-1454";
+  const { deps, token } = await setup(
+    "pending",
+    { logical_operation_id: logicalOperationId },
+    {
+      lifecycle: admitLifecycleRecord({
+        logical_operation_id: logicalOperationId,
+        updated_at: "2026-07-23T00:00:00.000Z",
+      }),
+    },
+  );
   const planningSha = "d".repeat(40);
   const { deps: observeDeps } = fakeObserveDeps({
     async getIssueStateAndLabels() {
@@ -775,8 +785,9 @@ test("reconcile: reopened pipeline:ready with an older merged planning PR remain
   assert.equal(result.observed["100"].artifact_role, "planning");
   assert.equal(result.observed["100"].integration_certainty, "uncertain");
   assert.notEqual(result.next_actions["100"], "repair-forward");
-  assert.equal(ledger.lifecycle?.owner, "RecoverySupervisor");
-  assert.equal(ledger.lifecycle?.complete, false);
+  assert.equal(ledger.lifecycle?.owned, true);
+  assert.equal(ledger.lifecycle?.ownerless, false);
+  assert.equal(ledger.lifecycle?.state, "active");
 });
 
 test("reconcile: an over-claim (ledger-ahead) is reconstructed locally without remote mutation", async () => {
@@ -940,8 +951,9 @@ test("reconcile: the merge barrier stays set when the base branch does not yet c
   });
 
   const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
-  assert.equal(result.next_actions["100"], "clear-merge-barrier");
+  assert.equal(result.next_actions["100"], "reconstruct");
   const after = await readLedger(deps, "run-1");
+  assert.equal(after.items["100"].state, "implemented");
   assert.deepEqual(after.merge_barrier, { item_id: "100", merged_sha: "mergesha", set_at: "2026-07-22T00:00:00.000Z" });
 });
 

@@ -224,6 +224,15 @@ function fakeObserveDeps(overrides: Partial<ReconcileObserveDeps> = {}): { deps:
       calls.push(`getPrChecks:${prNumber}`);
       return [];
     },
+    async getPrArtifactBinding(prNumber, detail) {
+      calls.push(`getPrArtifactBinding:${prNumber}`);
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+      };
+    },
     async getLocalHead(issueNumber) {
       calls.push(`getLocalHead:${issueNumber}`);
       return null;
@@ -264,6 +273,14 @@ function coordinatedFakes(outcomeFor: (itemId: string) => LoopExecutionResponse[
     },
     async getPrChecks() {
       return [{ bucket: "pass" }];
+    },
+    async getPrArtifactBinding(prNumber, detail) {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+      };
     },
     async getLocalHead() {
       return null;

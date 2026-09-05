@@ -1273,6 +1273,17 @@ const harnessTimeout: HarnessResult = {
   timed_out: true,
 };
 
+function exactImplementationObservation(candidateSha = "deadbeef") {
+  return {
+    present: true,
+    role: "implementation" as const,
+    artifact_id: "sha256:implementation-fixture",
+    candidate_sha: candidateSha,
+    candidate_epoch: candidateSha,
+    description: `product implementation at ${candidateSha}`,
+  };
+}
+
 /** Timeout + ownership-checkpoint salvage tip that is publishable unpublished. */
 function timeoutPublishableDeps(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   let callCount = 0;
@@ -1287,6 +1298,7 @@ function timeoutPublishableDeps(overrides: Record<string, unknown> = {}): Record
       return revisionOkResult;
     },
     trySalvageUncommittedWork: async () => ({ salvaged: false }),
+    probeImplementDeliverable: async () => exactImplementationObservation(),
     listChangeDirs: () => ["publish-unpublished-timeout-commit"],
     getPrForBranch: async () => null,
     gitInWorktree: async (_p: unknown, args: string[]) => {
@@ -1323,6 +1335,7 @@ test("runPlanningPhases #1272: timeout + checkpoint commit + salvaged false publ
       return callCount >= 2 ? harnessTimeout : revisionOkResult;
     },
     trySalvageUncommittedWork: async () => ({ salvaged: false }),
+    probeImplementDeliverable: async () => exactImplementationObservation(),
     listChangeDirs: () => ["publish-unpublished-timeout-commit"],
     getPrForBranch: async () => null,
     createPr: async (_c: unknown, spec: { body: string }) => {
@@ -1476,6 +1489,7 @@ test("runPlanningPhases #1272: failing test gate on post-timeout path does not c
       return revisionOkResult;
     },
     trySalvageUncommittedWork: async () => ({ salvaged: false }),
+    probeImplementDeliverable: async () => exactImplementationObservation(),
     listChangeDirs: () => ["publish-unpublished-timeout-commit"],
     createPr: async () => {
       created++;

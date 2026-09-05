@@ -1332,13 +1332,13 @@ test("single parent plus nested loop child observes both entrypoints (#1440)", a
   assert.ok(observed.includes("loop"));
 });
 
-test("pipeline single/merge/merge-queue persist public admission through initRunDir (#1440)", () => {
+test("pipeline single/merge/merge-queue execute only after acknowledged public admission (#1440)", () => {
   const src = readFileSync(join(CORE_ROOT, "scripts/pipeline.ts"), "utf8");
   assert.match(src, /persistPublicAdmission:\s*true/);
   const mergeDispatch = src.slice(src.indexOf("// Early merge dispatch"));
-  const persistMerge = mergeDispatch.indexOf("await persistPublicEntrypointAdmission");
-  const mergePr = mergeDispatch.indexOf("await mergePr");
-  const persistQueue = mergeDispatch.lastIndexOf("await persistPublicEntrypointAdmission");
+  const persistMerge = mergeDispatch.indexOf("await executeAfterPublicAdmission");
+  const mergePr = mergeDispatch.indexOf("mergePr(prNumber");
+  const persistQueue = mergeDispatch.indexOf("await admitPublicOperation");
   const runQueue = mergeDispatch.indexOf("await runMergeQueue");
   assert.ok(persistMerge >= 0 && persistMerge < mergePr);
   assert.ok(persistQueue >= 0 && persistQueue < runQueue);

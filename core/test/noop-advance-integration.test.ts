@@ -303,6 +303,10 @@ test("#787: verify_head_goal advances no-commits without repair_pipeline_item", 
     // Issue-bound deliverable + real gates probe — not listChangeDirs / true (#758 R2).
     probeImplementDeliverable: async () => ({
       present: true,
+      role: "implementation",
+      artifact_id: "sha256:implementation",
+      candidate_sha: SHA,
+      candidate_epoch: SHA,
       description: "branch-introduced OpenSpec deliverable(s) at HEAD: generalized-noop-advance-contract",
     }),
     probeGatesGreen: async () => true,
@@ -435,6 +439,10 @@ test("#758 R1: verify_head_goal fails closed when durable evidence cannot be rec
     isWorktreeClean: async () => true,
     probeImplementDeliverable: async () => ({
       present: true,
+      role: "implementation",
+      artifact_id: "sha256:implementation",
+      candidate_sha: SHA,
+      candidate_epoch: SHA,
       description: "branch-introduced OpenSpec deliverable(s) at HEAD: generalized-noop-advance-contract",
     }),
     probeGatesGreen: async () => true,
@@ -524,7 +532,7 @@ test("#758 R2: verify_head_goal does not treat arbitrary tip change-dirs as the 
     gitHead: async () => SHA,
     isWorktreeClean: async () => true,
     listChangeDirs: () => ["unrelated-leftover-change"],
-    listBranchChangedPaths: async () => ["src/foo.ts"],
+    listBranchChangedPaths: async () => ["openspec/changes/unrelated-leftover-change/proposal.md"],
     changeHasDeliverableArtifacts: () => true,
     probeGatesGreen: async () => true,
   });

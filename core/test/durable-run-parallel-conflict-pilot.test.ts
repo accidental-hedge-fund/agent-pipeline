@@ -237,6 +237,14 @@ function pilotFakes(_deps: LoopStoreDeps, _contract: LoopContract) {
     async getPrChecks() {
       return [{ bucket: "pass" }];
     },
+    async getPrArtifactBinding(prNumber, detail) {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+      };
+    },
     async getLocalHead() {
       return null;
     },

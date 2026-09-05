@@ -356,8 +356,9 @@ test("persist into factory-control generic store is observed by in-flight ship s
       },
       persistDeps,
     );
-    assert.ok(runDir.startsWith("/control-repo/.agent-pipeline/runs/"));
-    assert.equal(runDir.includes("/candidate-worktree/"), false);
+    assert.equal(admission.acknowledged, true);
+    assert.ok(admission.runDir?.startsWith("/control-repo/.agent-pipeline/runs/"));
+    assert.equal(admission.runDir?.includes("/candidate-worktree/"), false);
   }
   writeUnboundPrefixRun(files, GENERIC, "train-host");
   writeUnboundPrefixRun(files, GENERIC, "loop-host");
@@ -385,7 +386,7 @@ test("candidate-worktree-only persist is not unique-operation coverage (#1446)",
   const startedAt = new Date("2026-09-04T23:26:39.000Z");
   const persistDeps = persistMemDeps(files);
   for (const kind of ["single", "merge", "merge-queue"] as const) {
-    const { runDir } = await persistPublicEntrypointAdmission(
+    const admission = await persistPublicEntrypointAdmission(
       {
         repoDir: "/candidate-worktree",
         kind,

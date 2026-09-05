@@ -216,11 +216,19 @@ function pilotFakes(deps: LoopStoreDeps, contract: LoopContract) {
     async getPrChecks() {
       return [{ bucket: "pass" }];
     },
+    async getPrArtifactBinding(prNumber, detail) {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+      };
+    },
     async getLocalHead() {
       return null;
     },
     async baseBranchContainsSha() {
-      return null;
+      return aMerged;
     },
     async getExternalDependencyIssueState(issueNumber) {
       if (issueNumber === Number(ITEM_A)) return { state: "open", stateReason: null };
