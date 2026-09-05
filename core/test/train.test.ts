@@ -2171,14 +2171,22 @@ test("train merge admission: outer and nested attempts use distinct runs under o
 
 test("train merge admission: nested persistence refusal performs no merge and keeps the outer identity (#1454)", async () => {
   const admittedLogicalIds: string[] = [];
-  const deps = makeDeps({
+  let deps!: TrainTestDeps;
+  deps = makeDeps({
     async persistPublicAdmission(input): Promise<PublicAdmissionResult> {
+      if (input.kind === "train") {
+        return persistPublicEntrypointAdmission(
+          { ...input, factoryControlRoot: "/repo" },
+          deps.store.deps,
+        );
+      }
       const logicalOperationId = input.logicalOperationId ?? "";
       admittedLogicalIds.push(logicalOperationId);
       const identity = {
         kind: input.kind,
         runId: input.runId ?? "merge-refused",
         logicalOperationId,
+        operationKey: input.operationKey ?? "merge:o/r:pr:2454",
         repository: input.repo,
         domain: input.domain ?? input.repo,
         issue: input.issue ?? null,
@@ -2749,7 +2757,7 @@ test("train events: same-clock trains get distinct exclusive stores (#1301 1.3)"
   assert.notEqual(first.session!.runDir, second.session!.runDir);
 });
 
-test("train events: exhausted exclusive allocation refuses merge-mode mutations (#1454)", async () => {
+test("train events: an exclusive public-admission collision refuses merge-mode mutations (#1454)", async () => {
   const deps = makeDeps();
   const { attempts } = installExclusiveMkdir(deps.store, (p, recursive) => {
     if (!recursive && path.basename(p).startsWith("train-")) return errno("EEXIST", p);
@@ -2760,20 +2768,20 @@ test("train events: exhausted exclusive allocation refuses merge-mode mutations 
   deps.seedPr(11, 21);
   const result = await runTrain(baseOpts({ issues: [10, 11], merge: true }), deps);
   assert.equal(result.exitCode, 1);
-  assert.equal(result.status.events_coverage, "degraded");
+  assert.equal(result.status.events_coverage, "unknown");
   assert.equal(result.status.run_id, undefined);
   assert.equal(result.status.schema_version, 1);
   assert.equal(result.status.kind, "train_status");
   assert.equal(trainEventPaths(deps.store).length, 0);
   assert.ok(
     !deps.handoffLines.some((line) => line.includes("train_run_handoff")),
-    "exhausted allocation must not flush train_run_handoff",
+    "refused admission must not flush train_run_handoff",
   );
   assert.deepEqual(deps.mergeCalls, []);
   assert.equal(result.status.items.length, 0);
   assert.equal(
     attempts.filter((a) => a.startsWith("ex:train-")).length,
-    TRAIN_RUN_ID_MAX_EXCLUSIVE_ATTEMPTS,
+    1,
   );
 });
 

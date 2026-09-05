@@ -2293,6 +2293,7 @@ test("productionDispatchPackLoop persists binding before spawn", async () => {
     },
     {
       fileExists: () => true,
+      resolveCandidate: preparedCandidateResolver(),
       initBoundLoop: async () => {
         events.push("init");
         return { loop_run_id: "loop-persist-order" };
@@ -2313,6 +2314,40 @@ test("productionDispatchPackLoop persists binding before spawn", async () => {
   assert.deepEqual(events, ["init", "spawn"]);
   const binding = JSON.parse(files.get(factoryReleaseLoopBindingPath("loop-persist-order"))!);
   assert.equal(binding.dispatch_state, "dispatched");
+});
+
+test("productionDispatchPackLoop re-runs resolve-and-prepare for supplied invocation (#1454)", async () => {
+  let resolved = 0;
+  let spawned = 0;
+  await assert.rejects(
+    () => productionDispatchPackLoop(
+      {
+        repoDir: "/repo",
+        request: baseRequest(),
+        pack: packWithTemplates(),
+        packRunId: "pack-resolve-supplied",
+        issue_numbers: [101],
+        engineTrack: "candidate",
+        label: "factory-gate",
+        candidateInvocation: testInvocation("loop-resolve-supplied"),
+      },
+      {
+        fileExists: () => true,
+        initBoundLoop: async () => ({ loop_run_id: "loop-resolve-supplied" }),
+        resolveCandidate: async () => {
+          resolved += 1;
+          return { ok: false as const, kind: "readiness" as const, error: "candidate is dirty" };
+        },
+        spawnCandidateLoop: async () => {
+          spawned += 1;
+          return { dispatch_state: "dispatched" as const };
+        },
+      },
+    ),
+    /candidate is dirty/,
+  );
+  assert.equal(resolved, 1);
+  assert.equal(spawned, 0);
 });
 
 test("crash after persist before spawn resumes the same bound run", async () => {
@@ -2356,6 +2391,7 @@ test("crash after persist before spawn resumes the same bound run", async () => 
           { ...input, candidateInvocation: testInvocation("loop-crash-window") },
           {
           fileExists: () => true,
+          resolveCandidate: preparedCandidateResolver(),
           initBoundLoop: async () => ({ loop_run_id: "loop-crash-window" }),
           persistBinding: async (id) => {
             if (!input.persistCtx) throw new Error("missing persistCtx");
@@ -2457,6 +2493,7 @@ test("failed detached spawn is retried on the same bound run", async () => {
           { ...input, candidateInvocation: testInvocation("loop-spawn-enoent") },
           {
           fileExists: () => true,
+          resolveCandidate: preparedCandidateResolver(),
           initBoundLoop: async () => ({ loop_run_id: "loop-spawn-enoent" }),
           spawnCandidateLoop: async () => spawnOnce("first"),
         }),
@@ -2526,6 +2563,17 @@ function testInvocation(loopRunId: string, sha = CANDIDATE): CandidateInvocation
     executable: CANDIDATE_LAUNCHER,
     loopRunId,
     candidateSha: sha,
+  });
+}
+
+function preparedCandidateResolver() {
+  return async () => ({
+    ok: true as const,
+    engine: {
+      engineRoot: "/candidate-engine",
+      launcherPath: CANDIDATE_LAUNCHER,
+      commitSha: CANDIDATE,
+    },
   });
 }
 
@@ -2642,6 +2690,7 @@ test("dispatch spawn strips FRG signing vars from the candidate loop environment
     },
     {
       fileExists: () => true,
+      resolveCandidate: preparedCandidateResolver(),
       initBoundLoop: async () => ({ loop_run_id: "loop-env-dispatch" }),
       spawnCandidateLoop: (args) =>
         defaultSpawnCandidateLoop(
@@ -3407,6 +3456,7 @@ test("void spawnCandidateLoop does not persist dispatched (#1296)", async () => 
         },
         {
           fileExists: () => true,
+          resolveCandidate: preparedCandidateResolver(),
           initBoundLoop: async () => ({ loop_run_id: "loop-void-spawn" }),
           spawnCandidateLoop: async () => undefined,
         },

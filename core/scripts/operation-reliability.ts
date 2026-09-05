@@ -64,6 +64,7 @@ const EXPECTED_ADMISSION_ROUTES: Readonly<Record<string, RequiredPublicEntrypoin
   "host.claude-code": "drive",
   "host.codex": "drive",
 } as const;
+export type RequiredAdmissionRouteName = keyof typeof EXPECTED_ADMISSION_ROUTES;
 
 /** Executable-route contract; tests exercise each boundary and validate this exact set. */
 export const REQUIRED_ADMISSION_ROUTES: readonly RequiredAdmissionRoute[] = [
@@ -114,6 +115,55 @@ export function assertAdmissionRouteInventoryComplete(
 ): void {
   const gaps = admissionRouteInventoryGaps(routes);
   if (gaps.length) throw new Error(`required admission inventory invalid: ${gaps.join("; ")}`);
+}
+
+export function assertRequiredAdmissionRoute(
+  route: RequiredAdmissionRouteName,
+  entrypoint: RequiredPublicEntrypoint,
+  boundary: RequiredAdmissionRoute["boundary"],
+): void {
+  assertAdmissionRouteInventoryComplete();
+  const matches = REQUIRED_ADMISSION_ROUTES.filter((row) => row.route === route);
+  if (matches.length !== 1) throw new Error(`required admission route is not inventoried exactly once: ${route}`);
+  const row = matches[0]!;
+  if (row.entrypoint !== entrypoint || row.boundary !== boundary) {
+    throw new Error(
+      `required admission route binding mismatch for ${route}: expected ${entrypoint}/${boundary}`,
+    );
+  }
+}
+
+/**
+ * CI correspondence half of the executable inventory. Production route
+ * handlers call {@link assertRequiredAdmissionRoute}; this check makes those
+ * runtime bindings set-equal to the non-host inventory instead of trusting
+ * the declaration alone.
+ */
+export function admissionRouteRuntimeBindingGaps(
+  sources: Readonly<Record<string, string>>,
+): string[] {
+  const combined = Object.entries(sources)
+    .map(([file, source]) => `\n/* ${file} */\n${source}`)
+    .join("\n");
+  const gaps: string[] = [];
+  for (const row of REQUIRED_ADMISSION_ROUTES) {
+    if (row.class === "host") continue;
+    const escaped = row.route.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const occurrences = combined.match(new RegExp(`["']${escaped}["']`, "g"))?.length ?? 0;
+    if (occurrences === 0) gaps.push(`missing runtime route binding ${row.route}`);
+    if (occurrences > 1) gaps.push(`duplicate runtime route binding ${row.route}`);
+  }
+  const asserted = combined.matchAll(
+    /assertRequiredAdmissionRoute\(\s*([\s\S]{0,160}?),\s*["'](?:drive|single|loop|train|merge|merge-queue|ship)["']\s*,/g,
+  );
+  for (const match of asserted) {
+    for (const literal of match[1]!.matchAll(/["']([^"']+)["']/g)) {
+      if (!(literal[1]! in EXPECTED_ADMISSION_ROUTES)) {
+        gaps.push(`unknown runtime route binding ${literal[1]}`);
+      }
+    }
+  }
+  return gaps;
 }
 
 /** #1333 mechanical fault-matrix lifecycle classes required for FRG promotion. */

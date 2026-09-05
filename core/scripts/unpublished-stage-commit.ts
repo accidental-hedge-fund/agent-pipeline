@@ -343,8 +343,30 @@ function deliverableArtifactId(paths: readonly string[]): string {
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
-function isPlanningArtifactPath(filePath: string): boolean {
-  return /^openspec\/changes\/(?:archive\/)?[^/]+\//.test(filePath);
+export function isPlanningOnlyArtifactPath(filePath: string): boolean {
+  const normalized = filePath.trim().replace(/^\.\//, "");
+  return (
+    /^openspec\//.test(normalized) ||
+    /^docs\//.test(normalized) ||
+    /^\.github\/(?:workflows|ISSUE_TEMPLATE|PULL_REQUEST_TEMPLATE)\//.test(normalized) ||
+    /^(?:README|ROADMAP|CONTRIBUTING|CHANGELOG|SECURITY|CODE_OF_CONDUCT)(?:\.[^/]+)?$/i.test(normalized)
+  );
+}
+
+export function isProductImplementationArtifactPath(filePath: string): boolean {
+  const normalized = filePath.trim().replace(/^\.\//, "");
+  if (!normalized || isPlanningOnlyArtifactPath(normalized)) return false;
+  const basename = normalized.split("/").at(-1) ?? "";
+  if (
+    /^(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.(?:toml|lock)|go\.(?:mod|sum)|Gemfile(?:\.lock)?|requirements[^/]*\.txt|pyproject\.toml|Dockerfile)$/i.test(
+      basename,
+    )
+  ) {
+    return true;
+  }
+  return /\.(?:[cm]?[jt]sx?|py|rb|rs|go|java|kt|kts|swift|c|cc|cpp|h|hpp|cs|fs|fsx|php|scala|sh|bash|zsh|fish|sql|css|scss|sass|less|html|vue|svelte)$/i.test(
+    normalized,
+  );
 }
 
 export function observeImplementDeliverablePaths(input: {
@@ -363,7 +385,7 @@ export function observeImplementDeliverablePaths(input: {
       candidate_epoch: null,
     };
   }
-  const productPaths = paths.filter((filePath) => !isPlanningArtifactPath(filePath));
+  const productPaths = paths.filter(isProductImplementationArtifactPath);
   if (productPaths.length > 0) {
     return {
       present: true,
@@ -371,19 +393,25 @@ export function observeImplementDeliverablePaths(input: {
       artifact_id: deliverableArtifactId(productPaths),
       candidate_sha: candidateSha,
       candidate_epoch: candidateSha,
-      description: `product implementation at ${candidateSha.slice(0, 12)} (${productPaths.length} changed product path(s))`,
+      description: `proved product implementation at ${candidateSha.slice(0, 12)} (${productPaths.length} changed product path(s))`,
     };
   }
+  const planningPaths = paths.filter(isPlanningOnlyArtifactPath);
+  const hasUnprovedPaths = planningPaths.length !== paths.length;
   const accepted = input.acceptedPlanningIds ?? [];
   return {
-    present: accepted.length > 0,
-    role: accepted.length > 0 ? "planning" : "unknown",
+    present: !hasUnprovedPaths && planningPaths.length > 0,
+    role: !hasUnprovedPaths && planningPaths.length > 0 ? "planning" : "unknown",
     artifact_id: paths.length > 0 ? deliverableArtifactId(paths) : null,
     candidate_sha: candidateSha,
     candidate_epoch: candidateSha,
-    description: accepted.length > 0
-      ? `planning-only OpenSpec artifact(s) at HEAD: ${accepted.join(", ")}`
-      : undefined,
+    description: !hasUnprovedPaths && planningPaths.length > 0
+      ? accepted.length > 0
+        ? `planning-only OpenSpec artifact(s) at HEAD: ${accepted.join(", ")}`
+        : `planning-only artifact(s) at HEAD (${planningPaths.length} changed path(s))`
+      : paths.length > 0
+        ? "changed artifacts lack authoritative product postcondition proof"
+        : undefined,
   };
 }
 

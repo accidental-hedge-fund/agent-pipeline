@@ -57,6 +57,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { PipelineConfig } from "./types.ts";
 import { DEFAULT_CONFIG } from "./types.ts";
+import { publishIssueBodyOrThrow } from "./issue-body-publisher.ts";
 
 export const GRILL_USAGE =
   'Usage: pipeline refine-spec --title "<title>" --body "<markdown>"\n' +
@@ -772,14 +773,7 @@ export function realGrillIssueApplyDeps(cfg: PipelineConfig): GrillIssueApplyDep
       }
     },
     updateIssueBody: async (n, body) => {
-      const result = spawnSync(
-        "gh",
-        ["issue", "edit", String(n), "-R", cfg.repo, "--body", body],
-        { encoding: "utf8", stdio: "pipe", cwd: cfg.repo_dir },
-      );
-      if (result.status !== 0) {
-        throw new Error(result.stderr?.trim() || `gh issue edit failed (${result.status})`);
-      }
+      publishIssueBodyOrThrow({ repo: cfg.repo, repoDir: cfg.repo_dir, issueNumber: n, body });
     },
   };
 }

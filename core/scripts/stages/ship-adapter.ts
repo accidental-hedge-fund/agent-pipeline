@@ -2585,6 +2585,7 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
           repoDir: opts.repoDir,
           candidateSha: sha,
           candidateEngineRootEnv: env.PIPELINE_CANDIDATE_ENGINE_ROOT,
+          consumer: "ship.stage-adapter",
         },
         defaultResolveAndPrepareDeps(),
       ));

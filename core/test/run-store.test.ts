@@ -112,6 +112,7 @@ function memRunStore() {
   const files = new Map<string, string>();
   const appends = new Map<string, string[]>();
   const mkdirs: string[] = [];
+  const dirs = new Set<string>();
   const stdoutLines: string[] = [];
 
   const enoent = (p: string): NodeJS.ErrnoException => {
@@ -147,7 +148,13 @@ function memRunStore() {
       files.delete(from);
       appends.delete(from);
     },
-    mkdir: async (p) => {
+    mkdir: async (p, options) => {
+      if (dirs.has(p) && options?.recursive === false) {
+        const error = new Error(`EEXIST: ${p}`) as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+      dirs.add(p);
       mkdirs.push(p);
     },
     readdir: async (p) => {
@@ -532,6 +539,56 @@ test("persistPublicEntrypointAdmission: nested and resumed attempts reuse one im
   );
   assert.equal(missing.acknowledged, false);
   if (!missing.acknowledged) assert.equal(missing.failure.kind, "invalid_binding");
+});
+
+test("persistPublicEntrypointAdmission: direct retries reuse the durable operation claim and mint once (#1454)", async () => {
+  const store = memRunStore();
+  let mintCalls = 0;
+  const base = {
+    repoDir: "/candidate",
+    factoryControlRoot: "/control",
+    kind: "single" as const,
+    repo: "owner/repo",
+    domain: "github.com/owner/repo",
+    issue: 1454,
+    operationKey: "single:owner/repo:1454",
+    mintLogicalOperationId: () => `lop-direct-${++mintCalls}`,
+  };
+  const first = await persistPublicEntrypointAdmission(
+    { ...base, startedAt: new Date("2026-09-05T01:00:00Z") },
+    store.deps,
+  );
+  const retry = await persistPublicEntrypointAdmission(
+    { ...base, startedAt: new Date("2026-09-05T01:00:01Z") },
+    store.deps,
+  );
+  assert.equal(first.acknowledged, true);
+  assert.equal(retry.acknowledged, true);
+  assert.equal(first.logicalOperationId, "lop-direct-1");
+  assert.equal(retry.logicalOperationId, first.logicalOperationId);
+  assert.notEqual(retry.runId, first.runId);
+  assert.equal(mintCalls, 1);
+});
+
+test("persistPublicEntrypointAdmission: concurrent shared run id cannot overwrite an acknowledged stamp (#1454)", async () => {
+  const store = memRunStore();
+  const base = {
+    repoDir: "/candidate",
+    factoryControlRoot: "/control",
+    kind: "merge" as const,
+    repo: "owner/repo",
+    operationKey: "merge:owner/repo:pr:99",
+    runId: "merge-shared",
+    startedAt: new Date("2026-09-05T01:00:00Z"),
+  };
+  const [a, b] = await Promise.all([
+    persistPublicEntrypointAdmission({ ...base, logicalOperationId: "lop-a" }, store.deps),
+    persistPublicEntrypointAdmission({ ...base, logicalOperationId: "lop-b" }, store.deps),
+  ]);
+  assert.equal([a, b].filter((result) => result.acknowledged).length, 1);
+  const meta = JSON.parse(store.readFile(path.join("/control", ".agent-pipeline", "runs", "merge-shared", "run.json")));
+  const acknowledged = [a, b].find((result) => result.acknowledged)!;
+  assert.equal(meta.logical_operation_id, acknowledged.logicalOperationId);
 });
 
 test("persistPublicEntrypointAdmission: unavailable and non-canonical roots fail before writes", async () => {

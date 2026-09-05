@@ -7,7 +7,7 @@
 //   1. Print a one-line recovery diagnostic.
 //   2. Roll back the stage to `ready` via `transition()`.
 //   3. Restart planning by calling `planningStage.advance()`.
-//   4. Return the advance outcome (never `waiting`).
+//   4. Keep a bare advanced result waiting until exact planning evidence is bound.
 //
 // All tests are pure — no real network, git, or subprocess calls.
 
@@ -84,7 +84,8 @@ test("planning crash recovery: stranded planning rolls back to ready and restart
 
   const out = await dispatch(cfg, ISSUE, "planning", OPTS, RUN_ID, undefined, undefined, undefined, trackingDeps);
 
-  assert.equal(out.advanced, true, "outcome should be advancing (not waiting)");
+  assert.equal(out.advanced, false, "unbound recovery output must not certify advancement");
+  assert.equal((out as { status?: string }).status, "waiting");
   assert.equal(planningCalled, 1, "planningAdvance should be called once");
   assert.equal(transitionCalls.length, 1, "transition should be called once");
   assert.equal(transitionCalls[0].issueNumber, ISSUE);
@@ -111,7 +112,8 @@ test("planning crash recovery: stranded plan-review rolls back to ready and rest
 
   const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, trackingDeps);
 
-  assert.equal(out.advanced, true, "outcome should be advancing (not waiting)");
+  assert.equal(out.advanced, false, "unbound recovery output must not certify advancement");
+  assert.equal((out as { status?: string }).status, "waiting");
   assert.equal(planningCalled, 1, "planningAdvance should be called once");
   assert.equal(transitionCalls.length, 1, "transition should be called once");
   assert.equal(transitionCalls[0].issueNumber, ISSUE);
@@ -124,16 +126,16 @@ test("planning crash recovery: stranded plan-review rolls back to ready and rest
 // 3.3  Regression: `planning` no longer returns `waiting`
 // ---------------------------------------------------------------------------
 
-test("planning crash recovery: planning stage never returns waiting outcome", async () => {
+test("planning crash recovery: unbound planning recovery remains waiting", async () => {
   const cfg = makeCfg();
   const { deps } = makeDeps(ADVANCING_OUTCOME);
 
   const out = await dispatch(cfg, ISSUE, "planning", OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
-  assert.notEqual(
+  assert.equal(
     (out as { status?: string }).status,
     "waiting",
-    "planning dispatch must not return waiting — it must recover",
+    "planning recovery still runs, but bare handler output is not completion evidence",
   );
 });
 
@@ -141,16 +143,16 @@ test("planning crash recovery: planning stage never returns waiting outcome", as
 // 3.4  Regression: `plan-review` no longer returns `waiting`
 // ---------------------------------------------------------------------------
 
-test("planning crash recovery: plan-review stage never returns waiting outcome", async () => {
+test("planning crash recovery: unbound plan-review recovery remains waiting", async () => {
   const cfg = makeCfg();
   const { deps } = makeDeps(ADVANCING_OUTCOME);
 
   const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
-  assert.notEqual(
+  assert.equal(
     (out as { status?: string }).status,
     "waiting",
-    "plan-review dispatch must not return waiting — it must recover",
+    "plan-review recovery still runs, but bare handler output is not completion evidence",
   );
 });
 
@@ -347,7 +349,8 @@ test("planning crash recovery: absent live marker still triggers recovery (crash
 
   const out = await dispatch(cfg, ISSUE, "planning", OPTS, RUN_ID, undefined, undefined, undefined, noliveMarkerDeps);
 
-  assert.equal(out.advanced, true, "absent live marker must trigger recovery and advance");
+  assert.equal(out.advanced, false, "absent live marker triggers recovery but not unproved completion");
+  assert.equal((out as { status?: string }).status, "waiting");
   assert.equal(transitionCalls.length, 1, "must call transition to roll back to ready");
   assert.equal(planningCalled, 1, "must call planningAdvance to restart");
 });
@@ -376,7 +379,8 @@ test("plan-review recovery with completed plan resumes without rolling back to r
 
   const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
-  assert.equal(out.advanced, true);
+  assert.equal(out.advanced, false);
+  assert.equal((out as { status?: string }).status, "waiting");
   assert.equal(planningCalled, 1);
   assert.equal(transitionCalls.length, 0, "must not roll back to ready when plan exists");
   assert.equal(
@@ -404,7 +408,8 @@ test("plan-review recovery without completed plan still restarts from ready", as
 
   const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
-  assert.equal(out.advanced, true);
+  assert.equal(out.advanced, false);
+  assert.equal((out as { status?: string }).status, "waiting");
   assert.equal(planningCalled, 1);
   assert.equal(transitionCalls.length, 1);
   assert.equal(transitionCalls[0].from, "plan-review");

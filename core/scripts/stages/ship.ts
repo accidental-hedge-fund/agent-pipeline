@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { assertRequiredAdmissionRoute } from "../operation-reliability.ts";
 import { homedir } from "node:os";
 import {
   findMilestoneNumberByTitle,
@@ -1034,6 +1035,11 @@ export async function runShipCoordinator(
   if (!path.isAbsolute(eventsFile)) throw new Error("ship state: events_file must be an absolute path");
 
   const loaded = await deps.state.read(coordinateKey);
+  assertRequiredAdmissionRoute(
+    loaded ? "ship.resume" : "ship.direct",
+    "ship",
+    "ship-admission",
+  );
   let status: ShipStatus;
   if (loaded) {
     status = parseStatus(loaded);

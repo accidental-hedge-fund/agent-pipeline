@@ -84,8 +84,8 @@ export function trainRunIdFor(startedAt: Date): RunId {
   return `train-${filesystemSafeUtcTimestamp(startedAt)}`;
 }
 
-/** Public unique-operation entrypoints that persist through `initRunDir`. */
-export type PublicEntrypointKind = "single" | "merge" | "merge-queue";
+/** Public unique-operation entrypoints that require strict durable admission. */
+export type PublicEntrypointKind = "single" | "train" | "merge" | "merge-queue";
 
 export const PUBLIC_ADMISSION_STAMP_VERSION = "public-admission.v1" as const;
 
@@ -94,6 +94,7 @@ export interface PublicAdmissionStamp {
   logical_operation_id: string;
   physical_run_id: RunId;
   entrypoint: PublicEntrypointKind;
+  operation_key: string;
   repository: string;
   domain: string;
   issue: number | null;
@@ -1248,6 +1249,7 @@ export type PublicAdmissionFailureKind =
 
 export interface PublicAdmissionIdentity {
   kind: PublicEntrypointKind;
+  operationKey: string;
   runId: RunId;
   logicalOperationId: string;
   repository: string;
@@ -1275,6 +1277,20 @@ export interface PublicAdmissionStoreDeps extends RunStoreDeps {
   fsyncFile: (p: string) => Promise<void>;
   fsyncDirectory: (p: string) => Promise<void>;
   realpath: (p: string) => Promise<string>;
+}
+
+export const PUBLIC_ADMISSION_CLAIM_VERSION = "public-admission-claim.v1" as const;
+
+interface PublicAdmissionClaim {
+  schema_version: typeof PUBLIC_ADMISSION_CLAIM_VERSION;
+  operation_key: string;
+  logical_operation_id: string;
+  entrypoint: PublicEntrypointKind;
+  repository: string;
+  domain: string;
+  issue: number | null;
+  approved_root: string;
+  claimed_at: string;
 }
 
 export const defaultPublicAdmissionStoreDeps: PublicAdmissionStoreDeps = {
@@ -1402,6 +1418,98 @@ async function atomicallyPublishAdmissionFile(
   await deps.fsyncFile(target);
 }
 
+function admissionOperationKey(opts: {
+  operationKey?: string | null;
+  kind: PublicEntrypointKind;
+  repo: string;
+  domain?: string;
+  issue?: number;
+}): string {
+  const supplied = opts.operationKey?.trim();
+  if (supplied) return supplied;
+  return [opts.kind, opts.repo, opts.domain?.trim() || opts.repo, opts.issue ?? "none"].join(":");
+}
+
+function admissionClaimDir(approvedRoot: string, operationKey: string): string {
+  const digest = createHash("sha256").update(operationKey).digest("hex");
+  return path.join(approvedRoot, ".agent-pipeline", "admissions", digest);
+}
+
+function verifyAdmissionClaim(
+  claim: PublicAdmissionClaim,
+  expected: Omit<PublicAdmissionClaim, "schema_version" | "logical_operation_id" | "claimed_at">,
+): void {
+  if (claim.schema_version !== PUBLIC_ADMISSION_CLAIM_VERSION) throw new Error("admission claim schema mismatch");
+  if (!isLogicalOperationId(claim.logical_operation_id)) throw new Error("admission claim logical identity is invalid");
+  for (const [key, value] of Object.entries(expected)) {
+    if (claim[key as keyof PublicAdmissionClaim] !== value) {
+      throw new Error(`admission claim ${key} mismatch`);
+    }
+  }
+}
+
+async function claimPublicLogicalOperation(input: {
+  approvedRoot: string;
+  operationKey: string;
+  proposedLogicalOperationId: string | null;
+  mintLogicalOperationId: () => string;
+  onBound: (logicalOperationId: string) => void;
+  suppliedLogicalOperationId: string | null;
+  kind: PublicEntrypointKind;
+  repository: string;
+  domain: string;
+  issue: number | null;
+  claimedAt: string;
+  deps: PublicAdmissionStoreDeps;
+}): Promise<{ logicalOperationId: string; claimDir: string }> {
+  const claimsRoot = path.join(input.approvedRoot, ".agent-pipeline", "admissions");
+  const claimDir = admissionClaimDir(input.approvedRoot, input.operationKey);
+  const claimPath = path.join(claimDir, "claim.json");
+  await input.deps.mkdir(claimsRoot, { recursive: true });
+  let created = false;
+  try {
+    await input.deps.mkdir(claimDir, { recursive: false });
+    created = true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  const expected = {
+    operation_key: input.operationKey,
+    entrypoint: input.kind,
+    repository: input.repository,
+    domain: input.domain,
+    issue: input.issue,
+    approved_root: input.approvedRoot,
+  };
+  if (created) {
+    const logicalOperationId = input.proposedLogicalOperationId ?? input.mintLogicalOperationId();
+    if (!isLogicalOperationId(logicalOperationId)) {
+      throw new Error("logical operation mint returned an invalid identity");
+    }
+    input.onBound(logicalOperationId);
+    const claim: PublicAdmissionClaim = {
+      schema_version: PUBLIC_ADMISSION_CLAIM_VERSION,
+      ...expected,
+      logical_operation_id: logicalOperationId,
+      claimed_at: input.claimedAt,
+    };
+    await atomicallyPublishAdmissionFile(claimPath, `${JSON.stringify(claim, null, 2)}\n`, input.deps);
+    await input.deps.fsyncDirectory(claimDir);
+    await input.deps.fsyncDirectory(claimsRoot);
+    return { logicalOperationId: claim.logical_operation_id, claimDir };
+  }
+  const claim = JSON.parse(await input.deps.readFile(claimPath)) as PublicAdmissionClaim;
+  verifyAdmissionClaim(claim, expected);
+  if (
+    input.suppliedLogicalOperationId &&
+    input.suppliedLogicalOperationId !== claim.logical_operation_id
+  ) {
+    throw new Error("supplied Logical Operation conflicts with immutable admission claim");
+  }
+  input.onBound(claim.logical_operation_id);
+  return { logicalOperationId: claim.logical_operation_id, claimDir };
+}
+
 /**
  * Persist a control-host generic-store run for a public `pipeline single` /
  * `pipeline merge` / `pipeline merge-queue` admission. Uses the existing
@@ -1417,6 +1525,8 @@ export async function persistPublicEntrypointAdmission(
     issue?: number;
     startedAt?: Date;
     logicalOperationId?: string | null;
+    /** Stable identity of the admitted intent across process restarts/retries. */
+    operationKey?: string | null;
     /** Direct admissions mint; nested/resume admissions must reuse this id. */
     admissionMode?: "direct" | "nested" | "resume";
     domain?: string;
@@ -1432,18 +1542,20 @@ export async function persistPublicEntrypointAdmission(
   const runId = opts.runId ?? publicEntrypointRunIdFor(opts.kind, startedAt);
   const suppliedLogicalId = opts.logicalOperationId?.trim() || null;
   const mode = opts.admissionMode ?? "direct";
-  const logicalOperationId = suppliedLogicalId ??
-    (mode === "direct" ? (opts.mintLogicalOperationId ?? mintLogicalOperationId)() : "");
-  const identity: PublicAdmissionIdentity = {
+  const mintLogical = opts.mintLogicalOperationId ?? mintLogicalOperationId;
+  const proposedLogicalOperationId = suppliedLogicalId;
+  const operationKey = admissionOperationKey(opts);
+  let identity: PublicAdmissionIdentity = {
     kind: opts.kind,
+    operationKey,
     runId,
-    logicalOperationId,
+    logicalOperationId: proposedLogicalOperationId ?? "",
     repository: opts.repo,
     domain: opts.domain?.trim() || opts.repo,
     issue: opts.issue ?? null,
     startedAt: startedAt.toISOString(),
   };
-  if (!isLogicalOperationId(logicalOperationId)) {
+  if ((mode !== "direct" && !isLogicalOperationId(proposedLogicalOperationId)) || !operationKey) {
     return publicAdmissionFailure(
       identity,
       null,
@@ -1462,6 +1574,9 @@ export async function persistPublicEntrypointAdmission(
     factoryControlRoot: opts.factoryControlRoot,
   });
   if (!persistRoot) {
+    if (!identity.logicalOperationId && mode === "direct") {
+      identity = { ...identity, logicalOperationId: mintLogical() };
+    }
     return publicAdmissionFailure(
       identity,
       null,
@@ -1476,6 +1591,9 @@ export async function persistPublicEntrypointAdmission(
   try {
     approvedRoot = await deps.realpath(requestedRoot);
   } catch (err) {
+    if (!identity.logicalOperationId && mode === "direct") {
+      identity = { ...identity, logicalOperationId: mintLogical() };
+    }
     return publicAdmissionFailure(
       identity,
       requestedRoot,
@@ -1486,6 +1604,9 @@ export async function persistPublicEntrypointAdmission(
     );
   }
   if (approvedRoot !== requestedRoot) {
+    if (!identity.logicalOperationId && mode === "direct") {
+      identity = { ...identity, logicalOperationId: mintLogical() };
+    }
     return publicAdmissionFailure(
       identity,
       approvedRoot,
@@ -1495,11 +1616,45 @@ export async function persistPublicEntrypointAdmission(
       `approved root resolved to ${approvedRoot}, expected ${requestedRoot}`,
     );
   }
+  try {
+    const claimed = await claimPublicLogicalOperation({
+      approvedRoot,
+      operationKey,
+      proposedLogicalOperationId,
+      mintLogicalOperationId: mintLogical,
+      onBound: (logicalOperationId) => {
+        identity = { ...identity, logicalOperationId };
+      },
+      suppliedLogicalOperationId: suppliedLogicalId,
+      kind: opts.kind,
+      repository: identity.repository,
+      domain: identity.domain,
+      issue: identity.issue,
+      claimedAt: identity.startedAt,
+      deps,
+    });
+    identity = { ...identity, logicalOperationId: claimed.logicalOperationId };
+  } catch (err) {
+    if (!identity.logicalOperationId && mode === "direct") {
+      identity = { ...identity, logicalOperationId: mintLogical() };
+    }
+    const message = boundedAdmissionDiagnostic(err);
+    return publicAdmissionFailure(
+      identity,
+      approvedRoot,
+      null,
+      /conflict|mismatch/i.test(message) ? "identity_conflict" : "persistence_failure",
+      "claim_operation",
+      err,
+    );
+  }
+  const logicalOperationId = identity.logicalOperationId;
   const runDir = runDirPath(approvedRoot, runId);
   const stampInput = {
     logical_operation_id: logicalOperationId,
     physical_run_id: runId,
     entrypoint: opts.kind,
+    operation_key: operationKey,
     repository: identity.repository,
     domain: identity.domain,
     issue: identity.issue,
@@ -1535,23 +1690,21 @@ export async function persistPublicEntrypointAdmission(
     ...(identity.issue !== null ? { issue: identity.issue } : {}),
     admission_stamp: stamp,
   };
-  try {
-    const existing = await readExistingPublicAdmission(binding, deps);
-    if (existing === "matching") return { acknowledged: true, ...binding, binding };
-  } catch (err) {
-    return publicAdmissionFailure(
-      identity,
-      approvedRoot,
-      runDir,
-      "identity_conflict",
-      "verify_existing",
-      err,
-    );
-  }
   const parentRunsDir = runsDir(approvedRoot);
+  let createdRunDir = false;
   try {
     await deps.mkdir(parentRunsDir, { recursive: true });
-    await deps.mkdir(runDir, { recursive: true });
+    try {
+      await deps.mkdir(runDir, { recursive: false });
+      createdRunDir = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    if (!createdRunDir) {
+      const existing = await readExistingPublicAdmission(binding, deps);
+      if (existing === "matching") return { acknowledged: true, ...binding, binding };
+      throw new Error("existing admission run directory has no complete stamp");
+    }
     await atomicallyPublishAdmissionFile(
       path.join(runDir, "run.json"),
       `${JSON.stringify(meta, null, 2)}\n`,
@@ -1565,12 +1718,15 @@ export async function persistPublicEntrypointAdmission(
     await deps.fsyncDirectory(runDir);
     await deps.fsyncDirectory(parentRunsDir);
   } catch (err) {
+    const message = boundedAdmissionDiagnostic(err);
     return publicAdmissionFailure(
       identity,
       approvedRoot,
       runDir,
-      "persistence_failure",
-      "publish_stamp",
+      !createdRunDir || /existing admission|mismatch|partial/i.test(message)
+        ? "identity_conflict"
+        : "persistence_failure",
+      createdRunDir ? "publish_stamp" : "verify_existing",
       err,
     );
   }

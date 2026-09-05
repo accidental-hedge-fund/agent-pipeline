@@ -2,11 +2,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   REQUIRED_LIFECYCLE_CLASSES_1333,
   REQUIRED_PUBLIC_ENTRYPOINTS,
   REQUIRED_ADMISSION_ROUTES,
   admissionRouteInventoryGaps,
+  admissionRouteRuntimeBindingGaps,
   assertAdmissionRouteInventoryComplete,
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
@@ -18,6 +22,8 @@ import {
   uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
 } from "../scripts/operation-reliability.ts";
+
+const CORE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 import {
   computeFrgEvidence,
@@ -52,6 +58,26 @@ test("required admission route inventory is exact and hard-gated (#1454)", () =>
     row.route === "single.direct" ? { ...row, boundary: "" } : row,
   ) as never;
   assert.throws(() => assertAdmissionRouteInventoryComplete(nameOnly), /bypasses admission/);
+});
+
+test("production admission routes are runtime-bound to the executable inventory (#1454)", () => {
+  const sources = Object.fromEntries(
+    ["scripts/pipeline.ts", "scripts/stages/train.ts", "scripts/stages/ship.ts"].map((relative) => [
+      relative,
+      readFileSync(path.join(CORE_ROOT, relative), "utf8"),
+    ]),
+  );
+  assert.deepEqual(admissionRouteRuntimeBindingGaps(sources), []);
+  assert.match(sources["scripts/pipeline.ts"]!, /assertRequiredAdmissionRoute/);
+
+  const missing = {
+    ...sources,
+    "scripts/stages/ship.ts": sources["scripts/stages/ship.ts"]!.replace('"ship.resume"', '"ship.missing"'),
+  };
+  assert.deepEqual(
+    admissionRouteRuntimeBindingGaps(missing).filter((gap) => gap.includes("ship.resume")),
+    ["missing runtime route binding ship.resume"],
+  );
 });
 
 function packInput(over: Record<string, unknown> = {}) {

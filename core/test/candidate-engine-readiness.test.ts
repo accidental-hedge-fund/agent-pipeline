@@ -20,7 +20,7 @@ import {
   CANDIDATE_ENGINE_CONSUMERS,
   assertCandidateEngineConsumerInventoryComplete,
   candidateEngineConsumerInventoryGaps,
-  resolveAndPrepareCandidateEngine,
+  resolveAndPrepareCandidateEngine as sharedResolveAndPrepareCandidateEngine,
   resolveCandidateEngine,
   type ResolveAndPrepareCandidateEngineDeps,
   type ResolveCandidateEngineDeps,
@@ -36,6 +36,16 @@ const DIGEST_V2 = "d2-lock";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
+
+function resolveAndPrepareCandidateEngine(
+  opts: Omit<Parameters<typeof sharedResolveAndPrepareCandidateEngine>[0], "consumer">,
+  deps: ResolveAndPrepareCandidateEngineDeps,
+) {
+  return sharedResolveAndPrepareCandidateEngine(
+    { ...opts, consumer: "pipeline.candidate-leaf" },
+    deps,
+  );
+}
 
 test("candidate-engine consumer inventory is exact and hard-gated (#1454)", () => {
   assert.doesNotThrow(() => assertCandidateEngineConsumerInventoryComplete());

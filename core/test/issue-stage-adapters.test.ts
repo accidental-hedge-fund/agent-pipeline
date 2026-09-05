@@ -176,6 +176,30 @@ test("1.4 exit-0 with unproven postcondition is not known_complete", () => {
   assert.equal(obs.owned, true);
 });
 
+test("1.4 advanced handler output without exact evidence returns owned waiting (#1454)", async () => {
+  const sink = memoryObservationSink();
+  const out = await runDeliveryStageAdapter({
+    stage: "implementing",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-unproved-advance",
+    reportObservation: sink.reportObservation,
+    attempt: async () => ({
+      advanced: true,
+      from: "implementing",
+      to: "design-gate",
+      summary: "handler claimed advancement",
+    }),
+  });
+  assert.equal(out.advanced, false);
+  if (!out.advanced) {
+    assert.equal(out.status, "waiting");
+    assert.match(out.reason, /RecoverySupervisor retains ownership/);
+  }
+  assert.equal(sink.observations[0]?.complete, false);
+  assert.equal(sink.observations[0]?.certainty, "uncertain");
+});
+
 test("2.1 fixture that retries after uncertain side effects or candidate movement fails", () => {
   const uncertain = collectForbiddenLifecycleRetries(
     `

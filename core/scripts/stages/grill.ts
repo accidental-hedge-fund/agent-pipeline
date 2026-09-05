@@ -93,6 +93,7 @@ import type { TreatmentFingerprint } from "../harness-adapters/treatment-fingerp
 import { listHandoffs, type HandoffStoreDeps } from "../human-question-handoff.ts";
 import { buildGrillAdmissionPrompt } from "../prompts/index.ts";
 import { runTriage, type TriageDeps } from "./triage.ts";
+import { publishIssueBodyOrThrow } from "../issue-body-publisher.ts";
 
 export const GRILL_WITH_DOCS_MARKER_RE = /<!--\s*grill-with-docs:v1\.40\.1\s*-->/;
 
@@ -1077,14 +1078,7 @@ export function realGrillDeps(cfg: PipelineConfig): GrillDeps {
       return parseMilestoneIssuesPages(parseSlurpPages<MilestoneIssueApiRaw>(out)).map((i) => i.number);
     },
     updateIssueBody: async (n, body) => {
-      const result = spawnSync(
-        "gh",
-        ["issue", "edit", String(n), "-R", cfg.repo, "--body", body],
-        { encoding: "utf8", stdio: "pipe", cwd: cfg.repo_dir, env: ghChildEnv() },
-      );
-      if (result.status !== 0) {
-        throw new Error(result.stderr?.trim() || `gh issue edit failed (${result.status})`);
-      }
+      publishIssueBodyOrThrow({ repo: cfg.repo, repoDir: cfg.repo_dir, issueNumber: n, body });
     },
     getIssueLabels: async (n) => {
       const result = await getIssueStateAndLabels(cfg, n);

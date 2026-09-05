@@ -45,6 +45,7 @@ import {
   type RunStoreDeps,
 } from "../run-store.ts";
 import {
+  createTrainEventSession,
   flushTrainRunHandoff,
   initTrainRunStore,
   type TrainEventSession,
@@ -52,6 +53,7 @@ import {
 } from "../train-events.ts";
 import type { PipelineConfig } from "../types.ts";
 import { pipelineStageFromLabels } from "../loop/precondition.ts";
+import { assertRequiredAdmissionRoute } from "../operation-reliability.ts";
 import {
   integrationSideEffectCertainty,
   reportMechanicalFault,
@@ -1147,10 +1149,15 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
 
   deps.log(formatTrainOrderedIssuesLine(ordered, mergeMode, mergeFirst));
 
+  if (!mergeMode) {
+    assertRequiredAdmissionRoute("train.recovery", "train", "train-admission");
+  }
+
   const startedAt = deps.now?.() ?? new Date();
-  const outerLogicalOperationId = mintLogicalOperationId();
+  let outerLogicalOperationId = mintLogicalOperationId();
   let trainStoreRoot = opts.repoDir;
   if (mergeMode) {
+    assertRequiredAdmissionRoute("train.direct", "train", "train-admission");
     try {
       trainStoreRoot =
         (await (deps.resolveApprovedControlRoot ?? (() => resolvePublicAdmissionPersistRoot({ repoDir: opts.repoDir })))()) ?? "";
@@ -1185,24 +1192,72 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       };
     }
   }
-  const storeInit = await initTrainRunStore({
-    repoDir: trainStoreRoot,
-    repo: opts.repo,
-    startedAt,
-    mergeMode,
-    orderedIssues: ordered,
-    selector: {
-      ...(opts.issues && opts.issues.length > 0 ? { issues: [...opts.issues] } : {}),
-      ...(opts.milestone && opts.milestone.trim() !== ""
-        ? { milestone: opts.milestone.trim() }
-        : {}),
-    },
-    store: deps.runStore,
-    now: deps.now,
-    logicalOperationId: outerLogicalOperationId,
-  });
-  let eventsCoverage = storeInit.eventsCoverage;
-  const published = storeInit.session;
+  const selector = {
+    ...(opts.issues && opts.issues.length > 0 ? { issues: [...opts.issues] } : {}),
+    ...(opts.milestone && opts.milestone.trim() !== ""
+      ? { milestone: opts.milestone.trim() }
+      : {}),
+  };
+  let eventsCoverage: TrainEventsCoverage;
+  let published: TrainEventSession | null;
+  if (mergeMode) {
+    const selectorKey = opts.milestone?.trim()
+      ? `milestone:${opts.milestone.trim()}`
+      : `issues:${ordered.join(",")}`;
+    const admission = await (deps.persistPublicAdmission ?? persistPublicEntrypointAdmission)(
+      {
+        repoDir: opts.repoDir,
+        factoryControlRoot: trainStoreRoot,
+        kind: "train",
+        repo: opts.repo,
+        domain: opts.pipelineConfig?.domain ?? opts.repo,
+        operationKey: `train:${opts.repo}:merge:${selectorKey}`,
+        mintLogicalOperationId: () => outerLogicalOperationId,
+        startedAt,
+      },
+      deps.publicAdmissionStore,
+    );
+    if (!admission.acknowledged) {
+      reportPublicEntrypointAdmissionFailure(deps.reportOperationObservation, admission);
+      return {
+        exitCode: 1,
+        status: buildTrainStatus({
+          ordered_issues: ordered,
+          current_issue: ordered[0] ?? null,
+          current_index: 0,
+          next_action: "stopped",
+          merge_mode: true,
+          items: [],
+          blocker: `train merge admission refused (${admission.failure.kind}): ${admission.failure.diagnostic}`,
+          complete: false,
+          events_coverage: "unknown",
+        }),
+      };
+    }
+    outerLogicalOperationId = admission.logicalOperationId;
+    published = createTrainEventSession({
+      runDir: admission.runDir,
+      runId: admission.runId,
+      logicalOperationId: admission.logicalOperationId,
+      store: deps.publicAdmissionStore,
+      now: deps.now,
+    });
+    eventsCoverage = "ok";
+  } else {
+    const storeInit = await initTrainRunStore({
+      repoDir: trainStoreRoot,
+      repo: opts.repo,
+      startedAt,
+      mergeMode,
+      orderedIssues: ordered,
+      selector,
+      store: deps.runStore,
+      now: deps.now,
+      logicalOperationId: outerLogicalOperationId,
+    });
+    eventsCoverage = storeInit.eventsCoverage;
+    published = storeInit.session;
+  }
   if (mergeMode && !published) {
     reportMechanicalFault(deps.reportOperationObservation, {
       operation: "train",
@@ -1301,6 +1356,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     });
   };
   const admitNestedMergeSubmission = async (issue: number, pr: number): Promise<string | null> => {
+    assertRequiredAdmissionRoute("merge.train-nested", "merge", "public-admission");
     const admission = await (deps.persistPublicAdmission ?? persistPublicEntrypointAdmission)(
       {
         repoDir: opts.repoDir,
@@ -1309,6 +1365,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         repo: opts.repo,
         domain: opts.pipelineConfig?.domain ?? opts.repo,
         issue,
+        operationKey: `merge:${opts.repo}:pr:${pr}`,
         runId: `merge-${session.runId}-${issue}-${pr}`,
         logicalOperationId: session.logicalOperationId,
         admissionMode: "nested",

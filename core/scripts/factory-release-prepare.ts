@@ -2578,24 +2578,36 @@ export async function productionDispatchPackLoop(
     label: input.label,
   });
   const fileExists = deps.fileExists ?? defaultFileExistsSync;
-  let invocation = input.candidateInvocation;
-  if (!invocation) {
-    const resolved = await (deps.resolveCandidate ?? resolveAndPrepareCandidateEngine)(
-      {
-        repoDir: input.repoDir,
-        candidateSha: input.request.integrated_candidate.git_sha,
-        candidateEngineRootEnv: (deps.env ?? process.env).PIPELINE_CANDIDATE_ENGINE_ROOT,
-      },
-      deps.resolveCandidateDeps ?? defaultResolveAndPrepareDeps(),
+  const suppliedInvocation = input.candidateInvocation;
+  const resolved = await (deps.resolveCandidate ?? resolveAndPrepareCandidateEngine)(
+    {
+      repoDir: input.repoDir,
+      candidateSha: input.request.integrated_candidate.git_sha,
+      candidateEngineRootEnv: (deps.env ?? process.env).PIPELINE_CANDIDATE_ENGINE_ROOT,
+      consumer: "factory-release.pack-loop",
+    },
+    deps.resolveCandidateDeps ?? defaultResolveAndPrepareDeps(),
+  );
+  if (!resolved.ok) {
+    throw new Error(`pack-loop dispatch: ${resolved.error}`);
+  }
+  let invocation = freezeCandidateInvocation({
+    executable: resolved.engine.launcherPath,
+    loopRunId: loop_run_id,
+    candidateSha: resolved.engine.commitSha,
+  });
+  if (suppliedInvocation) {
+    const supplied = assertCandidateInvocation(
+      suppliedInvocation,
+      input.request.integrated_candidate.git_sha,
+      fileExists,
     );
-    if (!resolved.ok) {
-      throw new Error(`pack-loop dispatch: ${resolved.error}`);
+    if (
+      supplied.executable !== invocation.executable ||
+      JSON.stringify(supplied.argv) !== JSON.stringify(invocation.argv)
+    ) {
+      throw new Error("pack-loop stored invocation does not match the newly prepared candidate root");
     }
-    invocation = freezeCandidateInvocation({
-      executable: resolved.engine.launcherPath,
-      loopRunId: loop_run_id,
-      candidateSha: resolved.engine.commitSha,
-    });
   }
   invocation = assertCandidateInvocation(
     invocation,

@@ -751,11 +751,11 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
     });
     const reported = reportOwnedOperation(input.reportObservation, obs);
     if (!reported.complete) consumeReportedOwned(reported);
-    if (input.postconditionProven === true && outcome.advanced && !reported.complete) {
+    if (outcome.advanced && !reported.complete) {
       return {
         advanced: false,
         status: "waiting",
-        reason: reported.message,
+        reason: `${reported.message}; RecoverySupervisor retains ownership until exact stage evidence is proved`,
       };
     }
     const decision = reconcileIssueStageObservation(reported, outcome);

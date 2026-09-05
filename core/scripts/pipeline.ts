@@ -24,6 +24,11 @@ import { resolveConfig, resolveReleaseConfig, resolveLoopNativeGoalAttestation, 
 import { ensureArtifactIgnoreBlock } from "./artifact-ignore.ts";
 import { spawnDetached } from "./detach.ts";
 import { productionRestoreDeadDetached } from "./liveness-cli.ts";
+import { publishIssueBodyOrThrow } from "./issue-body-publisher.ts";
+import {
+  assertRequiredAdmissionRoute,
+  type RequiredAdmissionRouteName,
+} from "./operation-reliability.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
   addLabel,
@@ -3388,6 +3393,14 @@ export async function runLoopCommand(
     return;
   }
 
+  if (!outcome.args.audit) {
+    assertRequiredAdmissionRoute(
+      outcome.args.resumeRunId ? "loop.resume" : "loop.direct",
+      "loop",
+      "loop-admission",
+    );
+  }
+
   const writeLine = deps.writeStdoutLine ?? writeFlushedStdoutLine;
   const engineResult = await deps.runLoopEngine({
     engine,
@@ -3530,11 +3543,14 @@ export async function admitPublicOperation(
     kind: PublicEntrypointKind;
     profile?: string | null;
     issue?: number;
+    operationKey?: string;
     logicalOperationId?: string;
     admissionMode?: "direct" | "nested" | "resume";
+    route: RequiredAdmissionRouteName;
   },
   deps: PublicAdmissionGateDeps = {},
 ): Promise<PublicAdmissionResult> {
+  assertRequiredAdmissionRoute(input.route, input.kind, "public-admission");
   const admission = await (deps.persistPublicAdmission ?? persistPublicEntrypointAdmission)(input);
   if (!admission.acknowledged) {
     reportPublicEntrypointAdmissionFailure(deps.reportObservation, admission);
@@ -3640,6 +3656,8 @@ export async function runSingleIssueCommand(
       domain: cfg.domain,
       profile: opts.profile ?? null,
       issue: issueNumber,
+      operationKey: `single:${cfg.repo}:${issueNumber}`,
+      route: "single.direct",
     }, deps);
     if (!admission.acknowledged) {
       const message = `admission refused (${admission.failure.kind}): ${admission.failure.diagnostic}`;
@@ -3648,6 +3666,8 @@ export async function runSingleIssueCommand(
       return { exitCode: 1, engineMessage: message };
     }
     admittedLogicalOperationId = admission.logicalOperationId;
+  } else {
+    assertRequiredAdmissionRoute("drive.numeric", "drive", "loop-admission");
   }
 
   const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
@@ -5565,14 +5585,7 @@ async function main(): Promise<void> {
                 const out = await materializeGrillAnswer(handoff, text, {
                   getIssueBody: async (n) => (await getIssueDetail(cfg, n)).body,
                   updateIssueBody: async (n, body) => {
-                    const gh = spawnSync(
-                      "gh",
-                      ["issue", "edit", String(n), "-R", cfg.repo, "--body", body],
-                      { encoding: "utf8", stdio: "pipe", cwd: repoDir },
-                    );
-                    if (gh.status !== 0) {
-                      throw new Error(gh.stderr?.trim() || "gh issue edit failed");
-                    }
+                    publishIssueBodyOrThrow({ repo: cfg.repo, repoDir, issueNumber: n, body });
                   },
                   repoDir,
                   keyDeps: defaultGrillProposalKeyDeps,
@@ -6959,6 +6972,8 @@ async function main(): Promise<void> {
           repo: mergeCfg.repo,
           domain: mergeCfg.domain,
           profile: opts.profile ?? null,
+          operationKey: `merge:${mergeCfg.repo}:pr:${prNumber}`,
+          route: "merge.direct",
         },
         async () => mergePr(prNumber, {
           ...mergeDeps,
@@ -7014,6 +7029,8 @@ async function main(): Promise<void> {
           repo: mqCfg.repo,
           domain: mqCfg.domain,
           profile: opts.profile ?? null,
+          operationKey: `merge-queue:${mqCfg.repo}:milestone:${String(opts.milestone).trim()}`,
+          route: "merge-queue.apply",
         });
         if (!admission.acknowledged) throw new Error(
           `admission refused (${admission.failure.kind}): ${admission.failure.diagnostic}`,
@@ -8574,6 +8591,7 @@ export async function handleRunSubcommand(
   }
 
   if (opts.detach) {
+    assertRequiredAdmissionRoute("drive.detached-resume", "drive", "loop-admission");
     // Resolve the repo BEFORE creating any artifact (#485). A detached launch used to
     // compute `findGitRoot(start) ?? start` — silently falling back to an unvalidated
     // cwd — then create the wrapper dir, log, and run-store pointer, only to have the

@@ -331,6 +331,7 @@ function defaultResolveCandidateEngineForCollect(opts: {
       repoDir: opts.repoDir,
       candidateSha: opts.candidateSha,
       candidateEngineRootEnv: process.env.PIPELINE_CANDIDATE_ENGINE_ROOT,
+      consumer: "factory-gate.hybrid-v2",
     },
     defaultResolveAndPrepareDeps(),
   );

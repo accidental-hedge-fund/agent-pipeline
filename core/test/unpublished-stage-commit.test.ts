@@ -388,6 +388,20 @@ test("implement deliverable observer keeps planning identity distinct and invali
   assert.equal(implementation.role, "implementation");
   assert.equal(isExactImplementationDeliverable(implementation, sha1), true);
   assert.equal(isExactImplementationDeliverable(implementation, sha2), false);
+
+  for (const unprovedPath of [
+    "openspec/specs/operation-reliability/spec.md",
+    "docs/cli.md",
+    ".github/workflows/ci.yml",
+    "config/policy.yml",
+  ]) {
+    const unproved = observeImplementDeliverablePaths({
+      paths: [unprovedPath],
+      candidateSha: sha1,
+    });
+    assert.notEqual(unproved.role, "implementation", unprovedPath);
+    assert.equal(isExactImplementationDeliverable(unproved, sha1), false, unprovedPath);
+  }
 });
 
 test("executor: planning-only salvage cannot enter publication or design gate (#1454)", async () => {

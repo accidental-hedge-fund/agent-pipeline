@@ -44,6 +44,7 @@ const EXPECTED_CANDIDATE_ENGINE_CONSUMERS = [
   "ship.stage-adapter",
   "pipeline.candidate-leaf",
 ] as const;
+export type CandidateEngineConsumer = (typeof EXPECTED_CANDIDATE_ENGINE_CONSUMERS)[number];
 
 export const CANDIDATE_ENGINE_CONSUMERS: readonly CandidateEngineConsumerRoute[] =
   EXPECTED_CANDIDATE_ENGINE_CONSUMERS.map((consumer) => ({
@@ -91,6 +92,14 @@ export function assertCandidateEngineConsumerInventoryComplete(
 ): void {
   const gaps = candidateEngineConsumerInventoryGaps(routes);
   if (gaps.length) throw new Error(`candidate-engine consumer inventory invalid: ${gaps.join("; ")}`);
+}
+
+export function assertCandidateEngineConsumerRoute(consumer: CandidateEngineConsumer): void {
+  assertCandidateEngineConsumerInventoryComplete();
+  const matches = CANDIDATE_ENGINE_CONSUMERS.filter((route) => route.consumer === consumer);
+  if (matches.length !== 1 || matches[0]!.gate !== "resolve-and-prepare") {
+    throw new Error(`candidate-engine consumer is not bound exactly once to resolve-and-prepare: ${consumer}`);
+  }
 }
 
 export type CandidateEngineFailureKind = "identity" | "readiness" | "lock";
@@ -150,6 +159,7 @@ export function resolveCandidateEngine(
     repoDir: string;
     candidateSha: string;
     candidateEngineRootEnv?: string | null;
+    consumer: CandidateEngineConsumer;
   },
   deps: ResolveCandidateEngineDeps,
 ): CandidateEngineResult {
@@ -214,6 +224,7 @@ export async function resolveAndPrepareCandidateEngine(
   },
   deps: ResolveAndPrepareCandidateEngineDeps,
 ): Promise<CandidateEngineResult> {
+  assertCandidateEngineConsumerRoute(opts.consumer);
   const resolved = resolveCandidateEngine(opts, deps);
   if (!resolved.ok) return resolved;
   return prepareCandidateEngine(resolved.engine, deps as ResolveAndPrepareDeps);
@@ -523,6 +534,7 @@ export async function runResolveAndPrepareCli(
       repoDir,
       candidateSha: sha,
       candidateEngineRootEnv: env.PIPELINE_CANDIDATE_ENGINE_ROOT ?? null,
+      consumer: "pipeline.candidate-leaf",
     },
     deps,
   );

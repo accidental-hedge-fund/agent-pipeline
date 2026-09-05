@@ -34,6 +34,7 @@ import {
 } from "../gh.ts";
 import { diffFilePaths } from "../stages/review-parsing.ts";
 import { getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
+import { observeImplementDeliverablePaths } from "../unpublished-stage-commit.ts";
 import { isAdvanceStillNeeded, isBlockedInLabels, pipelineStageFromLabels } from "./precondition.ts";
 import {
   integrationSideEffectCertainty,
@@ -224,25 +225,13 @@ export function defaultReconcileObserveDeps(cfg: PipelineConfig): ReconcileObser
     async getPrArtifactBinding(prNumber, detail) {
       try {
         const paths = diffFilePaths(await getPrDiff(cfg, prNumber));
-        const productPaths = paths.filter(
-          (filePath) => !/^openspec\/changes\/(?:archive\/)?[^/]+\//.test(filePath),
-        );
-        const planningPaths = paths.filter(
-          (filePath) => /^openspec\/changes\/(?:archive\/)?[^/]+\//.test(filePath),
-        );
-        const role = productPaths.length > 0
-          ? "implementation"
-          : planningPaths.length > 0
-            ? "planning"
-            : "unknown";
         const candidateSha = detail.head_sha.trim().toLowerCase() || null;
+        const observation = observeImplementDeliverablePaths({ paths, candidateSha });
         return {
-          role,
-          artifactIdentity: role === "unknown" || !candidateSha
-            ? null
-            : `pr:${prNumber}:${candidateSha}`,
-          candidateSha,
-          candidateEpoch: candidateSha,
+          role: observation.role,
+          artifactIdentity: observation.artifact_id,
+          candidateSha: observation.candidate_sha,
+          candidateEpoch: observation.candidate_epoch,
         };
       } catch {
         return {
