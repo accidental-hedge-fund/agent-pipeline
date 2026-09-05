@@ -2,7 +2,9 @@
 
 ## Purpose
 The opt-in OpenSpec flow: auto-detect a repo's `openspec/` workspace, plan spec-first (author a change — proposal, tasks, spec deltas — instead of a freeform plan), validate it structurally, and at finalize archive the change into the living specs. The integration must leave the freeform (non-OpenSpec) path unchanged on repos that don't use it. (Propagation of spec deltas into the planning/implement/fix/review prompts is refined by `openspec-context-propagation`; the standalone `init` command is `init-command`.)
+
 ## Requirements
+
 ### Requirement: Activation is auto-detected and overridable
 Whether the OpenSpec flow runs SHALL be governed by `cfg.openspec.enabled` (`auto` | `on` | `off`): `on` always active, `off` never, `auto` active only when an `openspec/` workspace exists (`isInitialized`). `shouldPlanWithOpenspec` and `isActive` encode this.
 
@@ -54,36 +56,25 @@ SHALL NOT emit `human_intervention` without separate current authority evidence.
 
 ### Requirement: Archive into living specs at finalize
 
-At pre-merge the change SHALL be archived by `openspec archive` in machine-readable mode, folding
-its deltas into `openspec/specs/` and moving it under `openspec/changes/archive/`, and
-`openspec validate --all` SHALL pass before the item reaches `ready-to-deploy`. Archive success
-SHALL require both an explicit successful result for every intended change id and verification that
-each corresponding active change directory is absent from the authoritative post-archive
-candidate. Before archive, the pre-merge stage SHALL run the existing stale-delta consistency guard:
-it SHALL block when both a later non-pipeline implementation commit exists after the last delta-spec
-commit and the current structured review verdict carries `category: spec-divergence`. The guard
-SHALL read the category marker and SHALL NOT infer divergence from reviewer prose.
+At pre-merge the change SHALL be archived by `openspec archive` in machine-readable mode, folding its deltas into `openspec/specs/` and moving it under `openspec/changes/archive/`, and `openspec validate --all` SHALL pass before the item reaches `ready-to-deploy`. Archive success SHALL require both an explicit successful result for every intended change id and verification that each corresponding active change directory is absent from the authoritative post-archive candidate. Before archive, the pre-merge stage SHALL run the existing stale-delta consistency guard: it SHALL block when both a later non-pipeline implementation commit exists after the last delta-spec commit and the current structured review verdict carries `category: spec-divergence`. The guard SHALL read the category marker and SHALL NOT infer divergence from reviewer prose.
+
+The change SHALL be archived only after every explicit checklist item in each active change's `tasks.md` is checked. An unchecked `- [ ]` item, including a nested item, SHALL block before `openspec archive` is invoked and SHALL identify the affected change and remaining count. A change for which OpenSpec supplies no optional checklist remains governed by structural validation. Archive automation SHALL NOT convert an incomplete implementation checklist into an archived contract.
 
 #### Scenario: Archive on finalize when spec and code are consistent
 
-- **WHEN** an OpenSpec-active item reaches pre-merge and the consistency guard does not detect a
-  code-spec divergence
+- **WHEN** an OpenSpec-active item reaches pre-merge and the consistency guard does not detect a code-spec divergence
 - **THEN** each active change SHALL be archived in machine-readable mode
-- **AND** explicit archive results, active-directory removal, and `openspec validate --all` SHALL be
-  verified before advancing
+- **AND** explicit archive results, active-directory removal, and `openspec validate --all` SHALL be verified before advancing
 
 #### Scenario: Archive output without active-directory removal is not success
 
-- **WHEN** the archive command exits successfully but an intended change directory remains active
-  on the authoritative candidate
-- **THEN** the archive gate SHALL emit a canonical `implementation-ci` diagnostic with blocker kind
-  `openspec-invalid` and remain blocked
+- **WHEN** the archive command exits successfully but an intended change directory remains active on the authoritative candidate
+- **THEN** the archive gate SHALL emit a canonical `implementation-ci` diagnostic with blocker kind `openspec-invalid` and remain blocked
 - **AND** it SHALL NOT record archive success or advance
 
 #### Scenario: Pre-merge blocks when code moved but spec did not and a finding is tagged spec-divergence
 
-- **WHEN** a non-pipeline commit changed implementation files after the last commit that changed
-  the change's `specs/**`
+- **WHEN** a non-pipeline commit changed implementation files after the last commit that changed the change's `specs/**`
 - **AND** the most recent review verdict contains `category: spec-divergence`
 - **THEN** pre-merge SHALL remain blocked with a diagnostic naming the stale-delta condition
 - **AND** it SHALL NOT call `openspec archive`
@@ -97,10 +88,22 @@ SHALL read the category marker and SHALL NOT infer divergence from reviewer pros
 
 #### Scenario: The consistency guard ignores prose
 
-- **WHEN** a current review finding mentions spec divergence in prose but carries no structured
-  `category: spec-divergence` marker
+- **WHEN** a current review finding mentions spec divergence in prose but carries no structured `category: spec-divergence` marker
 - **THEN** the consistency guard SHALL treat it as no divergence flag
 - **AND** it SHALL NOT block on that prose alone
+
+#### Scenario: Unchecked implementation tasks block archive
+
+- **WHEN** an active OpenSpec change reaches pre-merge with one or more unchecked `tasks.md` items
+- **THEN** pre-merge SHALL remain blocked as `openspec-invalid`
+- **AND** `openspec archive` SHALL NOT be invoked
+- **AND** the reason SHALL name the change and number of unchecked tasks
+
+#### Scenario: Completed checklist permits normal archive evaluation
+
+- **WHEN** every explicit task in each active change is checked
+- **THEN** the completeness guard SHALL pass
+- **AND** the existing consistency, archive, validation, commit, and push gates SHALL continue normally
 
 ### Requirement: Bootstrap is opt-in
 When the flow is active on a repo lacking an `openspec/` workspace, planning SHALL run `openspec init` only if `cfg.openspec.bootstrap` is `true`; otherwise it SHALL block with an actionable message rather than silently proceeding.
@@ -686,4 +689,3 @@ step SHALL fail closed with `setBlocked` and SHALL NOT treat the tree as clean.
 - **THEN** the step SHALL call `setBlocked` with stage `pre-merge`
 - **AND** SHALL NOT invoke `git commit` for the archive
 - **AND** the block reason SHALL disclose the still-staged scratch path
-
