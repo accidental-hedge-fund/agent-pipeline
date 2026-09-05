@@ -754,6 +754,14 @@ function sameEvidenceBinding(before: DeliveryStageEvidence, after: DeliveryStage
   );
 }
 
+function sameCandidateBinding(before: DeliveryStageEvidence, after: DeliveryStageEvidence): boolean {
+  const candidate = before.candidateSha?.trim().toLowerCase() ?? "";
+  const epoch = before.candidateEpoch?.trim().toLowerCase() ?? "";
+  return Boolean(candidate) && candidate === epoch &&
+    candidate === (after.candidateSha?.trim().toLowerCase() ?? "") &&
+    epoch === (after.candidateEpoch?.trim().toLowerCase() ?? "");
+}
+
 export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInput): Promise<Outcome> {
   let evidence = {
     candidateSha: input.candidateSha,
@@ -830,7 +838,8 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
       evidence = await input.observeEvidence("after", outcome);
       const producerEstablishedEvidence = input.evidenceProducerBeforeAttempt &&
         preAttemptEvidence?.postconditionProven !== true &&
-        evidence.postconditionProven === true;
+        evidence.postconditionProven === true &&
+        sameCandidateBinding(preAttemptEvidence, evidence);
       if (preAttemptEvidence && !sameEvidenceBinding(preAttemptEvidence, evidence) && !producerEstablishedEvidence) {
         const waiting: Outcome = {
           advanced: false,

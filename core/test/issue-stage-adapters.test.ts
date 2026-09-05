@@ -321,6 +321,42 @@ test("1.4 evidence producer may establish the exact artifact during its attempt 
   assert.equal(out.advanced, true);
 });
 
+test("1.4 evidence producer cannot establish an artifact for a replacement Candidate (#1454)", async () => {
+  const beforeSha = "a".repeat(40);
+  const afterSha = "b".repeat(40);
+  const out = await runDeliveryStageAdapter({
+    stage: "implementing",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-producer-candidate-moved",
+    requireEvidenceBeforeAttempt: true,
+    evidenceProducerBeforeAttempt: true,
+    observeEvidence: async (phase) => phase === "before"
+      ? {
+          candidateSha: beforeSha,
+          candidateEpoch: beforeSha,
+          evidenceRole: null,
+          artifactIdentity: null,
+          postconditionProven: false,
+        }
+      : {
+          candidateSha: afterSha,
+          candidateEpoch: afterSha,
+          evidenceRole: "implementation",
+          artifactIdentity: `implementation:${afterSha}`,
+          postconditionProven: true,
+        },
+    attempt: async () => ({
+      advanced: true,
+      from: "implementing",
+      to: "design-gate",
+      summary: "must not certify replacement Candidate",
+    }),
+  });
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /Candidate binding changed during execution/);
+});
+
 test("1.4 protected dispatch rejects completion when the Candidate binding changes during execution (#1454)", async () => {
   const beforeSha = "a".repeat(40);
   const afterSha = "b".repeat(40);

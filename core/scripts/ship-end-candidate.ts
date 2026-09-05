@@ -318,7 +318,10 @@ export async function resolveAndPrepareCandidateEngine(
           .slice(0, 32)}.lock`,
       );
       const d = deps as ResolveAndPrepareDeps;
-      if (!d.statePathTrusted(lockPath)) return null;
+      // The lock does not exist on the uncontended path, so it cannot be
+      // trusted before exclusive creation. Trust the private parent first,
+      // then verify the created file before treating it as ownership.
+      if (!d.ensureStateDir(stateDir) || !d.statePathTrusted(stateDir)) return null;
       const owner = d.parentIdentity();
       const body = `${JSON.stringify({
         schema: "pipeline-candidate-process-lock/v1",
@@ -347,7 +350,12 @@ export async function resolveAndPrepareCandidateEngine(
         }
         if (!d.writeText(lockPath, body, "wx")) return null;
       }
-      return () => d.remove(lockPath);
+      if (!d.statePathTrusted(lockPath) || d.readText(lockPath) !== body) return null;
+      return () => {
+        if (d.statePathTrusted(lockPath) && d.readText(lockPath) === body) {
+          d.remove(lockPath);
+        }
+      };
     },
   });
   return { ok: true, engine: bindRevalidation(prepared.engine) };

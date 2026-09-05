@@ -469,6 +469,31 @@ test("candidate movement after an earlier parent check is refused inside the pro
   assert.equal(h.spawned.length, 0);
 });
 
+test("candidate process lock trusts its private parent before exclusively creating the lock (#1454)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  const originalTrusted = h.deps.statePathTrusted;
+  h.deps.statePathTrusted = (p) => p === "/tmp-state" || h.files.has(p) && originalTrusted(p);
+  const prepared = await resolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "ship.stage-adapter" },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  let starts = 0;
+  const result = await runCandidateEngineProcess({
+    consumer: "ship.stage-adapter",
+    engine: prepared.engine,
+    start: async () => ++starts,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(starts, 1);
+});
+
 test("spawn ordering fails if a candidate command precedes readiness success", () => {
   const events: EventLog = [];
   const spawned: string[][] = [];
