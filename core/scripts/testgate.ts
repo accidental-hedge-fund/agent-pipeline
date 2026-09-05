@@ -22,6 +22,13 @@ import {
   type HarnessResult,
   type InvokeOptions,
 } from "./harness.ts";
+import { PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV } from "./loop/pack-loop-liveness.ts";
+import {
+  FACTORY_CONTROL_DIR_ENV,
+  FACTORY_PLANE_REPO_DIR_ENV,
+  PRODUCTION_PIN_ENV,
+} from "./production-engine-pin.ts";
+import { CANDIDATE_PROCESS_GUARD_ENV } from "./ship-end-candidate.ts";
 import { gitInWorktree } from "./worktree.ts";
 import { buildTestFixPrompt } from "./prompts/index.ts";
 import {
@@ -1198,11 +1205,47 @@ export function testGateBlockReason(gate: TestGateResult): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Factory topology, candidate-process lease/guard data, pack-loop SHA,
+ * starting-lock pid, and merge authority omitted from the repo test-command
+ * child (#1459). Derived from existing single-sourced constants plus the
+ * remaining named literals. A new `CANDIDATE_PROCESS_GUARD_ENV` field is
+ * stripped without a new mole issue.
+ *
+ * Built lazily: `testgate.ts` importing `production-engine-pin.ts` is a cycle
+ * (`production-engine-pin` → ship-supervision / FRG → stages → testgate), so
+ * reading those bindings at module init hits TDZ.
+ */
+export function testGateOmittedEnvNames(): readonly string[] {
+  return Object.freeze([
+    ...Object.values(CANDIDATE_PROCESS_GUARD_ENV),
+    FACTORY_CONTROL_DIR_ENV,
+    PRODUCTION_PIN_ENV,
+    FACTORY_PLANE_REPO_DIR_ENV,
+    PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV,
+    "PIPELINE_CANDIDATE_ENGINE_ROOT",
+    "PIPELINE_STARTING_LOCK_PID",
+    "ALLOW_MERGE",
+  ]);
+}
+
+function testGateIsolatedEnvOverlay(): NodeJS.ProcessEnv {
+  const overlay: NodeJS.ProcessEnv = {};
+  for (const name of testGateOmittedEnvNames()) {
+    overlay[name] = undefined;
+  }
+  return overlay;
+}
+
+/**
  * Spawn the test/build command, capping output and enforcing a wall-clock
  * timeout. A non-zero exit, a timeout, or a spawn error all count as a
  * failure. When `killProcessGroup` is true (required for shell-backed
  * `bash -c` commands) the entire spawned process group is killed on timeout so
  * shell descendants do not outlive the gate.
+ *
+ * The child env keeps ordinary build inputs and omits factory topology,
+ * candidate-process lease/guard data, and `ALLOW_MERGE` (#1459). Isolation
+ * applies only at this spawn; the controller and harness env stay unchanged.
  */
 export async function runTests(
   cwd: string,
@@ -1220,7 +1263,7 @@ export async function runTests(
     timeoutSec,
     true,
     `test-gate:${command.cmd}`,
-    { killProcessGroup, spawnFn },
+    { killProcessGroup, spawnFn, env: testGateIsolatedEnvOverlay() },
   );
   let output = combineOutput(res);
   if (res.timed_out) {

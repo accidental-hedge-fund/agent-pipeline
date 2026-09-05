@@ -1022,6 +1022,15 @@ function ensurePermanentForwardGuard(dest: ForwardStream): void {
   });
 }
 
+/** Merge overlay onto process.env and drop undefined keys so they are absent at spawn (#1459). */
+function spawnEnvFromOverlay(overlay: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...overlay };
+  for (const key of Object.keys(env)) {
+    if (env[key] === undefined) delete env[key];
+  }
+  return env;
+}
+
 export async function runCapped(
   cmd: string,
   args: string[],
@@ -1053,7 +1062,8 @@ export async function runCapped(
     // Additional env vars to merge into the child's environment on top of
     // process.env (#419 — papercuts.enabled run/stage/harness/model identity).
     // Absent by default: the child inherits process.env unchanged, matching
-    // pre-#419 behavior exactly.
+    // pre-#419 behavior exactly. When present, keys whose overlay value is
+    // `undefined` are dropped after merge so they are absent at spawn (#1459).
     env?: NodeJS.ProcessEnv;
     // How captured stdout is bounded at MAX_OUTPUT (#429). "head" (default,
     // unchanged pre-#429 behavior) keeps the first MAX_OUTPUT chars and stops
@@ -1177,8 +1187,10 @@ export async function runCapped(
         // detached creates a new process group so we can kill all descendants on timeout
         ...(killProcessGroup ? { detached: true } : {}),
         // Merge in caller-supplied env additions (#419) on top of the inherited
-        // process.env; absent opts.env is a no-op (spread of undefined is {}).
-        ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
+        // process.env; absent opts.env is a no-op (no env key at spawn).
+        // Undefined overlay values are dropped after merge so those names are
+        // absent from the spawn env object (#1459 test-gate isolation).
+        ...(opts.env ? { env: spawnEnvFromOverlay(opts.env) } : {}),
       });
     } catch (err) {
       const duration = (Date.now() - start) / 1000;

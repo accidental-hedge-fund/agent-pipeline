@@ -14,10 +14,12 @@ import {
   runTests,
   shellSplit,
   testGateBlockReason,
+  testGateOmittedEnvNames,
   type ParsedCommand,
   type RunTestsResult,
   type TestGateDeps,
 } from "../scripts/testgate.ts";
+import { CANDIDATE_PROCESS_GUARD_ENV } from "../scripts/ship-end-candidate.ts";
 import type { HarnessResult, InvokeOptions } from "../scripts/harness.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import { defaultRunStoreDeps } from "../scripts/run-store.ts";
@@ -287,6 +289,106 @@ test("runTests (#384): capture stream breaks mid-run (no spawn_error) → toolin
 
   assert.equal(res.passed, false);
   assert.equal(res.toolingError, true);
+});
+
+// ---------------------------------------------------------------------------
+// Repo test-command env isolation (#1459)
+// ---------------------------------------------------------------------------
+
+const TEST_BUILD_GATE_DELTA_OMITTED_NAMES = [
+  "AGENT_PIPELINE_FACTORY_CONTROL",
+  "AGENT_PIPELINE_PRODUCTION_PIN",
+  "REPO_DIR",
+  "PIPELINE_CANDIDATE_ENGINE_ROOT",
+  "PIPELINE_PACK_LOOP_CANDIDATE_SHA",
+  "PIPELINE_STARTING_LOCK_PID",
+  "ALLOW_MERGE",
+  "PIPELINE_CANDIDATE_PROCESS_GUARD",
+  "PIPELINE_CANDIDATE_PROCESS_ROOT",
+  "PIPELINE_CANDIDATE_PROCESS_SHA",
+  "PIPELINE_CANDIDATE_PROCESS_READY_RECORD",
+  "PIPELINE_CANDIDATE_PROCESS_LOCKFILE_DIGEST",
+  "PIPELINE_CANDIDATE_PROCESS_LOCK",
+  "PIPELINE_CANDIDATE_PROCESS_LOCK_DIGEST",
+] as const;
+
+test("testGateOmittedEnvNames includes every name listed in the test-build-gate delta", () => {
+  const omitted = new Set(testGateOmittedEnvNames());
+  for (const name of TEST_BUILD_GATE_DELTA_OMITTED_NAMES) {
+    assert.ok(omitted.has(name), `omitted-name list must include ${name}`);
+  }
+});
+
+test("drift-guard: every CANDIDATE_PROCESS_GUARD_ENV name is in testGateOmittedEnvNames", () => {
+  const omitted = new Set(testGateOmittedEnvNames());
+  for (const name of Object.values(CANDIDATE_PROCESS_GUARD_ENV)) {
+    assert.ok(
+      omitted.has(name),
+      `CANDIDATE_PROCESS_GUARD_ENV name ${name} must be in testGateOmittedEnvNames`,
+    );
+  }
+});
+
+test("drift-guard bites when a candidate-process guard name is missing from the omitted set", () => {
+  const forged = "PIPELINE_CANDIDATE_PROCESS_FORGED_DRIFT";
+  const omitted = new Set(testGateOmittedEnvNames());
+  assert.equal(omitted.has(forged), false);
+  const guardValues = [...Object.values(CANDIDATE_PROCESS_GUARD_ENV), forged];
+  const missing = guardValues.filter((name) => !omitted.has(name));
+  assert.ok(
+    missing.includes(forged),
+    "dropping a guard name from the omitted set must fail the membership check",
+  );
+});
+
+test("runTests: omitted factory/candidate/merge names are absent from spawn env and a sentinel is preserved (#1459)", async () => {
+  const sentinelName = "PIPELINE_TESTGATE_ENV_SENTINEL";
+  const sentinelValue = "keep-me";
+  const omittedNames = testGateOmittedEnvNames();
+  const names = [...omittedNames, sentinelName];
+  const prior: Record<string, string | undefined> = {};
+  for (const name of names) {
+    prior[name] = process.env[name];
+    process.env[name] = name === sentinelName ? sentinelValue : `set-${name}`;
+  }
+
+  let capturedEnv: NodeJS.ProcessEnv | undefined;
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 1459001,
+    kill: () => true,
+  });
+  const spawnFn = ((_cmd: string, _args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    capturedEnv = options.env;
+    setImmediate(() => fakeChild.emit("close", 0));
+    return fakeChild;
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  try {
+    await runTests(tmpRoot, { cmd: "unused", args: [] }, 30, false, spawnFn);
+
+    assert.ok(capturedEnv, "runTests must pass an env overlay through to spawn");
+    for (const name of omittedNames) {
+      assert.notEqual(
+        typeof capturedEnv![name],
+        "string",
+        `${name} must not be a string value on the spawned repo test process`,
+      );
+      assert.equal(
+        process.env[name],
+        `set-${name}`,
+        `controller process.env.${name} must remain set after spawn`,
+      );
+    }
+    assert.equal(capturedEnv![sentinelName], sentinelValue);
+    assert.equal(capturedEnv!.PATH, process.env.PATH);
+  } finally {
+    for (const name of names) {
+      if (prior[name] === undefined) delete process.env[name];
+      else process.env[name] = prior[name];
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
