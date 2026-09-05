@@ -757,6 +757,19 @@ function recoveryCandidateIdentity(
   ].join("|");
 }
 
+/** Logical recovery epoch. Production observations explicitly set
+ * `logical_candidate_epoch`; null means commit lineage was unobservable and
+ * therefore cannot prove a new epoch. Older injected/test observations omit
+ * the field and retain the historical raw-HEAD behavior. */
+function observedCandidateEpoch(item: LoopItemLedgerEntry | undefined): string {
+  const identity = item?.last_verified_identity;
+  if (!identity) return "";
+  if (Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")) {
+    return identity.logical_candidate_epoch?.trim() ?? "";
+  }
+  return identity.head_sha.trim();
+}
+
 async function stopForRecoveryPreflight(
   deps: SupervisorDeps,
   contract: LoopContract,
@@ -999,7 +1012,7 @@ async function executeBlockedRecovery(
     }
   }
 
-  const currentEpoch = item.last_verified_identity?.head_sha.trim() ?? "";
+  const currentEpoch = observedCandidateEpoch(item);
   const matchingAttempts = ledger.recovery_attempts.filter(
     (attempt) =>
       attempt.item_id === itemId &&
@@ -2287,7 +2300,7 @@ export async function runSupervisorCycle(
     if (ledger.cooling) {
       const cooledId = ledger.cooling.item_id;
       const cooledItem = cooledId ? ledger.items[cooledId] : undefined;
-      const cooledEpoch = cooledItem?.last_verified_identity?.head_sha.trim() ?? "";
+      const cooledEpoch = observedCandidateEpoch(cooledItem);
       const staleCooling = coolingIsStaleForNewCandidateEpoch(
         ledger.cooling,
         ledger.recovery_attempts,
@@ -2356,9 +2369,7 @@ export async function runSupervisorCycle(
         itemId: exhausted.id,
         theme: exhausted.blocked_theme,
         candidateEpoch:
-          exhausted.last_verified_identity?.head_sha.trim() ||
-          exhausted.evidence_fingerprint ||
-          exhausted.id,
+          observedCandidateEpoch(exhausted) || exhausted.evidence_fingerprint || exhausted.id,
         historicalEvidence: "recovery_exhausted",
       });
       ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });

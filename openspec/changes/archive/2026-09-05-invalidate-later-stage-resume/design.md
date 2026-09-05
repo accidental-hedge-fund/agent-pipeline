@@ -85,7 +85,7 @@ See `proposal.md` for motivation and the #1459 / v1.40.1 dogfood path.
 
 **Choice:** After a new candidate epoch, RecoverySupervisor / next-action MUST treat `review-1` / `review-2` as actionable. Pending checks on H, or a Recovery Episode (cursor, exhaustion, prior failure) keyed to S, MUST NOT classify that item as `noop`. Start or resume an episode keyed to the new epoch. Existing Recovery Episode law already says a new epoch starts a new episode; this change makes later-stage review-currency resume a consumer of that law.
 
-Cooling written for an item MUST carry its creating candidate epoch. Staleness checks use that immutable binding instead of the latest attempt, so appending the first H attempt cannot make S-era Cooling authoritative for H again. Records predating the field retain the existing attempt-history fallback.
+Cooling written for an item MUST carry its creating candidate epoch. Recovery derives the logical epoch from the last non-pipeline-internal commit, so trailing archive/evidence commits neither reset recovery nor bypass backoff. Staleness checks use the immutable binding instead of the latest attempt, so appending the first H attempt cannot make S-era Cooling authoritative for H again. Records predating the field infer ownership only from attempt evidence present when Cooling was created.
 
 **Why:** The issue names this fail-open explicitly. Pending CI is not a reason to skip exact-SHA review. A prior-epoch failure episode is not authority that review is done.
 

@@ -812,13 +812,34 @@ test("advanceReview: CWD HEAD differs from captured PR SHA → blocked without h
   assert.deepEqual(out, {
     advanced: false,
     status: "blocked",
-    reason: "review CWD HEAD differs from captured PR SHA",
+    reason: "review CWD HEAD does not prove captured PR SHA",
   });
   assert.ok(
     rec.blocked.some((b) => b.includes("wrong checkout") && b.includes(cwdSha.slice(0, 7))),
     "must name the CWD/PR SHA mismatch",
   );
   assert.equal(rec.runReviewCalls, 0, "must not invoke the reviewer from a checkout that is not the captured PR SHA");
+  assert.equal(rec.comments.length, 0);
+});
+
+test("advanceReview: unreadable CWD HEAD fails closed without invoking harness (#1462)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  const unreadableDeps: AdvanceReviewDeps = {
+    ...deps,
+    getForIssue: async () => ({ path: "/wt", slug: "x" }),
+    gitInWorktree: async () => ({ stdout: "", stderr: "not a repository", code: 128 }),
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advanceReview(cfg, 1, 1, {}, 0, unreadableDeps);
+  });
+  assert.deepEqual(out, {
+    advanced: false,
+    status: "blocked",
+    reason: "review CWD HEAD does not prove captured PR SHA",
+  });
+  assert.ok(rec.blocked.some((b) => b.includes("CWD HEAD is unreadable")));
+  assert.equal(rec.runReviewCalls, 0);
   assert.equal(rec.comments.length, 0);
 });
 
@@ -887,6 +908,7 @@ function makeDeps(
         comments: [],
       }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>,
     getForIssue: async () => null,
+    gitInWorktree: async () => ({ stdout: `${"f".repeat(40)}\n`, stderr: "", code: 0 }),
     listPrHeadChangeDirs: async () => [],
     postComment: async (_cfg, _n, body) => {
       rec.comments.push(body);
@@ -4385,6 +4407,7 @@ function makeDelegationDeps(): { deps: AdvanceReviewDeps; rec: Recorder } {
         url: "https://example.test/1", labels: [], comments: [],
       }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>,
     getForIssue: async () => null,
+    gitInWorktree: async () => ({ stdout: `${"f".repeat(40)}\n`, stderr: "", code: 0 }),
     listPrHeadChangeDirs: async () => [],
     postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
     postPrComment: async (_cfg, _pr, body) => { rec.prComments.push(body); },

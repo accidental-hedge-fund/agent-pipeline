@@ -650,11 +650,13 @@ export async function advanceReview(
   } catch {
     cwdHead = "";
   }
-  if (/^[0-9a-f]{40}$/.test(cwdHead) && cwdHead !== commitSha.toLowerCase()) {
+  if (!/^[0-9a-f]{40}$/.test(cwdHead) || cwdHead !== commitSha.toLowerCase()) {
     const reason =
-      `Review CWD HEAD ${cwdHead.slice(0, 7)} differs from captured PR SHA ${commitSha.slice(0, 7)}; refusing to record exact-SHA review evidence from the wrong checkout.`;
+      cwdHead
+        ? `Review CWD HEAD ${cwdHead.slice(0, 7)} differs from captured PR SHA ${commitSha.slice(0, 7)}; refusing to record exact-SHA review evidence from the wrong checkout.`
+        : `Review CWD HEAD is unreadable; refusing to record exact-SHA review evidence for captured PR SHA ${commitSha.slice(0, 7)}.`;
     await setBlockedFn(cfg, issueNumber, reason, stage, "harness-failure");
-    return { advanced: false, status: "blocked", reason: "review CWD HEAD differs from captured PR SHA" };
+    return { advanced: false, status: "blocked", reason: "review CWD HEAD does not prove captured PR SHA" };
   }
 
   const invocation = await runReviewFn(

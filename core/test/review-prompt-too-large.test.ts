@@ -218,6 +218,7 @@ function makeAdvanceDeps(rec: {
       ],
     } as any),
     getForIssue: async () => ({ path: tmpRoot, branch: "pipeline/42-x" } as any),
+    gitInWorktree: async () => ({ stdout: `${sha}\n`, stderr: "", code: 0 }),
     postComment: async () => {},
     postPrComment: async () => {},
     transition: async () => {},

@@ -893,6 +893,9 @@ export interface LoopExternalIdentity {
   artifact_role?: "planning" | "implementation" | "unknown";
   artifact_identity?: string | null;
   candidate_epoch?: string | null;
+  /** Last non-pipeline-internal commit at the observed PR head. Trailing
+   * pipeline-owned bookkeeping commits remain in the same logical epoch. */
+  logical_candidate_epoch?: string | null;
   /** Operation marker on the selected artifact and the ledger operation it must match. */
   logical_operation_id?: string | null;
   expected_logical_operation_id?: string | null;

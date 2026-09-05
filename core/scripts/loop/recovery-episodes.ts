@@ -102,7 +102,7 @@ export function coolingIsStaleForNewCandidateEpoch(
   cooling: LoopCoolingRecord | null | undefined,
   attempts: readonly Pick<
     LoopRecoveryAttempt,
-    "item_id" | "candidate_epoch" | "candidate_identity"
+    "item_id" | "candidate_epoch" | "candidate_identity" | "time" | "next_eligible_at"
   >[],
   itemId: string | undefined,
   candidateEpoch: string,
@@ -121,10 +121,19 @@ export function coolingIsStaleForNewCandidateEpoch(
     );
   }
   // Backward compatibility for ledgers written before candidate_epoch was
-  // persisted on Cooling. Their best available owner is the latest attempt.
-  const latest = [...attempts].reverse().find((attempt) => attempt.item_id === itemId);
-  if (!latest) return false;
-  return !attemptBelongsToCandidateEpoch(latest, wanted);
+  // persisted on Cooling. Bind to evidence that existed when Cooling was
+  // created, never to the latest attempt: a later H attempt must not transfer
+  // S-era Cooling authority onto H. If old evidence cannot identify an owner,
+  // retain Cooling (fail closed against duplicate recovery) until its deadline.
+  const coolingTime = Date.parse(cooling.time);
+  const owner = [...attempts].reverse().find((attempt) => {
+    if (attempt.item_id !== itemId) return false;
+    if (cooling.next_eligible_at && attempt.next_eligible_at === cooling.next_eligible_at) return true;
+    const attemptTime = Date.parse(attempt.time);
+    return Number.isFinite(coolingTime) && Number.isFinite(attemptTime) && attemptTime <= coolingTime;
+  });
+  if (!owner) return false;
+  return !attemptBelongsToCandidateEpoch(owner, wanted);
 }
 
 export function recoveryEpisodeId(key: RecoveryEpisodeKey): string {

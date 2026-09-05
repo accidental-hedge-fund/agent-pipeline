@@ -305,6 +305,26 @@ test("observeExternalIdentity: builds a full identity from an open PR with green
   assert.ok(calls.includes("getPrChecks:12"));
 });
 
+test("observeExternalIdentity: trailing pipeline commits preserve the logical candidate epoch (#1462)", async () => {
+  const productSha = "a".repeat(40);
+  const archiveSha = "b".repeat(40);
+  const { deps } = fakeObserveDeps({
+    async findPrForIssue() { return 12; },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: archiveSha, merge_commit_sha: null };
+    },
+    async getPrCommits() {
+      return [
+        { oid: productSha, messageHeadline: "fix: product behavior" },
+        { oid: archiveSha, messageHeadline: "chore: archive OpenSpec change(s) for #100" },
+      ];
+    },
+  });
+  const identity = await observeExternalIdentity(deps, "100");
+  assert.equal(identity.head_sha, archiveSha);
+  assert.equal(identity.logical_candidate_epoch, productSha);
+});
+
 test("observeExternalIdentity: absent external objects are represented, not omitted", async () => {
   const { deps } = fakeObserveDeps();
   const identity = await observeExternalIdentity(deps, "100");

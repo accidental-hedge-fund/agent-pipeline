@@ -131,6 +131,7 @@ function makeBaseReviewDeps(counter?: ReturnType<typeof makeGhCounter>): Advance
     })),
     // getForIssue is NOT tracked (filesystem, not gh)
     getForIssue: async () => ({ path: "/fake/worktree", slug: "test" }),
+    gitInWorktree: async () => ({ stdout: `${FAKE_SHA}\n`, stderr: "", code: 0 }),
     runReview: fakeApproveReview,
     postComment: track(async () => {}),
     postPrComment: track(async () => {}),

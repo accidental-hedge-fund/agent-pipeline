@@ -1478,6 +1478,33 @@ test("coolingIsStaleForNewCandidateEpoch ignores S-episode Cooling after HEAD mo
   assert.equal(coolingIsStaleForNewCandidateEpoch(null, sAttempts, "100", shaH), false);
 });
 
+test("legacy Cooling binds to the attempt present at creation, not a later H attempt (#1462)", () => {
+  const shaS = "a".repeat(40);
+  const shaH = "b".repeat(40);
+  const legacyCooling = {
+    reason: "strategy_cursor_exhausted" as const,
+    time: "2026-09-05T00:10:00.000Z",
+    next_eligible_at: "2026-09-05T01:00:00.000Z",
+    item_id: "100",
+  };
+  const attempts = [
+    {
+      item_id: "100",
+      candidate_epoch: shaS,
+      candidate_identity: `head=${shaS}`,
+      time: "2026-09-05T00:00:00.000Z",
+      next_eligible_at: legacyCooling.next_eligible_at,
+    },
+    {
+      item_id: "100",
+      candidate_epoch: shaH,
+      candidate_identity: `head=${shaH}`,
+      time: "2026-09-05T00:20:00.000Z",
+    },
+  ];
+  assert.equal(coolingIsStaleForNewCandidateEpoch(legacyCooling, attempts, "100", shaH), true);
+});
+
 test("startRecoveryAttempt: new candidate epoch does not reuse S-episode cursor (#1462)", async () => {
   const { deps, contract, token } = await setup();
   await blockCi(deps, contract, token);

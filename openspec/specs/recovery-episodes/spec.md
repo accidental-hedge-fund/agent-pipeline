@@ -9,7 +9,7 @@ Persists candidate-scoped Recovery Episodes with a monotonic strategy cursor, pe
 
 RecoverySupervisor SHALL persist a Recovery Episode for each supervised recovery keyed by operation, invariant, candidate epoch, and normalized evidence identity. The episode SHALL reuse the existing recovery-attempt record family and operation-claim records. The engine SHALL NOT persist a competing private episode schema as production authority. The episode SHALL survive process restart. Cursor reset SHALL require a new candidate epoch or materially different evidence. Prose variation or restart SHALL NOT reset the cursor.
 
-Item-local Cooling created by a Recovery Episode SHALL persist the candidate epoch that created it. A later attempt for a new epoch SHALL NOT cause Cooling from the prior epoch to regain authority over the new epoch. Legacy Cooling records without an epoch MAY use attempt history only as a backward-compatible ownership inference.
+Item-local Cooling created by a Recovery Episode SHALL persist the candidate epoch that created it. Recovery SHALL derive that logical epoch through the shared pipeline-internal commit classification, so trailing pipeline-owned bookkeeping commits do not reset an episode or bypass its backoff. A later attempt for a new epoch SHALL NOT cause Cooling from the prior epoch to regain authority over the new epoch. Legacy Cooling records without an epoch MAY use only attempt evidence present when Cooling was created as a backward-compatible ownership inference; a later attempt SHALL NOT transfer ownership.
 
 #### Scenario: Episode key is candidate-scoped
 
