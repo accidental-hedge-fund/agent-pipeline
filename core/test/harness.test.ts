@@ -1825,6 +1825,39 @@ test("runCapped: opts.env is merged into the spawned child's environment when su
   assert.equal(capturedEnv!.PATH, process.env.PATH);
 });
 
+test("runCapped: undefined overlay values omit those names from spawn env (#1459)", async () => {
+  const prior = process.env.REPO_DIR;
+  process.env.REPO_DIR = "/factory/repo";
+  try {
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const fakeChild = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      pid: 1459002,
+      kill: () => true,
+    });
+    const spawnFn = ((_cmd: string, _args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+      capturedEnv = options.env;
+      setImmediate(() => fakeChild.emit("close", 0));
+      return fakeChild;
+    }) as unknown as typeof import("node:child_process").spawn;
+
+    await runCapped("unused", [], tmpRoot, 30, false, "test", {
+      spawnFn,
+      env: { REPO_DIR: undefined, PIPELINE_RUN_ID: "keep" },
+    });
+
+    assert.ok(capturedEnv, "spawn options.env must be set when opts.env is supplied");
+    assert.equal(Object.hasOwn(capturedEnv!, "REPO_DIR"), false);
+    assert.equal(capturedEnv!.PIPELINE_RUN_ID, "keep");
+    assert.equal(capturedEnv!.PATH, process.env.PATH);
+    assert.equal(process.env.REPO_DIR, "/factory/repo");
+  } finally {
+    if (prior === undefined) delete process.env.REPO_DIR;
+    else process.env.REPO_DIR = prior;
+  }
+});
+
 test("runCapped: no opts.env → spawn options carry no env key at all (byte-for-byte no-op on the default path)", async () => {
   let capturedOptions: { env?: NodeJS.ProcessEnv } | undefined;
   const fakeChild = Object.assign(new EventEmitter(), {
