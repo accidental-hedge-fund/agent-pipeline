@@ -27,6 +27,7 @@ import {
   persistPublicEntrypointAdmission,
   publicEntrypointRunIdFor,
   resolvePublicAdmissionPersistRoot,
+  resolvePublicAdmissionClaimRoot,
   readEvents,
   readWriteHealth,
   recordWriteHealthFailure,
@@ -38,6 +39,7 @@ import {
   writeHealthPath,
   writeHealthTextForReadFailure,
   type RunEvent,
+  type PublicAdmissionStoreDeps,
   type RunStoreDeps,
   type WriteHealthRecord,
 } from "../scripts/run-store.ts";
@@ -51,6 +53,14 @@ const STATE_DIR = "/tmp/test-state";
 const ISSUE = 155;
 const STARTED_AT = "2026-06-16T21-11-35-000Z"; // filesystem-safe (hyphens + ms)
 const STARTED_AT_ISO = "2026-06-16T21:11:35.000Z"; // ISO for Date parsing
+
+function directAdmissionRoute(kind: "single" | "merge" | "merge-queue") {
+  return kind === "single"
+    ? "single.direct" as const
+    : kind === "merge"
+      ? "merge.direct" as const
+      : "merge-queue.apply" as const;
+}
 
 // ---------------------------------------------------------------------------
 // runIdFor / runsDir / runDirPath
@@ -111,6 +121,7 @@ function memRunStore() {
   const files = new Map<string, string>();
   const appends = new Map<string, string[]>();
   const mkdirs: string[] = [];
+  const dirs = new Set<string>();
   const stdoutLines: string[] = [];
 
   const enoent = (p: string): NodeJS.ErrnoException => {
@@ -119,7 +130,9 @@ function memRunStore() {
     return e;
   };
 
-  const deps: RunStoreDeps = {
+  const flushes: string[] = [];
+  const directoryFlushes: string[] = [];
+  const deps: PublicAdmissionStoreDeps = {
     readFile: async (p) => {
       // Combine initial write + subsequent appends
       const base = files.get(p) ?? "";
@@ -144,7 +157,13 @@ function memRunStore() {
       files.delete(from);
       appends.delete(from);
     },
-    mkdir: async (p) => {
+    mkdir: async (p, options) => {
+      if (dirs.has(p) && options?.recursive === false) {
+        const error = new Error(`EEXIST: ${p}`) as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+      dirs.add(p);
       mkdirs.push(p);
     },
     readdir: async (p) => {
@@ -167,6 +186,22 @@ function memRunStore() {
       if (!files.has(p)) throw enoent(p);
       return { mtime: new Date(0) };
     },
+    fsyncFile: async (p) => { flushes.push(p); },
+    fsyncDirectory: async (p) => { directoryFlushes.push(p); },
+    realpath: async (p) => path.resolve(p),
+    link: async (existingPath, newPath) => {
+      if (files.has(newPath)) {
+        const error = new Error(`EEXIST: ${newPath}`) as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+      const contents = files.get(existingPath);
+      if (contents === undefined) throw enoent(existingPath);
+      files.set(newPath, contents);
+    },
+    unlink: async (p) => {
+      if (!files.delete(p)) throw enoent(p);
+    },
     stdoutWrite: (line) => {
       stdoutLines.push(line);
     },
@@ -178,7 +213,7 @@ function memRunStore() {
     return base + parts.join("");
   }
 
-  return { files, appends, mkdirs, stdoutLines, deps, readFile };
+  return { files, appends, mkdirs, stdoutLines, flushes, directoryFlushes, deps, readFile };
 }
 
 const RUN_DIR = path.join(REPO_DIR, ".agent-pipeline", "runs", `${ISSUE}-${STARTED_AT}`);
@@ -395,17 +430,19 @@ test("initRunDir: non-fatal on I/O error (no throw)", async () => {
 // Regression: calling initRunDir twice for the same run-id must not overwrite
 // run.json or truncate events.jsonl — both are written-once / append-only.
 test("persistPublicEntrypointAdmission: writes kind and run_start.entrypoint through the existing store (#1440)", async () => {
-  const { deps, readFile } = memRunStore();
+  const { deps, readFile, flushes, directoryFlushes } = memRunStore();
   const startedAt = new Date("2026-08-28T17:28:03.000Z");
   for (const kind of ["single", "merge", "merge-queue"] as const) {
     const { runId, runDir } = await persistPublicEntrypointAdmission(
       {
         repoDir: REPO_DIR,
         kind,
+        route: directAdmissionRoute(kind),
         repo: "owner/repo",
         profile: "codex",
         issue: kind === "single" ? ISSUE : undefined,
         startedAt,
+        factoryControlRoot: REPO_DIR,
       },
       deps,
     );
@@ -419,7 +456,12 @@ test("persistPublicEntrypointAdmission: writes kind and run_start.entrypoint thr
     assert.equal(events.type, "run_start");
     assert.equal(events.entrypoint, kind);
     assert.equal(events.run_id, runId);
+    assert.equal(meta.logical_operation_id, events.logical_operation_id);
+    assert.equal(meta.admission_stamp.binding_sha256, events.admission_stamp.binding_sha256);
   }
+  assert.ok(flushes.some((p) => p.endsWith("run.json")));
+  assert.ok(flushes.some((p) => p.endsWith("events.jsonl")));
+  assert.ok(directoryFlushes.some((p) => p.endsWith(path.join(".agent-pipeline", "runs"))));
 });
 
 test("persistPublicEntrypointAdmission: writes under factory-control generic store not candidate worktree (#1446)", async () => {
@@ -428,10 +470,11 @@ test("persistPublicEntrypointAdmission: writes under factory-control generic sto
   const controlRoot = "/control-repo";
   const candidateRepo = "/candidate-worktree";
   for (const kind of ["single", "merge", "merge-queue"] as const) {
-    const { runId, runDir } = await persistPublicEntrypointAdmission(
+    const result = await persistPublicEntrypointAdmission(
       {
         repoDir: candidateRepo,
         kind,
+        route: directAdmissionRoute(kind),
         repo: "owner/repo",
         profile: "codex",
         issue: kind === "single" ? ISSUE : undefined,
@@ -440,6 +483,8 @@ test("persistPublicEntrypointAdmission: writes under factory-control generic sto
       },
       deps,
     );
+    assert.equal(result.acknowledged, true);
+    const { runId, runDir } = result;
     assert.equal(runId, publicEntrypointRunIdFor(kind, startedAt));
     assert.equal(runDir, path.join(controlRoot, ".agent-pipeline", "runs", runId));
     assert.equal(runDir.startsWith(path.join(candidateRepo, ".agent-pipeline")), false);
@@ -451,13 +496,33 @@ test("persistPublicEntrypointAdmission: writes under factory-control generic sto
   }
 });
 
-test("resolvePublicAdmissionPersistRoot: unknown factory-control root keeps repoDir (#1446)", async () => {
+test("persistPublicEntrypointAdmission: an uninventoried production route fails before I/O (#1454)", async () => {
+  const store = memRunStore();
+  await assert.rejects(
+    persistPublicEntrypointAdmission(
+      {
+        repoDir: "/candidate",
+        factoryControlRoot: "/control",
+        kind: "single",
+        route: "merge.direct" as never,
+        repo: "owner/repo",
+        issue: 1454,
+      },
+      store.deps,
+    ),
+    /route binding mismatch/,
+  );
+  assert.equal(store.mkdirs.length, 0);
+  assert.equal(store.files.size, 0);
+});
+
+test("resolvePublicAdmissionPersistRoot: unknown factory-control root fails closed (#1454)", async () => {
   assert.equal(
     await resolvePublicAdmissionPersistRoot({
       repoDir: "/candidate-worktree",
       factoryControlRoot: null,
     }),
-    "/candidate-worktree",
+    null,
   );
   assert.equal(
     await resolvePublicAdmissionPersistRoot({
@@ -466,6 +531,404 @@ test("resolvePublicAdmissionPersistRoot: unknown factory-control root keeps repo
     }),
     "/control-repo",
   );
+});
+
+test("resolvePublicAdmissionClaimRoot: uses the RecoverySupervisor state home (#1454)", () => {
+  assert.equal(
+    resolvePublicAdmissionClaimRoot({ AGENT_PIPELINE_STATE_HOME: "/state" }),
+    path.join("/state", "public-admission-claims"),
+  );
+});
+
+test("persistPublicEntrypointAdmission: nested and resumed attempts reuse one immutable logical identity", async () => {
+  const logicalOperationId = "lop-root-operation";
+  const firstStore = memRunStore();
+  const nested = await persistPublicEntrypointAdmission(
+    {
+      repoDir: "/candidate",
+      factoryControlRoot: "/control",
+      kind: "merge",
+      route: "merge.train-nested",
+      repo: "owner/repo",
+      domain: "github.com/owner/repo",
+      startedAt: new Date("2026-09-05T01:00:00Z"),
+      admissionMode: "nested",
+      logicalOperationId,
+      mintLogicalOperationId: () => { throw new Error("nested admission must not mint"); },
+    },
+    firstStore.deps,
+  );
+  assert.equal(nested.acknowledged, true);
+  assert.equal(nested.logicalOperationId, logicalOperationId);
+
+  const resumed = await persistPublicEntrypointAdmission(
+    {
+      repoDir: "/candidate",
+      factoryControlRoot: "/control",
+      kind: "merge",
+      route: "merge.direct",
+      repo: "owner/repo",
+      domain: "github.com/owner/repo",
+      startedAt: new Date("2026-09-05T01:00:01Z"),
+      admissionMode: "resume",
+      logicalOperationId,
+      mintLogicalOperationId: () => { throw new Error("resume admission must not mint"); },
+    },
+    memRunStore().deps,
+  );
+  assert.equal(resumed.acknowledged, true);
+  assert.equal(resumed.logicalOperationId, logicalOperationId);
+
+  const missing = await persistPublicEntrypointAdmission(
+    {
+      repoDir: "/candidate",
+      factoryControlRoot: "/control",
+      kind: "merge",
+      route: "merge.train-nested",
+      repo: "owner/repo",
+      admissionMode: "nested",
+      mintLogicalOperationId: () => { throw new Error("must not mint"); },
+    },
+    memRunStore().deps,
+  );
+  assert.equal(missing.acknowledged, false);
+  if (!missing.acknowledged) assert.equal(missing.failure.kind, "invalid_binding");
+});
+
+test("persistPublicEntrypointAdmission: direct retries reuse the durable operation claim and mint once (#1454)", async () => {
+  const store = memRunStore();
+  let mintCalls = 0;
+  const base = {
+    repoDir: "/candidate",
+    factoryControlRoot: "/control",
+    kind: "single" as const,
+    route: "single.direct" as const,
+    repo: "owner/repo",
+    domain: "github.com/owner/repo",
+    issue: 1454,
+    operationKey: "single:owner/repo:1454",
+    mintLogicalOperationId: () => `lop-direct-${++mintCalls}`,
+  };
+  const first = await persistPublicEntrypointAdmission(
+    { ...base, startedAt: new Date("2026-09-05T01:00:00Z") },
+    store.deps,
+  );
+  const retry = await persistPublicEntrypointAdmission(
+    { ...base, startedAt: new Date("2026-09-05T01:00:01Z") },
+    store.deps,
+  );
+  assert.equal(first.acknowledged, true);
+  assert.equal(retry.acknowledged, true);
+  assert.equal(first.logicalOperationId, "lop-direct-1");
+  assert.equal(retry.logicalOperationId, first.logicalOperationId);
+  assert.notEqual(retry.runId, first.runId);
+  assert.equal(mintCalls, 1);
+});
+
+test("persistPublicEntrypointAdmission: interrupted claim publication is recovered without reminting (#1454)", async () => {
+  const store = memRunStore();
+  let mintCalls = 0;
+  let linkCalls = 0;
+  const opts = {
+    repoDir: "/candidate",
+    factoryControlRoot: "/control",
+    kind: "single" as const,
+    route: "single.direct" as const,
+    repo: "owner/repo",
+    domain: "github.com/owner/repo",
+    issue: 1454,
+    operationKey: "single:owner/repo:claim-recovery:1454",
+    mintLogicalOperationId: () => `lop-claim-recovery-${++mintCalls}`,
+  };
+  const failed = await persistPublicEntrypointAdmission(opts, {
+    ...store.deps,
+    link: async (existingPath, newPath) => {
+      linkCalls += 1;
+      if (linkCalls === 1) throw new Error("injected crash before exclusive claim publication");
+      await store.deps.link(existingPath, newPath);
+    },
+  });
+  assert.equal(failed.acknowledged, false);
+  assert.equal(failed.logicalOperationId, "lop-claim-recovery-1");
+
+  const retry = await persistPublicEntrypointAdmission(opts, store.deps);
+  assert.equal(retry.acknowledged, true);
+  assert.equal(retry.logicalOperationId, failed.logicalOperationId);
+  assert.equal(mintCalls, 1);
+});
+
+test("persistPublicEntrypointAdmission: legacy empty claim directory cannot poison atomic claim-file retry (#1454)", async () => {
+  const store = memRunStore();
+  const operationKey = "single:owner/repo:legacy-empty-claim:1454";
+  const legacyDigest = await import("node:crypto").then(({ createHash }) =>
+    createHash("sha256").update(operationKey).digest("hex")
+  );
+  await store.deps.mkdir(path.join("/control", ".agent-pipeline", "admissions", legacyDigest), {
+    recursive: false,
+  });
+  const retry = await persistPublicEntrypointAdmission(
+    {
+      repoDir: "/candidate",
+      factoryControlRoot: "/control",
+      kind: "single",
+      route: "single.direct",
+      repo: "owner/repo",
+      issue: 1454,
+      operationKey,
+      mintLogicalOperationId: () => "lop-after-empty-claim-dir",
+    },
+    store.deps,
+  );
+  assert.equal(retry.acknowledged, true);
+  assert.equal(retry.logicalOperationId, "lop-after-empty-claim-dir");
+});
+
+test("persistPublicEntrypointAdmission: direct and train-nested merge routes keep isolated claims in either order (#1454)", async () => {
+  for (const nestedFirst of [false, true]) {
+    const store = memRunStore();
+    const direct = {
+      repoDir: "/candidate",
+      factoryControlRoot: "/control",
+      kind: "merge" as const,
+      route: "merge.direct" as const,
+      repo: "owner/repo",
+      issue: 1454,
+      operationKey: "merge:owner/repo:pr:2454",
+      runId: `merge-direct-${nestedFirst}`,
+      logicalOperationId: "lop-direct-merge",
+    };
+    const nested = {
+      repoDir: "/candidate",
+      factoryControlRoot: "/control",
+      kind: "merge" as const,
+      route: "merge.train-nested" as const,
+      repo: "owner/repo",
+      issue: 1454,
+      operationKey: "merge:owner/repo:train:lop-train-root:pr:2454",
+      runId: `merge-nested-${nestedFirst}`,
+      logicalOperationId: "lop-train-root",
+      admissionMode: "nested" as const,
+    };
+    const ordered = nestedFirst ? [nested, direct] : [direct, nested];
+    const first = await persistPublicEntrypointAdmission(ordered[0]!, store.deps);
+    const second = await persistPublicEntrypointAdmission(ordered[1]!, store.deps);
+    assert.equal(first.acknowledged, true);
+    assert.equal(second.acknowledged, true);
+    assert.equal(
+      nestedFirst ? first.logicalOperationId : second.logicalOperationId,
+      "lop-train-root",
+    );
+    assert.equal(
+      nestedFirst ? second.logicalOperationId : first.logicalOperationId,
+      "lop-direct-merge",
+    );
+  }
+});
+
+test("persistPublicEntrypointAdmission: concurrent shared run id cannot overwrite an acknowledged stamp (#1454)", async () => {
+  const store = memRunStore();
+  const base = {
+    repoDir: "/candidate",
+    factoryControlRoot: "/control",
+    kind: "merge" as const,
+    route: "merge.direct" as const,
+    repo: "owner/repo",
+    operationKey: "merge:owner/repo:pr:99",
+    runId: "merge-shared",
+    startedAt: new Date("2026-09-05T01:00:00Z"),
+  };
+  const [a, b] = await Promise.all([
+    persistPublicEntrypointAdmission({ ...base, logicalOperationId: "lop-a" }, store.deps),
+    persistPublicEntrypointAdmission({ ...base, logicalOperationId: "lop-b" }, store.deps),
+  ]);
+  assert.equal([a, b].filter((result) => result.acknowledged).length, 1);
+  const meta = JSON.parse(store.readFile(path.join("/control", ".agent-pipeline", "runs", "merge-shared", "run.json")));
+  const acknowledged = [a, b].find((result) => result.acknowledged)!;
+  assert.equal(meta.logical_operation_id, acknowledged.logicalOperationId);
+});
+
+test("persistPublicEntrypointAdmission: approved-root refusals reuse a durable pre-admission identity after restart", async () => {
+  for (const fixture of [
+    { name: "unavailable", root: null, realpath: async (p: string) => p, kind: "approved_root_unavailable" },
+    { name: "uncanonicalizable", root: "/control", realpath: async () => { throw new Error("realpath failed"); }, kind: "approved_root_unavailable" },
+    { name: "noncanonical", root: "/control-link", realpath: async () => "/control-real", kind: "approved_root_mismatch" },
+  ] as const) {
+    const store = memRunStore();
+    let mintCalls = 0;
+    const input = {
+        repoDir: "/candidate",
+        factoryControlRoot: fixture.root,
+        kind: "single",
+        route: "single.direct",
+        repo: "owner/repo",
+        issue: 1454,
+        operationKey: `single:owner/repo:${fixture.name}:1454`,
+        env: { AGENT_PIPELINE_STATE_HOME: "/state" },
+        mintLogicalOperationId: () => `lop-prebound-${fixture.name}-${++mintCalls}`,
+      } as const;
+    const result = await persistPublicEntrypointAdmission(
+      input,
+      { ...store.deps, realpath: fixture.realpath },
+    );
+    const retry = await persistPublicEntrypointAdmission(
+      input,
+      { ...store.deps, realpath: fixture.realpath },
+    );
+    assert.equal(result.acknowledged, false);
+    assert.equal(retry.acknowledged, false);
+    if (!result.acknowledged) assert.equal(result.failure.kind, fixture.kind);
+    assert.equal(retry.logicalOperationId, result.logicalOperationId);
+    assert.equal(mintCalls, 1);
+    assert.ok(
+      [...store.files.keys()].some((p) => p.startsWith("/state/public-admission-claims/")),
+      `${fixture.name} must retain RecoverySupervisor-readable pre-admission evidence`,
+    );
+    assert.ok(
+      ![...store.files.keys()].some((p) => p.includes(`${path.sep}runs${path.sep}`)),
+      `${fixture.name} must not publish a qualifying run stamp`,
+    );
+  }
+});
+
+test("persistPublicEntrypointAdmission: every durability and read-back fault refuses acknowledgement", async () => {
+  const faults = [
+    "mkdir-parent",
+    "mkdir-run",
+    "write-run",
+    "flush-run-temp",
+    "rename-run",
+    "flush-run-final",
+    "write-events",
+    "flush-events-temp",
+    "rename-events",
+    "flush-events-final",
+    "flush-run-dir",
+    "flush-runs-dir",
+    "read-back",
+    "parse",
+    "identity-mismatch",
+  ] as const;
+  for (const fault of faults) {
+    const store = memRunStore();
+    let mkdirCount = 0;
+    let finalRead = false;
+    const base = store.deps;
+    const deps: PublicAdmissionStoreDeps = {
+      ...base,
+      mkdir: async (p, opts) => {
+        mkdirCount += 1;
+        if ((fault === "mkdir-parent" && mkdirCount === 1) || (fault === "mkdir-run" && mkdirCount === 2)) {
+          throw new Error(fault);
+        }
+        await base.mkdir(p, opts);
+      },
+      writeFile: async (p, data) => {
+        if (fault === "write-run" && p.includes("run.json.tmp-")) throw new Error(fault);
+        if (fault === "write-events" && p.includes("events.jsonl.tmp-")) throw new Error(fault);
+        await base.writeFile(p, data);
+      },
+      fsyncFile: async (p) => {
+        if (fault === "flush-run-temp" && p.includes("run.json.tmp-")) throw new Error(fault);
+        if (fault === "flush-run-final" && p.endsWith("run.json")) throw new Error(fault);
+        if (fault === "flush-events-temp" && p.includes("events.jsonl.tmp-")) throw new Error(fault);
+        if (fault === "flush-events-final" && p.endsWith("events.jsonl")) throw new Error(fault);
+        await base.fsyncFile(p);
+      },
+      rename: async (from, to) => {
+        if (fault === "rename-run" && to.endsWith("run.json")) throw new Error(fault);
+        if (fault === "rename-events" && to.endsWith("events.jsonl")) throw new Error(fault);
+        await base.rename(from, to);
+      },
+      fsyncDirectory: async (p) => {
+        if (fault === "flush-run-dir" && p.includes("single-") ) throw new Error(fault);
+        if (fault === "flush-runs-dir" && p.endsWith(path.join(".agent-pipeline", "runs"))) throw new Error(fault);
+        await base.fsyncDirectory(p);
+      },
+      readFile: async (p) => {
+        const raw = await base.readFile(p);
+        if (!p.includes(".tmp-") && store.directoryFlushes.length >= 2) finalRead = true;
+        if (finalRead && fault === "read-back") throw new Error(fault);
+        if (finalRead && fault === "parse" && p.endsWith("run.json")) return "{";
+        if (finalRead && fault === "identity-mismatch" && p.endsWith("run.json")) {
+          const parsed = JSON.parse(raw);
+          parsed.logical_operation_id = "lop-conflict";
+          return JSON.stringify(parsed);
+        }
+        return raw;
+      },
+    };
+    const result = await persistPublicEntrypointAdmission(
+      {
+        repoDir: "/candidate",
+        factoryControlRoot: "/control",
+        kind: "single",
+        route: "single.direct",
+        repo: "owner/repo",
+        issue: 1454,
+        startedAt: new Date("2026-09-05T02:00:00Z"),
+        mintLogicalOperationId: () => "lop-durable",
+      },
+      deps,
+    );
+    assert.equal(result.acknowledged, false, `${fault} must refuse acknowledgement`);
+    assert.equal(result.logicalOperationId, "lop-durable");
+  }
+});
+
+test("persistPublicEntrypointAdmission: a conflicting existing stamp is immutable and rejected", async () => {
+  const store = memRunStore();
+  const opts = {
+    repoDir: "/candidate",
+    factoryControlRoot: "/control",
+    kind: "single" as const,
+    route: "single.direct" as const,
+    repo: "owner/repo",
+    issue: 1454,
+    startedAt: new Date("2026-09-05T03:00:00Z"),
+    runId: "single-fixed",
+  };
+  const first = await persistPublicEntrypointAdmission(
+    { ...opts, logicalOperationId: "lop-first" },
+    store.deps,
+  );
+  assert.equal(first.acknowledged, true);
+  const second = await persistPublicEntrypointAdmission(
+    { ...opts, logicalOperationId: "lop-second" },
+    store.deps,
+  );
+  assert.equal(second.acknowledged, false);
+  if (!second.acknowledged) assert.equal(second.failure.kind, "identity_conflict");
+  const meta = JSON.parse(store.readFile(path.join("/control", ".agent-pipeline", "runs", "single-fixed", "run.json")));
+  assert.equal(meta.logical_operation_id, "lop-first");
+});
+
+test("persistPublicEntrypointAdmission: a partial existing stamp fails closed without replacement", async () => {
+  const store = memRunStore();
+  const opts = {
+    repoDir: "/candidate",
+    factoryControlRoot: "/control",
+    kind: "merge" as const,
+    route: "merge.direct" as const,
+    repo: "owner/repo",
+    startedAt: new Date("2026-09-05T03:01:00Z"),
+    runId: "merge-partial",
+    logicalOperationId: "lop-partial",
+  };
+  const first = await persistPublicEntrypointAdmission(opts, store.deps);
+  assert.equal(first.acknowledged, true);
+  const eventsPath = path.join(first.runDir, "events.jsonl");
+  store.files.delete(eventsPath);
+  const writesBefore = store.files.size;
+
+  const resumed = await persistPublicEntrypointAdmission(opts, store.deps);
+
+  assert.equal(resumed.acknowledged, false);
+  if (!resumed.acknowledged) {
+    assert.equal(resumed.failure.kind, "identity_conflict");
+    assert.match(resumed.failure.diagnostic, /partial existing admission artifact/);
+  }
+  assert.equal(store.files.size, writesBefore);
+  assert.equal(store.files.has(eventsPath), false);
 });
 
 test("initRunDir: train kind does not set issue to the first work-list number", async () => {

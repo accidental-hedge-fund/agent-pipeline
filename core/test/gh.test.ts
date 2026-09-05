@@ -14,6 +14,7 @@ import {
   listIssueCommentsWithIds,
   shouldTreatContents404AsEmpty,
   updateIssueComment,
+  updatePrBody,
 } from "../scripts/gh.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -1067,6 +1068,18 @@ test("updateIssueComment: PATCHes REST numeric id via injected runner", async ()
   assert.equal(seen[0].includes("PATCH"), true);
   assert.ok(String(seen[0].join(" ")).includes("issues/comments/5433321980"));
   assert.ok(seen[0].some((a) => a.startsWith("body=")));
+});
+
+test("updatePrBody: PATCHes the PR through an injected runner", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const seen: string[][] = [];
+  await updatePrBody(cfg, 1454, "new PR body", async (args) => {
+    seen.push(args);
+    return "{}";
+  });
+  assert.equal(seen[0].includes("PATCH"), true);
+  assert.ok(String(seen[0].join(" ")).includes("repos/acme/widget/pulls/1454"));
+  assert.ok(seen[0].includes("body=new PR body"));
 });
 
 test("deleteIssueComment: DELETEs REST numeric id via injected runner", async () => {

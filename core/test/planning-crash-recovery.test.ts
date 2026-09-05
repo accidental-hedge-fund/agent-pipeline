@@ -7,7 +7,7 @@
 //   1. Print a one-line recovery diagnostic.
 //   2. Roll back the stage to `ready` via `transition()`.
 //   3. Restart planning by calling `planningStage.advance()`.
-//   4. Return the advance outcome (never `waiting`).
+//   4. Keep a bare advanced result waiting until exact planning evidence is bound.
 //
 // All tests are pure — no real network, git, or subprocess calls.
 
@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import { _internals, type PlanningRecoveryDeps } from "../scripts/pipeline.ts";
 import type { Outcome, PipelineConfig, Stage } from "../scripts/types.ts";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
+import { attachProducerCompletionEvidence } from "../scripts/issue-stage-adapters.ts";
 
 const { dispatch } = _internals;
 
@@ -35,7 +36,22 @@ function makeCfg(): PipelineConfig {
 }
 
 const ISSUE = 271;
-const OPTS = { dryRun: false };
+const PLANNING_EVIDENCE = async () => ({
+  candidateSha: "a".repeat(40),
+  candidateEpoch: "a".repeat(40),
+  evidenceRole: "planning" as const,
+  artifactIdentity: "planning:test-owner/test-repo#271",
+  postconditionProven: false,
+});
+const PLAN_REVIEW_EVIDENCE = async (phase: "before" | "after") => ({
+  candidateSha: "a".repeat(40),
+  candidateEpoch: "a".repeat(40),
+  evidenceRole: "planning" as const,
+  artifactIdentity: "planning:test-owner/test-repo#271",
+  postconditionProven: phase === "before",
+});
+const OPTS = { dryRun: false, observeDeliveryStageEvidence: PLANNING_EVIDENCE };
+const PLAN_REVIEW_OPTS = { dryRun: false, observeDeliveryStageEvidence: PLAN_REVIEW_EVIDENCE };
 const RUN_ID = "271-2026-01-01T00:00:00Z";
 
 function makeDeps(planningResult: Outcome): {
@@ -84,7 +100,8 @@ test("planning crash recovery: stranded planning rolls back to ready and restart
 
   const out = await dispatch(cfg, ISSUE, "planning", OPTS, RUN_ID, undefined, undefined, undefined, trackingDeps);
 
-  assert.equal(out.advanced, true, "outcome should be advancing (not waiting)");
+  assert.equal(out.advanced, false, "unbound recovery output must not certify advancement");
+  assert.equal((out as { status?: string }).status, "waiting");
   assert.equal(planningCalled, 1, "planningAdvance should be called once");
   assert.equal(transitionCalls.length, 1, "transition should be called once");
   assert.equal(transitionCalls[0].issueNumber, ISSUE);
@@ -109,9 +126,10 @@ test("planning crash recovery: stranded plan-review rolls back to ready and rest
     },
   };
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, trackingDeps);
+  const out = await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, trackingDeps);
 
-  assert.equal(out.advanced, true, "outcome should be advancing (not waiting)");
+  assert.equal(out.advanced, false, "unbound recovery output must not certify advancement");
+  assert.equal((out as { status?: string }).status, "waiting");
   assert.equal(planningCalled, 1, "planningAdvance should be called once");
   assert.equal(transitionCalls.length, 1, "transition should be called once");
   assert.equal(transitionCalls[0].issueNumber, ISSUE);
@@ -124,16 +142,16 @@ test("planning crash recovery: stranded plan-review rolls back to ready and rest
 // 3.3  Regression: `planning` no longer returns `waiting`
 // ---------------------------------------------------------------------------
 
-test("planning crash recovery: planning stage never returns waiting outcome", async () => {
+test("planning crash recovery: unbound planning recovery remains waiting", async () => {
   const cfg = makeCfg();
   const { deps } = makeDeps(ADVANCING_OUTCOME);
 
   const out = await dispatch(cfg, ISSUE, "planning", OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
-  assert.notEqual(
+  assert.equal(
     (out as { status?: string }).status,
     "waiting",
-    "planning dispatch must not return waiting — it must recover",
+    "planning recovery still runs, but bare handler output is not completion evidence",
   );
 });
 
@@ -141,16 +159,16 @@ test("planning crash recovery: planning stage never returns waiting outcome", as
 // 3.4  Regression: `plan-review` no longer returns `waiting`
 // ---------------------------------------------------------------------------
 
-test("planning crash recovery: plan-review stage never returns waiting outcome", async () => {
+test("planning crash recovery: unbound plan-review recovery remains waiting", async () => {
   const cfg = makeCfg();
   const { deps } = makeDeps(ADVANCING_OUTCOME);
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
+  const out = await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
-  assert.notEqual(
+  assert.equal(
     (out as { status?: string }).status,
     "waiting",
-    "plan-review dispatch must not return waiting — it must recover",
+    "plan-review recovery still runs, but bare handler output is not completion evidence",
   );
 });
 
@@ -172,7 +190,7 @@ test("planning crash recovery: transition called with correct from-stage for pla
   const cfg = makeCfg();
   const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);
 
-  await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
+  await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
   assert.equal(transitionCalls[0]?.from, "plan-review");
   assert.equal(transitionCalls[0]?.to, "ready");
@@ -194,11 +212,126 @@ test("planning crash recovery: dry-run does not call transition for planning", a
     },
   };
 
-  const out = await dispatch(cfg, ISSUE, "planning", { dryRun: true }, RUN_ID, undefined, undefined, undefined, trackingDeps);
+  const out = await dispatch(
+    cfg,
+    ISSUE,
+    "planning",
+    { dryRun: true, observeDeliveryStageEvidence: PLANNING_EVIDENCE },
+    RUN_ID,
+    undefined,
+    undefined,
+    undefined,
+    trackingDeps,
+  );
 
   assert.equal(transitionCalls.length, 0, "dry-run must not call transition for planning");
   assert.equal(planningCalled, 1, "dry-run must still call planningAdvance");
   assert.ok(out !== undefined, "dry-run must return an outcome");
+});
+
+test("planning producer dispatch accepts only its captured epoch transition", async () => {
+  const cfg = makeCfg();
+  const before = "a".repeat(40);
+  const produced = "b".repeat(40);
+  const producedEvidence = {
+    candidateSha: produced,
+    candidateEpoch: produced,
+    evidenceRole: "planning" as const,
+    artifactIdentity: `planning:${produced}`,
+    postconditionProven: true,
+  };
+  let liveSha = before;
+  let observations = 0;
+  const out = await dispatch(
+    cfg,
+    ISSUE,
+    "planning",
+    {
+      dryRun: true,
+      logicalOperationId: "lop-planning-producer",
+      observeDeliveryStageEvidence: async () => {
+        observations += 1;
+        const sha = liveSha;
+        const proved = sha === produced;
+        return {
+          candidateSha: sha,
+          candidateEpoch: sha,
+          evidenceRole: "planning",
+          artifactIdentity: proved ? `planning:${sha}` : `planning-target:${sha}`,
+          postconditionProven: proved,
+        };
+      },
+    },
+    RUN_ID,
+    undefined,
+    undefined,
+    undefined,
+    {
+      transition: async () => {},
+      isLivePlanningActive: () => false,
+      planningAdvance: async () => {
+        liveSha = produced;
+        return attachProducerCompletionEvidence(
+          { advanced: true, from: "planning", to: "plan-review", summary: "plan produced" },
+          producedEvidence,
+        );
+      },
+    },
+  );
+  assert.equal(out.advanced, true);
+  assert.equal(observations, 2, "handler emission replaces a later observer capture");
+});
+
+test("planning producer dispatch refuses movement after its captured epoch", async () => {
+  const cfg = makeCfg();
+  const produced = "b".repeat(40);
+  const replacement = "c".repeat(40);
+  const producedEvidence = {
+    candidateSha: produced,
+    candidateEpoch: produced,
+    evidenceRole: "planning" as const,
+    artifactIdentity: `planning:${produced}`,
+    postconditionProven: true,
+  };
+  let liveSha = "a".repeat(40);
+  const out = await dispatch(
+    cfg,
+    ISSUE,
+    "planning",
+    {
+      dryRun: true,
+      logicalOperationId: "lop-planning-replaced",
+      observeDeliveryStageEvidence: async () => {
+        const sha = liveSha;
+        const proved = sha === produced || sha === replacement;
+        return {
+          candidateSha: sha,
+          candidateEpoch: sha,
+          evidenceRole: "planning",
+          artifactIdentity: proved ? `planning:${sha}` : `planning-target:${sha}`,
+          postconditionProven: proved,
+        };
+      },
+    },
+    RUN_ID,
+    undefined,
+    undefined,
+    undefined,
+    {
+      transition: async () => {},
+      isLivePlanningActive: () => false,
+      planningAdvance: async () => {
+        const outcome = attachProducerCompletionEvidence(
+          { advanced: true, from: "planning", to: "plan-review", summary: "plan produced" },
+          producedEvidence,
+        );
+        liveSha = replacement;
+        return outcome;
+      },
+    },
+  );
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /Candidate binding changed/);
 });
 
 test("planning crash recovery: dry-run does not call transition for plan-review", async () => {
@@ -213,7 +346,17 @@ test("planning crash recovery: dry-run does not call transition for plan-review"
     },
   };
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", { dryRun: true }, RUN_ID, undefined, undefined, undefined, trackingDeps);
+  const out = await dispatch(
+    cfg,
+    ISSUE,
+    "plan-review",
+    { dryRun: true, observeDeliveryStageEvidence: PLAN_REVIEW_EVIDENCE },
+    RUN_ID,
+    undefined,
+    undefined,
+    undefined,
+    trackingDeps,
+  );
 
   assert.equal(transitionCalls.length, 0, "dry-run must not call transition for plan-review");
   assert.equal(planningCalled, 1, "dry-run must still call planningAdvance");
@@ -267,7 +410,7 @@ test("planning crash recovery: live marker from another domain prevents rollback
     },
   };
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, crossDomainDeps);
+  const out = await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, crossDomainDeps);
 
   assert.equal(
     (out as { status?: string }).status,
@@ -347,7 +490,8 @@ test("planning crash recovery: absent live marker still triggers recovery (crash
 
   const out = await dispatch(cfg, ISSUE, "planning", OPTS, RUN_ID, undefined, undefined, undefined, noliveMarkerDeps);
 
-  assert.equal(out.advanced, true, "absent live marker must trigger recovery and advance");
+  assert.equal(out.advanced, false, "absent live marker triggers recovery but not unproved completion");
+  assert.equal((out as { status?: string }).status, "waiting");
   assert.equal(transitionCalls.length, 1, "must call transition to roll back to ready");
   assert.equal(planningCalled, 1, "must call planningAdvance to restart");
 });
@@ -374,9 +518,10 @@ test("plan-review recovery with completed plan resumes without rolling back to r
     hasCompletedPlan: async () => true,
   };
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
+  const out = await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
-  assert.equal(out.advanced, true);
+  assert.equal(out.advanced, false);
+  assert.equal((out as { status?: string }).status, "waiting");
   assert.equal(planningCalled, 1);
   assert.equal(transitionCalls.length, 0, "must not roll back to ready when plan exists");
   assert.equal(
@@ -402,9 +547,10 @@ test("plan-review recovery without completed plan still restarts from ready", as
     hasCompletedPlan: async () => false,
   };
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
+  const out = await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
-  assert.equal(out.advanced, true);
+  assert.equal(out.advanced, false);
+  assert.equal((out as { status?: string }).status, "waiting");
   assert.equal(planningCalled, 1);
   assert.equal(transitionCalls.length, 1);
   assert.equal(transitionCalls[0].from, "plan-review");

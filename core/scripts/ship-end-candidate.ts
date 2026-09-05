@@ -6,12 +6,16 @@
 // node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs". No eval of train JSON.
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CANDIDATE_CORE_LOCKFILE_REL,
+  candidateReadyRecordPath,
   defaultPrepareCandidateEngineDeps,
   prepareCandidateEngine,
+  revalidatePreparedCandidateEngineForSpawn,
   type PrepareCandidateEngineDeps,
   type ResolveAndPrepareDeps,
 } from "./candidate-engine-readiness.ts";
@@ -20,11 +24,232 @@ import { parseExactGitSha } from "./ship-end-identity.ts";
 export const CANDIDATE_WORKTREE_PREFIX = "ship-candidate-";
 export const PIPELINE_TS_REL = path.join("core", "scripts", "pipeline.ts");
 export const LAUNCHER_REL = path.join("scripts", "pipeline-launcher.mjs");
+export const CANDIDATE_PROCESS_GUARD_REL = path.join("scripts", "candidate-process-guard.mjs");
 
 export interface CandidateEngine {
   engineRoot: string;
   launcherPath: string;
   commitSha: string;
+  consumer?: CandidateEngineRoute;
+  /** Prepared proof is intentionally single-use at the spawn boundary. */
+  revalidateBeforeSpawn?: () => CandidateEngineResult;
+  /** Shared host-local lease held from final validation through process life. */
+  acquireProcessLock?: () => CandidateProcessLease | null;
+}
+
+export const CANDIDATE_PROCESS_GUARD_ENV = {
+  required: "PIPELINE_CANDIDATE_PROCESS_GUARD",
+  root: "PIPELINE_CANDIDATE_PROCESS_ROOT",
+  sha: "PIPELINE_CANDIDATE_PROCESS_SHA",
+  readyRecord: "PIPELINE_CANDIDATE_PROCESS_READY_RECORD",
+  lockfileDigest: "PIPELINE_CANDIDATE_PROCESS_LOCKFILE_DIGEST",
+  processLock: "PIPELINE_CANDIDATE_PROCESS_LOCK",
+  processLockDigest: "PIPELINE_CANDIDATE_PROCESS_LOCK_DIGEST",
+} as const;
+
+export interface CandidateProcessGuardProof {
+  engineRoot: string;
+  commitSha: string;
+  readyRecordPath: string;
+  lockfileDigest: string;
+  processLockPath: string;
+  processLockDigest: string;
+}
+
+export interface CandidateProcessLease {
+  proof: CandidateProcessGuardProof;
+  release(): void;
+  /** Rewrite the held lock to a detached supervisor. Missing keeps parent ownership. */
+  transferTo?(owner: { pid: number; starttime: string | null }): boolean;
+}
+
+/** Environment consumed by the candidate's child-side first-operation guard. */
+export function candidateProcessGuardEnv(
+  proof: CandidateProcessGuardProof,
+  source: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
+  return {
+    ...source,
+    [CANDIDATE_PROCESS_GUARD_ENV.required]: "1",
+    [CANDIDATE_PROCESS_GUARD_ENV.root]: proof.engineRoot,
+    [CANDIDATE_PROCESS_GUARD_ENV.sha]: proof.commitSha,
+    [CANDIDATE_PROCESS_GUARD_ENV.readyRecord]: proof.readyRecordPath,
+    [CANDIDATE_PROCESS_GUARD_ENV.lockfileDigest]: proof.lockfileDigest,
+    [CANDIDATE_PROCESS_GUARD_ENV.processLock]: proof.processLockPath,
+    [CANDIDATE_PROCESS_GUARD_ENV.processLockDigest]: proof.processLockDigest,
+  };
+}
+
+export function hasCandidateProcessGuardEnv(env: NodeJS.ProcessEnv | undefined): boolean {
+  return Boolean(
+    env?.[CANDIDATE_PROCESS_GUARD_ENV.required] === "1" &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.root] &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.sha] &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.readyRecord] &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.lockfileDigest] &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.processLock] &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.processLockDigest]
+  );
+}
+
+export interface CandidateEngineConsumerRoute {
+  consumer: string;
+  gate: "resolve-and-prepare";
+  exact_sha: true;
+  approved_canonical_root: true;
+  sha_lockfile_readiness: true;
+  clean_before_bootstrap: true;
+  clean_after_bootstrap: true;
+  revalidate_before_spawn: true;
+  child_side_guard: true;
+  /** Executable production boundary used by this consumer. */
+  execute<T>(input: CandidateEngineStartInput<T>): Promise<CandidateEngineProcessResult<T>>;
+}
+
+const EXPECTED_CANDIDATE_ENGINE_CONSUMERS = [
+  "factory-release.pack-loop.start",
+  "factory-release.pack-loop.resume",
+  "factory-gate.hybrid-v2",
+  "ship.stage-adapter",
+] as const;
+export type CandidateEngineConsumer = (typeof EXPECTED_CANDIDATE_ENGINE_CONSUMERS)[number];
+export type CandidateEngineRoute = CandidateEngineConsumer | "pipeline.candidate-leaf";
+
+export const CANDIDATE_ENGINE_CONSUMERS: readonly CandidateEngineConsumerRoute[] =
+  EXPECTED_CANDIDATE_ENGINE_CONSUMERS.map((consumer) => ({
+    consumer,
+    gate: "resolve-and-prepare" as const,
+    exact_sha: true as const,
+    approved_canonical_root: true as const,
+    sha_lockfile_readiness: true as const,
+    clean_before_bootstrap: true as const,
+    clean_after_bootstrap: true as const,
+    revalidate_before_spawn: true as const,
+    child_side_guard: true as const,
+    execute: <T>(input: CandidateEngineStartInput<T>) =>
+      runBoundCandidateEngineProcess(consumer, input),
+  }));
+
+export function candidateEngineConsumerInventoryGaps(
+  routes: readonly CandidateEngineConsumerRoute[] = CANDIDATE_ENGINE_CONSUMERS,
+): string[] {
+  const gaps: string[] = [];
+  const seen = new Set<string>();
+  for (const route of routes) {
+    if (seen.has(route.consumer)) gaps.push(`duplicate consumer ${route.consumer}`);
+    seen.add(route.consumer);
+    if (!(EXPECTED_CANDIDATE_ENGINE_CONSUMERS as readonly string[]).includes(route.consumer)) {
+      gaps.push(`unknown consumer ${route.consumer}`);
+    }
+    for (const proof of [
+      "exact_sha",
+      "approved_canonical_root",
+      "sha_lockfile_readiness",
+      "clean_before_bootstrap",
+      "clean_after_bootstrap",
+      "revalidate_before_spawn",
+      "child_side_guard",
+    ] as const) {
+      if (route[proof] !== true) gaps.push(`${route.consumer} missing ${proof}`);
+    }
+    if (route.gate !== "resolve-and-prepare") gaps.push(`${route.consumer} bypasses resolve-and-prepare`);
+    if (typeof route.execute !== "function") gaps.push(`${route.consumer} missing executable boundary`);
+  }
+  for (const consumer of EXPECTED_CANDIDATE_ENGINE_CONSUMERS) {
+    if (!seen.has(consumer)) gaps.push(`missing consumer ${consumer}`);
+  }
+  return gaps;
+}
+
+export function assertCandidateEngineConsumerInventoryComplete(
+  routes: readonly CandidateEngineConsumerRoute[] = CANDIDATE_ENGINE_CONSUMERS,
+): void {
+  const gaps = candidateEngineConsumerInventoryGaps(routes);
+  if (gaps.length) throw new Error(`candidate-engine consumer inventory invalid: ${gaps.join("; ")}`);
+}
+
+export function assertCandidateEngineConsumerRoute(consumer: CandidateEngineConsumer): void {
+  assertCandidateEngineConsumerInventoryComplete();
+  const matches = CANDIDATE_ENGINE_CONSUMERS.filter((route) => route.consumer === consumer);
+  if (matches.length !== 1 || matches[0]!.gate !== "resolve-and-prepare") {
+    throw new Error(`candidate-engine consumer is not bound exactly once to resolve-and-prepare: ${consumer}`);
+  }
+}
+
+export function assertCandidateEnginePreparationRoute(route: CandidateEngineRoute): void {
+  if (route === "pipeline.candidate-leaf") return;
+  assertCandidateEngineConsumerRoute(route);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Collect spawn/exec callees, including `const start = spawn` aliases. */
+function candidateProcessStartCallees(source: string): readonly string[] {
+  const names = new Set(["spawn", "spawnSync", "execFile", "execFileSync"]);
+  for (const match of source.matchAll(
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:[\w$.]*\.)?(spawn(?:Sync)?|execFile(?:Sync)?)\b/g,
+  )) {
+    names.add(match[1]!);
+  }
+  for (const match of source.matchAll(
+    /\b(?:spawn(?:Sync)?|execFile(?:Sync)?)\s+as\s+([A-Za-z_$][\w$]*)\b/g,
+  )) {
+    names.add(match[1]!);
+  }
+  return [...names];
+}
+
+function sourceHasRawCandidateProcessStart(source: string): boolean {
+  const callees = candidateProcessStartCallees(source).map(escapeRegExp).join("|");
+  return new RegExp(
+    String.raw`\b(?:${callees})\s*\(\s*[^,\n;]{0,160}(?:\.launcherPath|candidateInvocation\.executable)\b`,
+  ).test(source);
+}
+
+/** Discover actual production resolve/start bindings; declarations alone do not satisfy CI. */
+export function candidateEngineRuntimeBindingGaps(
+  sources: Readonly<Record<string, string>>,
+): string[] {
+  const resolved = new Set<string>();
+  const started = new Set<string>();
+  const gaps: string[] = [];
+  for (const [file, source] of Object.entries(sources)) {
+    for (const match of source.matchAll(/resolveAndPrepareCandidateEngine\)?\s*\(\s*\{[\s\S]{0,500}?consumer:\s*["']([^"']+)["']/g)) {
+      resolved.add(match[1]!);
+    }
+    for (const match of source.matchAll(/runCandidateEngineProcess\(\s*\{[\s\S]{0,240}?consumer:\s*["']([^"']+)["']/g)) {
+      started.add(match[1]!);
+    }
+    if (
+      file !== "ship-end-candidate.ts" &&
+      /\brevalidateCandidateEngineBeforeSpawn\s*\(/.test(source)
+    ) {
+      gaps.push(`raw parent-only candidate revalidation in ${file}`);
+    }
+    if (file !== "ship-end-candidate.ts" && sourceHasRawCandidateProcessStart(source)) {
+      gaps.push(`raw candidate process start in ${file}`);
+    }
+  }
+  for (const consumer of EXPECTED_CANDIDATE_ENGINE_CONSUMERS) {
+    if (!resolved.has(consumer)) gaps.push(`missing production resolve ${consumer}`);
+    if (!started.has(consumer)) gaps.push(`missing production start ${consumer}`);
+  }
+  for (const consumer of started) {
+    if (!(EXPECTED_CANDIDATE_ENGINE_CONSUMERS as readonly string[]).includes(consumer)) {
+      gaps.push(`unknown production start ${consumer}`);
+    }
+  }
+  for (const consumer of resolved) {
+    if (
+      consumer !== "pipeline.candidate-leaf" &&
+      !(EXPECTED_CANDIDATE_ENGINE_CONSUMERS as readonly string[]).includes(consumer)
+    ) {
+      gaps.push(`unknown production resolve ${consumer}`);
+    }
+  }
+  return gaps;
 }
 
 export type CandidateEngineFailureKind = "identity" | "readiness" | "lock";
@@ -63,6 +288,7 @@ function engineRootOk(
   if (!deps.fileExists(path.join(root, PIPELINE_TS_REL))) return null;
   const launcherPath = path.join(root, LAUNCHER_REL);
   if (!deps.fileExists(launcherPath)) return null;
+  if (!deps.fileExists(path.join(root, CANDIDATE_PROCESS_GUARD_REL))) return null;
   const head = parseExactGitSha(deps.revParseHead(root));
   if (head !== wantSha) return null;
   const porcelain = deps.porcelain(root);
@@ -84,6 +310,7 @@ export function resolveCandidateEngine(
     repoDir: string;
     candidateSha: string;
     candidateEngineRootEnv?: string | null;
+    consumer: CandidateEngineRoute;
   },
   deps: ResolveCandidateEngineDeps,
 ): CandidateEngineResult {
@@ -145,12 +372,221 @@ export async function resolveAndPrepareCandidateEngine(
     repoDir: string;
     candidateSha: string;
     candidateEngineRootEnv?: string | null;
+    /** Executable inventory identity checked before any resolution I/O. */
+    consumer: CandidateEngineConsumer;
   },
   deps: ResolveAndPrepareCandidateEngineDeps,
 ): Promise<CandidateEngineResult> {
+  assertCandidateEnginePreparationRoute(opts.consumer);
   const resolved = resolveCandidateEngine(opts, deps);
   if (!resolved.ok) return resolved;
-  return prepareCandidateEngine(resolved.engine, deps as ResolveAndPrepareDeps);
+  const prepared = await prepareCandidateEngine(resolved.engine, deps as ResolveAndPrepareDeps);
+  if (!prepared.ok) return prepared;
+  const bindRevalidation = (engine: CandidateEngine): CandidateEngine => ({
+    ...engine,
+    consumer: opts.consumer,
+    revalidateBeforeSpawn: () => {
+      const checked = revalidatePreparedCandidateEngineForSpawn(
+        engine,
+        deps as ResolveAndPrepareDeps,
+      );
+      if (!checked.ok) return checked;
+      return { ok: true, engine: bindRevalidation(checked.engine) };
+    },
+    acquireProcessLock: () => {
+      const stateDir = (deps as ResolveAndPrepareDeps).tmpDir();
+      const lockPath = path.join(
+        stateDir,
+        `pipeline-candidate-process-${createHash("sha256")
+          .update(engine.engineRoot)
+          .digest("hex")
+          .slice(0, 32)}.lock`,
+      );
+      const d = deps as ResolveAndPrepareDeps;
+      // The lock does not exist on the uncontended path, so it cannot be
+      // trusted before exclusive creation. Trust the private parent first,
+      // then verify the created file before treating it as ownership.
+      if (!d.ensureStateDir(stateDir) || !d.statePathTrusted(stateDir)) return null;
+      const owner = d.parentIdentity();
+      const lockRecord = (holder: { pid: number; starttime: string | null }) =>
+        `${JSON.stringify({
+          schema: "pipeline-candidate-process-lock/v1",
+          engineRoot: engine.engineRoot,
+          commitSha: engine.commitSha,
+          pid: holder.pid,
+          starttime: holder.starttime,
+        })}\n`;
+      let body = lockRecord(owner);
+      if (!d.writeText(lockPath, body, "wx")) {
+        try {
+          const existing = JSON.parse(d.readText(lockPath) ?? "null") as {
+            pid?: unknown;
+            starttime?: unknown;
+          } | null;
+          if (
+            !existing ||
+            typeof existing.pid !== "number" ||
+            d.processAlive(
+              existing.pid,
+              typeof existing.starttime === "string" ? existing.starttime : null,
+            )
+          ) return null;
+          d.remove(lockPath);
+        } catch {
+          return null;
+        }
+        if (!d.writeText(lockPath, body, "wx")) return null;
+      }
+      if (!d.statePathTrusted(lockPath) || d.readText(lockPath) !== body) return null;
+      try {
+        const lockfileDigest = d.digest(d.readFile(path.join(engine.engineRoot, CANDIDATE_CORE_LOCKFILE_REL)));
+        return {
+          proof: {
+            engineRoot: engine.engineRoot,
+            commitSha: engine.commitSha,
+            readyRecordPath: candidateReadyRecordPath(engine.engineRoot, engine.commitSha, stateDir),
+            lockfileDigest,
+            processLockPath: lockPath,
+            processLockDigest: createHash("sha256").update(body).digest("hex"),
+          },
+          release: () => {
+            if (d.statePathTrusted(lockPath) && d.readText(lockPath) === body) {
+              d.remove(lockPath);
+            }
+          },
+          transferTo: (nextOwner) => {
+            if (!d.statePathTrusted(lockPath) || d.readText(lockPath) !== body) return false;
+            const next = lockRecord(nextOwner);
+            if (!d.writeText(lockPath, next, "w")) return false;
+            if (!d.statePathTrusted(lockPath) || d.readText(lockPath) !== next) return false;
+            body = next;
+            return true;
+          },
+        };
+      } catch {
+        if (d.statePathTrusted(lockPath) && d.readText(lockPath) === body) d.remove(lockPath);
+        return null;
+      }
+    },
+  });
+  return { ok: true, engine: bindRevalidation(prepared.engine) };
+}
+
+export type CandidateEngineProcessResult<T> =
+  | { ok: true; value: T; engine: CandidateEngine }
+  | { ok: false; error: string; kind?: CandidateEngineFailureKind };
+
+export interface CandidateEngineStartInput<T> {
+  engine: CandidateEngine;
+  start: (engine: CandidateEngine, childEnv: NodeJS.ProcessEnv) => Promise<T>;
+  /**
+   * When start() hands off a live detached supervisor, transfer and retain the
+   * root lease until that child exits. Awaited starts omit this and release on return.
+   */
+  detachedSupervisor?: (value: T) => { pid: number; starttime?: string | null } | null;
+}
+
+/**
+ * The sole candidate-process start boundary. Revalidation happens inside the
+ * start operation, after all caller bookkeeping, and the prepared proof is
+ * bound to the inventoried consumer before the injected spawn seam is called.
+ */
+export async function runCandidateEngineProcess<T>(input: {
+  consumer: CandidateEngineConsumer;
+  engine: CandidateEngine;
+  start: (engine: CandidateEngine, childEnv: NodeJS.ProcessEnv) => Promise<T>;
+  detachedSupervisor?: (value: T) => { pid: number; starttime?: string | null } | null;
+}): Promise<CandidateEngineProcessResult<T>> {
+  const route = CANDIDATE_ENGINE_CONSUMERS.find((row) => row.consumer === input.consumer);
+  if (!route) {
+    assertCandidateEngineConsumerRoute(input.consumer);
+    throw new Error(`candidate-engine consumer has no executable boundary: ${input.consumer}`);
+  }
+  return route.execute({
+    engine: input.engine,
+    start: input.start,
+    detachedSupervisor: input.detachedSupervisor,
+  });
+}
+
+async function runBoundCandidateEngineProcess<T>(
+  consumer: CandidateEngineConsumer,
+  input: CandidateEngineStartInput<T>,
+): Promise<CandidateEngineProcessResult<T>> {
+  assertCandidateEngineConsumerRoute(consumer);
+  if (input.engine.consumer !== consumer) {
+    return {
+      ok: false,
+      kind: "identity",
+      error: `candidate engine proof belongs to ${input.engine.consumer ?? "no consumer"}, not ${consumer}`,
+    };
+  }
+  const lease = input.engine.acquireProcessLock?.() ?? null;
+  if (!lease) {
+    return { ok: false, kind: "lock", error: "candidate process-start lock is unavailable" };
+  }
+  let retainLease = false;
+  try {
+    const checked = revalidateCandidateEngineBeforeSpawn(input.engine);
+    if (!checked.ok) return checked;
+    // Invoke the process-start seam in the same turn as the synchronous final
+    // check while retaining the shared lease through process completion, or
+    // through detached-child lifetime after a verified supervisor handoff.
+    const started = input.start(checked.engine, candidateProcessGuardEnv(lease.proof));
+    const value = await started;
+    const supervisor = input.detachedSupervisor?.(value) ?? null;
+    if (supervisor && Number.isInteger(supervisor.pid) && supervisor.pid > 0) {
+      if (
+        typeof lease.transferTo === "function" &&
+        !lease.transferTo({
+          pid: supervisor.pid,
+          starttime: supervisor.starttime ?? null,
+        })
+      ) {
+        retainLease = true;
+        return {
+          ok: false,
+          kind: "lock",
+          error: "failed to transfer candidate lease to detached supervisor",
+        };
+      }
+      retainLease = true;
+    }
+    return {
+      ok: true,
+      value,
+      engine: checked.engine,
+    };
+  } finally {
+    if (!retainLease) lease.release();
+  }
+}
+
+/** Consume the prepared proof immediately before an inventoried spawn. */
+export function revalidateCandidateEngineBeforeSpawn(
+  engine: CandidateEngine,
+): CandidateEngineResult {
+  if (!engine.revalidateBeforeSpawn) {
+    return {
+      ok: false,
+      kind: "readiness",
+      error: "candidate engine has no final pre-spawn revalidation proof",
+    };
+  }
+  const checked = engine.revalidateBeforeSpawn();
+  if (!checked.ok) return checked;
+  if (
+    checked.engine.commitSha !== engine.commitSha ||
+    checked.engine.engineRoot !== engine.engineRoot ||
+    checked.engine.launcherPath !== engine.launcherPath
+  ) {
+    return {
+      ok: false,
+      kind: "identity",
+      error: "candidate identity changed during final pre-spawn revalidation",
+    };
+  }
+  return checked;
 }
 
 export function defaultResolveAndPrepareDeps(): ResolveAndPrepareCandidateEngineDeps {
@@ -457,6 +893,7 @@ export async function runResolveAndPrepareCli(
       repoDir,
       candidateSha: sha,
       candidateEngineRootEnv: env.PIPELINE_CANDIDATE_ENGINE_ROOT ?? null,
+      consumer: "pipeline.candidate-leaf",
     },
     deps,
   );

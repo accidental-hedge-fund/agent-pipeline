@@ -7,6 +7,7 @@
 
 import * as crypto from "node:crypto";
 import * as path from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { coveredLifecycleClassesFromExecutedRows, type ExecutedMatrixRow } from "./fault-recovery-matrix.ts";
 
 function stableFingerprint(value: unknown): string {
@@ -37,6 +38,173 @@ export const REQUIRED_PUBLIC_ENTRYPOINTS = [
   "ship",
 ] as const;
 export type RequiredPublicEntrypoint = (typeof REQUIRED_PUBLIC_ENTRYPOINTS)[number];
+
+export type AdmissionRouteClass = "direct" | "nested" | "resume" | "recovery" | "host";
+
+export interface RequiredAdmissionRoute {
+  route: string;
+  entrypoint: RequiredPublicEntrypoint;
+  class: AdmissionRouteClass;
+  host?: "claude" | "codex" | "grok" | "opencode";
+  /** Shared production boundary crossed by the exercised route. */
+  boundary: "public-admission" | "loop-admission" | "train-admission" | "ship-admission" | "cli-delegate";
+}
+
+const EXPECTED_ADMISSION_ROUTES: Readonly<Record<string, RequiredPublicEntrypoint>> = {
+  "drive.numeric": "drive",
+  "drive.detached-resume": "drive",
+  "single.direct": "single",
+  "loop.direct": "loop",
+  "loop.resume": "loop",
+  "train.direct": "train",
+  "train.recovery": "train",
+  "merge.direct": "merge",
+  "merge.train-nested": "merge",
+  "merge-queue.apply": "merge-queue",
+  "ship.direct": "ship",
+  "ship.resume": "ship",
+  "host.claude-code": "drive",
+  "host.codex": "drive",
+  "host.grok": "drive",
+  "host.opencode": "drive",
+} as const;
+export type RequiredAdmissionRouteName = keyof typeof EXPECTED_ADMISSION_ROUTES;
+
+const REQUIRED_ADMISSION_ROUTE_ROWS = [
+  { route: "drive.numeric", entrypoint: "drive", class: "direct", boundary: "loop-admission" },
+  { route: "drive.detached-resume", entrypoint: "drive", class: "resume", boundary: "loop-admission" },
+  { route: "single.direct", entrypoint: "single", class: "direct", boundary: "public-admission" },
+  { route: "loop.direct", entrypoint: "loop", class: "direct", boundary: "loop-admission" },
+  { route: "loop.resume", entrypoint: "loop", class: "resume", boundary: "loop-admission" },
+  { route: "train.direct", entrypoint: "train", class: "direct", boundary: "train-admission" },
+  { route: "train.recovery", entrypoint: "train", class: "recovery", boundary: "train-admission" },
+  { route: "merge.direct", entrypoint: "merge", class: "direct", boundary: "public-admission" },
+  { route: "merge.train-nested", entrypoint: "merge", class: "nested", boundary: "public-admission" },
+  { route: "merge-queue.apply", entrypoint: "merge-queue", class: "direct", boundary: "public-admission" },
+  { route: "ship.direct", entrypoint: "ship", class: "direct", boundary: "ship-admission" },
+  { route: "ship.resume", entrypoint: "ship", class: "resume", boundary: "ship-admission" },
+  { route: "host.claude-code", entrypoint: "drive", class: "host", boundary: "cli-delegate", host: "claude" },
+  { route: "host.codex", entrypoint: "drive", class: "host", boundary: "cli-delegate", host: "codex" },
+  { route: "host.grok", entrypoint: "drive", class: "host", boundary: "cli-delegate", host: "grok" },
+  { route: "host.opencode", entrypoint: "drive", class: "host", boundary: "cli-delegate", host: "opencode" },
+] as const;
+
+export const REQUIRED_ADMISSION_ROUTES: readonly RequiredAdmissionRoute[] = REQUIRED_ADMISSION_ROUTE_ROWS;
+
+const admissionRouteTrace = new AsyncLocalStorage<Set<string>>();
+
+/** Capture only crossings made by the production assertion boundary. */
+export async function captureRequiredAdmissionRouteCrossings<T>(
+  operation: () => Promise<T>,
+): Promise<{ value: T; routes: ReadonlySet<string> }> {
+  const routes = new Set<string>();
+  const value = await admissionRouteTrace.run(routes, operation);
+  return { value, routes };
+}
+
+export function admissionRouteExecutionGaps(executed: ReadonlySet<string>): string[] {
+  return REQUIRED_ADMISSION_ROUTES
+    .map((row) => row.route)
+    .filter((route) => !executed.has(route))
+    .map((route) => `unexercised production route ${route}`);
+}
+
+export function admissionRouteInventoryGaps(
+  routes: readonly RequiredAdmissionRoute[] = REQUIRED_ADMISSION_ROUTES,
+): string[] {
+  const gaps: string[] = [];
+  const seen = new Set<string>();
+  for (const row of routes) {
+    if (seen.has(row.route)) gaps.push(`duplicate route ${row.route}`);
+    seen.add(row.route);
+    const expected = EXPECTED_ADMISSION_ROUTES[row.route];
+    if (!expected) gaps.push(`unknown route ${row.route}`);
+    else if (expected !== row.entrypoint) gaps.push(`route ${row.route} expected ${expected}, got ${row.entrypoint}`);
+    if (!(REQUIRED_PUBLIC_ENTRYPOINTS as readonly string[]).includes(row.entrypoint)) {
+      gaps.push(`unknown entrypoint ${row.entrypoint}`);
+    }
+    if (!row.boundary) gaps.push(`route ${row.route} bypasses admission`);
+    if (row.class === "host" && !row.host) gaps.push(`host route ${row.route} missing generated host`);
+    if (row.class !== "host" && row.host) gaps.push(`non-host route ${row.route} declares generated host ${row.host}`);
+  }
+  for (const route of Object.keys(EXPECTED_ADMISSION_ROUTES)) {
+    if (!seen.has(route)) gaps.push(`missing route ${route}`);
+  }
+  const covered = new Set(routes.map((row) => row.entrypoint));
+  for (const entrypoint of REQUIRED_PUBLIC_ENTRYPOINTS) {
+    if (!covered.has(entrypoint)) gaps.push(`missing entrypoint ${entrypoint}`);
+  }
+  return gaps;
+}
+
+export function assertAdmissionRouteInventoryComplete(
+  routes: readonly RequiredAdmissionRoute[] = REQUIRED_ADMISSION_ROUTES,
+): void {
+  const gaps = admissionRouteInventoryGaps(routes);
+  if (gaps.length) throw new Error(`required admission inventory invalid: ${gaps.join("; ")}`);
+}
+
+export function assertRequiredAdmissionRoute(
+  route: RequiredAdmissionRouteName,
+  entrypoint: RequiredPublicEntrypoint,
+  boundary: RequiredAdmissionRoute["boundary"],
+): void {
+  assertAdmissionRouteInventoryComplete();
+  const matches = REQUIRED_ADMISSION_ROUTES.filter((row) => row.route === route);
+  if (matches.length !== 1) throw new Error(`required admission route is not inventoried exactly once: ${route}`);
+  const row = matches[0]!;
+  if (row.entrypoint !== entrypoint || row.boundary !== boundary) {
+    throw new Error(
+      `required admission route binding mismatch for ${row.route}: expected ${entrypoint}/${boundary}`,
+    );
+  }
+  admissionRouteTrace.getStore()?.add(route);
+}
+
+const GENERATED_HOST_ADMISSION_ROUTES = {
+  claude: "host.claude-code",
+  codex: "host.codex",
+  grok: "host.grok",
+  opencode: "host.opencode",
+} as const;
+
+export const GENERATED_HOST_ENV = "PIPELINE_GENERATED_HOST";
+
+export type GeneratedHostId = keyof typeof GENERATED_HOST_ADMISSION_ROUTES;
+
+/** Bind generated host packaging to the corresponding durable drive route. */
+export function assertGeneratedHostAdmissionRoute(
+  host: GeneratedHostId,
+): void {
+  const route = GENERATED_HOST_ADMISSION_ROUTES[host];
+  assertRequiredAdmissionRoute(route, "drive", "cli-delegate");
+}
+
+export function generatedHostFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): GeneratedHostId | null {
+  const value = env[GENERATED_HOST_ENV]?.trim();
+  if (!value) return null;
+  if (value in GENERATED_HOST_ADMISSION_ROUTES) return value as GeneratedHostId;
+  return null;
+}
+
+/** Production generated-host stamp used by CLI drive routes. */
+export function admitGeneratedHostLaunch(host: GeneratedHostId): void {
+  assertGeneratedHostAdmissionRoute(host);
+}
+
+/**
+ * When a generated host launcher forwarded its identity, stamp that host route
+ * before the CLI drive admission. Unknown or absent host ids are not host routes.
+ */
+export function admitGeneratedHostLaunchFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const host = generatedHostFromEnv(env);
+  if (!host) return;
+  admitGeneratedHostLaunch(host);
+}
 
 /** #1333 mechanical fault-matrix lifecycle classes required for FRG promotion. */
 export const REQUIRED_LIFECYCLE_CLASSES_1333 = [

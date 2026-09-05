@@ -37,9 +37,11 @@ import {
 } from "../scripts/train-events.ts";
 import {
   initRunDir,
+  persistPublicEntrypointAdmission,
   runIdFor,
   trainRunIdFor,
-  type RunStoreDeps,
+  type PublicAdmissionResult,
+  type PublicAdmissionStoreDeps,
 } from "../scripts/run-store.ts";
 import {
   MERGEABILITY_UNKNOWN_RETRY_DELAY_MS,
@@ -78,7 +80,7 @@ function memRunStore() {
     e.code = "ENOENT";
     return e;
   };
-  const deps: RunStoreDeps = {
+  const deps: PublicAdmissionStoreDeps = {
     readFile: async (p) => {
       const base = files.get(p) ?? "";
       const parts = appends.get(p) ?? [];
@@ -92,14 +94,34 @@ function memRunStore() {
       if (!appends.has(p)) appends.set(p, []);
       appends.get(p)!.push(data);
     },
-    rename: async () => {
-      throw new Error("unused");
+    rename: async (from, to) => {
+      const contents = files.get(from) ?? (appends.get(from) ?? []).join("");
+      if (!files.has(from) && !appends.has(from)) throw enoent(from);
+      files.set(to, contents);
+      files.delete(from);
+      appends.delete(from);
     },
     mkdir: async () => {},
     readdir: async () => [],
     stat: async (p) => {
       if (!files.has(p) && !appends.has(p)) throw enoent(p);
       return { mtime: new Date(0) };
+    },
+    fsyncFile: async () => {},
+    fsyncDirectory: async () => {},
+    realpath: async (p) => path.resolve(p),
+    link: async (existingPath, newPath) => {
+      if (files.has(newPath)) {
+        const error = new Error(`EEXIST: ${newPath}`) as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+      const contents = files.get(existingPath);
+      if (contents === undefined) throw enoent(existingPath);
+      files.set(newPath, contents);
+    },
+    unlink: async (p) => {
+      if (!files.delete(p)) throw enoent(p);
     },
   };
   function readFile(p: string): string {
@@ -230,6 +252,12 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainTestDeps {
   const base: TrainDeps = {
     log() {},
     runStore: store.deps,
+    publicAdmissionStore: store.deps,
+    persistPublicAdmission: (input) => persistPublicEntrypointAdmission(
+      { ...input, factoryControlRoot: "/repo" },
+      store.deps,
+    ),
+    resolveApprovedControlRoot: async () => "/repo",
     now: defaultNow,
     writeHandoff: (line) => {
       handoffLines.push(line.endsWith("\n") ? line : `${line}\n`);
@@ -2130,6 +2158,83 @@ test("train (#1095): merge-mode merges recovered-block-then-R2D and does not STO
   assert.doesNotMatch(item?.error ?? "", /implementation-ci on #1037/);
 });
 
+test("train merge admission: outer and nested attempts use distinct runs under one logical operation (#1454)", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1454, "durable admission", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(1454, 2454);
+
+  const result = await runTrain(baseOpts({ issues: [1454], merge: true }), deps);
+
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual(deps.mergeCalls, [2454]);
+  const metas = [...deps.store.files.entries()]
+    .filter(([filePath]) => filePath.endsWith(path.join("", "run.json")))
+    .map(([, raw]) => JSON.parse(raw) as Record<string, unknown>);
+  const outer = metas.find((meta) => meta.kind === "train");
+  const nested = metas.find((meta) => meta.kind === "merge");
+  assert.ok(outer);
+  assert.ok(nested);
+  assert.notEqual(outer.run_id, nested.run_id);
+  assert.equal(nested.logical_operation_id, outer.logical_operation_id);
+  assert.equal(
+    (nested.admission_stamp as Record<string, unknown>).logical_operation_id,
+    outer.logical_operation_id,
+  );
+});
+
+test("train merge admission: nested persistence refusal performs no merge and keeps the outer identity (#1454)", async () => {
+  const admittedLogicalIds: string[] = [];
+  let deps!: TrainTestDeps;
+  deps = makeDeps({
+    async persistPublicAdmission(input): Promise<PublicAdmissionResult> {
+      if (input.kind === "train") {
+        return persistPublicEntrypointAdmission(
+          { ...input, factoryControlRoot: "/repo" },
+          deps.store.deps,
+        );
+      }
+      const logicalOperationId = input.logicalOperationId ?? "";
+      admittedLogicalIds.push(logicalOperationId);
+      const identity = {
+        kind: input.kind,
+        runId: input.runId ?? "merge-refused",
+        logicalOperationId,
+        operationKey: input.operationKey ?? "merge:o/r:pr:2454",
+        repository: input.repo,
+        domain: input.domain ?? input.repo,
+        issue: input.issue ?? null,
+        startedAt: (input.startedAt ?? new Date("2026-09-05T00:00:00Z")).toISOString(),
+        approvedRoot: "/repo",
+        runDir: "/repo/.agent-pipeline/runs/merge-refused",
+      };
+      return {
+        acknowledged: false,
+        ...identity,
+        binding: identity,
+        failure: {
+          kind: "persistence_failure",
+          step: "publish_stamp",
+          diagnostic: "injected nested refusal",
+        },
+      };
+    },
+  });
+  deps.seedIssue(snap(1454, "durable admission", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(1454, 2454);
+
+  const result = await runTrain(baseOpts({ issues: [1454], merge: true }), deps);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(deps.mergeCalls.length, 0);
+  assert.equal(admittedLogicalIds.length, 1);
+  const trainMeta = [...deps.store.files.entries()]
+    .filter(([filePath]) => filePath.endsWith(path.join("", "run.json")))
+    .map(([, raw]) => JSON.parse(raw) as Record<string, unknown>)
+    .find((meta) => meta.kind === "train");
+  assert.ok(trainMeta);
+  assert.equal(admittedLogicalIds[0], trainMeta.logical_operation_id);
+});
+
 test("train (#1095): merge-mode does not merge a live blocked item on leftover class", async () => {
   const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
   const deps = makeDeps({
@@ -2665,7 +2770,7 @@ test("train events: same-clock trains get distinct exclusive stores (#1301 1.3)"
   assert.notEqual(first.session!.runDir, second.session!.runDir);
 });
 
-test("train events: exhausted exclusive allocation degrades coverage and continues mutations (#1301 1.4)", async () => {
+test("train events: an exclusive public-admission collision refuses merge-mode mutations (#1454)", async () => {
   const deps = makeDeps();
   const { attempts } = installExclusiveMkdir(deps.store, (p, recursive) => {
     if (!recursive && path.basename(p).startsWith("train-")) return errno("EEXIST", p);
@@ -2675,21 +2780,21 @@ test("train events: exhausted exclusive allocation degrades coverage and continu
   deps.seedPr(10, 20);
   deps.seedPr(11, 21);
   const result = await runTrain(baseOpts({ issues: [10, 11], merge: true }), deps);
-  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
-  assert.equal(result.status.events_coverage, "degraded");
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.status.events_coverage, "unknown");
   assert.equal(result.status.run_id, undefined);
   assert.equal(result.status.schema_version, 1);
   assert.equal(result.status.kind, "train_status");
   assert.equal(trainEventPaths(deps.store).length, 0);
   assert.ok(
     !deps.handoffLines.some((line) => line.includes("train_run_handoff")),
-    "exhausted allocation must not flush train_run_handoff",
+    "refused admission must not flush train_run_handoff",
   );
-  assert.deepEqual(deps.mergeCalls.slice().sort((a, b) => a - b), [20, 21]);
-  assert.equal(result.status.items.filter((i) => i.integrated).length, 2);
+  assert.deepEqual(deps.mergeCalls, []);
+  assert.equal(result.status.items.length, 0);
   assert.equal(
     attempts.filter((a) => a.startsWith("ex:train-")).length,
-    TRAIN_RUN_ID_MAX_EXCLUSIVE_ATTEMPTS,
+    1,
   );
 });
 
@@ -2763,7 +2868,7 @@ test("train events: conflicting later handoff keeps first link and degrades cove
   assert.equal(linked[0]!.events, "/abs/E");
 });
 
-test("train events: non-EEXIST exclusive mkdir is unknown and does not suffix-retry (#1301 1.8)", async () => {
+test("train events: non-EEXIST exclusive mkdir refuses merge-mode mutations without suffix retry (#1454)", async () => {
   const deps = makeDeps();
   const { attempts } = installExclusiveMkdir(deps.store, (p, recursive) => {
     if (!recursive && path.basename(p).startsWith("train-")) return errno("EACCES", p);
@@ -2773,12 +2878,12 @@ test("train events: non-EEXIST exclusive mkdir is unknown and does not suffix-re
   deps.seedPr(10, 20);
   deps.seedPr(11, 21);
   const result = await runTrain(baseOpts({ issues: [10, 11], merge: true }), deps);
-  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.equal(result.exitCode, 1);
   assert.equal(result.status.events_coverage, "unknown");
   assert.equal(result.status.run_id, undefined);
   assert.ok(!attempts.some((a) => a.startsWith("ex:train-") && a.endsWith("-2")));
   assert.equal(trainEventPaths(deps.store).length, 0);
-  assert.deepEqual(deps.mergeCalls.slice().sort((a, b) => a - b), [20, 21]);
+  assert.deepEqual(deps.mergeCalls, []);
 });
 
 test("train events: failed train_loop_linked append degrades coverage and continues (#1301 1.9)", async () => {

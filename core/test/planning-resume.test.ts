@@ -70,6 +70,13 @@ test("dispatchResume: worktree exists + commits ahead → calls resumeFromImplem
   const deps: DispatchResumeDeps = {
     getForIssue: async () => wt,
     hasCommitsAhead: async () => true,
+    probeImplementDeliverable: async () => ({
+      present: true,
+      role: "implementation",
+      artifact_id: "sha256:implementation",
+      candidate_sha: "a".repeat(40),
+      candidate_epoch: "a".repeat(40),
+    }),
     getIssueDetail: async () => ({ title: "Fix the bug", body: "" } as any),
     resumeFromImplementing: async () => {
       resumeCalled = true;
@@ -206,6 +213,90 @@ test("resumeFromImplementing: gate passes + push ok + PR already exists → reus
   assert.ok(!createPrCalled, "createPr must NOT be called when PR already exists");
   assert.ok(transitionMsg.includes("55"), "transition comment should reference the existing PR #55");
   assert.equal(result.advanced, true);
+});
+
+test("resumeFromImplementing: reused PR is bound and re-read before transition (#1454)", async () => {
+  const logicalOperationId = "lop-reused-pr-1454";
+  let body = "Closes #42";
+  let reads = 0;
+  let transitionCalled = false;
+  const deps: ResumeFromImplementingDeps = {
+    runTestGate: async () => passedGate(),
+    getPrForBranch: async () => 55,
+    getPrDetail: async () => {
+      reads++;
+      return { body } as any;
+    },
+    updatePrBody: async (_cfg, prNumber, nextBody) => {
+      assert.equal(prNumber, 55);
+      body = nextBody;
+    },
+    createPr: async () => assert.fail("createPr must not run for a reused PR"),
+    disposeSupersededIssuePrs: noopDispose,
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async () => {},
+    transition: async () => { transitionCalled = true; },
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg(),
+    42,
+    makeWt(),
+    {
+      prTitle: "[Pipeline] Fix the bug (#42)",
+      prBody: "Closes #42",
+      transitionMessage: (prNumber) => `PR #${prNumber} ready.`,
+      pipelineRunId: "run-1",
+      logicalOperationId,
+    },
+    deps,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(reads, 2, "the updated PR body must be re-read for confirmation");
+  assert.match(body, new RegExp(`pipeline-logical-operation: ${logicalOperationId}`));
+  assert.equal(transitionCalled, true);
+});
+
+test("resumeFromImplementing: conflicting race-winner PR binding fails closed (#1454)", async () => {
+  const logicalOperationId = "lop-race-loser-1454";
+  let lookups = 0;
+  let transitionCalled = false;
+  const deps: ResumeFromImplementingDeps = {
+    runTestGate: async () => passedGate(),
+    getPrForBranch: async () => ++lookups === 1 ? null : 66,
+    getPrDetail: async () => ({
+      body: "Closes #42\n\n<!-- pipeline-logical-operation: lop-race-winner-1454 -->",
+    } as any),
+    updatePrBody: async () => assert.fail("a conflicting PR marker must not be overwritten"),
+    createPr: async () => { throw new Error("PR already exists"); },
+    disposeSupersededIssuePrs: noopDispose,
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async () => {},
+    transition: async () => { transitionCalled = true; },
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg(),
+    42,
+    makeWt(),
+    {
+      prTitle: "[Pipeline] Fix the bug (#42)",
+      prBody: "Closes #42",
+      transitionMessage: (prNumber) => `PR #${prNumber} ready.`,
+      pipelineRunId: "run-1",
+      logicalOperationId,
+    },
+    deps,
+  );
+
+  assert.equal(result.advanced, false);
+  if (!result.advanced) {
+    assert.equal(result.status, "waiting");
+    assert.match(result.reason, /conflicting logical operation lop-race-winner-1454/);
+    assert.match(result.reason, /RecoverySupervisor retains ownership/);
+  }
+  assert.equal(transitionCalled, false);
 });
 
 // ---------------------------------------------------------------------------

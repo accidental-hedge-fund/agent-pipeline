@@ -16,10 +16,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isLogicalOperationId, mintLogicalOperationId } from "./logical-operation.ts";
+import type { PublicAdmissionResult } from "./run-store.ts";
 
 export const OPERATION_OBSERVATION_SCHEMA_VERSION = 1 as const;
 
 export type SideEffectCertainty = "known_complete" | "known_absent" | "uncertain";
+export type ArtifactEvidenceRole = "planning" | "implementation";
 
 /** Replay is allowed only when the observer has proven the side effect absent. */
 export function mayReplaySideEffect(certainty: SideEffectCertainty): boolean {
@@ -45,6 +47,32 @@ export interface LinkedPrIntegrationFact {
   state: "open" | "closed" | "merged";
   merge_commit_sha?: string | null;
   contained?: boolean | null;
+  artifact_role?: ArtifactEvidenceRole | "unknown";
+  artifact_identity?: string | null;
+  candidate_sha?: string | null;
+  candidate_epoch?: string | null;
+  logical_operation_id?: string | null;
+}
+
+export interface ExpectedLinkedPrBinding {
+  candidateSha?: string | null;
+  logicalOperationId?: string | null;
+}
+
+function isExactLinkedImplementation(
+  pr: LinkedPrIntegrationFact,
+  expected?: ExpectedLinkedPrBinding,
+): boolean {
+  const sha = pr.candidate_sha?.trim().toLowerCase() ?? "";
+  const epoch = pr.candidate_epoch?.trim().toLowerCase() ?? "";
+  const expectedSha = expected?.candidateSha?.trim().toLowerCase() ?? "";
+  const expectedOperation = expected?.logicalOperationId?.trim() ?? "";
+  return pr.artifact_role === "implementation" &&
+    Boolean(pr.artifact_identity?.trim()) &&
+    Boolean(sha) &&
+    sha === epoch &&
+    (!expectedSha || sha === expectedSha) &&
+    (!expectedOperation || pr.logical_operation_id?.trim() === expectedOperation);
 }
 
 /**
@@ -56,9 +84,11 @@ export interface LinkedPrIntegrationFact {
  */
 export function integrationSideEffectCertainty(
   linked: readonly LinkedPrIntegrationFact[],
-  opts?: { truncated?: boolean; incompleteDetails?: boolean },
+  opts?: { truncated?: boolean; incompleteDetails?: boolean } & ExpectedLinkedPrBinding,
 ): SideEffectCertainty {
-  if (linked.some((pr) => pr.state === "merged" && pr.contained === true)) {
+  if (linked.some((pr) =>
+    pr.state === "merged" && pr.contained === true && isExactLinkedImplementation(pr, opts)
+  )) {
     return "known_complete";
   }
   if (opts?.truncated || opts?.incompleteDetails) return "uncertain";
@@ -80,14 +110,35 @@ export function successorMutationsAllowed(certainty: SideEffectCertainty): {
 /** Prefer a merged-and-contained PR as integration authority over a later open PR. */
 export function selectAuthoritativeLinkedPr(
   linked: readonly LinkedPrIntegrationFact[],
+  expected?: ExpectedLinkedPrBinding,
 ): LinkedPrIntegrationFact | null {
-  const containedMerged = linked.find((pr) => pr.state === "merged" && pr.contained === true);
+  const containedMerged = linked.find((pr) =>
+    pr.state === "merged" && pr.contained === true && isExactLinkedImplementation(pr, expected)
+  );
   if (containedMerged) return containedMerged;
-  const merged = linked.find((pr) => pr.state === "merged");
-  if (merged) return merged;
-  const open = linked.find((pr) => pr.state === "open");
+  const open = linked.find((pr) =>
+    pr.state === "open" && isExactLinkedImplementation(pr, expected)
+  );
   if (open) return open;
+  const ambiguousMerged = linked.find((pr) => pr.state === "merged");
+  if (ambiguousMerged) return ambiguousMerged;
   return linked[0] ?? null;
+}
+
+const LOGICAL_OPERATION_BODY_MARKER_RE =
+  /<!--\s*pipeline-logical-operation:\s*([A-Za-z0-9._:-]+)\s*-->/;
+
+export function logicalOperationIdFromArtifactBody(body: string): string | null {
+  return LOGICAL_OPERATION_BODY_MARKER_RE.exec(body)?.[1] ?? null;
+}
+
+export function bindArtifactBodyToLogicalOperation(
+  body: string,
+  logicalOperationId?: string | null,
+): string {
+  const id = logicalOperationId?.trim();
+  if (!id || logicalOperationIdFromArtifactBody(body)) return body;
+  return `${body.trimEnd()}\n\n<!-- pipeline-logical-operation: ${id} -->`;
 }
 
 /**
@@ -151,6 +202,9 @@ export interface OperationObservation extends OperationIdentity {
   /** Recovery Episode fields on the shared claim family (#1325). */
   invariant?: string;
   candidate_epoch?: string;
+  /** Closed role and identity of the artifact proving this postcondition. */
+  evidence_role?: ArtifactEvidenceRole;
+  artifact_identity?: string;
   evidence_identity?: string;
   attempts_per_strategy?: Record<string, number>;
   strategy_cursor?: number;
@@ -628,6 +682,31 @@ export function reportMechanicalFault(
   input: Parameters<typeof mechanicalFaultObservation>[0],
 ): OperationObservation {
   return reportOwnedOperation(report, mechanicalFaultObservation(input));
+}
+
+/**
+ * Admission-refusal adapter. It is deliberately unable to mint: the refusal
+ * remains attached to the identity bound before persistence began.
+ */
+export function reportPublicEntrypointAdmissionFailure(
+  report: ReportOperationObservation | undefined,
+  result: Extract<PublicAdmissionResult, { acknowledged: false }>,
+): OperationObservation {
+  if (!isLogicalOperationId(result.logicalOperationId)) {
+    throw new Error("public admission refusal is missing its pre-bound Logical Operation identity");
+  }
+  return reportMechanicalFault(report, {
+    operation: result.kind,
+    form_id: `public-admission:${result.kind}`,
+    message: `${result.failure.step}: ${result.failure.diagnostic}`,
+    domain: result.domain,
+    logical_operation_id: result.logicalOperationId,
+    repository: result.repository,
+    issue: result.issue,
+    run_id: result.runId,
+    fault: `admission.${result.failure.kind}`,
+    certainty: "known_absent",
+  });
 }
 
 export function memoryObservationSink(): {

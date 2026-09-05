@@ -25,16 +25,20 @@ import {
   getIssueStateAndLabels,
   getPrChecks,
   getPrDetail,
+  getPrDiff,
   getPrForIssueAnyState,
   listPrsForIssueAnyState,
   normalizeLinkedIssuePrs,
   parseChecksAggregate,
   type LinkedIssuePrs,
 } from "../gh.ts";
+import { diffFilePaths } from "../stages/review-parsing.ts";
 import { getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
+import { observeImplementDeliverablePaths } from "../unpublished-stage-commit.ts";
 import { isAdvanceStillNeeded, isBlockedInLabels, pipelineStageFromLabels } from "./precondition.ts";
 import {
   integrationSideEffectCertainty,
+  logicalOperationIdFromArtifactBody,
   selectAuthoritativeLinkedPr,
   type LinkedPrIntegrationFact,
   type SideEffectCertainty,
@@ -142,8 +146,23 @@ export interface ReconcileObserveDeps {
     head_ref: string;
     head_sha: string;
     merge_commit_sha: string | null;
+    body?: string;
   } | null>;
   getPrChecks(prNumber: number): Promise<{ bucket: string }[]>;
+  /** Exact PR role/candidate observer. Missing or ambiguous bindings fail closed. */
+  getPrArtifactBinding?(prNumber: number, detail: {
+    state: "open" | "closed" | "merged";
+    head_ref: string;
+    head_sha: string;
+    merge_commit_sha: string | null;
+    body?: string;
+  }): Promise<{
+    role: "planning" | "implementation" | "unknown";
+    artifactIdentity: string | null;
+    candidateSha: string | null;
+    candidateEpoch: string | null;
+    logicalOperationId?: string | null;
+  }>;
   /** Local worktree fallback used only when no PR exists yet — reads the
    *  on-disk branch/head for the issue with zero GitHub calls. */
   getLocalHead(issueNumber: number): Promise<{
@@ -195,6 +214,7 @@ export function defaultReconcileObserveDeps(cfg: PipelineConfig): ReconcileObser
           head_ref: detail.head_ref,
           head_sha: detail.head_sha,
           merge_commit_sha: detail.merge_commit_sha,
+          body: detail.body,
         };
       } catch {
         return null;
@@ -205,6 +225,27 @@ export function defaultReconcileObserveDeps(cfg: PipelineConfig): ReconcileObser
         return await getPrChecks(cfg, prNumber);
       } catch {
         return [];
+      }
+    },
+    async getPrArtifactBinding(prNumber, detail) {
+      try {
+        const paths = diffFilePaths(await getPrDiff(cfg, prNumber));
+        const candidateSha = detail.head_sha.trim().toLowerCase() || null;
+        const observation = observeImplementDeliverablePaths({ paths, candidateSha });
+        return {
+          role: observation.role,
+          artifactIdentity: observation.artifact_id,
+          candidateSha: observation.candidate_sha,
+          candidateEpoch: observation.candidate_epoch,
+          logicalOperationId: logicalOperationIdFromArtifactBody(detail.body ?? ""),
+        };
+      } catch {
+        return {
+          role: "unknown",
+          artifactIdentity: null,
+          candidateSha: null,
+          candidateEpoch: null,
+        };
       }
     },
     async getLocalHead(issueNumber) {
@@ -291,7 +332,11 @@ export function parseItemIssueNumber(itemId: string): number {
 }
 
 /** Builds one item's verified live identity from the injected seam only. */
-export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId: string): Promise<LoopExternalIdentity> {
+export async function observeExternalIdentity(
+  deps: ReconcileObserveDeps,
+  itemId: string,
+  expected: { logicalOperationId?: string | null } = {},
+): Promise<LoopExternalIdentity> {
   const issueNumber = parseItemIssueNumber(itemId);
   const issue = await deps.getIssueStateAndLabels(issueNumber);
   const issue_open = issue?.state === "open";
@@ -332,21 +377,61 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
     if (detail.state === "merged" && detail.merge_commit_sha) {
       contained = await deps.baseBranchContainsSha(detail.merge_commit_sha);
     }
+    const artifact = deps.getPrArtifactBinding
+      ? await deps.getPrArtifactBinding(n, detail)
+      : {
+          role: "unknown" as const,
+          artifactIdentity: null,
+          candidateSha: null,
+          candidateEpoch: null,
+          logicalOperationId: null,
+        };
     linkedFacts.push({
       number: n,
       state: detail.state,
       merge_commit_sha: detail.merge_commit_sha,
       contained,
+      artifact_role: artifact.role,
+      artifact_identity: artifact.artifactIdentity,
+      candidate_sha: artifact.candidateSha,
+      candidate_epoch: artifact.candidateEpoch,
+      logical_operation_id: artifact.logicalOperationId,
     });
   }
+
+  const currentPrDetail = foundPrNumber === null
+    ? null
+    : detailByNumber.get(foundPrNumber) ?? null;
+  let local: Awaited<ReturnType<ReconcileObserveDeps["getLocalHead"]>> = null;
+  if (currentPrDetail) {
+    try {
+      local = await deps.getLocalHead(issueNumber);
+    } catch {
+      local = null;
+    }
+  } else {
+    // With no observable PR identity the local head is the only candidate
+    // authority. Preserve an observation failure so recovery retains its
+    // started claim instead of converting missing evidence into a mismatch.
+    local = await deps.getLocalHead(issueNumber);
+  }
+  const currentCandidateSha = local?.sha ?? currentPrDetail?.head_sha ?? null;
+  const exactBinding = {
+    candidateSha: currentCandidateSha,
+    logicalOperationId: expected.logicalOperationId,
+  };
   integration_certainty = integrationSideEffectCertainty(linkedFacts, {
     truncated: consultAllLinked && listed.truncated,
     incompleteDetails,
+    ...exactBinding,
   });
   const authoritative = consultAllLinked
-    ? selectAuthoritativeLinkedPr(linkedFacts)
+    ? selectAuthoritativeLinkedPr(linkedFacts, exactBinding)
     : linkedFacts[0] ?? null;
-  const chosen = authoritative?.number ?? foundPrNumber;
+  const chosen = integration_certainty === "known_complete"
+    ? authoritative?.number ?? foundPrNumber
+    : foundPrNumber ?? authoritative?.number ?? null;
+  const projectedArtifact = linkedFacts.find((fact) => fact.number === chosen) ?? authoritative;
   if (chosen !== null) {
     const detail = detailByNumber.get(chosen) ?? await deps.getPrDetail(chosen);
     if (detail) {
@@ -360,16 +445,6 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
     }
   }
 
-  let local: Awaited<ReturnType<ReconcileObserveDeps["getLocalHead"]>> = null;
-  if (head_branch) {
-    try {
-      local = await deps.getLocalHead(issueNumber);
-    } catch {
-      local = null;
-    }
-  } else {
-    local = await deps.getLocalHead(issueNumber);
-  }
   if (!head_branch && local) {
     head_branch = local.branch;
     head_sha = local.sha;
@@ -393,6 +468,11 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
     product_dirt: local?.product_dirt === true,
     integration_certainty,
     linked_pr_numbers,
+    artifact_role: projectedArtifact?.artifact_role ?? "unknown",
+    artifact_identity: projectedArtifact?.artifact_identity ?? null,
+    candidate_epoch: projectedArtifact?.candidate_epoch ?? null,
+    logical_operation_id: projectedArtifact?.logical_operation_id ?? null,
+    expected_logical_operation_id: expected.logicalOperationId ?? null,
   };
 }
 
@@ -475,8 +555,21 @@ export function repairShaMismatchIsHumanStop(input: {
  *
  *  Checks conclusion never influences this target. */
 export function verifiedForwardTarget(identity: LoopExternalIdentity): LoopItemState | null {
-  if (identity.pr_state === "merged") return "merged";
+  const expectedOperation = identity.expected_logical_operation_id?.trim() ?? "";
+  const artifactOperation = identity.logical_operation_id?.trim() ?? "";
+  const exactImplementation =
+    identity.artifact_role === "implementation" &&
+    Boolean(identity.artifact_identity?.trim()) &&
+    Boolean(identity.head_sha.trim()) &&
+    identity.candidate_epoch?.trim().toLowerCase() === identity.head_sha.trim().toLowerCase() &&
+    (!expectedOperation || artifactOperation === expectedOperation);
+  if (
+    identity.pr_state === "merged" &&
+    identity.integration_certainty === "known_complete" &&
+    exactImplementation
+  ) return "merged";
   if (identity.pr_number !== null && identity.pr_state === "open") {
+    if (!exactImplementation) return null;
     if (identity.ready_label_present) return "ready";
     // Advance-still-needed open PR is expected during advance (intake-ready,
     // mid-flight, crash-after-PR-open residual). It is not remote proof that the
@@ -519,7 +612,12 @@ export function classifyDrift(
   // Forward catch-up always wins first: the external truth already reached a
   // state strictly ahead of what the ledger claims. Merged and ready-label
   // catch-up both win over the advance-still-needed open-PR gate (#712 / #1068).
-  if (state !== "merged" && state !== "released" && state !== "deployed" && identity.pr_state === "merged") {
+  if (
+    state !== "merged" &&
+    state !== "released" &&
+    state !== "deployed" &&
+    verifiedForwardTarget(identity) === "merged"
+  ) {
     return "ledger-behind";
   }
   if (state === "pr_opened" && identity.pr_state === "open" && identity.ready_label_present) {
@@ -558,7 +656,7 @@ export function classifyDrift(
     case "merged":
     case "released":
     case "deployed":
-      if (identity.pr_state !== "merged") return "ledger-ahead";
+      if (verifiedForwardTarget(identity) !== "merged") return "ledger-ahead";
       return null;
     default:
       return null;
@@ -638,7 +736,9 @@ export async function reconcile(
   let observerProvedPostcondition = false;
 
   for (const [id, entry] of Object.entries(ledger.items)) {
-    const identity = await observeExternalIdentity(observeDeps, id);
+    const identity = await observeExternalIdentity(observeDeps, id, {
+      logicalOperationId: ledger.lifecycle?.logical_operation_id,
+    });
     observed[id] = identity;
     const bound = entry.last_verified_identity ?? null;
     const driftClass = classifyDrift(entry.state, identity, bound);
@@ -824,7 +924,9 @@ export async function resumeRecoveryExhaustedTerminalCatchUp(
   const repaired: Array<{ id: string; from: LoopItemState; to: LoopItemState }> = [];
 
   for (const [id, entry] of Object.entries(ledger.items)) {
-    const identity = await observeExternalIdentity(observeDeps, id);
+    const identity = await observeExternalIdentity(observeDeps, id, {
+      logicalOperationId: ledger.lifecycle?.logical_operation_id,
+    });
     const target = verifiedForwardTarget(identity);
     if (target !== "ready" && target !== "merged") continue;
     if (entry.state === target) continue;
@@ -923,7 +1025,11 @@ async function everySuccessItemHasFreshLiveProof(
     let identity: LoopExternalIdentity;
     try {
       identity =
-        id === liveItemId && liveIdentity ? liveIdentity : await observeExternalIdentity(observeDeps, id);
+        id === liveItemId && liveIdentity
+          ? liveIdentity
+          : await observeExternalIdentity(observeDeps, id, {
+              logicalOperationId: ledger.lifecycle?.logical_operation_id,
+            });
     } catch {
       return false;
     }
@@ -1008,7 +1114,9 @@ export async function transitionItem(
 
   let observedIdentity: LoopExternalIdentity | undefined;
   if (REMOTE_PROVING_STATES.has(input.to)) {
-    const identity = await observeExternalIdentity(observeDeps, input.itemId);
+    const identity = await observeExternalIdentity(observeDeps, input.itemId, {
+      logicalOperationId: ledger.lifecycle?.logical_operation_id,
+    });
     const ageSeconds = (deps.now().getTime() - Date.parse(identity.observed_at)) / 1000;
     if (!Number.isFinite(ageSeconds) || ageSeconds < 0 || ageSeconds > NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS) {
       throw new LoopError(

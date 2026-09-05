@@ -53,6 +53,7 @@ const READY_LABEL = "pipeline:ready-to-deploy";
 // they default to `pipeline:ready` (orthogonal to the parking/serialization behavior under test).
 const PIPELINE_READY_LABEL = "pipeline:ready";
 const RUN_ID = "pilot-parallel-run-1";
+const LOGICAL_OPERATION_ID = "lop-pilot-parallel-run-1";
 const ITEM_A = "300";
 const ITEM_B = "400";
 const ITEM_C = "500";
@@ -138,6 +139,7 @@ function pilotContract(): LoopContract {
   return {
     schema: LOOP_CONTRACT_SCHEMA,
     run_id: RUN_ID,
+    logical_operation_id: LOGICAL_OPERATION_ID,
     engine: "claude",
     repo: { name: "acme/widgets", base_branch: "main" },
     selector: { type: "issue-set", value: [ITEM_A, ITEM_B, ITEM_C] },
@@ -236,6 +238,15 @@ function pilotFakes(_deps: LoopStoreDeps, _contract: LoopContract) {
     },
     async getPrChecks() {
       return [{ bucket: "pass" }];
+    },
+    async getPrArtifactBinding(prNumber, detail) {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+        logicalOperationId: LOGICAL_OPERATION_ID,
+      };
     },
     async getLocalHead() {
       return null;

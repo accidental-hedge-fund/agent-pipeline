@@ -1152,6 +1152,7 @@ export async function defaultTryPublishUnpublishedStageCommit(
   try {
     const published = await executeFn(cfg, issueNumber, {
       ...executeDeps,
+      logicalOperationId: executeDeps.logicalOperationId ?? publishDeps.logicalOperationId,
       probeImplementDeliverable:
         executeDeps.probeImplementDeliverable ??
         createDefaultImplementDeliverableProbe(
@@ -1182,6 +1183,7 @@ export interface PublishUnpublishedRecoverDeps {
   execute?: typeof executePublishUnpublishedStageCommit;
   inspectDeps?: Parameters<typeof inspectPublishableUnpublishedStageCommit>[2];
   executeDeps?: Parameters<typeof executePublishUnpublishedStageCommit>[2];
+  logicalOperationId?: string | null;
 }
 
 /**
@@ -1380,7 +1382,10 @@ async function runRecoverParkedLocked(
     ((c, n, d) => defaultTryUnlinkEngineScratch(c, n, d, deps.scratchUnlinkDeps));
   const publishUnpublished =
     deps.tryPublishUnpublishedStageCommit ??
-    ((c, n, d) => defaultTryPublishUnpublishedStageCommit(c, n, d, deps.publishUnpublishedDeps));
+    ((c, n, d) => defaultTryPublishUnpublishedStageCommit(c, n, d, {
+      ...deps.publishUnpublishedDeps,
+      logicalOperationId: deps.logicalOperationId,
+    }));
   const recordOverride =
     deps.recordKeyOverride ?? defaultRecordKeyOverrideFactory(deps);
   const wrap = (

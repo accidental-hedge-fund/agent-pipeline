@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { assertRequiredAdmissionRoute } from "../operation-reliability.ts";
 import { homedir } from "node:os";
 import {
   findMilestoneNumberByTitle,
@@ -62,6 +63,11 @@ export {
 } from "./ship-supervision.ts";
 
 const execFileAsync = promisify(execFile);
+
+/** Production-owned admission adapter used at the locked ship coordinator boundary. */
+export function assertShipAdmissionRoute(route: "ship.direct" | "ship.resume"): void {
+  assertRequiredAdmissionRoute(route, "ship", "ship-admission");
+}
 
 export const SHIP_SCHEMA_VERSION = 1;
 export const SHIP_AUTHORIZATION_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -1034,6 +1040,7 @@ export async function runShipCoordinator(
   if (!path.isAbsolute(eventsFile)) throw new Error("ship state: events_file must be an absolute path");
 
   const loaded = await deps.state.read(coordinateKey);
+  assertShipAdmissionRoute(loaded ? "ship.resume" : "ship.direct");
   let status: ShipStatus;
   if (loaded) {
     status = parseStatus(loaded);

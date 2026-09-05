@@ -462,7 +462,8 @@ export interface SettledSurfaceDemotion {
 
 /**
  * The delta review's evidence rule (#496 design.md Decision 4): moves any
- * still-blocking finding whose surface matches a settled finding's surface,
+ * still-blocking finding that matches a specific settled finding by stable
+ * key or guarded title similarity on the same surface,
  * and whose body/recommendation/acknowledgment cites no HEAD-state evidence,
  * out of `blocking`. Reuses the same advisory routing the #389 reversal
  * machinery uses (called by the pre-merge delta path AFTER `partitionFindings`
@@ -481,11 +482,22 @@ export function applySettledSurfaceEvidenceRule(
   const stillBlocking: ReviewFinding[] = [];
   const demoted: SettledSurfaceDemotion[] = [];
   for (const f of blocking) {
-    const match = matchSettledSurface(f, settled);
-    if (!match) {
+    const specificMatch = matchSettledFinding(
+      f,
+      settled.map((entry) => ({ ...entry, rejectedAlternatives: [] })),
+    );
+    // A surface is only a coarse routing key. A later review may discover a
+    // genuinely new defect in the same file/category; suppressing it merely
+    // because an older, different finding was settled is a fail-open release
+    // gate. Only the same stable finding may use the no-new-evidence demotion.
+    if (!specificMatch) {
       stillBlocking.push(f);
       continue;
     }
+    const match: UnverifiedSettledSurfaceMatch = {
+      settledKey: specificMatch.entry.key,
+      settledRound: specificMatch.entry.round,
+    };
     // Evidence must come from the finding body itself, not the recommendation
     // or prior-round acknowledgment (#496 finding 594c736a) — those can quote
     // boilerplate the reviewer did not draw from the supplied HEAD state.
@@ -1845,4 +1857,3 @@ export function applyNoopHeadClassificationEvidenceRule(
   }
   return { blocking: stillBlocking, demoted };
 }
-

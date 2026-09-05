@@ -224,6 +224,16 @@ function fakeObserveDeps(overrides: Partial<ReconcileObserveDeps> = {}): { deps:
       calls.push(`getPrChecks:${prNumber}`);
       return [];
     },
+    async getPrArtifactBinding(prNumber, detail) {
+      calls.push(`getPrArtifactBinding:${prNumber}`);
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+        logicalOperationId: "lop-loop-supervisor-test",
+      };
+    },
     async getLocalHead(issueNumber) {
       calls.push(`getLocalHead:${issueNumber}`);
       return null;
@@ -264,6 +274,15 @@ function coordinatedFakes(outcomeFor: (itemId: string) => LoopExecutionResponse[
     },
     async getPrChecks() {
       return [{ bucket: "pass" }];
+    },
+    async getPrArtifactBinding(prNumber, detail) {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+        logicalOperationId: "lop-loop-supervisor-test",
+      };
     },
     async getLocalHead() {
       return null;
@@ -306,6 +325,7 @@ function testContract(overrides: Partial<LoopContract> = {}): LoopContract {
     consecutive_blocked_limit: 3,
     verification: null,
     report_format: "markdown",
+    logical_operation_id: "lop-loop-supervisor-test",
     ordering: "dependency_sequential",
     max_active_items: 1,
     concurrency_model: "exclusive_lock_single_engine",

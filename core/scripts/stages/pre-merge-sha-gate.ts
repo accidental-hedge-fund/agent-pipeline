@@ -1703,42 +1703,13 @@ export async function enforceReviewShaGate(
             const rePartition = partitionFindings(
               reResult.findings, cfg.review_policy, overrides, scopes, new Map(), null, reSettled,
             );
-            // Resolved-finding evidence rule (#496), mirroring the primary
-            // delta-review application above.
+            // A post-auto-fix re-review is the authoritative verdict for the
+            // new exact SHA. Do not apply historical settled/advisory demotions
+            // here: a residual that the bounded fix intentionally did not
+            // address must remain blocking, and a genuinely new defect must
+            // not disappear because an older round shared its surface.
             const reUnverifiedSurfaceDemotions = new Map<string, UnverifiedSettledSurfaceMatch>();
-            const reEvidenceResult = applySettledSurfaceEvidenceRule(rePartition.blocking, reSettledVerification, reHeadFiles);
-            rePartition.blocking = reEvidenceResult.blocking;
-            for (const { finding, match } of reEvidenceResult.demoted) {
-              rePartition.advisory.push({ finding, reason: "settled-surface-unverified", unverifiedSurfaceMatch: match });
-              reUnverifiedSurfaceDemotions.set(findingKey(finding), match);
-              if (deps.runDir) {
-                const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-                await appendEvent(deps.runDir, {
-                  schema_version: RUN_SCHEMA_VERSION, type: "settled_surface_unverified", at,
-                  finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
-                  settled_finding_key: match.settledKey, settling_round: match.settledRound,
-                }, deps.runStoreDeps).catch(() => {});
-              }
-            }
-            // Prior-round advisory carry-forward (#680), mirroring the primary path.
             const reAdvisoryCarryForwardDemotions = new Map<string, AdvisoryCarryForwardMatch>();
-            const reCarryForwardResult = applyAdvisoryCarryForwardRule(
-              rePartition.blocking, rePriorAdvisories, reHeadFiles,
-            );
-            rePartition.blocking = reCarryForwardResult.blocking;
-            for (const { finding, match } of reCarryForwardResult.demoted) {
-              rePartition.advisory.push({ finding, reason: "advisory-carry-forward", advisoryCarryForwardMatch: match });
-              reAdvisoryCarryForwardDemotions.set(findingKey(finding), match);
-              if (deps.runDir) {
-                const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-                await appendEvent(deps.runDir, {
-                  schema_version: RUN_SCHEMA_VERSION, type: "advisory_carry_forward", at,
-                  finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
-                  prior_advisory_key: match.priorKey, prior_round: match.priorRound,
-                  matched_by: match.matchedBy,
-                }, deps.runStoreDeps).catch(() => {});
-              }
-            }
 
 // Post-noop re-verify: demote pure classification/control-flow claims
             // when HEAD already implements the recommended behavior and the

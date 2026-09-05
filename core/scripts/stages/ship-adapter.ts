@@ -23,6 +23,7 @@ import {
   shipEndLeafArgv,
   uncredentialedPrepareEnv,
   resolveAndPrepareCandidateEngine,
+  runCandidateEngineProcess,
   type CandidateEngine,
   type CandidateEngineResult,
   type PresentFrgAttestorCredentialDeps,
@@ -242,6 +243,7 @@ export interface RealShipCoordinatorDepsOptions {
   spawnEnsureTag?: (
     engine: CandidateEngine,
     opts: { version: string; mergeCommitOid: string; packedCandidate: string },
+    childEnv: NodeJS.ProcessEnv,
   ) => Promise<void>;
   factoryReleaseRequestPath?: string;
   /** Persist or resume the ship-bound factory-release request JSON. */
@@ -1520,6 +1522,7 @@ export interface CandidateShipEndContext {
   spawnEnsureTag?(
     engine: CandidateEngine,
     opts: { version: string; mergeCommitOid: string; packedCandidate: string },
+    childEnv: NodeJS.ProcessEnv,
   ): Promise<void>;
   delay?(ms: number): Promise<void>;
   frgWaitAttempts?: number;
@@ -1553,9 +1556,19 @@ async function spawnLeaf(
   leaf: string[],
   env: NodeJS.ProcessEnv,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  const argv = [...shipEndCliPrefix(engine, ctx.nodeBin ?? "node"), ...leaf];
-  assertShipEndLeafArgv(argv);
-  return ctx.spawn(argv, env);
+  const started = await runCandidateEngineProcess({
+    consumer: "ship.stage-adapter",
+    engine,
+    start: async (checked, childEnv) => {
+      const argv = [...shipEndCliPrefix(checked, ctx.nodeBin ?? "node"), ...leaf];
+      assertShipEndLeafArgv(argv);
+      return ctx.spawn(argv, { ...env, ...childEnv });
+    },
+  });
+  if (!started.ok) {
+    throw candidateReadinessError(started.kind === "lock" ? "lock" : "readiness", started.error);
+  }
+  return started.value;
 }
 
 async function delayMs(ctx: CandidateShipEndContext, ms: number): Promise<void> {
@@ -2413,11 +2426,22 @@ export function bindCandidateShipEndOperations(
       const existing = await pinOps.observeTag(intent, release);
       if (existing) return existing;
       if (typeof ctx.spawnEnsureTag === "function") {
-        await ctx.spawnEnsureTag(engine, {
-          version: intent.version,
-          mergeCommitOid: release.merge_commit_oid,
-          packedCandidate: release.candidate_head_oid,
+        const started = await runCandidateEngineProcess({
+          consumer: "ship.stage-adapter",
+          engine,
+          start: (checked, childEnv) => ctx.spawnEnsureTag!(
+            checked,
+            {
+              version: intent.version,
+              mergeCommitOid: release.merge_commit_oid,
+              packedCandidate: release.candidate_head_oid,
+            },
+            childEnv,
+          ),
         });
+        if (!started.ok) {
+          throw candidateReadinessError(started.kind === "lock" ? "lock" : "readiness", started.error);
+        }
       } else {
         const spawned = await spawnLeaf(
           ctx,
@@ -2585,6 +2609,7 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
           repoDir: opts.repoDir,
           candidateSha: sha,
           candidateEngineRootEnv: env.PIPELINE_CANDIDATE_ENGINE_ROOT,
+          consumer: "ship.stage-adapter",
         },
         defaultResolveAndPrepareDeps(),
       ));

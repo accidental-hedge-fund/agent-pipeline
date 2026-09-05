@@ -875,9 +875,9 @@ async function offerRelocation(dest, base, dryRun) {
   return offerRelocationWith(dest, base, dryRun, Boolean(process.stdin.isTTY));
 }
 
-function renderShim(profile) {
+function renderShim(profile, host) {
   const tmpl = readFileSync(join(REPO_ROOT, "hosts", "_shared", "entry.template.mjs"), "utf8");
-  return tmpl.replaceAll("__PROFILE__", profile);
+  return tmpl.replaceAll("__PROFILE__", profile).replaceAll("__HOST__", host);
 }
 
 function stageInto(stagingDir, host) {
@@ -900,7 +900,7 @@ function stageInto(stagingDir, host) {
   const scriptsDst = join(stagingDir, "scripts");
   mkdirSync(scriptsDst, { recursive: true });
   const shimPath = join(scriptsDst, "pipeline.mjs");
-  writeFileSync(shimPath, renderShim(cfg.profile));
+  writeFileSync(shimPath, renderShim(cfg.profile, host));
   chmodSync(shimPath, 0o755);
   // Host skill docs pipe events through this path (not core/scripts/*.ts).
   const materialFilterPath = join(scriptsDst, "material-filter.mjs");

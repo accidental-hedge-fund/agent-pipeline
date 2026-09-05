@@ -10,7 +10,11 @@
 //   7. Run the primary implementer harness in the worktree against the revised impl prompt.
 //   8. Verify commits exist, push branch, create PR, transition implementing → review-1.
 
-import { successorMutationsAllowed } from "../operation-observation.ts";
+import {
+  bindArtifactBodyToLogicalOperation,
+  logicalOperationIdFromArtifactBody,
+  successorMutationsAllowed,
+} from "../operation-observation.ts";
 import {
   addLabel,
   createPr,
@@ -18,11 +22,13 @@ import {
   extractHumanPlanComments,
   getIssueDetail,
   getOpenIssues,
+  getPrDetail,
   getPrForBranch,
   getPrForIssue,
   postComment,
   setBlocked,
   transition,
+  updatePrBody,
   type DisposeSupersededIssuePrsDeps,
 } from "../gh.ts";
 import {
@@ -103,10 +109,14 @@ import {
   type OwnershipDeps,
 } from "../harness-mutation-ownership.ts";
 import {
+  createDefaultImplementDeliverableProbe,
   executePublishUnpublishedStageCommit,
+  isExactImplementationDeliverable,
   resolveTimeoutParkForUnpublishedCommit,
+  type ImplementDeliverableObservation,
   type InspectUnpublishedDeps,
 } from "../unpublished-stage-commit.ts";
+import { attachProducerCompletionEvidence } from "../issue-stage-adapters.ts";
 import {
   evaluatePostHarnessNoNewCommit,
   formatNoopAdvanceEvidenceNote,
@@ -305,6 +315,7 @@ export interface AdvanceOpts {
   model?: string;
   /** Dispatch-wide run id for the commit traceability trailers (#20). */
   pipelineRunId?: string;
+  logicalOperationId?: string | null;
   /** Evidence-bundle run/state dir (#147); when set, the test gate records its
    *  command runs under the active implementation stage. Undefined → recording disabled. */
   stateDir?: string;
@@ -505,7 +516,7 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
     probeImplementDeliverable?: (
       wtPath: string,
       issueNumber: number,
-    ) => Promise<{ present: boolean; description?: string }>;
+    ) => Promise<ImplementDeliverableObservation>;
     /** Override planning-facts observation. Tests inject counters and fakes. */
     observePlanningFacts?: typeof observePlanningFacts;
     /** Seams forwarded into the default observer (trusted blob, spawn, clock). */
@@ -713,6 +724,8 @@ export async function runPlanningPhases(
   const doGitInWorktree = deps.gitInWorktree ?? gitInWorktree;
   const doTrySalvage = deps.trySalvageUncommittedWork ?? trySalvageUncommittedWork;
   const doListChangeDirs = deps.listChangeDirs ?? openspec.listChangeDirs;
+  const doProbeImplementDeliverable =
+    deps.probeImplementDeliverable ?? createDefaultImplementDeliverableProbe(cfg, doGitInWorktree);
 
   const primary: Harness = cfg.harnesses.implementer;
   const reviewer: string = cfg.harnesses.reviewer;
@@ -1417,7 +1430,7 @@ export async function runPlanningPhases(
     // #758 / #588: shared harness-round clean no-new-commit hook → noop-advance.
     // Invoked only when salvageFoundNothing is already confirmed by harness-round.
     onCleanNoNewCommit: async ({ headBefore, headAfter }) => {
-      const activeChanges = doListChangeDirs(wt.path);
+      const observation = await doProbeImplementDeliverable(wt.path, issueNumber);
       return evaluatePostHarnessNoNewCommit({
         headBefore,
         headAfter,
@@ -1427,15 +1440,12 @@ export async function runPlanningPhases(
         issueNumber,
         goalCheck: () =>
           implementDeliverablePresentGoalCheck({
-            deliverablePresent: activeChanges.length > 0,
+            deliverablePresent: isExactImplementationDeliverable(observation, headAfter),
             worktreeClean: true,
             // Gates run in post-implement steps after this advance; do not
             // pre-certify them here. Fail closed if the path cannot run gates.
             gatesGreen: true,
-            deliverableDescription:
-              activeChanges.length > 0
-                ? `OpenSpec change(s) already present at HEAD: ${activeChanges.join(", ")}`
-                : undefined,
+            deliverableDescription: observation.description,
           }),
       });
     },
@@ -1545,8 +1555,8 @@ export async function runPlanningPhases(
           return blockedOutcome("PR linkage is indeterminate", "harness-failure");
         }
         if (timeoutPark.action === "publish") {
-          const activeChanges = doListChangeDirs(wt.path);
-          if (activeChanges.length === 0) {
+          const deliverable = await doProbeImplementDeliverable(wt.path, issueNumber);
+          if (!isExactImplementationDeliverable(deliverable)) {
             console.log(
               `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) ` +
                 `but left a publishable unpublished commit with unsatisfied deliverable — re-invoking implementer`,
@@ -1608,16 +1618,7 @@ export async function runPlanningPhases(
               transition: doTransition,
             },
             probeImplementDeliverable:
-              deps.probeImplementDeliverable ??
-              (async (wtPath) => {
-                const ids = doListChangeDirs(wtPath);
-                return ids.length > 0
-                  ? {
-                      present: true,
-                      description: `OpenSpec change(s) already present at HEAD: ${ids.join(", ")}`,
-                    }
-                  : { present: false };
-              }),
+              doProbeImplementDeliverable,
           });
           if (published.succeeded) {
             await completePlanningLifecycle(
@@ -1730,7 +1731,7 @@ export async function runPlanningPhases(
       // salvageFoundNothing). Never synthesize "unknown" heads or relax
       // cleanliness because a change directory exists (#758 R1 finding 2).
       if (!noopResult && cleanNoNewImplement) {
-        const activeChanges = doListChangeDirs(wt.path);
+        const observation = await doProbeImplementDeliverable(wt.path, issueNumber);
         noopResult = await evaluatePostHarnessNoNewCommit({
           headBefore: implHeadBefore,
           headAfter: ctx.headAfter,
@@ -1740,13 +1741,13 @@ export async function runPlanningPhases(
           issueNumber,
           goalCheck: () =>
             implementDeliverablePresentGoalCheck({
-              deliverablePresent: activeChanges.length > 0,
+              deliverablePresent: isExactImplementationDeliverable(
+                observation,
+                ctx.headAfter,
+              ),
               worktreeClean: true,
               gatesGreen: true,
-              deliverableDescription:
-                activeChanges.length > 0
-                  ? `OpenSpec change(s) already present at HEAD: ${activeChanges.join(", ")}`
-                  : undefined,
+              deliverableDescription: observation.description,
             }),
         });
       }
@@ -1839,7 +1840,10 @@ export async function runPlanningPhases(
 
       // ---- Build PR body and hand off to post-implementation steps ----
       const planExcerpt = revisedPlan.length > 2000 ? revisedPlan.slice(0, 2000) + "\n\n[…plan truncated]" : revisedPlan;
-      const prBody = hooks.buildPrBody(cfg, issueNumber, title, planExcerpt, primary, reviewer);
+      const prBody = bindArtifactBodyToLogicalOperation(
+        hooks.buildPrBody(cfg, issueNumber, title, planExcerpt, primary, reviewer),
+        opts.logicalOperationId,
+      );
 
       return resumeFromImplementing(cfg, issueNumber, wt, {
         prTitle: `[Pipeline] ${title} (#${issueNumber})`,
@@ -1849,6 +1853,7 @@ export async function runPlanningPhases(
         stateDir: opts.stateDir,
         runDir: opts.runDir,
         runStoreDeps: opts.runStoreDeps,
+        logicalOperationId: opts.logicalOperationId,
       }, deps);
     },
   });
@@ -2522,6 +2527,8 @@ export interface ResumeFromImplementingDeps {
   runTestGate?: typeof runTestGate;
   /** Exact-branch PR lookup — scoped to wt.branch so stale same-issue PRs are never reused. */
   getPrForBranch?: typeof getPrForBranch;
+  getPrDetail?: typeof getPrDetail;
+  updatePrBody?: typeof updatePrBody;
   createPr?: typeof createPr;
   /**
    * Integration side-effect certainty from every linked PR. When
@@ -2601,11 +2608,14 @@ export async function resumeFromImplementing(
     /** Run-store deps carrying `stdoutWrite` so events also stream to stdout under
      *  `--json-events` (#155). Undefined → events go to events.jsonl only. */
     runStoreDeps?: RunStoreDeps;
+    logicalOperationId?: string | null;
   },
   deps: ResumeFromImplementingDeps = {},
 ): Promise<Outcome> {
   const gateRunner = deps.runTestGate ?? runTestGate;
   const prLookup = deps.getPrForBranch ?? getPrForBranch;
+  const prDetail = deps.getPrDetail ?? getPrDetail;
+  const prBodyUpdater = deps.updatePrBody ?? updatePrBody;
   const prCreator = deps.createPr ?? createPr;
   const gitOp = deps.gitInWorktree ?? gitInWorktree;
   const blocker = deps.setBlocked ?? setBlocked;
@@ -2776,7 +2786,11 @@ export async function resumeFromImplementing(
     console.log(`[pipeline] #${issueNumber}: PR #${prNumber} already exists for branch ${branch} — reusing`);
   } else {
     try {
-      prNumber = await prCreator(cfg, { branch, title: opts.prTitle, body: opts.prBody });
+      prNumber = await prCreator(cfg, {
+        branch,
+        title: opts.prTitle,
+        body: bindArtifactBodyToLogicalOperation(opts.prBody, opts.logicalOperationId),
+      });
       prIsNew = true;
       console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
     } catch (err) {
@@ -2791,6 +2805,42 @@ export async function resumeFromImplementing(
         await blocker(cfg, issueNumber, `PR creation failed: ${e.message}`, "implementing", "pr-creation-failed");
         return blockedOutcome(e.message, "pr-creation-failed");
       }
+    }
+  }
+
+  if (!prIsNew && opts.logicalOperationId?.trim()) {
+    const expectedLogicalOperationId = opts.logicalOperationId.trim();
+    try {
+      let detail = await prDetail(cfg, prNumber);
+      const existingLogicalOperationId = logicalOperationIdFromArtifactBody(detail.body);
+      if (existingLogicalOperationId && existingLogicalOperationId !== expectedLogicalOperationId) {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: `Reused PR #${prNumber} is bound to conflicting logical operation ${existingLogicalOperationId}; RecoverySupervisor retains ownership`,
+        };
+      }
+      if (!existingLogicalOperationId) {
+        await prBodyUpdater(
+          cfg,
+          prNumber,
+          bindArtifactBodyToLogicalOperation(detail.body, expectedLogicalOperationId),
+        );
+        detail = await prDetail(cfg, prNumber);
+        if (logicalOperationIdFromArtifactBody(detail.body) !== expectedLogicalOperationId) {
+          return {
+            advanced: false,
+            status: "waiting",
+            reason: `Reused PR #${prNumber} logical-operation binding was not confirmed; RecoverySupervisor retains ownership`,
+          };
+        }
+      }
+    } catch (err) {
+      return {
+        advanced: false,
+        status: "waiting",
+        reason: `Could not bind reused PR #${prNumber} to logical operation ${expectedLogicalOperationId}: ${(err as Error).message}; RecoverySupervisor retains ownership`,
+      };
     }
   }
 
@@ -2865,10 +2915,11 @@ export interface DispatchResumeDeps {
   transition?: typeof transition;
   planningAdvance?: typeof advance;
   recoverInterruptedImplement?: typeof defaultRecoverInterruptedImplement;
+  gitInWorktree?: typeof gitInWorktree;
   probeImplementDeliverable?: (
     wtPath: string,
     issueNumber: number,
-  ) => Promise<{ present: boolean }>;
+  ) => Promise<ImplementDeliverableObservation>;
   ownershipDeps?: OwnershipDeps;
   setBlocked?: typeof setBlocked;
 }
@@ -2899,6 +2950,9 @@ export async function dispatchResume(
   const recoverInterrupted =
     deps.recoverInterruptedImplement ?? defaultRecoverInterruptedImplement;
   const blocker = deps.setBlocked ?? setBlocked;
+  const probeImplementDeliverable =
+    deps.probeImplementDeliverable ??
+    createDefaultImplementDeliverableProbe(cfg, deps.gitInWorktree ?? gitInWorktree);
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would resume from implementing: check gate + push + PR + review-1`);
@@ -2917,11 +2971,10 @@ export async function dispatchResume(
 
   const wt = await getWt(cfg, issueNumber);
   const pipelineRunIdEarly = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
+  let currentDeliverable: ImplementDeliverableObservation | null = null;
   if (wt) {
-    const probe = deps.probeImplementDeliverable;
-    const deliverablePresent = probe
-      ? (await probe(wt.path, issueNumber)).present
-      : false;
+    currentDeliverable = await probeImplementDeliverable(wt.path, issueNumber);
+    const deliverablePresent = isExactImplementationDeliverable(currentDeliverable);
     let recovered: Awaited<ReturnType<typeof recoverInterrupted>> = {
       action: "none",
       classified: { scratch: [], ownedLeftover: [], unknownProduct: [] },
@@ -2980,6 +3033,7 @@ export async function dispatchResume(
         runDir: opts.runDir,
         runStoreDeps: opts.runStoreDeps,
         resumeImplementing: true,
+        logicalOperationId: opts.logicalOperationId,
       });
     }
     if (recovered.action === "post-implement") {
@@ -3002,6 +3056,24 @@ export async function dispatchResume(
       stateDir: opts.stateDir,
       runDir: opts.runDir,
       runStoreDeps: opts.runStoreDeps,
+      logicalOperationId: opts.logicalOperationId,
+    });
+  }
+
+  if (!currentDeliverable || !isExactImplementationDeliverable(currentDeliverable)) {
+    console.log(
+      `[pipeline] #${issueNumber}: commits ahead are provenance only; exact implementation proof is absent ` +
+        `(role=${currentDeliverable?.role ?? "unknown"}) — resuming implementation`,
+    );
+    return planningAdvance(cfg, issueNumber, {
+      dryRun: opts.dryRun,
+      model: opts.model,
+      pipelineRunId: pipelineRunIdEarly,
+      stateDir: opts.stateDir,
+      runDir: opts.runDir,
+      runStoreDeps: opts.runStoreDeps,
+      resumeImplementing: true,
+      logicalOperationId: opts.logicalOperationId,
     });
   }
 
@@ -3024,7 +3096,7 @@ export async function dispatchResume(
 
   const resumeWt = { path: wt.path, branch: branchName(issueNumber, wt.slug) };
 
-  return doResume(cfg, issueNumber, resumeWt, {
+  const outcome = await doResume(cfg, issueNumber, resumeWt, {
     prTitle: `[Pipeline] ${title} (#${issueNumber})`,
     prBody,
     transitionMessage: (prNumber) =>
@@ -3033,7 +3105,22 @@ export async function dispatchResume(
     stateDir: opts.stateDir,
     runDir: opts.runDir,
     runStoreDeps: opts.runStoreDeps,
+    logicalOperationId: opts.logicalOperationId,
   });
+  if (
+    outcome.advanced &&
+    currentDeliverable &&
+    isExactImplementationDeliverable(currentDeliverable)
+  ) {
+    return attachProducerCompletionEvidence(outcome, {
+      candidateSha: currentDeliverable.candidate_sha,
+      candidateEpoch: currentDeliverable.candidate_epoch,
+      evidenceRole: "implementation",
+      artifactIdentity: currentDeliverable.artifact_id,
+      postconditionProven: true,
+    });
+  }
+  return outcome;
 }
 
 // ---------------------------------------------------------------------------

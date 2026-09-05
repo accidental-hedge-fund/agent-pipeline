@@ -21,6 +21,7 @@ import {
   advance,
   enforceOpenspecActiveChangeGuard,
   maybeArchiveOpenspec,
+  openSpecTaskReadiness,
   type AdvancePreMergeDeps,
 } from "../scripts/stages/pre_merge.ts";
 import {
@@ -39,6 +40,61 @@ const cfg = {
 
 const ISSUE = 467;
 const PR = 464;
+
+test("OpenSpec archive readiness permits an optional checklist and refuses unchecked task evidence", () => {
+  assert.deepEqual(openSpecTaskReadiness(null), {
+    complete: true,
+    incompleteCount: 0,
+    reason: null,
+  });
+  assert.deepEqual(openSpecTaskReadiness("- [x] done\n- [ ] still required\n  - [ ] nested"), {
+    complete: false,
+    incompleteCount: 2,
+    reason: "2 unchecked task(s) remain in tasks.md",
+  });
+  assert.deepEqual(openSpecTaskReadiness("- [x] implemented\n- [X] verified"), {
+    complete: true,
+    incompleteCount: 0,
+    reason: null,
+  });
+});
+
+test("maybeArchiveOpenspec refuses unchecked tasks before invoking archive", async (t) => {
+  let archiveCalls = 0;
+  const blocked: string[] = [];
+  const changeId = "incomplete-change";
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: (async (_p: string, args: string[]) => {
+      if (args[0] === "diff") {
+        return { stdout: `openspec/changes/${changeId}/tasks.md`, stderr: "", code: 0 };
+      }
+      if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    changeDirExists: () => true,
+    readChangeFile: () => "- [x] implemented\n- [ ] verification still required",
+    openspecArchive: (async () => {
+      archiveCalls += 1;
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    setBlocked: (async (_cfg, _n, reason) => { blocked.push(reason); }) as AdvancePreMergeDeps["setBlocked"],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    branchDeveloperCommits: async () => [],
+    trustedReviewAuthor: "test-actor",
+  };
+
+  let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, ISSUE, "run-incomplete", deps);
+  });
+  assert.equal((out as { status?: string })?.status, "blocked");
+  assert.equal(archiveCalls, 0);
+  assert.equal(blocked.length, 1);
+  assert.match(blocked[0]!, /1 unchecked task/);
+});
 
 async function quiet(t: TestContext, fn: () => Promise<void>): Promise<void> {
   t.mock.method(console, "log", () => {});
@@ -189,6 +245,7 @@ test("maybeArchiveOpenspec: openspec archive fails on a retitled MODIFIED header
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => true,
+    readChangeFile: () => "- [x] archive-ready",
     openspecArchive: (async () => ({
       success: false,
       unavailable: false,
@@ -567,6 +624,7 @@ test("advance(): override-resumed pre-merge (blocking delta-review key overridde
       }) as AdvancePreMergeDeps["gitInWorktree"];
     })(),
     changeDirExists: (_d, id) => activeDirs.has(id),
+    readChangeFile: () => "- [x] archive-ready",
     openspecArchive: (async (_w: string, id: string) => {
       archiveCalls.push(id);
       activeDirs.delete(id);
@@ -644,6 +702,7 @@ test("maybeArchiveOpenspec: records a gate_result event when archived", async (t
       }) as AdvancePreMergeDeps["gitInWorktree"];
     })(),
     changeDirExists: (_d, id) => activeDirs.has(id),
+    readChangeFile: () => "- [x] archive-ready",
     openspecArchive: (async (_w, id) => {
       activeDirs.delete(id);
       return { success: true, unavailable: false, output: "" };
@@ -679,6 +738,7 @@ test("maybeArchiveOpenspec: records a gate_result event when blocked (archive CL
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => true,
+    readChangeFile: () => "- [x] archive-ready",
     openspecArchive: (async () => ({ success: false, unavailable: false, output: "header not found" })) as AdvancePreMergeDeps["openspecArchive"],
     setBlocked: async () => {},
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],

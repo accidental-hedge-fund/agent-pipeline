@@ -2344,6 +2344,24 @@ export async function createPr(
   return Number.parseInt(match[1], 10);
 }
 
+/** Update a PR body through the typed, injectable GitHub API seam. */
+export async function updatePrBody(
+  cfg: PipelineConfig,
+  prNumber: number,
+  body: string,
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "updatePrBody" }),
+): Promise<void> {
+  const [owner, repo] = cfg.repo.split("/");
+  await run([
+    "api",
+    "--method",
+    "PATCH",
+    `repos/${owner}/${repo}/pulls/${prNumber}`,
+    "-f",
+    `body=${body}`,
+  ]);
+}
+
 /** Structured closing-issue reference returned by the GH API (includes repo). */
 export interface ClosingIssueRef {
   number: number;

@@ -39,6 +39,8 @@ export interface GrillTypedRequestRecord {
 
 export interface GrillIssueState {
   issue: number;
+  /** Stable admitted operation retained across publication retries/resume. */
+  logical_operation_id?: string;
   status: GrillIssueStatus;
   migrated: boolean;
   facts: string[];

@@ -21,6 +21,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
+if (process.env.PIPELINE_CANDIDATE_PROCESS_GUARD === "1") {
+  await import("./candidate-process-guard.mjs");
+}
+
 const here = dirname(fileURLToPath(import.meta.url)); // agent-pipeline/scripts/
 const scriptPath = fileURLToPath(import.meta.url);
 const coreDir = resolve(here, "..", "core");           // agent-pipeline/core/
@@ -238,6 +242,8 @@ if (!String(process.env.AGENT_PIPELINE_PRODUCTION_PIN ?? "").trim()) {
   }
 }
 
-const args = ["--experimental-strip-types", entry, ...rawArgs];
+const guard = join(here, "candidate-process-guard.mjs");
+const guardArgs = process.env.PIPELINE_CANDIDATE_PROCESS_GUARD === "1" ? ["--import", guard] : [];
+const args = [...guardArgs, "--experimental-strip-types", entry, ...rawArgs];
 const run = spawnSync(process.execPath, args, { stdio: "inherit" });
 process.exit(run.status ?? 1);

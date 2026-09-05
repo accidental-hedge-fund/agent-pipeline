@@ -19,6 +19,8 @@ import type { LoopContract, LoopLedger } from "./loop/types.ts";
 import { defaultLoopStoreDeps, runDir } from "./loop/store.ts";
 import {
   defaultResolveAndPrepareDeps,
+  hasCandidateProcessGuardEnv,
+  runCandidateEngineProcess,
   resolveAndPrepareCandidateEngine,
   type CandidateEngineResult,
 } from "./ship-end-candidate.ts";
@@ -44,10 +46,10 @@ function canonicalJson(value: unknown): string {
 function runCommand(
   cmd: string,
   args: string[],
-  opts: { cwd: string; timeoutMs?: number },
+  opts: { cwd: string; timeoutMs?: number; env?: NodeJS.ProcessEnv },
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: opts.cwd });
+    const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
@@ -98,6 +100,8 @@ export type LayerAProbeRunInput = {
   candidateGitSha: string;
   /** Resolved candidate-engine checkout for TAP cwd. */
   candidateEngineDir: string;
+  /** Child-side exact candidate/readiness/lease proof. */
+  candidateEnv: NodeJS.ProcessEnv;
 };
 
 export interface HybridV2FromRunDeps {
@@ -235,8 +239,13 @@ export async function defaultRunLayerAProbe(
   probe: { id: string; test_file: string; test_name: string },
   input: LayerAProbeRunInput,
 ): Promise<VerifiedFrgPackRun["probes"][number]> {
+  if (!hasCandidateProcessGuardEnv(input.candidateEnv)) {
+    throw new Error(`pipeline factory-gate: Layer A probe ${probe.id} missing child-side candidate process proof`);
+  }
   const pattern = `^${probe.test_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
   const args = [
+    "--import",
+    path.join(input.candidateEngineDir, "scripts", "candidate-process-guard.mjs"),
     "--test",
     "--experimental-strip-types",
     "--test-reporter=tap",
@@ -245,7 +254,10 @@ export async function defaultRunLayerAProbe(
     probe.test_file,
   ];
   const startedAt = new Date().toISOString();
-  const result = await runCommand(process.execPath, args, { cwd: input.candidateEngineDir });
+  const result = await runCommand(process.execPath, args, {
+    cwd: input.candidateEngineDir,
+    env: input.candidateEnv,
+  });
   const finishedAt = new Date().toISOString();
   const tapEscaped = probe.test_name.replaceAll("#", "\\#");
   const names = [...new Set([probe.test_name, tapEscaped])];
@@ -331,6 +343,7 @@ function defaultResolveCandidateEngineForCollect(opts: {
       repoDir: opts.repoDir,
       candidateSha: opts.candidateSha,
       candidateEngineRootEnv: process.env.PIPELINE_CANDIDATE_ENGINE_ROOT,
+      consumer: "factory-gate.hybrid-v2",
     },
     defaultResolveAndPrepareDeps(),
   );
@@ -385,7 +398,7 @@ export async function defaultCollectHybridV2FromRun(
   if (!engineResult.ok) {
     throw new Error(`pipeline factory-gate: hybrid-v2 collect ${engineResult.error}`);
   }
-  const candidateEngineDir = engineResult.engine.engineRoot;
+  let candidateEngine = engineResult.engine;
 
   let repository = "";
   try {
@@ -497,13 +510,21 @@ export async function defaultCollectHybridV2FromRun(
 
   const probes: VerifiedFrgPackRun["probes"] = [];
   for (const probe of pack.manifest.pilot_policy.layer_a_probes) {
-    probes.push(
-      await runProbe(probe, {
+    const started = await runCandidateEngineProcess({
+      consumer: "factory-gate.hybrid-v2",
+      engine: candidateEngine,
+      start: (checked, candidateEnv) => runProbe(probe, {
         repoDir: args.repoDir,
         candidateGitSha,
-        candidateEngineDir,
+        candidateEngineDir: checked.engineRoot,
+        candidateEnv: { ...process.env, ...candidateEnv },
       }),
-    );
+    });
+    if (!started.ok) {
+      throw new Error(`pipeline factory-gate: hybrid-v2 collect ${started.error}`);
+    }
+    candidateEngine = started.engine;
+    probes.push(started.value);
   }
 
   const events: Array<{ seq?: number; kind?: string; item_id?: string; data?: { item_id?: string } }> = [];

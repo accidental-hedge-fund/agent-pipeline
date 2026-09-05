@@ -22,6 +22,7 @@ import {
   reportOwnedOperation,
   treatmentForSideEffectCertainty,
   type ObservationLifecycleState,
+  type ArtifactEvidenceRole,
   type OperationObservation,
   type ReportOperationObservation,
   type SideEffectCertainty,
@@ -298,6 +299,30 @@ export function candidateEpochChanged(previous: string | null | undefined, next:
   return a !== b;
 }
 
+export const CANDIDATE_BOUND_EVIDENCE_CLASSES = [
+  "implementation",
+  "test",
+  "review",
+  "design",
+  "eval",
+  "shipcheck",
+  "decision",
+  "authority_request",
+  "authority_grant",
+  "completion",
+] as const;
+
+/** Every candidate-bound fact is invalid after movement; callers must re-prove it. */
+export function candidateBoundEvidenceAfterMovement(
+  previous: string | null | undefined,
+  next: string | null | undefined,
+): Record<(typeof CANDIDATE_BOUND_EVIDENCE_CLASSES)[number], boolean> {
+  const remainsValid = !candidateEpochChanged(previous, next) && Boolean(previous && next);
+  return Object.fromEntries(
+    CANDIDATE_BOUND_EVIDENCE_CLASSES.map((kind) => [kind, remainsValid]),
+  ) as Record<(typeof CANDIDATE_BOUND_EVIDENCE_CLASSES)[number], boolean>;
+}
+
 /** Candidate-bound evidence is valid only when it names the current epoch SHA. */
 export function isCandidateBoundEvidenceValid(
   evidenceSha: string | null | undefined,
@@ -466,10 +491,36 @@ export interface AdapterAttemptInput {
   issue?: number | null;
   run_id?: string | null;
   candidateSha?: string | null;
+  candidateEpoch?: string | null;
+  evidenceRole?: ArtifactEvidenceRole | string | null;
+  artifactIdentity?: string | null;
   exitCode?: number | null;
   postconditionProven?: boolean;
+  requireEvidenceBeforeAttempt?: boolean;
   outcome?: Outcome;
   error?: unknown;
+}
+
+export function requiredEvidenceRoleForStage(stage: DeliveryStage): ArtifactEvidenceRole {
+  return stage === "planning" || stage === "plan-review" || stage === "pre-code-attestation"
+    ? "planning"
+    : "implementation";
+}
+
+export function completingEvidenceBindingFailure(input: Pick<
+  AdapterAttemptInput,
+  "stage" | "candidateSha" | "candidateEpoch" | "evidenceRole" | "artifactIdentity"
+>): string | null {
+  const expectedRole = requiredEvidenceRoleForStage(input.stage);
+  if (input.evidenceRole !== expectedRole) {
+    return `required ${expectedRole} evidence role, observed ${input.evidenceRole ?? "missing"}`;
+  }
+  if (!input.artifactIdentity?.trim()) return "artifact identity is missing";
+  const candidate = input.candidateSha?.trim().toLowerCase() ?? "";
+  const epoch = input.candidateEpoch?.trim().toLowerCase() ?? "";
+  if (!candidate || !epoch) return "candidate and Candidate epoch bindings are required";
+  if (candidate !== epoch) return `prior or conflicting Candidate epoch ${epoch} for ${candidate}`;
+  return null;
 }
 
 function formIdForStage(stage: DeliveryStage): string {
@@ -492,7 +543,17 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
   }
   const outcome = input.outcome;
   const exitZero = input.exitCode === 0;
-  const proven = input.postconditionProven === true;
+  const bindingFailure = input.postconditionProven === true
+    ? completingEvidenceBindingFailure(input)
+    : null;
+  const proven = input.postconditionProven === true && bindingFailure === null;
+  const evidenceFields = {
+    ...(input.candidateEpoch?.trim() ? { candidate_epoch: input.candidateEpoch.trim().toLowerCase() } : {}),
+    ...(input.evidenceRole === "planning" || input.evidenceRole === "implementation"
+      ? { evidence_role: input.evidenceRole }
+      : {}),
+    ...(input.artifactIdentity?.trim() ? { artifact_identity: input.artifactIdentity.trim() } : {}),
+  };
   if (exitZero && !proven) {
     return {
       ...ownedAdmissionObservation({
@@ -504,6 +565,7 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
       certainty: "uncertain",
       complete: false,
       process_exit_is_completion: false,
+      ...evidenceFields,
     };
   }
   if (!outcome) {
@@ -512,6 +574,7 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
       form_id,
       message: input.message ?? "adapter attempt produced no outcome",
       ...identity,
+      ...evidenceFields,
       certainty: "uncertain",
     });
   }
@@ -522,6 +585,7 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
       operation: invariant.operation,
       form_id,
       ...identity,
+      ...evidenceFields,
       certainty,
       lifecycle: proven ? "complete" : "active",
       human_owned: false,
@@ -530,7 +594,9 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
       process_exit_is_completion: false,
       owned: true,
       fault: null,
-      message: input.message ?? outcome.summary,
+      message: input.message ?? (bindingFailure
+        ? `${outcome.summary}; completion evidence rejected: ${bindingFailure}`
+        : outcome.summary),
       capability_request: null,
     };
   }
@@ -554,6 +620,7 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
     operation: invariant.operation,
     form_id,
     ...identity,
+    ...evidenceFields,
     certainty: "uncertain",
     lifecycle,
     human_owned: false,
@@ -656,29 +723,181 @@ export interface RunDeliveryStageAdapterInput {
   logicalOperationId?: string | null;
   reportObservation?: ReportOperationObservation;
   candidateSha?: string | null;
+  candidateEpoch?: string | null;
+  evidenceRole?: ArtifactEvidenceRole | string | null;
+  artifactIdentity?: string | null;
   postconditionProven?: boolean;
+  /** This stage authors its required artifact; consumers must already prove it. */
+  evidenceProducerBeforeAttempt?: boolean;
+  observeEvidence?: (
+    phase: "before" | "after",
+    outcome?: Outcome,
+  ) => Promise<Pick<
+    AdapterAttemptInput,
+    "candidateSha" | "candidateEpoch" | "evidenceRole" | "artifactIdentity" | "postconditionProven"
+  >>;
+  /**
+   * Immutable Candidate/artifact binding emitted by the producing handler at
+   * its successful completion. The adapter re-observes after that boundary and
+   * accepts a producer-created Candidate epoch only while both observations agree.
+   */
+  producerCompletionEvidence?: () => DeliveryStageEvidence | null;
   attempt: () => Promise<Outcome>;
 }
 
+export type DeliveryStageEvidenceObserver = NonNullable<
+  RunDeliveryStageAdapterInput["observeEvidence"]
+>;
+
+export type DeliveryStageEvidence = Awaited<ReturnType<DeliveryStageEvidenceObserver>>;
+
+const producerCompletionEvidenceByOutcome = new WeakMap<object, DeliveryStageEvidence>();
+
+export function freezeDeliveryStageEvidence(evidence: DeliveryStageEvidence): DeliveryStageEvidence {
+  return Object.freeze({
+    candidateSha: evidence.candidateSha,
+    candidateEpoch: evidence.candidateEpoch,
+    evidenceRole: evidence.evidenceRole,
+    artifactIdentity: evidence.artifactIdentity,
+    postconditionProven: evidence.postconditionProven,
+  });
+}
+
+/** Bind the exact Candidate/artifact the producing handler established. */
+export function attachProducerCompletionEvidence(
+  outcome: Outcome,
+  evidence: DeliveryStageEvidence,
+): Outcome {
+  producerCompletionEvidenceByOutcome.set(outcome, freezeDeliveryStageEvidence(evidence));
+  return outcome;
+}
+
+export function readProducerCompletionEvidence(outcome: Outcome): DeliveryStageEvidence | null {
+  return producerCompletionEvidenceByOutcome.get(outcome) ?? null;
+}
+
+function sameEvidenceBinding(before: DeliveryStageEvidence, after: DeliveryStageEvidence): boolean {
+  return (
+    before.candidateSha === after.candidateSha &&
+    before.candidateEpoch === after.candidateEpoch &&
+    before.evidenceRole === after.evidenceRole &&
+    before.artifactIdentity === after.artifactIdentity
+  );
+}
+
 export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInput): Promise<Outcome> {
-  const base = {
+  let evidence = {
+    candidateSha: input.candidateSha,
+    candidateEpoch: input.candidateEpoch,
+    evidenceRole: input.evidenceRole,
+    artifactIdentity: input.artifactIdentity,
+    postconditionProven: input.postconditionProven,
+  };
+  let preAttemptEvidence: DeliveryStageEvidence | null = null;
+  const baseIdentity = {
     stage: input.stage,
     domain: input.cfg.domain ?? "unknown",
     logical_operation_id: input.logicalOperationId,
     repository: input.cfg.repo,
     issue: input.issueNumber,
     run_id: input.pipelineRunId ?? null,
-    candidateSha: input.candidateSha,
   };
   try {
+    if (input.requireEvidenceBeforeAttempt && !input.observeEvidence) {
+      const outcome: Outcome = {
+        advanced: false,
+        status: "waiting",
+        reason: "delivery-stage evidence observer is required before execution",
+      };
+      const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+        ...baseIdentity,
+        ...evidence,
+        outcome,
+        postconditionProven: false,
+      }));
+      consumeReportedOwned(obs);
+      return outcome;
+    }
+    if (input.observeEvidence) {
+      evidence = await input.observeEvidence("before");
+      preAttemptEvidence = evidence;
+      const bindingFailure = completingEvidenceBindingFailure({
+        stage: input.stage,
+        ...evidence,
+      });
+      if (bindingFailure && !input.evidenceProducerBeforeAttempt) {
+        const outcome: Outcome = {
+          advanced: false,
+          status: "waiting",
+          reason: `delivery-stage evidence binding refused before execution: ${bindingFailure}`,
+        };
+        const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+          ...baseIdentity,
+          ...evidence,
+          outcome,
+          postconditionProven: false,
+        }));
+        consumeReportedOwned(obs);
+        return outcome;
+      }
+      if (!input.evidenceProducerBeforeAttempt && evidence.postconditionProven !== true) {
+        const outcome: Outcome = {
+          advanced: false,
+          status: "waiting",
+          reason: "delivery-stage evidence refused before execution: required artifact postcondition is unproved",
+        };
+        const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+          ...baseIdentity,
+          ...evidence,
+          outcome,
+          postconditionProven: false,
+        }));
+        consumeReportedOwned(obs);
+        return outcome;
+      }
+    }
     const outcome = await input.attempt();
+    if (input.observeEvidence) {
+      evidence = await input.observeEvidence("after", outcome);
+      const producerCompletionEvidence = input.producerCompletionEvidence?.() ?? null;
+      const producerEstablishedEvidence = input.evidenceProducerBeforeAttempt &&
+        outcome.advanced &&
+        Boolean(input.logicalOperationId?.trim()) &&
+        preAttemptEvidence?.postconditionProven !== true &&
+        evidence.postconditionProven === true &&
+        completingEvidenceBindingFailure({ stage: input.stage, ...evidence }) === null &&
+        producerCompletionEvidence !== null &&
+        sameEvidenceBinding(producerCompletionEvidence, evidence);
+      if (preAttemptEvidence && !sameEvidenceBinding(preAttemptEvidence, evidence) && !producerEstablishedEvidence) {
+        const waiting: Outcome = {
+          advanced: false,
+          status: "waiting",
+          reason: "delivery-stage Candidate binding changed during execution; RecoverySupervisor retains ownership and must rerun the stage against the replacement candidate",
+        };
+        const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+          ...baseIdentity,
+          ...evidence,
+          outcome: waiting,
+          postconditionProven: false,
+        }));
+        consumeReportedOwned(obs);
+        return waiting;
+      }
+    }
     const obs = observationFromAdapterAttempt({
-      ...base,
+      ...baseIdentity,
+      ...evidence,
       outcome,
-      postconditionProven: input.postconditionProven,
     });
     const reported = reportOwnedOperation(input.reportObservation, obs);
     if (!reported.complete) consumeReportedOwned(reported);
+    if (outcome.advanced && !reported.complete) {
+      return {
+        advanced: false,
+        status: "waiting",
+        reason: `${reported.message}; RecoverySupervisor retains ownership until exact stage evidence is proved`,
+      };
+    }
     const decision = reconcileIssueStageObservation(reported, outcome);
     if (
       decision.treatment === "re-entry" &&
@@ -686,11 +905,52 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
       outcome.blockerKind === "head-drift" &&
       mayReplaySideEffect(reported.certainty)
     ) {
+      if (input.observeEvidence) {
+        evidence = await input.observeEvidence("before");
+        const bindingFailure = completingEvidenceBindingFailure({
+          stage: input.stage,
+          ...evidence,
+        });
+        if (bindingFailure) {
+          const waiting: Outcome = {
+            advanced: false,
+            status: "waiting",
+            reason: `delivery-stage evidence binding refused before replay: ${bindingFailure}`,
+          };
+          const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+            ...baseIdentity,
+            ...evidence,
+            outcome: waiting,
+            postconditionProven: false,
+          }));
+          consumeReportedOwned(obs);
+          return waiting;
+        }
+        preAttemptEvidence = evidence;
+      }
       const retry = await input.attempt();
+      if (input.observeEvidence) {
+        evidence = await input.observeEvidence("after", retry);
+        if (preAttemptEvidence && !sameEvidenceBinding(preAttemptEvidence, evidence)) {
+          const waiting: Outcome = {
+            advanced: false,
+            status: "waiting",
+            reason: "delivery-stage Candidate binding changed during replay; RecoverySupervisor retains ownership and must rerun the stage against the replacement candidate",
+          };
+          const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+            ...baseIdentity,
+            ...evidence,
+            outcome: waiting,
+            postconditionProven: false,
+          }));
+          consumeReportedOwned(obs);
+          return waiting;
+        }
+      }
       const retryObs = observationFromAdapterAttempt({
-        ...base,
+        ...baseIdentity,
+        ...evidence,
         outcome: retry,
-        postconditionProven: input.postconditionProven,
       });
       const reportedRetry = reportOwnedOperation(input.reportObservation, retryObs);
       if (!reportedRetry.complete) consumeReportedOwned(reportedRetry);

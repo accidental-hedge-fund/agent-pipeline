@@ -20,6 +20,7 @@ import {
   assertNoSuperviseAdvanceCommand,
   canStartFixReentry,
   candidateEpochChanged,
+  candidateBoundEvidenceAfterMovement,
   candidateEpochFromSha,
   collectForbiddenAdapterTreatments,
   collectForbiddenLifecycleRetries,
@@ -34,6 +35,7 @@ import {
   observationFromAdapterAttempt,
   reconcileIssueStageObservation,
   remainingFixTimeoutSec,
+  requiredEvidenceRoleForStage,
   runDeliveryStageAdapter,
   runOwnedFixAttempts,
   scanDeliveryStageAdapterContracts,
@@ -172,6 +174,249 @@ test("1.4 exit-0 with unproven postcondition is not known_complete", () => {
   assert.equal(obs.complete, false);
   assert.equal(obs.process_exit_is_completion, false);
   assert.equal(obs.owned, true);
+});
+
+test("1.4 advanced handler output without exact evidence returns owned waiting (#1454)", async () => {
+  const sink = memoryObservationSink();
+  const out = await runDeliveryStageAdapter({
+    stage: "implementing",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-unproved-advance",
+    reportObservation: sink.reportObservation,
+    attempt: async () => ({
+      advanced: true,
+      from: "implementing",
+      to: "design-gate",
+      summary: "handler claimed advancement",
+    }),
+  });
+  assert.equal(out.advanced, false);
+  if (!out.advanced) {
+    assert.equal(out.status, "waiting");
+    assert.match(out.reason, /RecoverySupervisor retains ownership/);
+  }
+  assert.equal(sink.observations[0]?.complete, false);
+  assert.equal(sink.observations[0]?.certainty, "uncertain");
+});
+
+test("1.4 protected dispatch does not invoke its handler before exact evidence is bound (#1454)", async () => {
+  let attempts = 0;
+  const out = await runDeliveryStageAdapter({
+    stage: "implementing",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-prebound-1454",
+    requireEvidenceBeforeAttempt: true,
+    attempt: async () => {
+      attempts++;
+      return {
+        advanced: true,
+        from: "implementing",
+        to: "design-gate",
+        summary: "must not mutate",
+      };
+    },
+  });
+  assert.equal(attempts, 0);
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /observer is required before execution/);
+});
+
+test("1.4 protected dispatch binds before mutation and re-observes completion (#1454)", async () => {
+  const order: string[] = [];
+  const sha = "a".repeat(40);
+  const out = await runDeliveryStageAdapter({
+    stage: "implementing",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-prebound-1454",
+    requireEvidenceBeforeAttempt: true,
+    observeEvidence: async (phase) => {
+      order.push(`observe:${phase}`);
+      return {
+        candidateSha: sha,
+        candidateEpoch: sha,
+        evidenceRole: "implementation",
+        artifactIdentity: `implementation:${sha}`,
+        postconditionProven: true,
+      };
+    },
+    attempt: async () => {
+      order.push("attempt");
+      return {
+        advanced: true,
+        from: "implementing",
+        to: "design-gate",
+        summary: "proved implementation",
+      };
+    },
+  });
+  assert.equal(out.advanced, true);
+  assert.deepEqual(order, ["observe:before", "attempt", "observe:after"]);
+});
+
+test("1.4 evidence-consuming stage cannot mutate before artifact proof (#1454)", async () => {
+  let attempts = 0;
+  const sha = "a".repeat(40);
+  const out = await runDeliveryStageAdapter({
+    stage: "ready-to-deploy",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-no-implementation-proof",
+    requireEvidenceBeforeAttempt: true,
+    observeEvidence: async () => ({
+      candidateSha: sha,
+      candidateEpoch: sha,
+      evidenceRole: null,
+      artifactIdentity: null,
+      postconditionProven: false,
+    }),
+    attempt: async () => {
+      attempts++;
+      return { advanced: false, status: "finalized", reason: "must not publish" };
+    },
+  });
+  assert.equal(attempts, 0);
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /evidence (binding )?refused before execution/);
+});
+
+test("1.4 evidence producer may establish the exact artifact during its attempt (#1454)", async () => {
+  let attempts = 0;
+  const sha = "a".repeat(40);
+  const out = await runDeliveryStageAdapter({
+    stage: "implementing",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-produce-implementation",
+    requireEvidenceBeforeAttempt: true,
+    evidenceProducerBeforeAttempt: true,
+    producerCompletionEvidence: () => ({
+      candidateSha: sha,
+      candidateEpoch: sha,
+      evidenceRole: "implementation",
+      artifactIdentity: `implementation:${sha}`,
+      postconditionProven: true,
+    }),
+    observeEvidence: async (phase) => phase === "before"
+      ? {
+          candidateSha: sha,
+          candidateEpoch: sha,
+          evidenceRole: null,
+          artifactIdentity: null,
+          postconditionProven: false,
+        }
+      : {
+          candidateSha: sha,
+          candidateEpoch: sha,
+          evidenceRole: "implementation",
+          artifactIdentity: `implementation:${sha}`,
+          postconditionProven: true,
+        },
+    attempt: async () => {
+      attempts++;
+      return {
+        advanced: true,
+        from: "implementing",
+        to: "design-gate",
+        summary: "implementation proof established",
+      };
+    },
+  });
+  assert.equal(attempts, 1);
+  assert.equal(out.advanced, true);
+});
+
+test("1.4 evidence producer cannot establish an artifact for a replacement Candidate (#1454)", async () => {
+  const beforeSha = "a".repeat(40);
+  const afterSha = "b".repeat(40);
+  const out = await runDeliveryStageAdapter({
+    stage: "implementing",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-producer-candidate-moved",
+    requireEvidenceBeforeAttempt: true,
+    evidenceProducerBeforeAttempt: true,
+    producerCompletionEvidence: () => ({
+      candidateSha: beforeSha,
+      candidateEpoch: beforeSha,
+      evidenceRole: "implementation",
+      artifactIdentity: `implementation:${beforeSha}`,
+      postconditionProven: true,
+    }),
+    observeEvidence: async (phase) => phase === "before"
+      ? {
+          candidateSha: beforeSha,
+          candidateEpoch: beforeSha,
+          evidenceRole: null,
+          artifactIdentity: null,
+          postconditionProven: false,
+        }
+      : {
+          candidateSha: afterSha,
+          candidateEpoch: afterSha,
+          evidenceRole: "implementation",
+          artifactIdentity: `implementation:${afterSha}`,
+          postconditionProven: true,
+        },
+    attempt: async () => ({
+      advanced: true,
+      from: "implementing",
+      to: "design-gate",
+      summary: "must not certify replacement Candidate",
+    }),
+  });
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /Candidate binding changed during execution/);
+});
+
+test("1.4 protected dispatch rejects completion when the Candidate binding changes during execution (#1454)", async () => {
+  const beforeSha = "a".repeat(40);
+  const afterSha = "b".repeat(40);
+  const before = {
+    candidateSha: beforeSha,
+    candidateEpoch: beforeSha,
+    evidenceRole: "implementation" as const,
+    artifactIdentity: `implementation:${beforeSha}`,
+    postconditionProven: true,
+  };
+  const changedBindings = [
+    { name: "candidate SHA", after: { ...before, candidateSha: afterSha } },
+    { name: "candidate epoch", after: { ...before, candidateEpoch: afterSha } },
+    { name: "evidence role", after: { ...before, evidenceRole: "planning" as const } },
+    { name: "artifact identity", after: { ...before, artifactIdentity: `implementation:${afterSha}` } },
+  ];
+
+  for (const changed of changedBindings) {
+    const sink = memoryObservationSink();
+    const out = await runDeliveryStageAdapter({
+      stage: "implementing",
+      cfg: cfg(),
+      issueNumber: 1454,
+      logicalOperationId: `lop-candidate-moved-${changed.name.replaceAll(" ", "-")}`,
+      requireEvidenceBeforeAttempt: true,
+      reportObservation: sink.reportObservation,
+      observeEvidence: async (phase) => phase === "before"
+        ? before
+        : { ...changed.after, postconditionProven: true },
+      attempt: async () => ({
+        advanced: true,
+        from: "implementing",
+        to: "design-gate",
+        summary: "must not certify the replacement Candidate",
+      }),
+    });
+
+    assert.equal(out.advanced, false, changed.name);
+    if (!out.advanced) {
+      assert.equal(out.status, "waiting", changed.name);
+      assert.match(out.reason, /Candidate binding changed during execution/, changed.name);
+    }
+    assert.equal(sink.observations.length, 1, changed.name);
+    assert.equal(sink.observations[0]?.complete, false, changed.name);
+    assert.equal(sink.observations[0]?.owned, true, changed.name);
+  }
 });
 
 test("2.1 fixture that retries after uncertain side effects or candidate movement fails", () => {
@@ -565,6 +810,48 @@ test("4.1 prior-epoch review verdict cannot authorize advancement at the new HEA
   assert.equal(candidateEpochChanged(prior.sha, next.sha), true);
   assert.equal(isCandidateBoundEvidenceValid(prior.sha, next.sha), false);
   assert.equal(isCandidateBoundEvidenceValid(next.sha, next.sha), true);
+  const invalidated = candidateBoundEvidenceAfterMovement(prior.sha, next.sha);
+  assert.ok(Object.values(invalidated).every((valid) => valid === false));
+});
+
+test("4.1 completing observations require the exact role, artifact, candidate, and epoch (#1454)", () => {
+  const sha = "a".repeat(40);
+  const complete = observationFromAdapterAttempt({
+    stage: "implementing",
+    domain: "test",
+    logical_operation_id: "lop-role-exact",
+    candidateSha: sha,
+    candidateEpoch: sha,
+    evidenceRole: "implementation",
+    artifactIdentity: "sha256:product-delta",
+    postconditionProven: true,
+    outcome: { advanced: true, from: "implementing", to: "design-gate", summary: "proved" },
+  });
+  assert.equal(complete.complete, true);
+  assert.equal(complete.evidence_role, "implementation");
+  assert.equal(complete.candidate_epoch, sha);
+
+  for (const fixture of [
+    {},
+    { evidenceRole: "unknown" },
+    { evidenceRole: "planning", artifactIdentity: "sha256:plan", candidateEpoch: sha },
+    { evidenceRole: "implementation", artifactIdentity: "sha256:impl", candidateEpoch: "b".repeat(40) },
+  ]) {
+    const rejected = observationFromAdapterAttempt({
+      stage: "implementing",
+      domain: "test",
+      logical_operation_id: "lop-role-rejected",
+      candidateSha: sha,
+      postconditionProven: true,
+      outcome: { advanced: true, from: "implementing", to: "design-gate", summary: "claimed" },
+      ...fixture,
+    });
+    assert.equal(rejected.complete, false);
+    assert.equal(rejected.certainty, "uncertain");
+    assert.match(rejected.message, /completion evidence rejected/);
+  }
+  assert.equal(requiredEvidenceRoleForStage("planning"), "planning");
+  assert.equal(requiredEvidenceRoleForStage("review-1"), "implementation");
 });
 
 test("4.2 stale authority hold is not preserved by a leftover blocked label", () => {

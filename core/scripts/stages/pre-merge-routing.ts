@@ -210,6 +210,8 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   changeDirExists?: typeof openspec.changeDirExists;
   /** Tip-tree listing of active change dirs (`openspec/changes/<id>/`, excl. archive). */
   listChangeDirs?: typeof openspec.listChangeDirs;
+  /** Read a file from an active change; injected for archive-readiness tests. */
+  readChangeFile?: typeof openspec.readChangeFile;
   /**
    * Tip-tree listing of active OpenSpec change ids on the reviewed PR head when
    * no on-disk worktree is available (#714 review 2). Production default uses the

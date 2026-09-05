@@ -23,12 +23,15 @@ import {
   reconstructedLocalState,
   recoveryRecipeCompletesOriginalMutation,
   repairShaMismatchIsHumanStop,
+  verifiedForwardTarget,
   type ReconcileObserveDeps,
 } from "../scripts/loop/reconcile.ts";
 import { isLoopNextAction, type LoopExternalIdentity } from "../scripts/loop/types.ts";
 import {
   archiveReplayDecision,
+  bindArtifactBodyToLogicalOperation,
   integrationSideEffectCertainty,
+  logicalOperationIdFromArtifactBody,
   mayReplaySideEffect,
   successorMutationsAllowed,
   treatmentForSideEffectCertainty,
@@ -39,6 +42,12 @@ import { pipelineStageFromLabels as trainPipelineStageFromLabels } from "../scri
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CORE_ROOT = join(__dirname, "..");
+
+test("implementation artifact bodies retain their admitted operation identity (#1454)", () => {
+  const body = bindArtifactBodyToLogicalOperation("Closes #1454", "lop-current-1454");
+  assert.equal(logicalOperationIdFromArtifactBody(body), "lop-current-1454");
+  assert.equal(bindArtifactBodyToLogicalOperation(body, "lop-other"), body);
+});
 
 function identity(overrides: Partial<LoopExternalIdentity> = {}): LoopExternalIdentity {
   return {
@@ -54,6 +63,10 @@ function identity(overrides: Partial<LoopExternalIdentity> = {}): LoopExternalId
     checks_conclusion: "success",
     pipeline_stage: "fix-2",
     observed_at: "2026-09-01T00:00:00.000Z",
+    integration_certainty: "known_complete",
+    artifact_role: "implementation",
+    artifact_identity: `pr:42:${"a".repeat(40)}`,
+    candidate_epoch: "a".repeat(40),
     ...overrides,
   };
 }
@@ -74,6 +87,14 @@ function fakeObserve(overrides: Partial<ReconcileObserveDeps> = {}): ReconcileOb
     },
     async getPrChecks() {
       return [];
+    },
+    async getPrArtifactBinding(pr, detail) {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${pr}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+      };
     },
     async getLocalHead() {
       return null;
@@ -186,12 +207,99 @@ test("3.4 hold-for-human still requires current typed-request evidence", () => {
 
 test("4.1 later open PR does not hide a prior merged-and-contained PR", () => {
   const certainty = integrationSideEffectCertainty([
-    { number: 10, state: "merged", merge_commit_sha: "c".repeat(40), contained: true },
-    { number: 99, state: "open", merge_commit_sha: null, contained: null },
-  ]);
+    {
+      number: 10,
+      state: "merged",
+      merge_commit_sha: "c".repeat(40),
+      contained: true,
+      artifact_role: "implementation",
+      artifact_identity: "pr:10:head",
+      candidate_sha: "a".repeat(40),
+      candidate_epoch: "a".repeat(40),
+      logical_operation_id: "lop-current",
+    },
+    {
+      number: 99,
+      state: "open",
+      merge_commit_sha: null,
+      contained: null,
+      candidate_sha: "a".repeat(40),
+      candidate_epoch: "a".repeat(40),
+      logical_operation_id: "lop-current",
+    },
+  ], { candidateSha: "a".repeat(40), logicalOperationId: "lop-current" });
   assert.equal(certainty, "known_complete");
   assert.equal(successorMutationsAllowed(certainty).openSuccessorPr, false);
   assert.equal(successorMutationsAllowed(certainty).rebaseContainedCommits, false);
+});
+
+test("4.1 merged completion must match the active operation and candidate (#1454)", () => {
+  const merged = {
+    number: 10,
+    state: "merged" as const,
+    contained: true,
+    artifact_role: "implementation" as const,
+    artifact_identity: "pr:10:head",
+    candidate_sha: "a".repeat(40),
+    candidate_epoch: "a".repeat(40),
+    logical_operation_id: "lop-old",
+  };
+  assert.equal(
+    integrationSideEffectCertainty([merged], {
+      candidateSha: "b".repeat(40),
+      logicalOperationId: "lop-current",
+    }),
+    "uncertain",
+  );
+  assert.equal(
+    integrationSideEffectCertainty([merged], {
+      candidateSha: "a".repeat(40),
+      logicalOperationId: "lop-current",
+    }),
+    "uncertain",
+  );
+});
+
+test("4.1 unrelated open implementation PR cannot advance the active operation (#1454)", async () => {
+  const sha = "a".repeat(40);
+  const deps = fakeObserve({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:ready-to-deploy"] };
+    },
+    async findPrForIssue() {
+      return 99;
+    },
+    async listLinkedPrs() {
+      return [99];
+    },
+    async getPrDetail() {
+      return {
+        number: 99,
+        state: "open",
+        head_ref: "pipeline/unrelated",
+        head_sha: sha,
+        merge_commit_sha: null,
+      };
+    },
+    async getPrArtifactBinding() {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:99:${sha}`,
+        candidateSha: sha,
+        candidateEpoch: sha,
+        logicalOperationId: "lop-unrelated",
+      };
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/unrelated", sha, rebase_in_progress: false, product_dirt: false };
+    },
+  });
+  const observed = await observeExternalIdentity(deps, "1369", {
+    logicalOperationId: "lop-current",
+  });
+  assert.equal(observed.logical_operation_id, "lop-unrelated");
+  assert.equal(observed.expected_logical_operation_id, "lop-current");
+  assert.equal(verifiedForwardTarget(observed), null);
 });
 
 test("4.1 truncated linked-PR scan is uncertain, never known_absent", () => {
@@ -209,7 +317,7 @@ test("4.1 truncated linked-PR scan is uncertain, never known_absent", () => {
       [{ number: 10, state: "merged", merge_commit_sha: "c".repeat(40), contained: true }],
       { truncated: true },
     ),
-    "known_complete",
+    "uncertain",
   );
 });
 
@@ -236,7 +344,7 @@ test("4.2/4.3 squash-merge while fix-2 is known_complete even if the issue is st
       return {
         state: "open",
         head_ref: "pipeline/1369-fix",
-        head_sha: "b".repeat(40),
+        head_sha: "a".repeat(40),
         merge_commit_sha: null,
       };
     },
@@ -251,6 +359,39 @@ test("4.2/4.3 squash-merge while fix-2 is known_complete even if the issue is st
   assert.equal(observed.pipeline_stage, "fix-2");
   assert.equal(observed.issue_open, true);
   assert.equal(successorMutationsAllowed(observed.integration_certainty!).openSuccessorPr, false);
+});
+
+test("4.2 merged candidate A cannot complete later active candidate B (#1454)", async () => {
+  const deps = fakeObserve({
+    async findPrForIssue() {
+      return 99;
+    },
+    async listLinkedPrs() {
+      return [10, 99];
+    },
+    async getPrDetail(pr) {
+      return pr === 10
+        ? {
+            state: "merged",
+            head_ref: "pipeline/1369-fix",
+            head_sha: "a".repeat(40),
+            merge_commit_sha: "c".repeat(40),
+          }
+        : {
+            state: "open",
+            head_ref: "pipeline/1369-fix",
+            head_sha: "b".repeat(40),
+            merge_commit_sha: null,
+          };
+    },
+    async baseBranchContainsSha() {
+      return true;
+    },
+  });
+  const observed = await observeExternalIdentity(deps, "1369");
+  assert.equal(observed.integration_certainty, "uncertain");
+  assert.equal(observed.pr_number, 99);
+  assert.equal(observed.head_sha, "b".repeat(40));
 });
 
 test("4.1 truncated listLinkedPrs does not declare integration absent", async () => {
@@ -289,7 +430,16 @@ test("4.1 failed linked-PR detail reads are uncertain, never known_absent", asyn
   );
   assert.equal(
     integrationSideEffectCertainty(
-      [{ number: 10, state: "merged", merge_commit_sha: "c".repeat(40), contained: true }],
+      [{
+        number: 10,
+        state: "merged",
+        merge_commit_sha: "c".repeat(40),
+        contained: true,
+        artifact_role: "implementation",
+        artifact_identity: "pr:10:head",
+        candidate_sha: "a".repeat(40),
+        candidate_epoch: "a".repeat(40),
+      }],
       { incompleteDetails: true },
     ),
     "known_complete",
@@ -409,8 +559,8 @@ test("6.1/6.2 #1369 dogfood fixture: squash-merge, contradictory labels, SHA dri
   });
   const observed = await observeExternalIdentity(deps, "1369");
   assert.equal(observed.pipeline_stage, "pre-merge");
-  assert.equal(observed.pr_state, "merged");
-  assert.equal(observed.integration_certainty, "known_complete");
+  assert.equal(observed.pr_state, "open");
+  assert.equal(observed.integration_certainty, "uncertain");
   assert.equal(observed.rebase_in_progress, true);
   assert.equal(observed.product_dirt, true);
 
@@ -492,7 +642,15 @@ test("6.4 contradictory labels, remote/local drift, stale evidence, remote mutat
   );
   assert.equal(
     integrationSideEffectCertainty([
-      { number: 10, state: "merged", contained: true },
+      {
+        number: 10,
+        state: "merged",
+        contained: true,
+        artifact_role: "implementation",
+        artifact_identity: "pr:10:head",
+        candidate_sha: "a".repeat(40),
+        candidate_epoch: "a".repeat(40),
+      },
       { number: 99, state: "open" },
     ]),
     "known_complete",

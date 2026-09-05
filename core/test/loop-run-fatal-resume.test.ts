@@ -18,6 +18,7 @@ import {
 } from "../scripts/loop/store.ts";
 import { reconcile, transitionItem, type ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import { DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.ts";
+import { admitLifecycleRecord } from "../scripts/recovery-lifecycle-ownership.ts";
 import {
   classifyOutstandingItem,
   classifyRunFatalResumeEligibility,
@@ -118,19 +119,25 @@ function fakeDeps(): { deps: LoopStoreDeps; files: Map<string, string> } {
 }
 
 function identity(overrides: Partial<LoopExternalIdentity> = {}): LoopExternalIdentity {
+  const headSha = overrides.head_sha ?? "abc123";
+  const prState = overrides.pr_state ?? null;
   return {
     issue_number: 1253,
     issue_open: true,
     ready_label_present: false,
     blocked_label_present: false,
     pr_number: null,
-    pr_state: null,
+    pr_state: prState,
     head_branch: "pipeline/1253-fix",
-    head_sha: "abc123",
+    head_sha: headSha,
     merge_commit_sha: null,
     checks_conclusion: "none",
     pipeline_stage: "ready",
     observed_at: "2026-08-27T16:00:00.000Z",
+    integration_certainty: prState === "merged" ? "known_complete" : "known_absent",
+    artifact_role: "implementation",
+    artifact_identity: `pr:${overrides.pr_number ?? "none"}:${headSha}`,
+    candidate_epoch: headSha,
     ...overrides,
   };
 }
@@ -209,6 +216,14 @@ function coordinatedFakes(outcomeFor: (itemId: string) => LoopExecutionResponse[
     },
     async getPrChecks() {
       return [{ bucket: "pass" }];
+    },
+    async getPrArtifactBinding(prNumber, detail) {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+      };
     },
     async getLocalHead() {
       return null;
@@ -676,7 +691,10 @@ test("resume of recovery_exhausted does not clear that stop or dispatch", async 
   await releaseLock(deps, RUN_ID, token);
 });
 
-function observeWithIdentities(byId: Record<string, LoopExternalIdentity>): ReconcileObserveDeps {
+function observeWithIdentities(
+  byId: Record<string, LoopExternalIdentity>,
+  logicalOperationId?: string,
+): ReconcileObserveDeps {
   const byPr = new Map<number, LoopExternalIdentity>();
   for (const row of Object.values(byId)) {
     if (row.pr_number != null) byPr.set(row.pr_number, row);
@@ -707,11 +725,23 @@ function observeWithIdentities(byId: Record<string, LoopExternalIdentity>): Reco
     async getPrChecks() {
       return [{ bucket: "pass" }];
     },
+    async getPrArtifactBinding(prNumber, detail) {
+      const row = byPr.get(prNumber);
+      return {
+        role: row?.artifact_role ?? "unknown",
+        artifactIdentity: row?.artifact_identity ?? null,
+        candidateSha: row?.head_sha ?? detail.head_sha,
+        candidateEpoch: row?.candidate_epoch ?? null,
+        logicalOperationId,
+      };
+    },
     async getLocalHead() {
       return null;
     },
-    async baseBranchContainsSha() {
-      return null;
+    async baseBranchContainsSha(sha) {
+      return [...byPr.values()].some(
+        (row) => row.merge_commit_sha === sha && row.integration_certainty === "known_complete",
+      );
     },
     async getLabelEvents() {
       return [];
@@ -790,7 +820,11 @@ test("resume of recovery_exhausted repair-forwards GitHub-ready blocked item (#1
 });
 
 test("resume of recovery_exhausted repair-forwards verified merged identity (#1297)", async () => {
-  const contract = testContract({ items: [{ id: "1290", depends_on: [], external_depends_on: [] }] });
+  const logicalOperationId = "lop-run-fatal-resume-1290";
+  const contract = testContract({
+    logical_operation_id: logicalOperationId,
+    items: [{ id: "1290", depends_on: [], external_depends_on: [] }],
+  });
   const stop: LoopStopRecord = {
     reason: "recovery_exhausted",
     time: ORIGINAL_STOP_TIME,
@@ -802,6 +836,10 @@ test("resume of recovery_exhausted repair-forwards verified merged identity (#12
     { "1290": { ...itemEntry("1290", "blocked"), blocked_theme: "implementation-ci" } },
     stop,
   );
+  ledger.lifecycle = admitLifecycleRecord({
+    logical_operation_id: logicalOperationId,
+    updated_at: ORIGINAL_STOP_TIME,
+  });
   const { deps } = await seedStoppedRun(contract, ledger);
   const observe = observeWithIdentities({
     "1290": identity({
@@ -810,7 +848,7 @@ test("resume of recovery_exhausted repair-forwards verified merged identity (#12
       pr_state: "merged",
       merge_commit_sha: "f".repeat(40),
     }),
-  });
+  }, logicalOperationId);
   const calls: LoopExecutionRequest[] = [];
   const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
     calls.push(request);

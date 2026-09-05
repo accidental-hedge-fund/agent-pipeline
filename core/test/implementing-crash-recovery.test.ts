@@ -168,6 +168,13 @@ test("implementing crash recovery: no live owner + commits ahead still resumes p
     isLivePlanningActive: () => false,
     getForIssue: async () => ({ path: "/fake/wt", branch: "pipeline/382-fake-slug" }),
     hasCommitsAhead: async () => true,
+    probeImplementDeliverable: async () => ({
+      present: true,
+      role: "implementation",
+      artifact_id: "sha256:implementation",
+      candidate_sha: "a".repeat(40),
+      candidate_epoch: "a".repeat(40),
+    }),
     getIssueDetail: async () => ({ title: "Fix the bug", body: "" } as any),
     resumeFromImplementing: async () => {
       resumeCalled = true;
@@ -182,6 +189,46 @@ test("implementing crash recovery: no live owner + commits ahead still resumes p
   assert.ok(resumeCalled, "resumeFromImplementing should run for the commits-ahead case");
   assert.equal(transitionCalls.length, 0, "the recovery rollback must NOT run when commits exist");
   assert.equal(planningCalled, 0, "the recovery restart must NOT run when commits exist");
+});
+
+test("implementing crash recovery: a planning-only candidate remains owned and invokes implementation (#1454)", async () => {
+  const cfg = makeCfg();
+  let resumeCalled = 0;
+  let implementingCalls = 0;
+  const planningSha = "b".repeat(40);
+  const out = await dispatchResume(cfg, ISSUE, { pipelineRunId: "run-planning-only" }, {
+    isLivePlanningActive: () => false,
+    getForIssue: async () => ({ path: "/fake/wt", branch: "pipeline/382-fake-slug" }),
+    hasCommitsAhead: async () => true,
+    probeImplementDeliverable: async () => ({
+      present: true,
+      role: "planning",
+      artifact_id: "sha256:planning",
+      candidate_sha: planningSha,
+      candidate_epoch: planningSha,
+      description: "planning-only OpenSpec artifact",
+    }),
+    recoverInterruptedImplement: async () => ({
+      action: "none",
+      classified: { scratch: [], ownedLeftover: [], unknownProduct: [] },
+      checkpointed: false,
+      record: null,
+    }),
+    resumeFromImplementing: async () => {
+      resumeCalled += 1;
+      return { advanced: true, from: "implementing", to: "design-gate", summary: "wrong" };
+    },
+    planningAdvance: async (_c, _n, opts) => {
+      implementingCalls += 1;
+      assert.equal(opts.resumeImplementing, true);
+      return { advanced: false, status: "waiting", reason: "implementation scheduled" };
+    },
+  });
+
+  assert.equal(resumeCalled, 0);
+  assert.equal(implementingCalls, 1);
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.equal(out.status, "waiting");
 });
 
 // ---------------------------------------------------------------------------

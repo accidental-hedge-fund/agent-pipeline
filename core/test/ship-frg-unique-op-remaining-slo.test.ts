@@ -104,6 +104,7 @@ test("runSingleIssueCommand persists a single admission on public pipeline singl
   process.exitCode = 0;
   console.error = () => {};
   const persisted: Array<{ kind: string; issue?: number; repoDir: string }> = [];
+  let childLogicalOperationId: string | undefined;
   try {
     const result = await runSingleIssueCommand(
       "42",
@@ -119,9 +120,16 @@ test("runSingleIssueCommand persists a single admission on public pipeline singl
         resolveIssueNumber: async (_c, n) => n,
         persistPublicAdmission: async (opts) => {
           persisted.push({ kind: opts.kind, issue: opts.issue, repoDir: opts.repoDir });
-          return { runId: "single-test", runDir: "/tmp/repo/.agent-pipeline/runs/single-test" };
+          return {
+            acknowledged: true,
+            runId: "single-test",
+            runDir: "/tmp/repo/.agent-pipeline/runs/single-test",
+            logicalOperationId: "lop-single-test",
+          } as never;
         },
-        runLoopEngine: async () => ({
+        runLoopEngine: async (input) => {
+          childLogicalOperationId = input.logicalOperationId;
+          return ({
           kind: "drive",
           result: {
             runId: "loop-child-of-single",
@@ -136,7 +144,8 @@ test("runSingleIssueCommand persists a single admission on public pipeline singl
             exclusionReason: null,
             completion: "complete",
           },
-        }),
+          });
+        },
         writeStdoutLine: () => {},
       },
       { persistPublicAdmission: true, emitMachineOutput: false },
@@ -144,6 +153,74 @@ test("runSingleIssueCommand persists a single admission on public pipeline singl
     assert.equal(result.exitCode, 0);
     assert.equal(result.runId, "loop-child-of-single");
     assert.deepEqual(persisted, [{ kind: "single", issue: 42, repoDir: "/tmp/repo" }]);
+    assert.equal(childLogicalOperationId, "lop-single-test");
+  } finally {
+    process.exitCode = original;
+    console.error = originalError;
+  }
+});
+
+test("runSingleIssueCommand refuses drive and retains owned evidence after admission failure", async () => {
+  const original = process.exitCode;
+  const originalError = console.error;
+  process.exitCode = 0;
+  console.error = () => {};
+  let drives = 0;
+  const observations: unknown[] = [];
+  try {
+    const result = await runSingleIssueCommand(
+      "42",
+      { profile: "codex" },
+      {
+        resolveConfig: () => ({
+          repo_dir: "/candidate",
+          repo: "o/r",
+          base_branch: "main",
+          domain: "github.com/o/r",
+        }) as never,
+        resolveIssueNumber: async (_c, n) => n,
+        persistPublicAdmission: async () => ({
+          acknowledged: false,
+          kind: "single",
+          runId: "single-refused",
+          logicalOperationId: "lop-refused",
+          repository: "o/r",
+          domain: "github.com/o/r",
+          issue: 42,
+          startedAt: "2026-09-05T00:00:00Z",
+          approvedRoot: null,
+          runDir: null,
+          binding: {},
+          failure: {
+            kind: "approved_root_unavailable",
+            step: "resolve_approved_root",
+            diagnostic: "no approved root",
+          },
+        }) as never,
+        reportObservation: (observation) => observations.push(observation),
+        runLoopEngine: async () => {
+          drives += 1;
+          throw new Error("drive must not run");
+        },
+        writeStdoutLine: () => {},
+      },
+      { persistPublicAdmission: true, emitMachineOutput: false },
+    );
+    assert.equal(result.exitCode, 1);
+    assert.equal(drives, 0);
+    assert.equal(observations.length, 1);
+    const observation = observations[0] as {
+      logical_operation_id: string;
+      run_id: string;
+      certainty: string;
+      owned: boolean;
+      human_owned: boolean;
+    };
+    assert.equal(observation.logical_operation_id, "lop-refused");
+    assert.equal(observation.run_id, "single-refused");
+    assert.equal(observation.certainty, "known_absent");
+    assert.equal(observation.owned, true);
+    assert.equal(observation.human_owned, false);
   } finally {
     process.exitCode = original;
     console.error = originalError;
@@ -171,7 +248,7 @@ test("runSingleIssueCommand does not persist single for nested/numeric callers (
         resolveIssueNumber: async (_c, n) => n,
         persistPublicAdmission: async () => {
           persistCalls += 1;
-          return { runId: "single-x", runDir: "/x" };
+          return { acknowledged: true, runId: "single-x", runDir: "/x", logicalOperationId: "lop-single-x" } as never;
         },
         runLoopEngine: async () => ({
           kind: "drive",
@@ -202,47 +279,18 @@ test("runSingleIssueCommand does not persist single for nested/numeric callers (
 
 test("persistPublicEntrypointAdmission plus mapping observes all three public commands (#1440)", async () => {
   const files = new Map<string, string>();
-  const deps = {
-    async readFile(p: string) {
-      const v = files.get(p);
-      if (v === undefined) {
-        const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
-        err.code = "ENOENT";
-        throw err;
-      }
-      return v;
-    },
-    async writeFile(p: string, data: string) {
-      files.set(p, data);
-    },
-    async appendFile(p: string, data: string) {
-      files.set(p, (files.get(p) ?? "") + data);
-    },
-    async rename() {},
-    async mkdir() {},
-    async readdir() {
-      return [];
-    },
-    async stat(p: string) {
-      if (!files.has(p)) {
-        const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
-        err.code = "ENOENT";
-        throw err;
-      }
-      return { mtime: new Date(0) };
-    },
-  };
+  const deps = persistMemDeps(files);
   const startedAt = new Date("2026-09-04T21:00:15.000Z");
   await persistPublicEntrypointAdmission(
-    { repoDir: "/repo", kind: "single", repo: "o/r", issue: 42, startedAt, factoryControlRoot: "/repo" },
+    { repoDir: "/repo", kind: "single", route: "single.direct", repo: "o/r", issue: 42, startedAt, factoryControlRoot: "/repo" },
     deps,
   );
   await persistPublicEntrypointAdmission(
-    { repoDir: "/repo", kind: "merge", repo: "o/r", startedAt, factoryControlRoot: "/repo" },
+    { repoDir: "/repo", kind: "merge", route: "merge.direct", repo: "o/r", startedAt, factoryControlRoot: "/repo" },
     deps,
   );
   await persistPublicEntrypointAdmission(
-    { repoDir: "/repo", kind: "merge-queue", repo: "o/r", startedAt, factoryControlRoot: "/repo" },
+    { repoDir: "/repo", kind: "merge-queue", route: "merge-queue.apply", repo: "o/r", startedAt, factoryControlRoot: "/repo" },
     deps,
   );
   const kinds = [...files.keys()]
@@ -268,8 +316,29 @@ function persistMemDeps(files: Map<string, string>) {
     async appendFile(p: string, data: string) {
       files.set(p, (files.get(p) ?? "") + data);
     },
-    async rename() {},
+    async rename(from: string, to: string) {
+      const value = files.get(from);
+      if (value === undefined) throw new Error(`ENOENT: ${from}`);
+      files.set(to, value);
+      files.delete(from);
+    },
+    async link(from: string, to: string) {
+      const value = files.get(from);
+      if (value === undefined) throw new Error(`ENOENT: ${from}`);
+      if (files.has(to)) {
+        const err = new Error(`EEXIST: ${to}`) as NodeJS.ErrnoException;
+        err.code = "EEXIST";
+        throw err;
+      }
+      files.set(to, value);
+    },
+    async unlink(p: string) {
+      files.delete(p);
+    },
     async mkdir() {},
+    async fsyncFile() {},
+    async fsyncDirectory() {},
+    async realpath(p: string) { return p; },
     async readdir() {
       return [];
     },
@@ -289,10 +358,11 @@ test("persist into factory-control generic store is observed by in-flight ship s
   const startedAt = new Date("2026-09-04T23:26:39.000Z");
   const persistDeps = persistMemDeps(files);
   for (const kind of ["single", "merge", "merge-queue"] as const) {
-    const { runDir } = await persistPublicEntrypointAdmission(
+    const admission = await persistPublicEntrypointAdmission(
       {
         repoDir: "/candidate-worktree",
         kind,
+        route: kind === "single" ? "single.direct" : kind === "merge" ? "merge.direct" : "merge-queue.apply",
         repo: "o/r",
         issue: kind === "single" ? 42 : undefined,
         startedAt,
@@ -300,8 +370,9 @@ test("persist into factory-control generic store is observed by in-flight ship s
       },
       persistDeps,
     );
-    assert.ok(runDir.startsWith("/control-repo/.agent-pipeline/runs/"));
-    assert.equal(runDir.includes("/candidate-worktree/"), false);
+    assert.equal(admission.acknowledged, true);
+    assert.ok(admission.runDir?.startsWith("/control-repo/.agent-pipeline/runs/"));
+    assert.equal(admission.runDir?.includes("/candidate-worktree/"), false);
   }
   writeUnboundPrefixRun(files, GENERIC, "train-host");
   writeUnboundPrefixRun(files, GENERIC, "loop-host");
@@ -329,10 +400,11 @@ test("candidate-worktree-only persist is not unique-operation coverage (#1446)",
   const startedAt = new Date("2026-09-04T23:26:39.000Z");
   const persistDeps = persistMemDeps(files);
   for (const kind of ["single", "merge", "merge-queue"] as const) {
-    const { runDir } = await persistPublicEntrypointAdmission(
+    const admission = await persistPublicEntrypointAdmission(
       {
         repoDir: "/candidate-worktree",
         kind,
+        route: kind === "single" ? "single.direct" : kind === "merge" ? "merge.direct" : "merge-queue.apply",
         repo: "o/r",
         issue: kind === "single" ? 42 : undefined,
         startedAt,
@@ -340,8 +412,15 @@ test("candidate-worktree-only persist is not unique-operation coverage (#1446)",
       },
       persistDeps,
     );
-    assert.ok(runDir.startsWith("/candidate-worktree/.agent-pipeline/runs/"));
+    assert.equal(admission.acknowledged, false);
+    if (!admission.acknowledged) {
+      assert.equal(admission.failure.kind, "approved_root_unavailable");
+      assert.equal(admission.runDir, null);
+    }
   }
+  assert.equal(files.size, 3, "root refusal retains only the three durable pre-admission claims");
+  assert.ok([...files.keys()].every((p) => p.includes("/public-admission-claims/") && p.endsWith(".json")));
+  assert.equal([...files.keys()].some((p) => p.endsWith("/run.json") || p.endsWith("/events.jsonl")), false);
   writeUnboundPrefixRun(files, GENERIC, "train-host");
   writeUnboundPrefixRun(files, GENERIC, "1446-2026-09-04T23-26-39-000Z");
   const result = await runFactoryGate(

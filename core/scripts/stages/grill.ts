@@ -93,6 +93,10 @@ import type { TreatmentFingerprint } from "../harness-adapters/treatment-fingerp
 import { listHandoffs, type HandoffStoreDeps } from "../human-question-handoff.ts";
 import { buildGrillAdmissionPrompt } from "../prompts/index.ts";
 import { runTriage, type TriageDeps } from "./triage.ts";
+import {
+  IssueBodyPublicationError,
+  publishIssueBodyOrThrow,
+} from "../issue-body-publisher.ts";
 
 export const GRILL_WITH_DOCS_MARKER_RE = /<!--\s*grill-with-docs:v1\.40\.1\s*-->/;
 
@@ -526,6 +530,7 @@ export async function grillOneIssue(
   opts: { dryRun: boolean; state: GrillIssueState },
 ): Promise<GrillIssueState> {
   const state = opts.state;
+  delete state.error;
   const live = await deps.getIssue(issueNumber);
   if (!live || live.state === "closed") {
     return {
@@ -867,8 +872,15 @@ export async function runGrill(input: GrillCliInput, deps: GrillDeps): Promise<n
       completed.add(id);
       continue;
     }
+    const admitted = prior.logical_operation_id
+      ? prior
+      : { ...prior, logical_operation_id: mintLogicalOperationId() };
+    if (!prior.logical_operation_id && !dryRun) {
+      ledger.issues[String(id)] = admitted;
+      await saveGrillLedger(deps.store, ledger);
+    }
     try {
-      const next = await grillOneIssue(id, deps, { dryRun, state: { ...prior } });
+      const next = await grillOneIssue(id, deps, { dryRun, state: { ...admitted } });
       ledger.issues[String(id)] = next;
       if (next.status === "failed") {
         completed.add(id);
@@ -876,20 +888,26 @@ export async function runGrill(input: GrillCliInput, deps: GrillDeps): Promise<n
         completed.add(id);
       }
     } catch (err) {
+      const publicationFailure = err instanceof IssueBodyPublicationError;
       ledger.issues[String(id)] = {
-        ...prior,
-        status: "failed",
+        ...admitted,
+        status: publicationFailure ? "waiting" : "failed",
         error: (err as Error).message,
-        evidence: [...prior.evidence, "isolated failure"],
+        evidence: [
+          ...admitted.evidence,
+          publicationFailure
+            ? `publication ${err.kind}; retained for RecoverySupervisor retry`
+            : "isolated failure",
+        ],
       };
       if (!dryRun) {
         reportMechanicalFault(deps.reportObservation, {
           operation: "grill_admit",
           form_id: "grill",
           message: (err as Error).message,
-          fault: "mechanical",
+          fault: publicationFailure ? `issue_body_publication.${err.kind}` : "mechanical",
           domain: deps.domain,
-          logical_operation_id: mintLogicalOperationId(),
+          logical_operation_id: admitted.logical_operation_id,
           repository: deps.repo,
           issue: id,
           run_id: ledger.run_id,
@@ -1077,14 +1095,7 @@ export function realGrillDeps(cfg: PipelineConfig): GrillDeps {
       return parseMilestoneIssuesPages(parseSlurpPages<MilestoneIssueApiRaw>(out)).map((i) => i.number);
     },
     updateIssueBody: async (n, body) => {
-      const result = spawnSync(
-        "gh",
-        ["issue", "edit", String(n), "-R", cfg.repo, "--body", body],
-        { encoding: "utf8", stdio: "pipe", cwd: cfg.repo_dir, env: ghChildEnv() },
-      );
-      if (result.status !== 0) {
-        throw new Error(result.stderr?.trim() || `gh issue edit failed (${result.status})`);
-      }
+      publishIssueBodyOrThrow({ repo: cfg.repo, repoDir: cfg.repo_dir, issueNumber: n, body });
     },
     getIssueLabels: async (n) => {
       const result = await getIssueStateAndLabels(cfg, n);

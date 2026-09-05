@@ -99,6 +99,8 @@ export interface StageAttemptRecord {
   last_error?: string;
   invariant?: string;
   candidate_epoch?: string;
+  evidence_role?: "planning" | "implementation";
+  artifact_identity?: string;
   evidence_identity?: string;
   attempts_per_strategy?: Record<string, number>;
   strategy_cursor?: number;
@@ -626,6 +628,8 @@ export interface ClaimStageAttemptInput {
   nextAttemptAt?: string;
   invariant?: string;
   candidateEpoch?: string;
+  evidenceRole?: "planning" | "implementation";
+  artifactIdentity?: string;
   evidenceIdentity?: string;
   attemptsPerStrategy?: Record<string, number>;
   strategyCursor?: number;
@@ -699,6 +703,8 @@ export function claimStageAttempt(
       : {}),
     ...(input.invariant ? { invariant: input.invariant } : {}),
     ...(input.candidateEpoch ? { candidate_epoch: input.candidateEpoch } : {}),
+    ...(input.evidenceRole ? { evidence_role: input.evidenceRole } : {}),
+    ...(input.artifactIdentity ? { artifact_identity: input.artifactIdentity } : {}),
     ...(input.evidenceIdentity ? { evidence_identity: input.evidenceIdentity } : {}),
     ...(input.attemptsPerStrategy ? { attempts_per_strategy: input.attemptsPerStrategy } : {}),
     ...(input.strategyCursor !== undefined ? { strategy_cursor: input.strategyCursor } : {}),

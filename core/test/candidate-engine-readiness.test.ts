@@ -3,6 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,12 +18,20 @@ import {
   type PrepareCandidateEngineDeps,
 } from "../scripts/candidate-engine-readiness.ts";
 import {
-  resolveAndPrepareCandidateEngine,
+  CANDIDATE_PROCESS_GUARD_REL,
+  CANDIDATE_ENGINE_CONSUMERS,
+  assertCandidateEngineConsumerInventoryComplete,
+  candidateEngineConsumerInventoryGaps,
+  candidateEngineRuntimeBindingGaps,
+  runCandidateEngineProcess,
+  revalidateCandidateEngineBeforeSpawn,
+  resolveAndPrepareCandidateEngine as sharedResolveAndPrepareCandidateEngine,
   resolveCandidateEngine,
   type ResolveAndPrepareCandidateEngineDeps,
   type ResolveCandidateEngineDeps,
 } from "../scripts/ship-end-candidate.ts";
 import { BLOCKER_KINDS } from "../scripts/types.ts";
+import { verifyCandidateProcessGuard } from "../../scripts/candidate-process-guard.mjs";
 
 const SHA = "b".repeat(40);
 const OTHER = "d".repeat(40);
@@ -31,8 +40,161 @@ const LOCKFILE_V2 = Buffer.from('{"lockfileVersion":1,"v":"two"}');
 const DIGEST_V1 = "d1-lock";
 const DIGEST_V2 = "d2-lock";
 
+function fakeProcessLease() {
+  return {
+    proof: {
+      engineRoot: "/candidate",
+      commitSha: SHA,
+      readyRecordPath: "/state/ready.json",
+      lockfileDigest: DIGEST_V1,
+      processLockPath: "/state/process.lock",
+      processLockDigest: "f".repeat(64),
+    },
+    release() {},
+  };
+}
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
+
+function resolveAndPrepareCandidateEngine(
+  opts: Omit<Parameters<typeof sharedResolveAndPrepareCandidateEngine>[0], "consumer">,
+  deps: ResolveAndPrepareCandidateEngineDeps,
+) {
+  return sharedResolveAndPrepareCandidateEngine(
+    { ...opts, consumer: "ship.stage-adapter" },
+    deps,
+  );
+}
+
+function readTypeScriptSources(root: string, relative = ""): Record<string, string> {
+  const sources: Record<string, string> = {};
+  for (const entry of fs.readdirSync(path.join(root, relative), { withFileTypes: true })) {
+    const child = path.join(relative, entry.name);
+    if (entry.isDirectory()) {
+      Object.assign(sources, readTypeScriptSources(root, child));
+    } else if (entry.isFile() && entry.name.endsWith(".ts")) {
+      sources[child] = fs.readFileSync(path.join(root, child), "utf8");
+    }
+  }
+  return sources;
+}
+
+test("candidate-engine consumer inventory is exact and hard-gated (#1454)", () => {
+  assert.doesNotThrow(() => assertCandidateEngineConsumerInventoryComplete());
+  assert.deepEqual(candidateEngineConsumerInventoryGaps(), []);
+  assert.throws(
+    () => assertCandidateEngineConsumerInventoryComplete(
+      CANDIDATE_ENGINE_CONSUMERS.filter((row) => row.consumer !== "factory-release.pack-loop.start"),
+    ),
+    /missing consumer factory-release\.pack-loop\.start/,
+  );
+  const bypass = CANDIDATE_ENGINE_CONSUMERS.map((row) =>
+    row.consumer === "ship.stage-adapter" ? { ...row, child_side_guard: false } : row,
+  ) as never;
+  assert.throws(
+    () => assertCandidateEngineConsumerInventoryComplete(bypass),
+    /ship\.stage-adapter missing child_side_guard/,
+  );
+});
+
+test("candidate-engine hard gate discovers and exercises every production process start (#1454)", async () => {
+  const sources = readTypeScriptSources(path.join(repoRoot, "core", "scripts"));
+  assert.deepEqual(candidateEngineRuntimeBindingGaps(sources), []);
+
+  const bypass = {
+    ...sources,
+    "new-consumer.ts": `async function bypass(engine) {
+      await resolveAndPrepareCandidateEngine(engine);
+      await revalidateCandidateEngineBeforeSpawn(engine);
+      spawn(engine.launcherPath);
+    }`,
+  };
+  assert.deepEqual(
+    candidateEngineRuntimeBindingGaps(bypass).filter((gap) => gap.includes("new-consumer.ts")),
+    [
+      "raw parent-only candidate revalidation in new-consumer.ts",
+      "raw candidate process start in new-consumer.ts",
+    ],
+  );
+
+  const hiddenAlongsideAValidConsumer = {
+    ...sources,
+    "stages/ship-adapter.ts": `${sources["stages/ship-adapter.ts"]}\nspawn(candidate.engine.launcherPath);`,
+  };
+  assert.ok(
+    candidateEngineRuntimeBindingGaps(hiddenAlongsideAValidConsumer)
+      .includes("raw candidate process start in stages/ship-adapter.ts"),
+    "a raw new spawn in a file that already has a valid consumer must still fail the hard gate",
+  );
+
+  const aliasedSpawn = {
+    ...sources,
+    "aliased-consumer.ts": `const start = spawn;\nstart(engine.launcherPath, args);`,
+  };
+  assert.ok(
+    candidateEngineRuntimeBindingGaps(aliasedSpawn)
+      .includes("raw candidate process start in aliased-consumer.ts"),
+    "an aliased spawn of the candidate launcher must fail the hard gate",
+  );
+
+  const renamedImport = {
+    ...sources,
+    "aliased-import.ts": `import { spawn as start } from "node:child_process";\nstart(engine.launcherPath);`,
+  };
+  assert.ok(
+    candidateEngineRuntimeBindingGaps(renamedImport)
+      .includes("raw candidate process start in aliased-import.ts"),
+    "a renamed spawn import of the candidate launcher must fail the hard gate",
+  );
+
+  for (const row of CANDIDATE_ENGINE_CONSUMERS) {
+    let starts = 0;
+    const engine = {
+      engineRoot: "/candidate",
+      launcherPath: "/candidate/scripts/pipeline-launcher.mjs",
+      commitSha: SHA,
+      consumer: row.consumer,
+      acquireProcessLock: fakeProcessLease,
+      revalidateBeforeSpawn: () => ({ ok: true as const, engine: {
+        engineRoot: "/candidate",
+        launcherPath: "/candidate/scripts/pipeline-launcher.mjs",
+        commitSha: SHA,
+        consumer: row.consumer,
+        acquireProcessLock: fakeProcessLease,
+        revalidateBeforeSpawn: () => { throw new Error("single boundary validation only"); },
+      } }),
+    };
+    const result = await row.execute({
+      engine,
+      start: async () => ++starts,
+    });
+    assert.equal(result.ok, true, row.consumer);
+    assert.equal(starts, 1, row.consumer);
+  }
+});
+
+test("resolve-and-prepare rejects an uninventoried consumer before resolution I/O (#1454)", async () => {
+  let touched = false;
+  const deps = {
+    isDirectory() { touched = true; return true; },
+    fileExists() { touched = true; return true; },
+    revParseHead() { touched = true; return SHA; },
+    porcelain() { touched = true; return ""; },
+  } as ResolveAndPrepareCandidateEngineDeps;
+  await assert.rejects(
+    sharedResolveAndPrepareCandidateEngine(
+      {
+        repoDir: "/repo",
+        candidateSha: SHA,
+        consumer: "new.uninventoried.consumer" as never,
+      },
+      deps,
+    ),
+    /not bound exactly once/,
+  );
+  assert.equal(touched, false);
+});
 
 type RootState = {
   head: string | null;
@@ -46,6 +208,7 @@ function defaultFiles(root: string): string[] {
   return [
     path.join(root, "core/scripts/pipeline.ts"),
     path.join(root, "scripts/pipeline-launcher.mjs"),
+    path.join(root, CANDIDATE_PROCESS_GUARD_REL),
     path.join(root, CANDIDATE_CORE_LOCKFILE_REL),
   ];
 }
@@ -312,15 +475,254 @@ async function resolveThenSpawn(
   );
   if (result.ok) {
     h.events.push("ready");
+    const checked = await revalidateCandidateEngineBeforeSpawn(result.engine);
+    if (!checked.ok) return checked;
     recordSpawn(h.events, h.spawned, [
       "node",
-      result.engine.launcherPath,
+      checked.engine.launcherPath,
       "factory-release",
       "prepare",
     ]);
   }
   return result;
 }
+
+test("candidate movement after an earlier parent check is refused inside the process-start boundary (#1454)", async () => {
+  const repo = "/repo";
+  const root = { head: SHA, porcelain: "" };
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: root },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  const prepared = await resolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  if (prepared.ok) {
+    const priorParentCheck = revalidateCandidateEngineBeforeSpawn(prepared.engine);
+    assert.equal(priorParentCheck.ok, true);
+    root.head = OTHER;
+    const started = await runCandidateEngineProcess({
+      consumer: "ship.stage-adapter",
+      engine: prepared.engine,
+      start: async () => {
+        recordSpawn(h.events, h.spawned, ["node", prepared.engine.launcherPath]);
+      },
+    });
+    assert.equal(started.ok, false);
+  }
+  assert.equal(h.spawned.length, 0);
+});
+
+test("candidate movement after final parent validation is refused by the child-side guard (#1454)", async () => {
+  const engineRoot = "/candidate";
+  const lockfile = Buffer.from("candidate lockfile");
+  const lockfileDigest = createHash("sha256").update(lockfile).digest("hex");
+  const processLock = Buffer.from("held candidate process lease");
+  const proof = {
+    engineRoot,
+    commitSha: SHA,
+    readyRecordPath: "/state/ready.json",
+    lockfileDigest,
+    processLockPath: "/state/process.lock",
+    processLockDigest: createHash("sha256").update(processLock).digest("hex"),
+  };
+  let head = SHA;
+  let candidateStarts = 0;
+  const engine = {
+    engineRoot,
+    launcherPath: path.join(engineRoot, "scripts", "pipeline-launcher.mjs"),
+    commitSha: SHA,
+    consumer: "ship.stage-adapter" as const,
+    acquireProcessLock: () => ({ proof, release() {} }),
+    revalidateBeforeSpawn: () => ({ ok: true as const, engine }),
+  };
+
+  const started = await runCandidateEngineProcess({
+    consumer: "ship.stage-adapter",
+    engine,
+    start: async (_checked, childEnv) => {
+      head = OTHER; // The reviewed race: movement after the parent's final check.
+      const guarded = verifyCandidateProcessGuard(childEnv, {
+        realpath: (p: string) => p === engineRoot
+          ? engineRoot
+          : p.endsWith("candidate-process-guard.mjs")
+            ? path.join(engineRoot, CANDIDATE_PROCESS_GUARD_REL)
+            : p,
+        readFile: (p: string) => {
+          if (p === proof.processLockPath) return processLock;
+          if (p === proof.readyRecordPath) return Buffer.from(JSON.stringify({
+            schema: READY_RECORD_SCHEMA,
+            engineRoot,
+            commitSha: SHA,
+            lockfileDigest,
+          }));
+          if (p === path.join(engineRoot, CANDIDATE_CORE_LOCKFILE_REL)) return lockfile;
+          throw new Error(`unexpected guard read ${p}`);
+        },
+        git: (_root: string, args: string[]) => args[0] === "status" ? "" : `${head}\n`,
+      });
+      if (guarded.ok) candidateStarts += 1;
+      return guarded.ok ? 0 : 78;
+    },
+  });
+
+  assert.equal(started.ok, true);
+  if (started.ok) assert.equal(started.value, 78);
+  assert.equal(candidateStarts, 0);
+});
+
+function candidateRootLockPath(engineRoot: string): string {
+  return path.join(
+    "/tmp-state",
+    `pipeline-candidate-process-${createHash("sha256").update(engineRoot).digest("hex").slice(0, 32)}.lock`,
+  );
+}
+
+test("detached pack loop retains the candidate-root lease until the child exits (#1454)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  let childAlive = true;
+  let parentAlive = true;
+  h.deps.processAlive = (pid) => {
+    if (pid === 111) return parentAlive;
+    if (pid === 4242) return childAlive;
+    return false;
+  };
+  const prepared = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const first = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: prepared.engine,
+    start: async () => ({ dispatch_state: "dispatched" as const, pid: 4242 }),
+    detachedSupervisor: (value) =>
+      value.dispatch_state === "dispatched" ? { pid: value.pid, starttime: null } : null,
+  });
+  assert.equal(first.ok, true);
+  const lockPath = candidateRootLockPath(repo);
+  assert.equal(h.files.has(lockPath), true, "lease must remain after detached handoff");
+  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 4242);
+
+  const resumePrepared = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.resume" },
+    h.deps,
+  );
+  assert.equal(resumePrepared.ok, true);
+  if (!resumePrepared.ok) return;
+
+  const concurrent = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: resumePrepared.engine,
+    start: async () => {
+      throw new Error("must not spawn while detached child holds the root");
+    },
+  });
+  assert.equal(concurrent.ok, false);
+  if (!concurrent.ok) assert.equal(concurrent.kind, "lock");
+
+  parentAlive = false;
+  const afterParentCrash = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: resumePrepared.engine,
+    start: async () => {
+      throw new Error("must not spawn after parent crash while child is live");
+    },
+  });
+  assert.equal(afterParentCrash.ok, false);
+  if (!afterParentCrash.ok) assert.equal(afterParentCrash.kind, "lock");
+
+  childAlive = false;
+  let reclaimed = 0;
+  const afterChildExit = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: resumePrepared.engine,
+    start: async () => ++reclaimed,
+  });
+  assert.equal(afterChildExit.ok, true);
+  assert.equal(reclaimed, 1);
+});
+
+test("candidate process lock serializes distinct SHAs on one canonical root (#1454)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const root = { head: SHA, porcelain: "" };
+  const h = prepareHarness({
+    roots: { [repo]: root },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  let childAlive = true;
+  h.deps.processAlive = (pid) => {
+    if (pid === 111) return true;
+    if (pid === 4242) return childAlive;
+    return false;
+  };
+  const first = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+  const started = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: first.engine,
+    start: async () => ({ dispatch_state: "dispatched" as const, pid: 4242 }),
+    detachedSupervisor: (value) => ({ pid: value.pid, starttime: null }),
+  });
+  assert.equal(started.ok, true);
+
+  root.head = OTHER;
+  const second = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: OTHER, consumer: "ship.stage-adapter" },
+    h.deps,
+  );
+  assert.equal(second.ok, true);
+  if (!second.ok) return;
+  const contended = await runCandidateEngineProcess({
+    consumer: "ship.stage-adapter",
+    engine: second.engine,
+    start: async () => {
+      throw new Error("must not spawn C2 while C1 child holds the canonical root");
+    },
+  });
+  assert.equal(contended.ok, false);
+  if (!contended.ok) assert.equal(contended.kind, "lock");
+});
+
+test("candidate process lock trusts its private parent before exclusively creating the lock (#1454)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  const originalTrusted = h.deps.statePathTrusted;
+  h.deps.statePathTrusted = (p) => p === "/tmp-state" || h.files.has(p) && originalTrusted(p);
+  const prepared = await resolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "ship.stage-adapter" },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  let starts = 0;
+  const result = await runCandidateEngineProcess({
+    consumer: "ship.stage-adapter",
+    engine: prepared.engine,
+    start: async () => ++starts,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(starts, 1);
+});
 
 test("spawn ordering fails if a candidate command precedes readiness success", () => {
   const events: EventLog = [];
@@ -512,6 +914,7 @@ test("missing nested lockfile fails closed with no spawn", async () => {
         files: [
           path.join(repo, "core/scripts/pipeline.ts"),
           path.join(repo, "scripts/pipeline-launcher.mjs"),
+          path.join(repo, CANDIDATE_PROCESS_GUARD_REL),
         ],
       },
     },
@@ -736,9 +1139,9 @@ test("pre-existing untrusted ready record does not skip install", async () => {
     untrustedPaths: [readyPath],
   });
   const r = await resolveThenSpawn(h, { repoDir: repo });
-  assert.equal(r.ok, true);
+  assert.equal(r.ok, false);
   assert.equal(h.installs.length, 1, "untrusted record must not skip nested-core install");
-  assert.equal(h.spawned.length, 1);
+  assert.equal(h.spawned.length, 0, "untrusted final readiness proof must refuse spawn");
 });
 
 test("pre-existing untrusted setup lock is not treated as ownership", async () => {
@@ -975,11 +1378,17 @@ test("seam source does not call detectAndInstall or honor setup_command", () => 
     "utf8",
   );
   const seam = fs.readFileSync(path.join(repoRoot, "core/scripts/ship-end-candidate.ts"), "utf8");
+  const factoryRelease = fs.readFileSync(
+    path.join(repoRoot, "core/scripts/factory-release-prepare.ts"),
+    "utf8",
+  );
   assert.doesNotMatch(readiness, /detectAndInstall/);
   assert.doesNotMatch(readiness, /setup_command/);
   assert.doesNotMatch(seam, /detectAndInstall/);
   assert.match(seam, /resolveAndPrepareCandidateEngine/);
   assert.match(seam, /resolveCandidateEngine\(/);
+  assert.match(factoryRelease, /resolveAndPrepareCandidateEngine/);
+  assert.doesNotMatch(factoryRelease, /defaultResolveCandidateEngineDeps/);
 });
 
 test("default state writes refuse shared /tmp and follow no attacker entries", () => {

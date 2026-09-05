@@ -2,9 +2,20 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   REQUIRED_LIFECYCLE_CLASSES_1333,
   REQUIRED_PUBLIC_ENTRYPOINTS,
+  REQUIRED_ADMISSION_ROUTES,
+  GENERATED_HOST_ENV,
+  admissionRouteExecutionGaps,
+  admissionRouteInventoryGaps,
+  assertAdmissionRouteInventoryComplete,
+  captureRequiredAdmissionRouteCrossings,
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
   filterAttemptsBoundToCandidate,
@@ -15,6 +26,79 @@ import {
   uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
 } from "../scripts/operation-reliability.ts";
+import {
+  SKILL_HOST_IDS,
+} from "../scripts/host-skill.ts";
+import {
+  executeAfterPublicAdmission,
+  handleRunSubcommand,
+  runLoopCommand,
+  runSingleIssueCommand,
+  type CliOpts,
+  type LoopCliDeps,
+  type RunSubcommandDeps,
+  type SingleIssueCommandDeps,
+} from "../scripts/pipeline.ts";
+import { runTrain, type TrainDeps, type TrainIssueSnapshot } from "../scripts/stages/train.ts";
+import {
+  operatorShipIntent,
+  runShipCoordinator,
+  type ShipCoordinatorDeps,
+  type ShipStatus,
+} from "../scripts/stages/ship.ts";
+import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
+
+const CORE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const REPO_ROOT = path.resolve(CORE_ROOT, "..");
+
+async function executeGeneratedHostNumericDrive(
+  host: (typeof SKILL_HOST_IDS)[number],
+  invokeCli: (argv: readonly string[]) => Promise<boolean>,
+): Promise<boolean> {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), `pipeline-admission-host-${host}-`));
+  try {
+    const manifest = JSON.parse(fs.readFileSync(
+      path.join(REPO_ROOT, "hosts", host, "outer-host.manifest.json"),
+      "utf8",
+    )) as { profileDefault: string };
+    const scriptsDir = path.join(temp, "scripts");
+    const coreScripts = path.join(temp, "core", "scripts");
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    fs.mkdirSync(coreScripts, { recursive: true });
+    fs.mkdirSync(path.join(temp, "core", "node_modules"), { recursive: true });
+    fs.mkdirSync(path.join(temp, "tmp"), { recursive: true });
+    const template = fs.readFileSync(path.join(REPO_ROOT, "hosts", "_shared", "entry.template.mjs"), "utf8");
+    const launcher = path.join(scriptsDir, "pipeline.mjs");
+    fs.writeFileSync(
+      launcher,
+      template.replaceAll("__PROFILE__", manifest.profileDefault).replaceAll("__HOST__", host),
+    );
+    fs.copyFileSync(
+      path.join(REPO_ROOT, "scripts", "ensure-engines-node.mjs"),
+      path.join(scriptsDir, "ensure-engines-node.mjs"),
+    );
+    fs.writeFileSync(path.join(temp, "core", "package.json"), JSON.stringify({ version: "0.0.0-test" }));
+    fs.writeFileSync(
+      path.join(coreScripts, "pipeline.ts"),
+      "console.log(JSON.stringify({ argv: process.argv.slice(2), host: process.env.PIPELINE_GENERATED_HOST ?? null }));\n",
+    );
+    const result = spawnSync(process.execPath, [launcher, "1454"], {
+      encoding: "utf8",
+      env: { ...process.env, TMPDIR: path.join(temp, "tmp") },
+    });
+    assert.equal(result.status, 0, `${host} generated launcher failed: ${result.stderr}`);
+    const forwarded = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1) ?? "null") as {
+      argv: string[];
+      host: string | null;
+    };
+    assert.deepEqual(forwarded.argv, ["1454", "--profile", manifest.profileDefault]);
+    assert.equal(forwarded.host, host, `${host} generated launcher must forward ${GENERATED_HOST_ENV}`);
+    return invokeCli([forwarded.argv[0]!]);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+}
+
 import {
   computeFrgEvidence,
   FRG_PACK_MANIFEST,
@@ -27,6 +111,522 @@ import {
   verifyFrgAttestation,
   type FrgFsDeps,
 } from "../scripts/factory-reliability-gate.ts";
+
+test("required admission route inventory is exact and hard-gated (#1454)", () => {
+  assert.doesNotThrow(() => assertAdmissionRouteInventoryComplete());
+  assert.deepEqual(admissionRouteInventoryGaps(), []);
+
+  const missing = REQUIRED_ADMISSION_ROUTES.filter((row) => row.route !== "merge.train-nested");
+  assert.throws(() => assertAdmissionRouteInventoryComplete(missing), /missing route merge\.train-nested/);
+
+  const duplicate = [...REQUIRED_ADMISSION_ROUTES, REQUIRED_ADMISSION_ROUTES[0]!];
+  assert.throws(() => assertAdmissionRouteInventoryComplete(duplicate), /duplicate route drive\.numeric/);
+
+  const unknown = [
+    ...REQUIRED_ADMISSION_ROUTES,
+    { route: "invented", entrypoint: "invented", class: "direct", boundary: "public-admission" },
+  ] as never;
+  assert.throws(() => assertAdmissionRouteInventoryComplete(unknown), /unknown route invented.*unknown entrypoint invented/);
+
+  const nameOnly = REQUIRED_ADMISSION_ROUTES.map((row) =>
+    row.route === "single.direct" ? { ...row, boundary: "" } : row,
+  ) as never;
+  assert.throws(() => assertAdmissionRouteInventoryComplete(nameOnly), /bypasses admission/);
+
+});
+
+function admissionCfg(): PipelineConfig {
+  return {
+    ...DEFAULT_CONFIG,
+    repo: "acme/repo",
+    repo_dir: "/factory-control",
+    domain: "acme+repo",
+    base_branch: "main",
+  };
+}
+
+function acknowledgedAdmission(input: {
+  operationKey?: string;
+  logicalOperationId?: string;
+  approvedRoot?: string | null;
+}) {
+  return {
+    acknowledged: true as const,
+    operationKey: input.operationKey ?? "",
+    logicalOperationId: input.logicalOperationId ?? "lop-admitted",
+    approvedRoot: input.approvedRoot ?? "/factory-control",
+  };
+}
+
+async function withCapturedConsole<T>(fn: () => Promise<T>): Promise<T> {
+  const origLog = console.log;
+  const origErr = console.error;
+  console.log = () => {};
+  console.error = () => {};
+  try {
+    return await fn();
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+  }
+}
+
+function driveEngineResult(runId: string) {
+  return {
+    kind: "drive" as const,
+    result: {
+      runId,
+      cycles: 1,
+      stop: null,
+      holdOutstanding: false,
+      allDone: true,
+      resumed: false,
+      heldItemIds: [],
+      dispatched: 1,
+      excludedItemIds: [],
+      exclusionReason: null,
+      completion: "all_items_done" as const,
+    },
+  };
+}
+
+function fakeGitRepo(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-admission-loop-"));
+  fs.mkdirSync(path.join(dir, ".git"));
+  return dir;
+}
+
+function memAdmissionStore() {
+  const files = new Map<string, string>();
+  const enoent = (p: string): NodeJS.ErrnoException => {
+    const e = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+    e.code = "ENOENT";
+    return e;
+  };
+  return {
+    readFile: async (p: string) => {
+      if (!files.has(p)) throw enoent(p);
+      return files.get(p)!;
+    },
+    writeFile: async (p: string, data: string) => {
+      files.set(p, data);
+    },
+    appendFile: async (p: string, data: string) => {
+      files.set(p, (files.get(p) ?? "") + data);
+    },
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async (p: string) => {
+      if (!files.has(p)) throw enoent(p);
+      return { mtime: new Date(0) };
+    },
+    rename: async (from: string, to: string) => {
+      const contents = files.get(from);
+      if (contents === undefined) throw enoent(from);
+      files.set(to, contents);
+      files.delete(from);
+    },
+    fsyncFile: async () => {},
+    fsyncDirectory: async () => {},
+    realpath: async (p: string) => path.resolve(p),
+    link: async (existingPath: string, newPath: string) => {
+      if (files.has(newPath)) {
+        const error = new Error(`EEXIST: ${newPath}`) as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+      const contents = files.get(existingPath);
+      if (contents === undefined) throw enoent(existingPath);
+      files.set(newPath, contents);
+    },
+    unlink: async (p: string) => {
+      if (!files.delete(p)) throw enoent(p);
+    },
+  };
+}
+
+function trainAdmissionDeps(
+  events: string[],
+  persist: TrainDeps["persistPublicAdmission"],
+): TrainDeps & {
+  seedIssue(s: TrainIssueSnapshot): void;
+  seedPr(issue: number, pr: number): void;
+} {
+  const issues = new Map<number, TrainIssueSnapshot>();
+  const openPr = new Map<number, number>();
+  const prState = new Map<number, { state: "open" | "merged"; oid: string | null; head: string }>();
+  const store = memAdmissionStore();
+  const deps: TrainDeps & {
+    seedIssue(s: TrainIssueSnapshot): void;
+    seedPr(issue: number, pr: number): void;
+  } = {
+    log() {},
+    now: () => new Date("2026-08-28T17:28:03.000Z"),
+    runStore: store,
+    publicAdmissionStore: store,
+    resolveApprovedControlRoot: async () => "/factory-control",
+    persistPublicAdmission: persist,
+    async getIssue(n) {
+      const s = issues.get(n);
+      if (!s) throw new Error(`missing issue ${n}`);
+      return s;
+    },
+    async listMilestoneIssues() {
+      return [...issues.values()];
+    },
+    discoverDeps: {
+      async getIssueTitleBody(n) {
+        const s = issues.get(n);
+        return s ? { title: s.title, body: s.body } : null;
+      },
+      async getBlockedByIssueNumbers() {
+        return [];
+      },
+      async getIssueOpenState(n) {
+        return issues.get(n)?.state === "closed" ? "closed" : "open";
+      },
+    },
+    async advanceWave(list) {
+      const out = new Map();
+      for (const n of list) {
+        const s = issues.get(n)!;
+        s.labels = ["pipeline:ready-to-deploy"];
+        out.set(n, { ok: true as const, terminal: "ready-to-deploy" as const, labels: s.labels });
+      }
+      return out;
+    },
+    async getPrForIssue(n) {
+      return openPr.get(n) ?? null;
+    },
+    async getPrForIssueAnyState(n) {
+      return openPr.get(n) ?? null;
+    },
+    async mergeIssuePr(pr) {
+      events.push(`protected:merge.train-nested:${pr}`);
+      const cur = prState.get(pr) ?? { state: "open" as const, oid: null, head: "h" };
+      prState.set(pr, {
+        state: "merged",
+        oid: `aa${pr}${"c".repeat(40)}`.slice(0, 40),
+        head: cur.head,
+      });
+      for (const [issue, p] of openPr) if (p === pr) openPr.delete(issue);
+    },
+    async observePr(pr) {
+      const cur = prState.get(pr) ?? { state: "open" as const, oid: null, head: "h" };
+      return {
+        state: cur.state === "merged" ? "merged" : "open",
+        mergeCommitOid: cur.oid,
+        headRefOid: cur.head,
+      };
+    },
+    async fetchBase() {},
+    async baseTip() {
+      return "b".repeat(40);
+    },
+    async isAncestor(ancestor, descendant) {
+      return descendant === "b".repeat(40) && ancestor.startsWith("aa");
+    },
+    seedIssue(s) {
+      issues.set(s.number, s);
+    },
+    seedPr(issue, pr) {
+      openPr.set(issue, pr);
+      prState.set(pr, { state: "open", oid: null, head: "a".repeat(40) });
+    },
+  };
+  return deps;
+}
+
+function shipAdmissionDeps(store: { status: ShipStatus | null }): ShipCoordinatorDeps {
+  const boom = async (): Promise<never> => {
+    throw new Error("stop after admission");
+  };
+  return {
+    now: () => new Date("2026-08-10T12:00:00.000Z"),
+    state: {
+      statusFile: (key) => `/state/ships/${key}/status.json`,
+      eventsFile: (key) => `/state/ships/${key}/events.jsonl`,
+      async read() {
+        return store.status ? structuredClone(store.status) : null;
+      },
+      async writeAtomic(_key, value) {
+        store.status = structuredClone(value);
+      },
+      async appendEvent() {},
+    },
+    authorizationPublicKey: "unused",
+    async withRunLock(_key, fn) {
+      return fn();
+    },
+    reconcile: boom,
+    planTrain: boom,
+    convergeTrain: boom,
+    convergeFrgPack: boom,
+    convergeFrgScore: boom,
+    convergeReleasePrepare: boom,
+    convergeReleaseFinish: boom,
+    convergeTag: boom,
+    waitForRelease: boom,
+    convergeEnginePromote: boom,
+    convergeDeployment: boom,
+    async observeRemainingOpenMilestoneIssues() {
+      return [];
+    },
+  };
+}
+
+test("hard gate executes inventoried production admission routes (#1454)", async () => {
+  const events: string[] = [];
+  const persist = (async (input: {
+    operationKey?: string;
+    logicalOperationId?: string;
+    route?: string;
+  }) => {
+    events.push(`admit:${input.route ?? input.operationKey}`);
+    return {
+      ...acknowledgedAdmission({
+        operationKey: input.operationKey,
+        logicalOperationId: `lop-${input.route ?? "admitted"}`,
+        approvedRoot: "/factory-control",
+      }),
+      runDir: "/factory-control/.agent-pipeline/runs/admission-test",
+      runId: "admission-test",
+    };
+  }) as never;
+
+  const captured = await captureRequiredAdmissionRouteCrossings(async () => {
+    await withCapturedConsole(async () => {
+      for (const [route, kind] of [
+        ["merge.direct", "merge"],
+        ["merge-queue.apply", "merge-queue"],
+      ] as const) {
+        const executed = await executeAfterPublicAdmission(
+          {
+            repoDir: "/factory-control",
+            repo: "acme/repo",
+            domain: "acme+repo",
+            kind,
+            operationKey: `inventory:${route}`,
+            route,
+          },
+          async (admission) => {
+            assert.equal(admission.logicalOperationId, `lop-${route}`);
+            assert.equal(admission.approvedRoot, "/factory-control");
+            events.push(`protected:${route}`);
+          },
+          { persistPublicAdmission: persist },
+        );
+        assert.equal(executed.ok, true);
+        assert.deepEqual(events.slice(-2), [`admit:${route}`, `protected:${route}`]);
+      }
+
+      const singleDeps: SingleIssueCommandDeps = {
+        resolveConfig: () => admissionCfg(),
+        resolveIssueNumber: async (_cfg, n) => n,
+        runLoopEngine: async (input) => {
+          assert.equal(input.logicalOperationId, "lop-single.direct");
+          events.push("protected:single.direct");
+          return driveEngineResult("loop-single");
+        },
+        writeStdoutLine: () => {},
+        persistPublicAdmission: persist,
+      };
+      await runSingleIssueCommand("1454", { profile: "codex" } as CliOpts, singleDeps, {
+        persistPublicAdmission: true,
+      });
+      assert.deepEqual(events.slice(-2), ["admit:single.direct", "protected:single.direct"]);
+
+      const numericDeps: SingleIssueCommandDeps = {
+        resolveConfig: () => admissionCfg(),
+        resolveIssueNumber: async (_cfg, n) => n,
+        runLoopEngine: async () => {
+          events.push("protected:drive.numeric");
+          return driveEngineResult("loop-numeric");
+        },
+        writeStdoutLine: () => {},
+      };
+      await runSingleIssueCommand("1454", { profile: "codex" } as CliOpts, numericDeps);
+
+      const detachDeps: RunSubcommandDeps = {
+        spawnDetached: async () => {
+          events.push("protected:drive.detached-resume");
+          return { runDir: "/tmp/wrapper", pid: 1 };
+        },
+        findGitRoot: () => "/factory-control",
+        cwd: () => "/factory-control",
+        restoreDeadDetached: async () => null,
+      };
+      const priorExit = process.exitCode;
+      process.exitCode = undefined;
+      await handleRunSubcommand("1454", { detach: true, profile: "codex" } as CliOpts, detachDeps);
+      process.exitCode = priorExit;
+      assert.ok(events.includes("protected:drive.detached-resume"));
+
+      const repoDir = fakeGitRepo();
+      try {
+        const loopDirect: LoopCliDeps = {
+          runLoopPreflight: async () => ({
+            ok: true,
+            args: { selector: { type: "work-list", value: ["1454"] }, resumeRunId: undefined, audit: false },
+          }),
+          runLoopEngine: async () => {
+            events.push("protected:loop.direct");
+            return driveEngineResult("loop-direct");
+          },
+          writeStdoutLine: () => {},
+        };
+        await runLoopCommand({ profile: "codex", repoPath: repoDir } as CliOpts, ["1454"], loopDirect);
+
+        const loopResume: LoopCliDeps = {
+          runLoopPreflight: async () => ({
+            ok: true,
+            args: { selector: { type: "work-list", value: ["1454"] }, resumeRunId: "loop-resume-1", audit: false },
+          }),
+          runLoopEngine: async (input) => {
+            assert.equal(input.resumeRunId, "loop-resume-1");
+            events.push("protected:loop.resume");
+            return { ...driveEngineResult("loop-resume-1"), result: { ...driveEngineResult("loop-resume-1").result, resumed: true } };
+          },
+          writeStdoutLine: () => {},
+        };
+        await runLoopCommand({ profile: "codex", repoPath: repoDir, resume: "loop-resume-1" } as CliOpts, [], loopResume);
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      }
+
+      const recovery = trainAdmissionDeps(events, persist);
+      recovery.seedIssue({
+        number: 11,
+        title: "recovery",
+        body: "independent",
+        labels: ["pipeline:ready"],
+        state: "open",
+      });
+      await runTrain(
+        { issues: [11], merge: false, baseBranch: "main", repoDir: "/tmp/repo", repo: "acme/repo" },
+        recovery,
+      );
+      events.push("protected:train.recovery");
+
+      const nested = trainAdmissionDeps(events, persist);
+      nested.seedIssue({
+        number: 12,
+        title: "merge",
+        body: "independent",
+        labels: ["pipeline:ready-to-deploy"],
+        state: "open",
+      });
+      nested.seedPr(12, 112);
+      await runTrain(
+        { issues: [12], merge: true, baseBranch: "main", repoDir: "/tmp/repo", repo: "acme/repo" },
+        nested,
+      );
+      events.push("protected:train.direct");
+
+      const shipStore: { status: ShipStatus | null } = { status: null };
+      const shipIntent = operatorShipIntent({
+        repository: "acme/repo",
+        base_branch: "main",
+        milestone: "v1.40.1",
+        version: "1.40.1",
+      });
+      await runShipCoordinator(shipIntent, null, shipAdmissionDeps(shipStore)).catch(() => {});
+      events.push("protected:ship.direct");
+      assert.ok(shipStore.status, "ship.direct must persist coordinator status");
+      await runShipCoordinator(shipIntent, null, shipAdmissionDeps(shipStore)).catch(() => {});
+      events.push("protected:ship.resume");
+
+      const hostExecutors: Record<string, () => Promise<void>> = {};
+      for (const host of SKILL_HOST_IDS) {
+        hostExecutors[`host.${host === "claude" ? "claude-code" : host}`] = async () => {
+          const prev = process.env[GENERATED_HOST_ENV];
+          const delegated = await executeGeneratedHostNumericDrive(host, async (argv) => {
+            assert.deepEqual(argv, ["1454"]);
+            process.env[GENERATED_HOST_ENV] = host;
+            try {
+              const hostDrive: SingleIssueCommandDeps = {
+                resolveConfig: () => admissionCfg(),
+                resolveIssueNumber: async (_cfg, n) => n,
+                runLoopEngine: async () => {
+                  events.push(`protected:host.${host}`);
+                  return driveEngineResult(`loop-host-${host}`);
+                },
+                writeStdoutLine: () => {},
+              };
+              await runSingleIssueCommand("1454", { profile: "codex" } as CliOpts, hostDrive);
+            } finally {
+              if (prev === undefined) delete process.env[GENERATED_HOST_ENV];
+              else process.env[GENERATED_HOST_ENV] = prev;
+            }
+            return true;
+          });
+          assert.equal(delegated, true);
+        };
+      }
+      for (const [route, execute] of Object.entries(hostExecutors)) {
+        assert.equal(
+          REQUIRED_ADMISSION_ROUTES.some((row) => row.route === route),
+          true,
+          `host executor ${route} must be inventoried`,
+        );
+        await execute();
+      }
+      assert.deepEqual(
+        [...Object.keys(hostExecutors)].sort(),
+        REQUIRED_ADMISSION_ROUTES.filter((row) => row.class === "host").map((row) => row.route).sort(),
+      );
+    });
+  });
+
+  assert.deepEqual(admissionRouteExecutionGaps(captured.routes), []);
+  assert.ok(events.includes("protected:merge.train-nested:112"));
+  assert.deepEqual(
+    REQUIRED_ADMISSION_ROUTES.filter((row) => row.class === "host").map((row) => row.host).sort(),
+    [...SKILL_HOST_IDS].sort(),
+  );
+  for (const host of SKILL_HOST_IDS) {
+    const generated = fs.readFileSync(path.join(CORE_ROOT, "..", "hosts", host, "SKILL.md"), "utf8");
+    assert.match(generated, /Host SKILL for the `pipeline` CLI/);
+    assert.match(generated, /`pipeline <N>` starts the durable\s+one-item drive/);
+  }
+});
+
+test("production public admission refusal executes no protected operation (#1454)", async () => {
+  let protectedCalls = 0;
+  const executed = await executeAfterPublicAdmission(
+    {
+      repoDir: "/factory-control",
+      repo: "acme/repo",
+      domain: "acme+repo",
+      kind: "merge",
+      operationKey: "inventory:merge.direct",
+      route: "merge.direct",
+    },
+    async () => { protectedCalls += 1; },
+    {
+      persistPublicAdmission: (async () => ({
+        acknowledged: false,
+        kind: "merge",
+        runId: "merge-refused",
+        logicalOperationId: "lop-refused",
+        repository: "acme/repo",
+        domain: "acme+repo",
+        issue: null,
+        startedAt: "2026-09-05T00:00:00Z",
+        approvedRoot: null,
+        runDir: null,
+        binding: {},
+        failure: {
+          kind: "approved_root_unavailable",
+          step: "resolve_approved_root",
+          diagnostic: "injected refusal",
+        },
+      })) as never,
+    },
+  );
+  assert.equal(executed.ok, false);
+  assert.equal(protectedCalls, 0);
+});
 
 function packInput(over: Record<string, unknown> = {}) {
   return {
