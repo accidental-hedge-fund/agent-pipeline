@@ -1848,7 +1848,7 @@ test("runCapped: undefined overlay values omit those names from spawn env (#1459
     });
 
     assert.ok(capturedEnv, "spawn options.env must be set when opts.env is supplied");
-    assert.notEqual(typeof capturedEnv!.REPO_DIR, "string");
+    assert.equal(Object.hasOwn(capturedEnv!, "REPO_DIR"), false);
     assert.equal(capturedEnv!.PIPELINE_RUN_ID, "keep");
     assert.equal(capturedEnv!.PATH, process.env.PATH);
     assert.equal(process.env.REPO_DIR, "/factory/repo");

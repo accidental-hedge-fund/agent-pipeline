@@ -370,10 +370,10 @@ test("runTests: omitted factory/candidate/merge names are absent from spawn env 
 
     assert.ok(capturedEnv, "runTests must pass an env overlay through to spawn");
     for (const name of omittedNames) {
-      assert.notEqual(
-        typeof capturedEnv![name],
-        "string",
-        `${name} must not be a string value on the spawned repo test process`,
+      assert.equal(
+        Object.hasOwn(capturedEnv!, name),
+        false,
+        `${name} must be absent from the spawned repo test process`,
       );
       assert.equal(
         process.env[name],
