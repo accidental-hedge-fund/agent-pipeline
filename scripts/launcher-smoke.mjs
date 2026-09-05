@@ -18,6 +18,13 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const NODE = process.execPath;
 const LAUNCHER = join(REPO_ROOT, "scripts", "pipeline-launcher.mjs");
 
+// A factory candidate worker binds PIPELINE_CANDIDATE_PROCESS_* to the packed
+// engine root. This smoke suite must exercise THIS checkout's launcher, not
+// refuse because the nested worktree is outside that bound root.
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith("PIPELINE_CANDIDATE_")) delete process.env[key];
+}
+
 let passed = 0;
 let failed = 0;
 

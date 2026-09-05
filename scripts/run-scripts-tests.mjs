@@ -41,7 +41,9 @@ export function listScriptsTestFiles(scriptsDir) {
  * Env for a top-level `node --test` child. Strip parent test-runner context so
  * nested invocations (e.g. regression tests that spawn this wrapper under
  * `node --test`) do not hit "run() is being called recursively … skipping
- * running files" and silently exit 0.
+ * running files" and silently exit 0. Also strip inherited candidate-process
+ * bindings so a factory worker cannot fail scripts tests by treating this
+ * checkout as outside the packed engine root.
  * @param {NodeJS.ProcessEnv} [base]
  * @returns {NodeJS.ProcessEnv}
  */
@@ -49,6 +51,9 @@ export function childTestEnv(base = process.env) {
   const env = { ...base };
   delete env.NODE_TEST_CONTEXT;
   delete env.NODE_TEST_WORKER_ID;
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("PIPELINE_CANDIDATE_")) delete env[key];
+  }
   return env;
 }
 

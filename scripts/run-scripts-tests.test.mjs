@@ -179,10 +179,14 @@ test("childTestEnv strips parent test-runner context", () => {
     PATH: "/usr/bin",
     NODE_TEST_CONTEXT: "child-v8",
     NODE_TEST_WORKER_ID: "1",
+    PIPELINE_CANDIDATE_PROCESS_GUARD: "1",
+    PIPELINE_CANDIDATE_PROCESS_ROOT: "/factory/control",
     KEEP: "yes",
   });
   assert.equal(cleaned.NODE_TEST_CONTEXT, undefined);
   assert.equal(cleaned.NODE_TEST_WORKER_ID, undefined);
+  assert.equal(cleaned.PIPELINE_CANDIDATE_PROCESS_GUARD, undefined);
+  assert.equal(cleaned.PIPELINE_CANDIDATE_PROCESS_ROOT, undefined);
   assert.equal(cleaned.KEEP, "yes");
   assert.equal(cleaned.PATH, "/usr/bin");
 });

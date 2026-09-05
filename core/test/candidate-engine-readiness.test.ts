@@ -31,7 +31,16 @@ import {
   type ResolveCandidateEngineDeps,
 } from "../scripts/ship-end-candidate.ts";
 import { BLOCKER_KINDS } from "../scripts/types.ts";
-import { verifyCandidateProcessGuard } from "../../scripts/candidate-process-guard.mjs";
+
+// The guard module process.exits on import when PIPELINE_CANDIDATE_PROCESS_GUARD=1
+// and this checkout is not the bound candidate root. Clear that host binding
+// before the import so unit tests can load the function under a factory worker.
+const savedCandidateProcessGuard = process.env.PIPELINE_CANDIDATE_PROCESS_GUARD;
+delete process.env.PIPELINE_CANDIDATE_PROCESS_GUARD;
+const { verifyCandidateProcessGuard } = await import("../../scripts/candidate-process-guard.mjs");
+if (savedCandidateProcessGuard !== undefined) {
+  process.env.PIPELINE_CANDIDATE_PROCESS_GUARD = savedCandidateProcessGuard;
+}
 
 const SHA = "b".repeat(40);
 const OTHER = "d".repeat(40);

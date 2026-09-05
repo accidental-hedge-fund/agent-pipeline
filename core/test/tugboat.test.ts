@@ -52,7 +52,9 @@ function tugboatReleaseCiParentEnv(): NodeJS.ProcessEnv {
 
 /**
  * Spawn env for real `tugboat.sh`. Omits inherited skip-train / candidate
- * composer unless the check is asserting skip-train (#1192).
+ * composer unless the check is asserting skip-train (#1192). Always omits
+ * inherited factory-control and candidate-process bindings so a live
+ * factory worker cannot make fixtures resolve the host engine.
  */
 function tugboatSpawnEnv(
   extra: NodeJS.ProcessEnv = {},
@@ -62,6 +64,11 @@ function tugboatSpawnEnv(
   if (!opts.inheritParentSkipTrain) {
     delete env.TUGBOAT_SKIP_TRAIN;
     delete env.TUGBOAT_CANDIDATE_COMPOSER;
+  }
+  delete env.AGENT_PIPELINE_FACTORY_CONTROL;
+  delete env.AGENT_PIPELINE_PRODUCTION_PIN;
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("PIPELINE_CANDIDATE_")) delete env[key];
   }
   Object.assign(env, extra);
   return env;
@@ -3679,6 +3686,7 @@ test("host pipeline-launcher.sh exports factory pin when unset and preserves ove
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "unset AGENT_PIPELINE_PRODUCTION_PIN",
+        "unset AGENT_PIPELINE_FACTORY_CONTROL",
         'REPO_DIR="/factory/control"',
         snippet[0],
         'printf "%s" "$AGENT_PIPELINE_PRODUCTION_PIN"',
@@ -5243,12 +5251,20 @@ test("tugboatSpawnEnv omits inherited skip-train unless asserting skip-train (#1
         TUGBOAT_SKIP_TRAIN: "1",
         TUGBOAT_CANDIDATE_COMPOSER: "deadbeef",
         TUGBOAT_CANDIDATE_SHA: "parent-sha",
+        AGENT_PIPELINE_FACTORY_CONTROL: "/factory/control",
+        AGENT_PIPELINE_PRODUCTION_PIN: "/factory/control/.agent-pipeline/production-engine-pin.json",
+        PIPELINE_CANDIDATE_ENGINE_ROOT: "/factory/control",
+        PIPELINE_CANDIDATE_PROCESS_GUARD: "1",
         PATH: "/usr/bin",
       },
     },
   );
   assert.equal(isolated.TUGBOAT_SKIP_TRAIN, undefined);
   assert.equal(isolated.TUGBOAT_CANDIDATE_COMPOSER, undefined);
+  assert.equal(isolated.AGENT_PIPELINE_FACTORY_CONTROL, undefined);
+  assert.equal(isolated.AGENT_PIPELINE_PRODUCTION_PIN, undefined);
+  assert.equal(isolated.PIPELINE_CANDIDATE_ENGINE_ROOT, undefined);
+  assert.equal(isolated.PIPELINE_CANDIDATE_PROCESS_GUARD, undefined);
   assert.equal(isolated.TUGBOAT_CANDIDATE_SHA, "c".repeat(40));
   assert.equal(isolated.TUGBOAT_BASE_BRANCH, "main");
   assert.equal(isolated.TUGBOAT_OPEN_RELEASE_PR, "12");
