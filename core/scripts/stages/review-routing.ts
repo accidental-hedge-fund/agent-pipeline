@@ -590,7 +590,18 @@ export async function advanceReview(
       // Primary: prefer artifact for diff-hash read (task 4.4 — #264).
       const priorArtifact = extractReviewArtifact(latestPriorComment.body);
       const cachedHash = priorArtifact?.diffHash ?? extractDiffHashFromComment(latestPriorComment.body);
-      if (cachedHash !== null && cachedHash === diffHash) {
+      const cachedReviewedSha =
+        priorArtifact?.reviewedSha ?? extractReviewedSha([latestPriorComment])?.sha ?? null;
+      const cachedShaMatchesHead =
+        cachedReviewedSha !== null &&
+        cachedReviewedSha.toLowerCase() === commitSha.toLowerCase();
+      if (cachedHash !== null && cachedHash === diffHash && !cachedShaMatchesHead) {
+        console.log(
+          `[pipeline] #${issueNumber}: Diff hash unchanged but cached reviewed SHA does not equal HEAD; ` +
+          `running exact-SHA review for round ${round}`,
+        );
+        // Fall through to the full review path below — do NOT return.
+      } else if (cachedHash !== null && cachedHash === diffHash) {
         console.log(`[pipeline] #${issueNumber}: Diff hash unchanged; reusing cached verdict for round ${round}`);
         const cachedVerdict = extractVerdictFromComment(latestPriorComment.body);
         // Primary: prefer artifact for blocking-keys read (task 4.5 — #264).

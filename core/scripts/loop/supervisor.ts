@@ -770,6 +770,21 @@ function observedCandidateEpoch(item: LoopItemLedgerEntry | undefined): string {
   return identity.head_sha.trim();
 }
 
+/** Episode key / persisted attempt epoch: prefer the observed logical epoch
+ * when lineage is observable. Keep the caller's existing fallback when the
+ * field is absent or lineage could not be read. */
+function recoveryEpisodeCandidateEpoch(
+  item: LoopItemLedgerEntry | undefined,
+  fallback: string,
+): string {
+  const identity = item?.last_verified_identity;
+  if (identity && Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")) {
+    const logical = identity.logical_candidate_epoch?.trim() ?? "";
+    if (logical) return logical;
+  }
+  return fallback;
+}
+
 async function stopForRecoveryPreflight(
   deps: SupervisorDeps,
   contract: LoopContract,
@@ -1078,7 +1093,10 @@ async function executeBlockedRecovery(
       persisted.transport,
       matchingAttempts.length,
     );
-    const candidateEpoch = candidateIdentity.replace(/\|attempt=\d+$/i, "");
+    const candidateEpoch = recoveryEpisodeCandidateEpoch(
+      item,
+      candidateIdentity.replace(/\|attempt=\d+$/i, ""),
+    );
     const episodeKey = {
       operation: "loop_recovery",
       invariant: item.blocked_theme,
@@ -2346,7 +2364,10 @@ export async function runSupervisorCycle(
       const episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, {
         operation: "loop_recovery",
         invariant: candidate.blocked_theme,
-        candidate_epoch: candidate.last_verified_identity?.head_sha.trim() || candidate.evidence_fingerprint || candidate.id,
+        candidate_epoch: recoveryEpisodeCandidateEpoch(
+          candidate,
+          candidate.last_verified_identity?.head_sha.trim() || candidate.evidence_fingerprint || candidate.id,
+        ),
         evidence_identity: candidate.evidence_fingerprint ?? "",
       });
       const repeated = (candidate.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit;

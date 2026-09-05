@@ -2216,8 +2216,7 @@ const REVIEW_DIFF = "diff --git a/x.ts b/x.ts\n+const a = 1;";
 const REVIEW_DIFF_HASH = computeDiffHash(REVIEW_DIFF);
 
 /** Build a prior review-N comment body that already embeds a diff-hash sentinel. */
-function priorReviewComment(round: 1 | 2, hash: string, verdict = "approve"): string {
-  const sha = "a".repeat(40);
+function priorReviewComment(round: 1 | 2, hash: string, verdict = "approve", sha = "f".repeat(40)): string {
   const type = round === 1 ? "Standard" : "Adversarial";
   return [
     `## Review ${round} (${type}) — ${verdict} (commit ${sha.slice(0, 7)})`,
@@ -2259,11 +2258,45 @@ test("advanceReview: cache hit — prior comment has same diff hash → reviewer
   assert.match(outcome.summary, /cached verdict/);
 });
 
+test("advanceReview: same diff hash at a new SHA does not reuse the S verdict (#1462)", async (t) => {
+  // Epoch restart S→H with an unchanged PR diff must still invoke the reviewer
+  // at H. Reusing the S verdict from the diff-hash cache would record H
+  // authority from S evidence.
+  const shaS = "a".repeat(40);
+  const shaH = "f".repeat(40);
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "Title",
+      body: "Body",
+      state: "open",
+      url: "https://example.test/1",
+      labels: [],
+      comments: [{ body: priorReviewComment(1, REVIEW_DIFF_HASH, "approve", shaS), author: TEST_ACTOR }],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  deps.getPrDiff = async () => REVIEW_DIFF;
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+
+  assert.equal(rec.runReviewCalls, 1, "reviewer must run at H even when the S diff hash is unchanged");
+  assert.ok(outcome.advanced, "fresh review at H must still advance");
+  assert.equal(outcome.to, "review-2");
+  const posted = rec.comments.find((c) => c.startsWith("## Review 1"));
+  assert.ok(posted, "fresh review must post a comment");
+  assert.match(posted!, new RegExp(`<!-- reviewed-sha: ${shaH} -->`), "recorded reviewed-sha must be H, not S");
+  assert.equal(posted!.includes(`<!-- reviewed-sha: ${shaS} -->`), false);
+});
+
 test("advanceReview: cache hit with blocking findings → routes to fix without calling reviewer (5.3b)", async (t) => {
   const { deps, rec } = makeDeps([APPROVE]);
   // Simulate a prior blocking verdict for round 2.
   const blockingComment = [
-    `## Review 2 (Adversarial) — needs-attention (commit ${"a".repeat(7)})`,
+    `## Review 2 (Adversarial) — needs-attention (commit ${"f".repeat(7)})`,
     "",
     "**Reviewer**: codex",
     "",
@@ -2275,7 +2308,7 @@ test("advanceReview: cache hit with blocking findings → routes to fix without 
       return "aabbccdd";
     }).join(",")} -->`,
     "",
-    `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+    `<!-- reviewed-sha: ${"f".repeat(40)} -->`,
     `<!-- verdict-diff-hash: ${REVIEW_DIFF_HASH} -->`,
   ].join("\n");
   deps.getIssueDetail = async () =>
@@ -2368,7 +2401,7 @@ test("advanceReview: cache hit with all blocking keys overridden → advances in
     "*Automated by Claude Code Pipeline Skill*",
     `<!-- pipeline-blocking-keys: ${blockingKey} -->`,
     "",
-    `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+    `<!-- reviewed-sha: ${"f".repeat(40)} -->`,
     `<!-- verdict-diff-hash: ${REVIEW_DIFF_HASH} -->`,
   ].join("\n");
   const overrideComment = `## Pipeline: Finding override\n\n<!-- pipeline-override: ${blockingKey} wontfix — out of scope -->`;
@@ -2415,7 +2448,7 @@ test("advanceReview: cache hit with scoped override active and remaining blocker
     "*Automated by Claude Code Pipeline Skill*",
     `<!-- pipeline-blocking-keys: ${blockingKey} -->`,
     "",
-    `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+    `<!-- reviewed-sha: ${"f".repeat(40)} -->`,
     `<!-- verdict-diff-hash: ${REVIEW_DIFF_HASH} -->`,
   ].join("\n");
   const scopeComment = scopedOverrideComment({
@@ -2564,7 +2597,7 @@ test("advanceReview: self-review cache hit on unchanged diff — reviewer NOT ca
     "LGTM",
     "",
     "*Automated by Claude Code Pipeline Skill*",
-    `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+    `<!-- reviewed-sha: ${"f".repeat(40)} -->`,
     `<!-- verdict-diff-hash: ${REVIEW_DIFF_HASH} -->`,
   ].join("\n");
 
