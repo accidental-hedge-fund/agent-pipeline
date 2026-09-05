@@ -106,6 +106,7 @@ export function coolingIsStaleForNewCandidateEpoch(
   >[],
   itemId: string | undefined,
   candidateEpoch: string,
+  candidateHead = candidateEpoch,
 ): boolean {
   if (!cooling || !itemId) return false;
   if (cooling.item_id && cooling.item_id !== itemId) return false;
@@ -133,7 +134,10 @@ export function coolingIsStaleForNewCandidateEpoch(
     return Number.isFinite(coolingTime) && Number.isFinite(attemptTime) && attemptTime <= coolingTime;
   });
   if (!owner) return false;
-  return !attemptBelongsToCandidateEpoch(owner, wanted);
+  // Legacy attempts predate logical epochs and identify their owner by the
+  // raw observed HEAD. Compare them with the current raw HEAD so upgrading at
+  // an internal-only tip does not invalidate an otherwise-current backoff.
+  return !attemptBelongsToCandidateEpoch(owner, candidateHead.trim());
 }
 
 export function recoveryEpisodeId(key: RecoveryEpisodeKey): string {

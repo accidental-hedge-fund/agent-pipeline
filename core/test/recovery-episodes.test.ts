@@ -1505,6 +1505,36 @@ test("legacy Cooling binds to the attempt present at creation, not a later H att
   assert.equal(coolingIsStaleForNewCandidateEpoch(legacyCooling, attempts, "100", shaH), true);
 });
 
+test("legacy Cooling at an internal-only tip survives logical-epoch upgrade (#1462)", () => {
+  const logicalSha = "a".repeat(40);
+  const archiveTip = "b".repeat(40);
+  const movedHead = "c".repeat(40);
+  const legacyCooling = {
+    reason: "strategy_cursor_exhausted" as const,
+    time: "2026-09-05T00:10:00.000Z",
+    next_eligible_at: "2026-09-05T01:00:00.000Z",
+    item_id: "100",
+  };
+  const attempts = [{
+    item_id: "100",
+    candidate_epoch: `repo=o/r|head=${archiveTip}|advance=legacy`,
+    candidate_identity: `repo=o/r|head=${archiveTip}|advance=legacy`,
+    time: "2026-09-05T00:00:00.000Z",
+    next_eligible_at: legacyCooling.next_eligible_at,
+  }];
+
+  assert.equal(
+    coolingIsStaleForNewCandidateEpoch(legacyCooling, attempts, "100", logicalSha, archiveTip),
+    false,
+    "an unchanged raw archive tip must retain legacy Cooling after logical epochs are introduced",
+  );
+  assert.equal(
+    coolingIsStaleForNewCandidateEpoch(legacyCooling, attempts, "100", logicalSha, movedHead),
+    true,
+    "a later raw HEAD movement must invalidate the legacy Cooling owner",
+  );
+});
+
 test("startRecoveryAttempt: new candidate epoch does not reuse S-episode cursor (#1462)", async () => {
   const { deps, contract, token } = await setup();
   await blockCi(deps, contract, token);

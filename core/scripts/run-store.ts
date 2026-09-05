@@ -513,6 +513,17 @@ export interface AdvisoryCarryForwardEvent extends RunEventBase {
   matched_by: "surface" | "key";
 }
 
+/** A later-stage resume observed a new non-pipeline-internal candidate and
+ *  atomically returned the issue to review for exact-SHA evidence (#1462). */
+export interface CandidateEpochRestartedEvent extends RunEventBase {
+  type: "candidate_epoch_restarted";
+  from_sha: string;
+  to_sha: string;
+  from_stage: string;
+  review_stage: string;
+  disposition: "new_epoch";
+}
+
 export type { HumanInterventionEvent };
 export type { CorrectionEvent };
 export type { ProductFaultEvent };
@@ -544,6 +555,7 @@ export type RunEvent =
   | SettledAlternativeReinstatedEvent
   | SettledSurfaceUnverifiedEvent
   | AdvisoryCarryForwardEvent
+  | CandidateEpochRestartedEvent
   | DeltaRoundEvent
   | DeltaRoundCeilingEvent
   | DeltaChurnSuspectedEvent

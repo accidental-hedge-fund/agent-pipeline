@@ -1051,6 +1051,7 @@ async function executeBlockedRecovery(
         ledger.recovery_attempts,
         itemId,
         currentEpoch,
+        item.last_verified_identity?.head_sha ?? currentEpoch,
       )
     ) {
       await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
@@ -2329,6 +2330,7 @@ export async function runSupervisorCycle(
         ledger.recovery_attempts,
         cooledId,
         cooledEpoch,
+        cooledItem?.last_verified_identity?.head_sha ?? cooledEpoch,
       );
       if (!staleCooling) {
         await appendActionEvidence(deps.store, runId, token, {
