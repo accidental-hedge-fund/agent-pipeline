@@ -315,6 +315,7 @@ function isCoolingRecordShape(value: unknown): boolean {
   if (value.reason !== "strategy_cursor_exhausted" && value.reason !== "mechanical_exhaustion") return false;
   if (!isIsoTimestamp(value.time)) return false;
   if (!isIsoTimestamp(value.next_eligible_at)) return false;
+  if (value.candidate_epoch !== undefined && typeof value.candidate_epoch !== "string") return false;
   return true;
 }
 

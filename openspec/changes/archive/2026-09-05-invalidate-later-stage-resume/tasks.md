@@ -23,6 +23,7 @@
 
 - [x] 4.1 After a new candidate epoch, keep `review-1` / `review-2` actionable even when checks on H are pending, and verify a recovery fixture does not classify that item as noop solely from pending checks
 - [x] 4.2 After a new candidate epoch, persist or resume a Recovery Episode keyed to H and ignore S-episode cursor/exhaustion as authority to skip review, and verify a fixture with a failed S episode still treats review of H as actionable
+- [x] 4.3 Bind item-local Cooling to its creating candidate epoch and verify an appended H attempt cannot restore S-era Cooling authority over H
 
 ## 5. Hermetic regressions
 

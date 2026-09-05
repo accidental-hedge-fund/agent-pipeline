@@ -111,6 +111,17 @@ export function coolingIsStaleForNewCandidateEpoch(
   if (cooling.item_id && cooling.item_id !== itemId) return false;
   const wanted = candidateEpoch.trim();
   if (!wanted) return false;
+  // New records bind Cooling directly to the epoch that created it. Do not
+  // infer ownership from the latest attempt: once an H attempt is appended,
+  // that inference would incorrectly make S-era Cooling current for H again.
+  if (cooling.candidate_epoch) {
+    return !attemptBelongsToCandidateEpoch(
+      { candidate_epoch: cooling.candidate_epoch },
+      wanted,
+    );
+  }
+  // Backward compatibility for ledgers written before candidate_epoch was
+  // persisted on Cooling. Their best available owner is the latest attempt.
   const latest = [...attempts].reverse().find((attempt) => attempt.item_id === itemId);
   if (!latest) return false;
   return !attemptBelongsToCandidateEpoch(latest, wanted);
@@ -497,6 +508,7 @@ export function buildCoolingRecord(input: {
   nextEligibleAt: string;
   itemId?: string;
   theme?: string;
+  candidateEpoch?: string;
   historicalEvidence?: LoopCoolingRecord["historical_evidence"];
   quarantinePath?: string;
 }): LoopCoolingRecord {
@@ -506,6 +518,7 @@ export function buildCoolingRecord(input: {
     next_eligible_at: input.nextEligibleAt,
     ...(input.itemId ? { item_id: input.itemId } : {}),
     ...(input.theme ? { theme: input.theme } : {}),
+    ...(input.candidateEpoch ? { candidate_epoch: input.candidateEpoch } : {}),
     ...(input.historicalEvidence ? { historical_evidence: input.historicalEvidence } : {}),
     ...(input.quarantinePath ? { quarantine_path: input.quarantinePath } : {}),
   };

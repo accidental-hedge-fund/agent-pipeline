@@ -1449,6 +1449,7 @@ test("coolingIsStaleForNewCandidateEpoch ignores S-episode Cooling after HEAD mo
     nextEligibleAt: "2026-09-05T01:00:00.000Z",
     itemId: "100",
     theme: "review-findings",
+    candidateEpoch: shaS,
     historicalEvidence: "recovery_exhausted",
   });
   const sAttempts = [
@@ -1460,6 +1461,20 @@ test("coolingIsStaleForNewCandidateEpoch ignores S-episode Cooling after HEAD mo
   ];
   assert.equal(coolingIsStaleForNewCandidateEpoch(cooling, sAttempts, "100", shaH), true);
   assert.equal(coolingIsStaleForNewCandidateEpoch(cooling, sAttempts, "100", shaS), false);
+  const afterFirstHAttempt = [
+    ...sAttempts,
+    {
+      item_id: "100",
+      candidate_epoch: shaH,
+      candidate_identity: `head=${shaH}`,
+    },
+  ];
+  assert.equal(
+    coolingIsStaleForNewCandidateEpoch(cooling, afterFirstHAttempt, "100", shaH),
+    true,
+    "an H attempt must not transfer S-era Cooling authority onto H",
+  );
+  assert.equal(cooling.candidate_epoch, shaS);
   assert.equal(coolingIsStaleForNewCandidateEpoch(null, sAttempts, "100", shaH), false);
 });
 

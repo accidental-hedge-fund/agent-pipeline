@@ -1038,6 +1038,7 @@ async function executeBlockedRecovery(
         nextEligibleAt: coolingDeadline(time, policy.backoff, item.repeated_evidence_count ?? 1),
         itemId,
         theme: item.blocked_theme,
+        candidateEpoch: currentEpoch,
         historicalEvidence: "repeated_no_progress",
       });
       ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
@@ -1142,6 +1143,7 @@ async function executeBlockedRecovery(
         nextEligibleAt: coolingDeadline(time, policy.backoff, 1),
         itemId,
         theme: item.blocked_theme,
+        candidateEpoch: currentEpoch,
         historicalEvidence: "recovery_exhausted",
       });
       ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
@@ -2353,6 +2355,10 @@ export async function runSupervisorCycle(
         nextEligibleAt: coolingDeadline(time, policy?.backoff ?? { initial_seconds: 30, multiplier: 2, max_seconds: 300 }, 1),
         itemId: exhausted.id,
         theme: exhausted.blocked_theme,
+        candidateEpoch:
+          exhausted.last_verified_identity?.head_sha.trim() ||
+          exhausted.evidence_fingerprint ||
+          exhausted.id,
         historicalEvidence: "recovery_exhausted",
       });
       ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });

@@ -1083,6 +1083,7 @@ export async function persistOwnedCooling(
   await appendEvent(deps, input.runId, input.token, "loop_item_cooling", {
     item_id: input.cooling.item_id,
     theme: input.cooling.theme,
+    candidate_epoch: input.cooling.candidate_epoch,
     reason: input.cooling.reason,
     next_eligible_at: input.cooling.next_eligible_at,
     historical_evidence: input.cooling.historical_evidence,
