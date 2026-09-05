@@ -125,6 +125,7 @@ import {
   filterRecipesForHarnessBackgroundWait,
   filterRecipesForNeverStartedPreflight,
 } from "../harness-adapters/background-job-lifecycle.ts";
+import { filterRecipesForWorkflowEngineDiagnostic } from "../rebind-tester-evidence-after-pr.ts";
 import {
   evaluateRunFatalResumeEligibility,
   formatRunFatalResumeRefusal,
@@ -1093,6 +1094,10 @@ async function executeBlockedRecovery(
     const neverStartedFiltered = preflightNeverStarted
       ? filterRecipesForNeverStartedPreflight(reasonFiltered)
       : reasonFiltered;
+    const diagnosticFiltered =
+      item.blocked_theme === "workflow-engine-defect"
+        ? filterRecipesForWorkflowEngineDiagnostic(neverStartedFiltered, persisted.diagnostic)
+        : neverStartedFiltered;
     const candidateIdentity = recoveryCandidateIdentity(
       contract,
       item,
@@ -1111,7 +1116,7 @@ async function executeBlockedRecovery(
     };
     let episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, episodeKey) ?? emptyEpisode(episodeKey, deps.store.now().toISOString());
     const isApplicable = (recipe: RecoveryRecipe): boolean => {
-      if (!neverStartedFiltered.includes(recipe)) return false;
+      if (!diagnosticFiltered.includes(recipe)) return false;
       if (recipe === "verify_head_goal" && !hasCandidateHead) return false;
       if (recipe === "repair_pipeline_item" && !hasCandidateHead) return false;
       return true;

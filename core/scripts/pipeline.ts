@@ -150,6 +150,7 @@ import {
   listRunIds,
   parseWriteHealthText,
   persistPublicEntrypointAdmission,
+  readTrustedSurfaceDecision,
   runDirPath,
   runIdFor,
   runsDir,
@@ -2035,6 +2036,13 @@ export interface RealExecuteRecoveryDeps {
   ownership?: OwnershipDeps;
   /** #1272: inspect/execute unpublished stage-commit publish. */
   publishUnpublished?: PublishUnpublishedExecutorDeps;
+  /** #1468: shared Tester bind-or-reproduce. Tests inject fakes. */
+  rebindTesterEvidenceAfterPr?: (
+    input: import("./rebind-tester-evidence-after-pr.ts").RebindTesterEvidenceAfterPrInput,
+  ) => Promise<import("./rebind-tester-evidence-after-pr.ts").RebindTesterEvidenceResult>;
+  getPrForIssue?: typeof getPrForIssue;
+  getPrDetail?: typeof getPrDetail;
+  readTrustedSurfaceDecision?: typeof import("./run-store.ts").readTrustedSurfaceDecision;
 }
 
 /** Production provider-neutral recovery registry. Substantive repair delegates
@@ -2726,6 +2734,71 @@ export function realExecuteRecovery(
         return {
           succeeded: true,
           evidence: published.evidence,
+        };
+      }
+      case "rebind_tester_evidence_after_pr": {
+        const issueNumber = Number(input.itemId);
+        if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+          return failed(`rebind_tester_evidence_after_pr requires a positive numeric item id`);
+        }
+        if (input.blockerClass === "specification-decision" || input.blockerClass === "missing-authority") {
+          return failed(
+            `rebind_tester_evidence_after_pr does not apply to human-authority class ${input.blockerClass}`,
+          );
+        }
+        const rebindFn = deps.rebindTesterEvidenceAfterPr ??
+          (await import("./rebind-tester-evidence-after-pr.ts")).rebindTesterEvidenceAfterPr;
+        const getPr = deps.getPrForIssue ?? getPrForIssue;
+        const getDetailPr = deps.getPrDetail ?? getPrDetail;
+        const prNumber = await getPr(cfg, issueNumber).catch(() => null);
+        const prDetail = prNumber
+          ? await getDetailPr(cfg, prNumber).catch(() => null)
+          : null;
+        const runId = input.evidence?.pipeline_run_id?.trim() ?? "";
+        const runDir = runId ? runDirPath(cfg.repo_dir, runId) : "";
+        const readTs = deps.readTrustedSurfaceDecision ?? readTrustedSurfaceDecision;
+        const trustedSurface = runDir ? await readTs(runDir).catch(() => null) : null;
+        const rebind = await rebindFn({
+          cfg,
+          issueNumber,
+          stage: input.diagnostic.detail.stage ?? "design-gate",
+          runDir,
+          prNumber,
+          prHeadSha: prDetail?.head_sha ?? null,
+          trustedSurface,
+          reproduce: async ({ runDir: dest }) => {
+            const wt = await getWorktree(cfg, issueNumber);
+            if (!wt) return { ok: false };
+            const { runTestGate } = await import("./testgate.ts");
+            const gate = await runTestGate(
+              cfg,
+              issueNumber,
+              wt.path,
+              {},
+              input.runId,
+              "test-gate",
+              undefined,
+              dest,
+            );
+            return { ok: gate.passed === true, candidate_sha: gate.persist?.candidate_sha ?? null };
+          },
+        });
+        if (!rebind.ok) {
+          return failed(`${rebind.code}: ${rebind.summary}`);
+        }
+        try {
+          await clear(cfg, issueNumber);
+        } catch (err) {
+          return failed(
+            `rebind_tester_evidence_after_pr succeeded but could not clear blocked: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        return {
+          succeeded: true,
+          evidence:
+            `rebind_tester_evidence_after_pr: ${rebind.action} Tester evidence for ${rebind.candidateSha}`,
         };
       }
       case "wait_and_retry":

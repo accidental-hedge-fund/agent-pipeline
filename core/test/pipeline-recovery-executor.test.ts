@@ -528,10 +528,121 @@ test("DEFAULT_RECOVERY_POLICY recipe order: checkpoint owned leftovers before re
   const repairIdx = recipes.indexOf("repair_pipeline_item");
   assert.ok(checkpointIdx >= 0, "checkpoint_owned_harness_dirt must be configured");
   assert.ok(publishIdx >= 0, "publish_unpublished_stage_commit must be configured");
+  const rebindIdx = recipes.indexOf("rebind_tester_evidence_after_pr");
+  assert.ok(checkpointIdx >= 0, "checkpoint_owned_harness_dirt must be configured");
+  assert.ok(publishIdx >= 0, "publish_unpublished_stage_commit must be configured");
+  assert.ok(rebindIdx >= 0, "rebind_tester_evidence_after_pr must be configured");
   assert.ok(
-    unlinkIdx < checkpointIdx && checkpointIdx < publishIdx && publishIdx < repairIdx,
+    unlinkIdx < checkpointIdx && checkpointIdx < publishIdx && publishIdx < rebindIdx && rebindIdx < repairIdx,
     `got ${recipes.join(" → ")}`,
   );
+});
+
+test("rebind_tester_evidence_after_pr executes the shared bind and does not repair", async () => {
+  let repairs = 0;
+  let clears = 0;
+  let rebindCalls = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    clearBlocked: async () => { clears++; },
+    repairPipelineItem: async () => {
+      repairs++;
+      return { succeeded: true, evidence: "must not run" };
+    },
+    rebindTesterEvidenceAfterPr: async () => {
+      rebindCalls++;
+      return {
+        ok: true,
+        action: "bind",
+        candidateSha: "a".repeat(40),
+        evidence: { candidate_sha: "a".repeat(40) } as never,
+        suiteCommandInvoked: false,
+      };
+    },
+    getPrForIssue: async () => 99,
+    getPrDetail: async () => ({ number: 99, head_sha: "a".repeat(40) }) as never,
+    readTrustedSurfaceDecision: async () => ({
+      outcome: "passthrough",
+      candidate_sha: "a".repeat(40),
+      effective_verifier_hash: "c".repeat(64),
+    }) as never,
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "required implementation evidence role, observed missing",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      trusted_surface_outcome: "passthrough",
+      pr_head: "a".repeat(40),
+    },
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "rebind_tester_evidence_after_pr",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, true, result.error ?? result.evidence);
+  assert.equal(rebindCalls, 1);
+  assert.equal(repairs, 0);
+  assert.equal(clears, 1);
+  assert.match(result.evidence, /rebind_tester_evidence_after_pr/);
+});
+
+test("rebind_tester_evidence_after_pr fail-closed does not report recovered", async () => {
+  let clears = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    clearBlocked: async () => { clears++; },
+    getPrForIssue: async () => 99,
+    getPrDetail: async () => ({ number: 99, head_sha: "a".repeat(40) }) as never,
+    readTrustedSurfaceDecision: async () => null,
+    rebindTesterEvidenceAfterPr: async () => ({
+      ok: false,
+      code: "tester_rebind_trusted_surface_unobservable",
+      summary: "tester rebind: trusted-surface is not passthrough/rebound with a trustworthy verifier pin",
+      candidateSha: "a".repeat(40),
+      evidence: null,
+      diagnostic: buildStageDiagnostic({
+        reasonCode: "workflow-engine-defect",
+        blockerKind: "harness-failure",
+        reason: "tester rebind failed",
+        stage: "design-gate",
+      }),
+      blocker: {
+        schema_version: 1,
+        kind: "tester_rebind_blocker",
+        code: "tester_rebind_trusted_surface_unobservable",
+        candidate_sha: "a".repeat(40),
+        pr: 99,
+        summary: "blocked",
+      },
+    }),
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "required implementation evidence role, observed missing",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      trusted_surface_outcome: "blocked",
+      pr_head: "a".repeat(40),
+    },
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "rebind_tester_evidence_after_pr",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(clears, 0);
+  assert.match(result.error ?? "", /tester_rebind_trusted_surface_unobservable/);
 });
 
 test("DEFAULT_RECOVERY_POLICY recipe order: review-findings unlink before repair (#1060)", async () => {

@@ -120,7 +120,10 @@ import {
   type LinkedPrHead,
   type TrustedSurfaceObjectSource,
 } from "./trusted-surface-candidate.ts";
-import { buildReadinessEvidenceSubjectFromDecision } from "./evidence-subject.ts";
+import {
+  buildEngineFingerprint,
+  buildReadinessEvidenceSubjectFromDecision,
+} from "./evidence-subject.ts";
 import { buildEventSinkDeps } from "./event-sink.ts";
 import {
   isEngineDriftTransition,
@@ -196,6 +199,16 @@ import {
 } from "./issue-stage-adapters.ts";
 import { diffFilePaths } from "./stages/review-parsing.ts";
 import { observeImplementDeliverablePaths } from "./unpublished-stage-commit.ts";
+import {
+  observeTesterImplementationRole,
+  rebindTesterEvidenceAfterPr,
+  type RebindTesterEvidenceAfterPrInput,
+  type RebindTesterEvidenceResult,
+} from "./rebind-tester-evidence-after-pr.ts";
+import {
+  readTesterEvidence,
+  type TesterEvidenceIoDeps,
+} from "./tester-evidence.ts";
 import {
   reviewStageSkipTarget,
   type BlockerKind,
@@ -722,6 +735,17 @@ export interface AdvanceDeps {
   getPrDetail?: typeof getPrDetail;
   getPrCommits?: typeof getPrCommits;
   getPrDiff?: typeof getPrDiff;
+  /**
+   * #1468: run directory for consumer-stage Tester evidence. Observer and
+   * post-PR rebind read `tester-evidence.json` from this path.
+   */
+  runDir?: string;
+  /** Injected Tester evidence IO. Tests supply a memory map; production omits. */
+  testerIo?: TesterEvidenceIoDeps;
+  /** Injected post-PR Tester bind-or-reproduce. Nested/single/loop/FRG share runAdvance. */
+  rebindTesterEvidenceAfterPr?: (
+    input: RebindTesterEvidenceAfterPrInput,
+  ) => Promise<RebindTesterEvidenceResult>;
   /** Label transition seam. Tests inject a fake so later-stage epoch restart does not call GitHub. */
   transition?: typeof transition;
   /** Block-clear seam used when a later-stage candidate epoch restarts review. */
@@ -1060,7 +1084,14 @@ export function createDeliveryStageEvidenceObserver(
   dryRun: boolean,
   deps: Pick<
     AdvanceDeps,
-    "getIssueDetail" | "getPrForIssue" | "getPrDetail" | "getPrDiff" | "getOnDiskForIssue" | "gitInWorktree"
+    | "getIssueDetail"
+    | "getPrForIssue"
+    | "getPrDetail"
+    | "getPrDiff"
+    | "getOnDiskForIssue"
+    | "gitInWorktree"
+    | "runDir"
+    | "testerIo"
   > = {},
 ): DeliveryStageEvidenceObserver {
   return async (phase) => {
@@ -1113,12 +1144,37 @@ export function createDeliveryStageEvidenceObserver(
     }
     const implementation = observeImplementDeliverablePaths({ paths, candidateSha });
     const exactImplementation = implementation.role === "implementation" && Boolean(implementation.artifact_id);
+    if (exactImplementation) {
+      return {
+        candidateSha,
+        candidateEpoch: candidateSha,
+        evidenceRole: "implementation",
+        artifactIdentity: implementation.artifact_id,
+        postconditionProven: phase === "before" || progressed,
+      };
+    }
+    if (role === "implementation" && deps.runDir) {
+      const read = await readTesterEvidence(deps.runDir, deps.testerIo);
+      const tester = observeTesterImplementationRole(
+        read.status === "ok" ? read.evidence : null,
+        candidateSha,
+      );
+      if (tester) {
+        return {
+          candidateSha: tester.candidateSha,
+          candidateEpoch: tester.candidateSha,
+          evidenceRole: "implementation",
+          artifactIdentity: tester.artifactIdentity,
+          postconditionProven: phase === "before" || progressed,
+        };
+      }
+    }
     return {
       candidateSha,
       candidateEpoch: candidateSha,
-      evidenceRole: exactImplementation ? "implementation" : null,
-      artifactIdentity: exactImplementation ? implementation.artifact_id : null,
-      postconditionProven: exactImplementation && (phase === "before" || progressed),
+      evidenceRole: null,
+      artifactIdentity: null,
+      postconditionProven: false,
     };
   };
 }
@@ -2903,6 +2959,95 @@ export async function runAdvance(
           ).catch(() => {});
         }
       }
+      // #1468: after implementing has pushed and a linked PR exists, re-resolve
+      // trusted-surface and bind or reproduce SHA-matched Tester evidence before
+      // the next consumer delivery-stage observer. Nested/single/loop/FRG share
+      // this path because they enter runAdvance.
+      if (stage === "design-gate" && runDir && !opts.dryRun) {
+        const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
+          () => null,
+        );
+        if (prNumber) {
+          const existingTester = await readTesterEvidence(runDir, deps.testerIo);
+          if (existingTester.status === "missing") {
+            // No Tester record to rebind. Path-exact implementation proof remains
+            // sufficient for later consumers; do not fail-closed this stage.
+          } else {
+          const prDetail = await (deps.getPrDetail ?? getPrDetail)(cfg, prNumber).catch(() => null);
+          const prHeadSha = prDetail?.head_sha ?? null;
+          const engineFp = pinnedEngine
+            ? buildEngineFingerprint({
+                version: pinnedEngine.version,
+                templates_fingerprint: pinnedEngine.templates_fingerprint,
+                ...(pinnedEngine.commit_sha ? { commit_sha: pinnedEngine.commit_sha } : {}),
+              })
+            : null;
+          const rebindFn = deps.rebindTesterEvidenceAfterPr ?? rebindTesterEvidenceAfterPr;
+          const rebind = await rebindFn({
+            cfg,
+            issueNumber,
+            stage,
+            runDir,
+            prNumber,
+            prHeadSha,
+            trustedSurface: currentTrustedSurface,
+            domain: (cfg.domain || cfg.repo || "").trim() || undefined,
+            engineFingerprint: engineFp,
+            io: deps.testerIo,
+            reproduce: async ({ runDir: dest }) => {
+              const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
+                () => null,
+              );
+              if (!wt || !cfg.test_gate) return { ok: false };
+              try {
+                const { runTestGate } = await import("./testgate.ts");
+                const gate = await runTestGate(
+                  cfg,
+                  issueNumber,
+                  wt.path,
+                  {},
+                  pipelineRunId,
+                  evidenceStageName(stage),
+                  stateDir,
+                  dest,
+                  runStoreDeps,
+                );
+                return { ok: gate.passed === true, candidate_sha: gate.persist?.candidate_sha ?? null };
+              } catch {
+                return { ok: false };
+              }
+            },
+          });
+          if (!rebind.ok) {
+            tlog(`[pipeline] #${issueNumber}: ${rebind.summary}`);
+            const blockedOut: Outcome = {
+              advanced: false,
+              status: "blocked",
+              reason: rebind.summary,
+              blockerKind: "harness-failure",
+              diagnostic: rebind.diagnostic,
+            };
+            await emitBlockedOutcomeEvents(
+              runDir,
+              issueNumber,
+              stage,
+              blockedOut,
+              runStoreDeps,
+            ).catch(() => {});
+            await (deps.setBlocked ?? setBlocked)(
+              cfg,
+              issueNumber,
+              rebind.summary,
+              stage,
+              "harness-failure",
+            ).catch(() => {});
+            printOutcome(issueNumber, stage, blockedOut, tlog);
+            return blockedOut;
+          }
+          }
+        }
+      }
+
       let out: Outcome;
       try {
         const dispatchOpts: AdvanceOpts = {
@@ -2910,7 +3055,11 @@ export async function runAdvance(
           observeDeliveryStageEvidence:
             opts.observeDeliveryStageEvidence ??
             (isDeliveryStage(stage)
-              ? createDeliveryStageEvidenceObserver(cfg, issueNumber, stage, !!opts.dryRun, deps)
+              ? createDeliveryStageEvidenceObserver(cfg, issueNumber, stage, !!opts.dryRun, {
+                  ...deps,
+                  runDir,
+                  testerIo: deps.testerIo,
+                })
               : undefined),
         };
         out = await (deps.dispatch ?? dispatch)(

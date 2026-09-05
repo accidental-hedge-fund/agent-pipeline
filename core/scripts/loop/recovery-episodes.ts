@@ -175,6 +175,7 @@ const CLASS_RECOVERY_SEQUENCE: Record<DurableBlockerClass, { recipes: readonly R
       "unlink_engine_scratch",
       "checkpoint_owned_harness_dirt",
       "publish_unpublished_stage_commit",
+      "rebind_tester_evidence_after_pr",
       "restart_workflow_engine",
       "repair_pipeline_item",
     ],
