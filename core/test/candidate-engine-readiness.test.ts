@@ -65,6 +65,28 @@ test("candidate-engine consumer inventory is exact and hard-gated (#1454)", () =
   );
 });
 
+test("resolve-and-prepare rejects an uninventoried consumer before resolution I/O (#1454)", async () => {
+  let touched = false;
+  const deps = {
+    isDirectory() { touched = true; return true; },
+    fileExists() { touched = true; return true; },
+    revParseHead() { touched = true; return SHA; },
+    porcelain() { touched = true; return ""; },
+  } as ResolveAndPrepareCandidateEngineDeps;
+  await assert.rejects(
+    sharedResolveAndPrepareCandidateEngine(
+      {
+        repoDir: "/repo",
+        candidateSha: SHA,
+        consumer: "new.uninventoried.consumer" as never,
+      },
+      deps,
+    ),
+    /not bound exactly once/,
+  );
+  assert.equal(touched, false);
+});
+
 type RootState = {
   head: string | null;
   porcelain: string | null;

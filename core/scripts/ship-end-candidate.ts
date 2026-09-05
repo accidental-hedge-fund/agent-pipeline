@@ -221,6 +221,8 @@ export async function resolveAndPrepareCandidateEngine(
     repoDir: string;
     candidateSha: string;
     candidateEngineRootEnv?: string | null;
+    /** Executable inventory identity checked before any resolution I/O. */
+    consumer: CandidateEngineConsumer;
   },
   deps: ResolveAndPrepareCandidateEngineDeps,
 ): Promise<CandidateEngineResult> {

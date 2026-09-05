@@ -54,6 +54,10 @@ import {
   type TrustedSurfaceDecision,
 } from "./trusted-surface.ts";
 import { isLogicalOperationId, mintLogicalOperationId, resolveLogicalOperationId } from "./logical-operation.ts";
+import {
+  assertRequiredAdmissionRoute,
+  type RequiredAdmissionRouteName,
+} from "./operation-reliability.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
 
@@ -1535,9 +1539,13 @@ export async function persistPublicEntrypointAdmission(
     env?: NodeJS.ProcessEnv;
     factoryControlDir?: string | null;
     factoryControlRoot?: string | null;
+    /** Executable inventory route that authorizes this strict boundary. */
+    route: RequiredAdmissionRouteName;
   },
   deps: PublicAdmissionStoreDeps = defaultPublicAdmissionStoreDeps,
 ): Promise<PublicAdmissionResult> {
+  const expectedBoundary = opts.kind === "train" ? "train-admission" : "public-admission";
+  assertRequiredAdmissionRoute(opts.route, opts.kind, expectedBoundary);
   const startedAt = opts.startedAt ?? new Date();
   const runId = opts.runId ?? publicEntrypointRunIdFor(opts.kind, startedAt);
   const suppliedLogicalId = opts.logicalOperationId?.trim() || null;

@@ -1157,7 +1157,6 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
   let outerLogicalOperationId = mintLogicalOperationId();
   let trainStoreRoot = opts.repoDir;
   if (mergeMode) {
-    assertRequiredAdmissionRoute("train.direct", "train", "train-admission");
     try {
       trainStoreRoot =
         (await (deps.resolveApprovedControlRoot ?? (() => resolvePublicAdmissionPersistRoot({ repoDir: opts.repoDir })))()) ?? "";
@@ -1212,6 +1211,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         repo: opts.repo,
         domain: opts.pipelineConfig?.domain ?? opts.repo,
         operationKey: `train:${opts.repo}:merge:${selectorKey}`,
+        route: "train.direct",
         mintLogicalOperationId: () => outerLogicalOperationId,
         startedAt,
       },
@@ -1356,7 +1356,6 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     });
   };
   const admitNestedMergeSubmission = async (issue: number, pr: number): Promise<string | null> => {
-    assertRequiredAdmissionRoute("merge.train-nested", "merge", "public-admission");
     const admission = await (deps.persistPublicAdmission ?? persistPublicEntrypointAdmission)(
       {
         repoDir: opts.repoDir,
@@ -1366,6 +1365,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         domain: opts.pipelineConfig?.domain ?? opts.repo,
         issue,
         operationKey: `merge:${opts.repo}:pr:${pr}`,
+        route: "merge.train-nested",
         runId: `merge-${session.runId}-${issue}-${pr}`,
         logicalOperationId: session.logicalOperationId,
         admissionMode: "nested",

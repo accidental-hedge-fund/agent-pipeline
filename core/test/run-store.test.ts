@@ -53,6 +53,14 @@ const ISSUE = 155;
 const STARTED_AT = "2026-06-16T21-11-35-000Z"; // filesystem-safe (hyphens + ms)
 const STARTED_AT_ISO = "2026-06-16T21:11:35.000Z"; // ISO for Date parsing
 
+function directAdmissionRoute(kind: "single" | "merge" | "merge-queue") {
+  return kind === "single"
+    ? "single.direct" as const
+    : kind === "merge"
+      ? "merge.direct" as const
+      : "merge-queue.apply" as const;
+}
+
 // ---------------------------------------------------------------------------
 // runIdFor / runsDir / runDirPath
 // ---------------------------------------------------------------------------
@@ -415,6 +423,7 @@ test("persistPublicEntrypointAdmission: writes kind and run_start.entrypoint thr
       {
         repoDir: REPO_DIR,
         kind,
+        route: directAdmissionRoute(kind),
         repo: "owner/repo",
         profile: "codex",
         issue: kind === "single" ? ISSUE : undefined,
@@ -451,6 +460,7 @@ test("persistPublicEntrypointAdmission: writes under factory-control generic sto
       {
         repoDir: candidateRepo,
         kind,
+        route: directAdmissionRoute(kind),
         repo: "owner/repo",
         profile: "codex",
         issue: kind === "single" ? ISSUE : undefined,
@@ -470,6 +480,26 @@ test("persistPublicEntrypointAdmission: writes under factory-control generic sto
     assert.equal(events.type, "run_start");
     assert.equal(events.entrypoint, kind);
   }
+});
+
+test("persistPublicEntrypointAdmission: an uninventoried production route fails before I/O (#1454)", async () => {
+  const store = memRunStore();
+  await assert.rejects(
+    persistPublicEntrypointAdmission(
+      {
+        repoDir: "/candidate",
+        factoryControlRoot: "/control",
+        kind: "single",
+        route: "merge.direct" as never,
+        repo: "owner/repo",
+        issue: 1454,
+      },
+      store.deps,
+    ),
+    /route binding mismatch/,
+  );
+  assert.equal(store.mkdirs.length, 0);
+  assert.equal(store.files.size, 0);
 });
 
 test("resolvePublicAdmissionPersistRoot: unknown factory-control root fails closed (#1454)", async () => {
@@ -497,6 +527,7 @@ test("persistPublicEntrypointAdmission: nested and resumed attempts reuse one im
       repoDir: "/candidate",
       factoryControlRoot: "/control",
       kind: "merge",
+      route: "merge.train-nested",
       repo: "owner/repo",
       domain: "github.com/owner/repo",
       startedAt: new Date("2026-09-05T01:00:00Z"),
@@ -514,6 +545,7 @@ test("persistPublicEntrypointAdmission: nested and resumed attempts reuse one im
       repoDir: "/candidate",
       factoryControlRoot: "/control",
       kind: "merge",
+      route: "merge.direct",
       repo: "owner/repo",
       domain: "github.com/owner/repo",
       startedAt: new Date("2026-09-05T01:00:01Z"),
@@ -531,6 +563,7 @@ test("persistPublicEntrypointAdmission: nested and resumed attempts reuse one im
       repoDir: "/candidate",
       factoryControlRoot: "/control",
       kind: "merge",
+      route: "merge.train-nested",
       repo: "owner/repo",
       admissionMode: "nested",
       mintLogicalOperationId: () => { throw new Error("must not mint"); },
@@ -548,6 +581,7 @@ test("persistPublicEntrypointAdmission: direct retries reuse the durable operati
     repoDir: "/candidate",
     factoryControlRoot: "/control",
     kind: "single" as const,
+    route: "single.direct" as const,
     repo: "owner/repo",
     domain: "github.com/owner/repo",
     issue: 1454,
@@ -576,6 +610,7 @@ test("persistPublicEntrypointAdmission: concurrent shared run id cannot overwrit
     repoDir: "/candidate",
     factoryControlRoot: "/control",
     kind: "merge" as const,
+    route: "merge.direct" as const,
     repo: "owner/repo",
     operationKey: "merge:owner/repo:pr:99",
     runId: "merge-shared",
@@ -602,6 +637,7 @@ test("persistPublicEntrypointAdmission: unavailable and non-canonical roots fail
         repoDir: "/candidate",
         factoryControlRoot: fixture.root,
         kind: "single",
+        route: "single.direct",
         repo: "owner/repo",
         issue: 1454,
         mintLogicalOperationId: () => "lop-prebound",
@@ -688,6 +724,7 @@ test("persistPublicEntrypointAdmission: every durability and read-back fault ref
         repoDir: "/candidate",
         factoryControlRoot: "/control",
         kind: "single",
+        route: "single.direct",
         repo: "owner/repo",
         issue: 1454,
         startedAt: new Date("2026-09-05T02:00:00Z"),
@@ -706,6 +743,7 @@ test("persistPublicEntrypointAdmission: a conflicting existing stamp is immutabl
     repoDir: "/candidate",
     factoryControlRoot: "/control",
     kind: "single" as const,
+    route: "single.direct" as const,
     repo: "owner/repo",
     issue: 1454,
     startedAt: new Date("2026-09-05T03:00:00Z"),
@@ -732,6 +770,7 @@ test("persistPublicEntrypointAdmission: a partial existing stamp fails closed wi
     repoDir: "/candidate",
     factoryControlRoot: "/control",
     kind: "merge" as const,
+    route: "merge.direct" as const,
     repo: "owner/repo",
     startedAt: new Date("2026-09-05T03:01:00Z"),
     runId: "merge-partial",

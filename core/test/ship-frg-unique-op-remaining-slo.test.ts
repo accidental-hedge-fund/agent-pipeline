@@ -282,15 +282,15 @@ test("persistPublicEntrypointAdmission plus mapping observes all three public co
   const deps = persistMemDeps(files);
   const startedAt = new Date("2026-09-04T21:00:15.000Z");
   await persistPublicEntrypointAdmission(
-    { repoDir: "/repo", kind: "single", repo: "o/r", issue: 42, startedAt, factoryControlRoot: "/repo" },
+    { repoDir: "/repo", kind: "single", route: "single.direct", repo: "o/r", issue: 42, startedAt, factoryControlRoot: "/repo" },
     deps,
   );
   await persistPublicEntrypointAdmission(
-    { repoDir: "/repo", kind: "merge", repo: "o/r", startedAt, factoryControlRoot: "/repo" },
+    { repoDir: "/repo", kind: "merge", route: "merge.direct", repo: "o/r", startedAt, factoryControlRoot: "/repo" },
     deps,
   );
   await persistPublicEntrypointAdmission(
-    { repoDir: "/repo", kind: "merge-queue", repo: "o/r", startedAt, factoryControlRoot: "/repo" },
+    { repoDir: "/repo", kind: "merge-queue", route: "merge-queue.apply", repo: "o/r", startedAt, factoryControlRoot: "/repo" },
     deps,
   );
   const kinds = [...files.keys()]
@@ -349,6 +349,7 @@ test("persist into factory-control generic store is observed by in-flight ship s
       {
         repoDir: "/candidate-worktree",
         kind,
+        route: kind === "single" ? "single.direct" : kind === "merge" ? "merge.direct" : "merge-queue.apply",
         repo: "o/r",
         issue: kind === "single" ? 42 : undefined,
         startedAt,
@@ -390,6 +391,7 @@ test("candidate-worktree-only persist is not unique-operation coverage (#1446)",
       {
         repoDir: "/candidate-worktree",
         kind,
+        route: kind === "single" ? "single.direct" : kind === "merge" ? "merge.direct" : "merge-queue.apply",
         repo: "o/r",
         issue: kind === "single" ? 42 : undefined,
         startedAt,
