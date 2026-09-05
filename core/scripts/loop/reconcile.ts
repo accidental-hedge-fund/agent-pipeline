@@ -24,6 +24,7 @@ import {
   getIssueLabelEvents,
   getIssueStateAndLabels,
   getPrChecks,
+  getPrCommits,
   getPrDetail,
   getPrDiff,
   getPrForIssueAnyState,
@@ -35,6 +36,7 @@ import {
 import { diffFilePaths } from "../stages/review-parsing.ts";
 import { getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
 import { observeImplementDeliverablePaths } from "../unpublished-stage-commit.ts";
+import { isPipelineInternalCommit } from "../pipeline-commits.ts";
 import { isAdvanceStillNeeded, isBlockedInLabels, pipelineStageFromLabels } from "./precondition.ts";
 import {
   integrationSideEffectCertainty,
@@ -149,6 +151,9 @@ export interface ReconcileObserveDeps {
     body?: string;
   } | null>;
   getPrChecks(prNumber: number): Promise<{ bucket: string }[]>;
+  /** Ordered commits through the live PR head, used to collapse trailing
+   * pipeline-owned bookkeeping commits into the prior logical epoch. */
+  getPrCommits?(prNumber: number): Promise<{ oid: string; messageHeadline: string }[]>;
   /** Exact PR role/candidate observer. Missing or ambiguous bindings fail closed. */
   getPrArtifactBinding?(prNumber: number, detail: {
     state: "open" | "closed" | "merged";
@@ -226,6 +231,9 @@ export function defaultReconcileObserveDeps(cfg: PipelineConfig): ReconcileObser
       } catch {
         return [];
       }
+    },
+    async getPrCommits(prNumber) {
+      return getPrCommits(cfg, prNumber);
     },
     async getPrArtifactBinding(prNumber, detail) {
       try {
@@ -352,6 +360,7 @@ export async function observeExternalIdentity(
   let checks_conclusion: LoopExternalIdentity["checks_conclusion"] = "none";
   let integration_certainty: SideEffectCertainty = "known_absent";
   let linked_pr_numbers: number[] = [];
+  let logical_candidate_epoch: string | null | undefined;
 
   const foundPrNumber = await deps.findPrForIssue(issueNumber);
   const listedRaw = deps.listLinkedPrs ? await deps.listLinkedPrs(issueNumber) : null;
@@ -442,6 +451,25 @@ export async function observeExternalIdentity(
       merge_commit_sha = detail.merge_commit_sha;
       const checks = await deps.getPrChecks(chosen);
       checks_conclusion = deriveChecksConclusion(checks);
+      if (deps.getPrCommits) {
+        try {
+          const commits = await deps.getPrCommits(chosen);
+          const headIndex = commits.findIndex(
+            (commit) => commit.oid.trim().toLowerCase() === head_sha.trim().toLowerCase(),
+          );
+          if (headIndex >= 0) {
+            logical_candidate_epoch =
+              [...commits.slice(0, headIndex + 1)]
+                .reverse()
+                .find((commit) => !isPipelineInternalCommit(commit.messageHeadline))
+                ?.oid.trim().toLowerCase() ?? head_sha.trim().toLowerCase();
+          } else {
+            logical_candidate_epoch = null;
+          }
+        } catch {
+          logical_candidate_epoch = null;
+        }
+      }
     }
   }
 
@@ -471,6 +499,7 @@ export async function observeExternalIdentity(
     artifact_role: projectedArtifact?.artifact_role ?? "unknown",
     artifact_identity: projectedArtifact?.artifact_identity ?? null,
     candidate_epoch: projectedArtifact?.candidate_epoch ?? null,
+    ...(logical_candidate_epoch !== undefined ? { logical_candidate_epoch } : {}),
     logical_operation_id: projectedArtifact?.logical_operation_id ?? null,
     expected_logical_operation_id: expected.logicalOperationId ?? null,
   };
@@ -674,6 +703,10 @@ function describeObservedState(identity: LoopExternalIdentity): string {
 /** Computes exactly one {@link LoopNextAction} from the reconciled item state
  *  and its verified identity alone. No clock read, randomness, or I/O — the
  *  same inputs always yield the same action (#511 acceptance criterion). */
+function isReviewPipelineStage(stage: string | null | undefined): boolean {
+  return stage === "review-1" || stage === "review-2";
+}
+
 export function computeNextAction(
   state: LoopItemState,
   identity: LoopExternalIdentity,
@@ -686,14 +719,24 @@ export function computeNextAction(
   if (drift === "ledger-ahead" || drift === "external-absent" || drift === "identity-mismatch") {
     return "reconstruct";
   }
-  if (drift === "checks-regressed") return identity.checks_conclusion === "pending" ? "await-checks" : "noop";
+  const reviewStage = isReviewPipelineStage(identity.pipeline_stage);
+  // #1462: pending checks must not noop exact-SHA review after a new candidate epoch.
+  if (drift === "checks-regressed") {
+    if (reviewStage) return "advance";
+    return identity.checks_conclusion === "pending" ? "await-checks" : "noop";
+  }
   // Labels carry workflow state, never authority.
   if (identity.blocked_label_present) return "noop";
 
   switch (state) {
     case "pr_opened":
+      if (reviewStage) return "advance";
       if (identity.checks_conclusion === "pending") return "await-checks";
       if (identity.checks_conclusion === "success") return "advance";
+      return "noop";
+    case "in_progress":
+    case "pending":
+      if (reviewStage) return "advance";
       return "noop";
     case "merged":
       return mergeBarrierSetForThisItem ? "clear-merge-barrier" : "noop";

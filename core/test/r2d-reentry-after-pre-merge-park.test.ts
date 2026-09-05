@@ -78,7 +78,7 @@ function nextStage(stage: Stage): Stage {
 }
 
 function auditComments(): { author: string; body: string }[] {
-  return ["pre-merge", "visual-gate", "eval-gate", "shipcheck-gate", "ready-to-deploy"].map(
+  return ["review-1", "review-2", "pre-merge", "visual-gate", "eval-gate", "shipcheck-gate", "ready-to-deploy"].map(
     (s) => ({
       author: "pipeline-bot",
       body: `## Pipeline: ${s}\n<!-- pipeline-audit: run=test state=${s} -->`,
@@ -208,6 +208,7 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
   let createWorktreeCalls = 0;
   const origLog = console.log;
   const origWarn = console.warn;
+  const origExit = process.exitCode;
   console.log = (...args: unknown[]) => {
     logs.push(args.map(String).join(" "));
   };
@@ -251,7 +252,20 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
     state: "open",
     url: `https://example.test/${ISSUE}`,
     labels,
-    comments: [...auditComments(), ...(opts.extraComments ?? [])],
+    comments: [
+      ...auditComments(),
+      ...(opts.prHead && !opts.extraComments
+        ? [
+            {
+              author: "pipeline-bot",
+              body:
+                `## Review 2 (Adversarial) — approve (commit ${opts.prHead.slice(0, 7)})\n\n` +
+                `ok\n\n<!-- reviewed-sha: ${opts.prHead} -->`,
+            },
+          ]
+        : []),
+      ...(opts.extraComments ?? []),
+    ],
   };
 
   const deps: AdvanceDeps = {
@@ -274,6 +288,13 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
     getPrDetail: async () => {
       if (!opts.prHead) throw new Error("getPrDetail must not run without a PR");
       return prDetail(opts.prHead);
+    },
+    getPrCommits: async () =>
+      opts.prHead ? [{ oid: opts.prHead, messageHeadline: "feat: implement" }] : [],
+    transition: async (_cfg, _n, from, to) => {
+      const idx = labels.findIndex((l) => l.startsWith("pipeline:"));
+      if (idx >= 0) labels[idx] = `pipeline:${to}`;
+      else labels.push(`pipeline:${to}`);
     },
     getOnDiskForIssue: async () => {
       worktreeLookups += 1;
@@ -317,6 +338,13 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
       dispatchStages.push(stage);
       if (stage === "ready-to-deploy") {
         throw new Error("dispatch must not handle ready-to-deploy");
+      }
+      if (stage === "review-1" || stage === "review-2") {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: `review evaluating ${opts.prHead ?? "unknown"}`,
+        };
       }
       const to = nextStage(stage);
       const idx = labels.findIndex((l) => l.startsWith("pipeline:"));
@@ -371,6 +399,7 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
   } finally {
     console.log = origLog;
     console.warn = origWarn;
+    process.exitCode = origExit;
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
     void mergeCalls;
@@ -811,10 +840,12 @@ test("fresh re-entry loads review SHA-gate pin without lastAdvancedCandidateSha"
       },
     ],
   });
-  assert.ok(result.decision);
-  assert.equal(result.decision?.outcome, "blocked");
-  assert.equal(result.decision?.reason.code, "candidate_sha_mismatch");
-  assert.notEqual(result.decision?.candidate_sha, OTHER);
+  assert.ok(
+    result.dispatchStages.includes("review-1") ||
+      result.logs.some((l) => /returning to review-1/.test(l)),
+    "developer HEAD past review SHA must return to review-1 (#1462)",
+  );
+  assert.equal(result.dispatchStages.includes("visual-gate"), false);
   assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
 });
 
@@ -980,10 +1011,12 @@ test("fresh re-entry loads pre-merge delta-review pin without lastAdvancedCandid
       },
     ],
   });
-  assert.ok(result.decision);
-  assert.equal(result.decision?.outcome, "blocked");
-  assert.equal(result.decision?.reason.code, "candidate_sha_mismatch");
-  assert.notEqual(result.decision?.candidate_sha, OTHER);
+  assert.ok(
+    result.dispatchStages.includes("review-1") ||
+      result.logs.some((l) => /returning to review-1/.test(l)),
+    "developer HEAD past review SHA must return to review-1 (#1462)",
+  );
+  assert.equal(result.dispatchStages.includes("visual-gate"), false);
   assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
 });
 

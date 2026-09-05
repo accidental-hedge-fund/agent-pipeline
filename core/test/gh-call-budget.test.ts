@@ -214,9 +214,8 @@ function makeBudgetHarness(opts: {
     listPrHeadChangeDirs: track("listPrHeadChangeDirs", async () => []),
     openspecIsActive: async () => false,
     changeDirExists: () => false,
-    gitInWorktree: async () => {
-      throw new Error("gitInWorktree must not run in #839 budget unit tests");
-    },
+    // Local exact-SHA proof is mandatory and does not consume the GitHub budget.
+    gitInWorktree: async () => ({ stdout: `${headSha.current}\n`, stderr: "", code: 0 }),
     postComment: track("postComment", async (_cfg, _n, body) => {
       comments.push(body);
     }),

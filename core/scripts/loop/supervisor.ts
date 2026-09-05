@@ -69,6 +69,7 @@ import {
   buildCoolingRecord,
   coolingDeadline,
   coolingIsActive,
+  coolingIsStaleForNewCandidateEpoch,
   coolingRecordForItem,
   emptyEpisode,
   perStrategyBound,
@@ -756,6 +757,39 @@ function recoveryCandidateIdentity(
   ].join("|");
 }
 
+/** Logical recovery epoch. Production observations explicitly set
+ * `logical_candidate_epoch`. A non-empty logical epoch is preferred when
+ * lineage is readable. Null/empty means the commit list was unobservable:
+ * Cooling invalidation then uses the readable raw HEAD as a conservative
+ * new epoch so a known S→H movement cannot keep S-era Cooling
+ * authoritative. Older injected/test observations omit the field and
+ * retain the historical raw-HEAD behavior. */
+function observedCandidateEpoch(item: LoopItemLedgerEntry | undefined): string {
+  const identity = item?.last_verified_identity;
+  if (!identity) return "";
+  if (Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")) {
+    const logical = identity.logical_candidate_epoch?.trim() ?? "";
+    if (logical) return logical;
+    return identity.head_sha.trim();
+  }
+  return identity.head_sha.trim();
+}
+
+/** Episode key / persisted attempt epoch: prefer the observed logical epoch
+ * when lineage is observable. Keep the caller's existing fallback when the
+ * field is absent or lineage could not be read. */
+function recoveryEpisodeCandidateEpoch(
+  item: LoopItemLedgerEntry | undefined,
+  fallback: string,
+): string {
+  const identity = item?.last_verified_identity;
+  if (identity && Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")) {
+    const logical = identity.logical_candidate_epoch?.trim() ?? "";
+    if (logical) return logical;
+  }
+  return fallback;
+}
+
 async function stopForRecoveryPreflight(
   deps: SupervisorDeps,
   contract: LoopContract,
@@ -998,6 +1032,7 @@ async function executeBlockedRecovery(
     }
   }
 
+  const currentEpoch = observedCandidateEpoch(item);
   const matchingAttempts = ledger.recovery_attempts.filter(
     (attempt) =>
       attempt.item_id === itemId &&
@@ -1009,7 +1044,16 @@ async function executeBlockedRecovery(
   if (!attempt) {
     const policy = contract.recovery_policy[item.blocked_theme];
     const ownedCooling = coolingRecordForItem(ledger, itemId);
-    if (coolingIsActive(ownedCooling, deps.store.now().toISOString())) {
+    if (
+      coolingIsActive(ownedCooling, deps.store.now().toISOString()) &&
+      !coolingIsStaleForNewCandidateEpoch(
+        ownedCooling,
+        ledger.recovery_attempts,
+        itemId,
+        currentEpoch,
+        item.last_verified_identity?.head_sha ?? currentEpoch,
+      )
+    ) {
       await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
         item_id: itemId,
         reason: "cooling_next_eligible_at",
@@ -1028,6 +1072,7 @@ async function executeBlockedRecovery(
         nextEligibleAt: coolingDeadline(time, policy.backoff, item.repeated_evidence_count ?? 1),
         itemId,
         theme: item.blocked_theme,
+        candidateEpoch: currentEpoch,
         historicalEvidence: "repeated_no_progress",
       });
       ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
@@ -1054,7 +1099,10 @@ async function executeBlockedRecovery(
       persisted.transport,
       matchingAttempts.length,
     );
-    const candidateEpoch = candidateIdentity.replace(/\|attempt=\d+$/i, "");
+    const candidateEpoch = recoveryEpisodeCandidateEpoch(
+      item,
+      candidateIdentity.replace(/\|attempt=\d+$/i, ""),
+    );
     const episodeKey = {
       operation: "loop_recovery",
       invariant: item.blocked_theme,
@@ -1132,6 +1180,7 @@ async function executeBlockedRecovery(
         nextEligibleAt: coolingDeadline(time, policy.backoff, 1),
         itemId,
         theme: item.blocked_theme,
+        candidateEpoch: currentEpoch,
         historicalEvidence: "recovery_exhausted",
       });
       ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
@@ -2273,21 +2322,33 @@ export async function runSupervisorCycle(
     }
 
     if (ledger.cooling) {
-      await appendActionEvidence(deps.store, runId, token, {
-        item_id: ledger.cooling.item_id ?? null,
-        action: "noop",
-        outcome: "cooling_recovery",
-        next_action: null,
-        progress: recoveryProgress ? "progress" : "no_progress",
-      });
-      return {
-        progress: recoveryProgress,
-        stop: null,
-        cooling: ledger.cooling,
-        holdOutstanding: false,
-        allDone: false,
-        heldItemIds: heldItemIdsFromLedger(ledger),
-      };
+      const cooledId = ledger.cooling.item_id;
+      const cooledItem = cooledId ? ledger.items[cooledId] : undefined;
+      const cooledEpoch = observedCandidateEpoch(cooledItem);
+      const staleCooling = coolingIsStaleForNewCandidateEpoch(
+        ledger.cooling,
+        ledger.recovery_attempts,
+        cooledId,
+        cooledEpoch,
+        cooledItem?.last_verified_identity?.head_sha ?? cooledEpoch,
+      );
+      if (!staleCooling) {
+        await appendActionEvidence(deps.store, runId, token, {
+          item_id: ledger.cooling.item_id ?? null,
+          action: "noop",
+          outcome: "cooling_recovery",
+          next_action: null,
+          progress: recoveryProgress ? "progress" : "no_progress",
+        });
+        return {
+          progress: recoveryProgress,
+          stop: null,
+          cooling: ledger.cooling,
+          holdOutstanding: false,
+          allDone: false,
+          heldItemIds: heldItemIdsFromLedger(ledger),
+        };
+      }
     }
 
     // Engine-owned strategy-cursor exhaustion stays item-local Cooling (or an
@@ -2310,7 +2371,10 @@ export async function runSupervisorCycle(
       const episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, {
         operation: "loop_recovery",
         invariant: candidate.blocked_theme,
-        candidate_epoch: candidate.last_verified_identity?.head_sha.trim() || candidate.evidence_fingerprint || candidate.id,
+        candidate_epoch: recoveryEpisodeCandidateEpoch(
+          candidate,
+          candidate.last_verified_identity?.head_sha.trim() || candidate.evidence_fingerprint || candidate.id,
+        ),
         evidence_identity: candidate.evidence_fingerprint ?? "",
       });
       const repeated = (candidate.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit;
@@ -2332,6 +2396,8 @@ export async function runSupervisorCycle(
         nextEligibleAt: coolingDeadline(time, policy?.backoff ?? { initial_seconds: 30, multiplier: 2, max_seconds: 300 }, 1),
         itemId: exhausted.id,
         theme: exhausted.blocked_theme,
+        candidateEpoch:
+          observedCandidateEpoch(exhausted) || exhausted.evidence_fingerprint || exhausted.id,
         historicalEvidence: "recovery_exhausted",
       });
       ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });

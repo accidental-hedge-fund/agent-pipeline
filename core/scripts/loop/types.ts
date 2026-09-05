@@ -745,6 +745,8 @@ export interface LoopCoolingRecord {
   time: string;
   item_id?: string;
   theme?: string;
+  /** Candidate epoch that created this item-local Cooling authority. */
+  candidate_epoch?: string;
   /** Earliest wake time. Required on live Cooling writes (#1325). */
   next_eligible_at?: string;
   /** Historical evidence token only — not a lifecycle STOP. */
@@ -891,6 +893,9 @@ export interface LoopExternalIdentity {
   artifact_role?: "planning" | "implementation" | "unknown";
   artifact_identity?: string | null;
   candidate_epoch?: string | null;
+  /** Last non-pipeline-internal commit at the observed PR head. Trailing
+   * pipeline-owned bookkeeping commits remain in the same logical epoch. */
+  logical_candidate_epoch?: string | null;
   /** Operation marker on the selected artifact and the ledger operation it must match. */
   logical_operation_id?: string | null;
   expected_logical_operation_id?: string | null;

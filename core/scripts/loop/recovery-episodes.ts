@@ -80,6 +80,66 @@ export type SelectStrategyResult =
   | { kind: "claim"; action: RecoveryRecipe; cursor: number; skipped: RecoveryRecipe[] }
   | { kind: "exhausted"; skipped: RecoveryRecipe[] };
 
+/** True when a recovery attempt is keyed to `candidateEpoch` (HEAD SHA or `head=` identity). */
+export function attemptBelongsToCandidateEpoch(
+  attempt: { candidate_epoch?: string | null; candidate_identity?: string | null },
+  candidateEpoch: string,
+): boolean {
+  const wanted = candidateEpoch.trim().toLowerCase();
+  if (!wanted) return false;
+  const epoch = (attempt.candidate_epoch ?? "").trim().toLowerCase();
+  if (epoch === wanted) return true;
+  if (epoch.includes(`head=${wanted}`)) return true;
+  const identity = (attempt.candidate_identity ?? "").toLowerCase();
+  return identity.includes(`head=${wanted}`);
+}
+
+/**
+ * True when Cooling was recorded under a previous candidate epoch. A new HEAD
+ * must not inherit S-episode exhaustion or Cooling as authority to skip review.
+ */
+export function coolingIsStaleForNewCandidateEpoch(
+  cooling: LoopCoolingRecord | null | undefined,
+  attempts: readonly Pick<
+    LoopRecoveryAttempt,
+    "item_id" | "candidate_epoch" | "candidate_identity" | "time" | "next_eligible_at"
+  >[],
+  itemId: string | undefined,
+  candidateEpoch: string,
+  candidateHead = candidateEpoch,
+): boolean {
+  if (!cooling || !itemId) return false;
+  if (cooling.item_id && cooling.item_id !== itemId) return false;
+  const wanted = candidateEpoch.trim();
+  if (!wanted) return false;
+  // New records bind Cooling directly to the epoch that created it. Do not
+  // infer ownership from the latest attempt: once an H attempt is appended,
+  // that inference would incorrectly make S-era Cooling current for H again.
+  if (cooling.candidate_epoch) {
+    return !attemptBelongsToCandidateEpoch(
+      { candidate_epoch: cooling.candidate_epoch },
+      wanted,
+    );
+  }
+  // Backward compatibility for ledgers written before candidate_epoch was
+  // persisted on Cooling. Bind to evidence that existed when Cooling was
+  // created, never to the latest attempt: a later H attempt must not transfer
+  // S-era Cooling authority onto H. If old evidence cannot identify an owner,
+  // retain Cooling (fail closed against duplicate recovery) until its deadline.
+  const coolingTime = Date.parse(cooling.time);
+  const owner = [...attempts].reverse().find((attempt) => {
+    if (attempt.item_id !== itemId) return false;
+    if (cooling.next_eligible_at && attempt.next_eligible_at === cooling.next_eligible_at) return true;
+    const attemptTime = Date.parse(attempt.time);
+    return Number.isFinite(coolingTime) && Number.isFinite(attemptTime) && attemptTime <= coolingTime;
+  });
+  if (!owner) return false;
+  // Legacy attempts predate logical epochs and identify their owner by the
+  // raw observed HEAD. Compare them with the current raw HEAD so upgrading at
+  // an internal-only tip does not invalidate an otherwise-current backoff.
+  return !attemptBelongsToCandidateEpoch(owner, candidateHead.trim());
+}
+
 export function recoveryEpisodeId(key: RecoveryEpisodeKey): string {
   const canonical = [
     "pipeline-recovery-episode@1",
@@ -461,6 +521,7 @@ export function buildCoolingRecord(input: {
   nextEligibleAt: string;
   itemId?: string;
   theme?: string;
+  candidateEpoch?: string;
   historicalEvidence?: LoopCoolingRecord["historical_evidence"];
   quarantinePath?: string;
 }): LoopCoolingRecord {
@@ -470,6 +531,7 @@ export function buildCoolingRecord(input: {
     next_eligible_at: input.nextEligibleAt,
     ...(input.itemId ? { item_id: input.itemId } : {}),
     ...(input.theme ? { theme: input.theme } : {}),
+    ...(input.candidateEpoch ? { candidate_epoch: input.candidateEpoch } : {}),
     ...(input.historicalEvidence ? { historical_evidence: input.historicalEvidence } : {}),
     ...(input.quarantinePath ? { quarantine_path: input.quarantinePath } : {}),
   };

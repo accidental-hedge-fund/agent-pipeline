@@ -305,6 +305,44 @@ test("observeExternalIdentity: builds a full identity from an open PR with green
   assert.ok(calls.includes("getPrChecks:12"));
 });
 
+test("observeExternalIdentity: trailing pipeline commits preserve the logical candidate epoch (#1462)", async () => {
+  const productSha = "a".repeat(40);
+  const archiveSha = "b".repeat(40);
+  const { deps } = fakeObserveDeps({
+    async findPrForIssue() { return 12; },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: archiveSha, merge_commit_sha: null };
+    },
+    async getPrCommits() {
+      return [
+        { oid: productSha, messageHeadline: "fix: product behavior" },
+        { oid: archiveSha, messageHeadline: "chore: archive OpenSpec change(s) for #100" },
+      ];
+    },
+  });
+  const identity = await observeExternalIdentity(deps, "100");
+  assert.equal(identity.head_sha, archiveSha);
+  assert.equal(identity.logical_candidate_epoch, productSha);
+});
+
+test("observeExternalIdentity: getPrCommits failure leaves raw HEAD with unobservable logical epoch (#1462)", async () => {
+  const shaS = "a".repeat(40);
+  const shaH = "b".repeat(40);
+  const { deps } = fakeObserveDeps({
+    async findPrForIssue() { return 12; },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: shaH, merge_commit_sha: null };
+    },
+    async getPrCommits() {
+      throw new Error("commit list unobservable");
+    },
+  });
+  const identity = await observeExternalIdentity(deps, "100");
+  assert.equal(identity.head_sha, shaH);
+  assert.equal(identity.logical_candidate_epoch, null);
+  assert.notEqual(identity.head_sha, shaS);
+});
+
 test("observeExternalIdentity: absent external objects are represented, not omitted", async () => {
   const { deps } = fakeObserveDeps();
   const identity = await observeExternalIdentity(deps, "100");
@@ -540,6 +578,32 @@ test("isLoopDriftClass: rejects an out-of-enum value", () => {
 test("computeNextAction: pending checks on an aligned pr_opened item yields await-checks", () => {
   const identity = openPrIdentity({ checks_conclusion: "pending" });
   assert.equal(computeNextAction("pr_opened", identity, null, false), "await-checks");
+});
+
+test("computeNextAction: pending checks do not noop review-1 after epoch change (#1462)", () => {
+  const identity = openPrIdentity({
+    pipeline_stage: "review-1",
+    checks_conclusion: "pending",
+    head_sha: "b".repeat(40),
+    candidate_epoch: "b".repeat(40),
+  });
+  assert.equal(computeNextAction("in_progress", identity, null, false), "advance");
+  assert.equal(computeNextAction("pending", identity, null, false), "advance");
+  assert.equal(computeNextAction("pr_opened", identity, null, false), "advance");
+  assert.equal(
+    computeNextAction("in_progress", identity, "checks-regressed", false),
+    "advance",
+  );
+  assert.notEqual(computeNextAction("in_progress", identity, null, false), "noop");
+  assert.notEqual(computeNextAction("in_progress", identity, "checks-regressed", false), "await-checks");
+});
+
+test("computeNextAction: review-2 stays actionable with pending checks (#1462)", () => {
+  const identity = openPrIdentity({
+    pipeline_stage: "review-2",
+    checks_conclusion: "pending",
+  });
+  assert.equal(computeNextAction("in_progress", identity, null, false), "advance");
 });
 
 test("computeNextAction: contradictions never invent human authority", () => {

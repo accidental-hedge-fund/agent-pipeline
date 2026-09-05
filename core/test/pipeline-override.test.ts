@@ -227,6 +227,7 @@ function makeReviewDeps(
       >,
     getIssueDetail: (async () => detail) as NonNullable<AdvanceReviewDeps["getIssueDetail"]>,
     getForIssue: async () => null,
+    gitInWorktree: async () => ({ stdout: `${"f".repeat(40)}\n`, stderr: "", code: 0 }),
     listPrHeadChangeDirs: async () => [],
     postComment: async (_cfg, _n, body) => {
       rec.comments.push(body);

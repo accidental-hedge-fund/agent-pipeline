@@ -2890,6 +2890,187 @@ test("recovery performs deterministic redispatch before model repair", async () 
   assert.ok((finalLedger.items["100"].recovery_budgets_remaining["workflow-state"] ?? 0) < 3);
 });
 
+test("pipeline-internal tip resumes the existing recovery episode cursor (#1462)", async () => {
+  const shaS = "a".repeat(40);
+  const shaH = "b".repeat(40);
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": {
+        ...workflowState,
+        recipes: ["resync_workflow_state", "repair_pipeline_item"],
+        retry_budget: 3,
+        per_strategy_bound: 1,
+        backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
+        repeated_evidence_limit: 5,
+      },
+    },
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const actions: string[] = [];
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "The PR head must be rebased onto main",
+    stage: "pre-merge",
+  });
+  const observe = fakeObserveDeps({
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      const head = actions.length === 0 ? shaS : shaH;
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: head, merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getPrCommits() {
+      const product = { oid: shaS, messageHeadline: "fix: product behavior" };
+      if (actions.length === 0) return [product];
+      return [
+        product,
+        { oid: shaH, messageHeadline: "chore: archive OpenSpec change(s) for #100" },
+      ];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: actions.length === 0 ? shaS : shaH };
+    },
+    async baseBranchContainsSha() {
+      return false;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: actions.includes("repair_pipeline_item") ? "ready_to_deploy" : "blocked_recoverable",
+    evidence: { pr_number: 12, pipeline_run_id: "advance-100" },
+    ...(actions.includes("repair_pipeline_item") ? {} : { diagnostic }),
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    actions.push(input.action);
+    if (input.action === "repair_pipeline_item") {
+      return { succeeded: true, evidence: "candidate repaired", candidateHead: shaH };
+    }
+    return { succeeded: false, evidence: "resync failed", error: "resync failed" };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, executeRecovery, recoverySleep: async () => {} },
+    { runId: "run-1", engine: "claude", maxCyclesSafety: 20 },
+  );
+
+  assert.equal(actions[0], "resync_workflow_state");
+  assert.equal(
+    actions[1],
+    "repair_pipeline_item",
+    "an internal-only tip must resume the S episode cursor instead of replaying the first recipe",
+  );
+  const finalLedger = await readLedger(deps, "run-1");
+  const claimed = finalLedger.recovery_attempts.filter((attempt) => attempt.outcome !== "skipped");
+  assert.ok(claimed.length >= 2);
+  assert.equal(claimed[0]?.candidate_epoch, shaS);
+  assert.equal(claimed[1]?.candidate_epoch, shaS);
+  assert.equal(claimed[0]?.episode_id, claimed[1]?.episode_id);
+  assert.equal(result.stop, null);
+});
+
+test("unobservable commit list after S→H does not keep S-era Cooling authoritative (#1462)", async () => {
+  const shaS = "a".repeat(40);
+  const shaH = "b".repeat(40);
+  const reviewFindings = DEFAULT_RECOVERY_POLICY["review-findings"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "review-findings": {
+        ...reviewFindings,
+        backoff: { initial_seconds: 3600, multiplier: 2, max_seconds: 7200 },
+      },
+    },
+  });
+  const seeded = blockedReviewRecoveryItem("100");
+  seeded.last_verified_identity = {
+    ...currentLocalIdentity(100),
+    pr_number: 12,
+    pr_state: "open",
+    head_sha: shaS,
+    logical_candidate_epoch: shaS,
+    pipeline_stage: "review-1",
+    checks_conclusion: "pending",
+  };
+  const ledger = testLedger({ "100": seeded });
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const time = deps.now().toISOString();
+  await persistOwnedCooling(deps, {
+    runId: "run-1",
+    token,
+    cooling: buildCoolingRecord({
+      reason: "strategy_cursor_exhausted",
+      time,
+      nextEligibleAt: coolingDeadline(time, { initial_seconds: 3600, multiplier: 2, max_seconds: 7200 }, 1),
+      itemId: "100",
+      theme: "review-findings",
+      candidateEpoch: shaS,
+      historicalEvidence: "recovery_exhausted",
+    }),
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:review-1"] };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: shaH, merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pending" }];
+    },
+    async getPrCommits() {
+      throw new Error("commit list unobservable");
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: shaH };
+    },
+  }).deps;
+  let recoveryCalls = 0;
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: false, evidence: "H recovery claimed", error: "fixture stops after H claim" };
+  };
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem: async () => {
+        throw new Error("blocked review item must recover before redispatch");
+      },
+      executeRecovery,
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+  assert.ok(
+    recoveryCalls >= 1,
+    "a readable S→H movement with unobservable lineage must not defer to S-era Cooling",
+  );
+  const auditAfter = await auditSupervisor(deps, "run-1");
+  const lastEntry = auditAfter.action_evidence.at(-1);
+  assert.notEqual(
+    lastEntry?.outcome,
+    "cooling_recovery",
+    "supervisor must not record cooling_recovery for stale S-era Cooling at H",
+  );
+  assert.equal(cycle.stop, null);
+});
+
 // ---------------------------------------------------------------------------
 // Needs-human blocker disposition (#570, capability
 // `loop-needs-human-blocker-disposition`) — regression for run

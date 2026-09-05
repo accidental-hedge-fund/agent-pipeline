@@ -361,6 +361,23 @@ test("readEvents: preserves additive logical_operation_id", async () => {
   assert.equal(events[0]!.logical_operation_id, "lop-preserved");
 });
 
+test("readEvents: preserves candidate-epoch restart audit events (#1462)", async () => {
+  const { deps } = memRunStore();
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "candidate_epoch_restarted",
+    at: STARTED_AT_ISO,
+    from_sha: "a".repeat(40),
+    to_sha: "b".repeat(40),
+    from_stage: "visual-gate",
+    review_stage: "review-1",
+    disposition: "new_epoch",
+  };
+  await appendEvent(RUN_DIR, event, deps);
+
+  assert.deepEqual(await readEvents(RUN_DIR, deps), [event]);
+});
+
 test("finalizeRun: copies logical_operation_id from run.json into summary.json", async () => {
   const { deps, readFile } = memRunStore();
   await initRunDir(

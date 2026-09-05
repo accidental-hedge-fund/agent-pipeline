@@ -17,9 +17,11 @@ import {
   RECOVERY_EPISODE_REQUIRED_FIELDS,
   assertNoMechanicalLifecycleStop,
   assertRecoveryEpisodeFields,
+  attemptBelongsToCandidateEpoch,
   buildCoolingRecord,
   coolingDeadline,
   coolingIsActive,
+  coolingIsStaleForNewCandidateEpoch,
   coolingRecordForItem,
   assertCursorDoesNotRegress,
   competingPrivateEpisodePath,
@@ -1411,4 +1413,163 @@ test("complete started claim after known_complete does not mint a second attempt
   });
   assert.equal(completed.attempt.outcome, "recovered");
   assert.equal(completed.ledger.recovery_attempts.length, 1);
+});
+
+test("attemptBelongsToCandidateEpoch matches HEAD SHA and head= identity (#1462)", () => {
+  const shaS = "a".repeat(40);
+  const shaH = "b".repeat(40);
+  assert.equal(attemptBelongsToCandidateEpoch({ candidate_epoch: shaH }, shaH), true);
+  assert.equal(
+    attemptBelongsToCandidateEpoch(
+      { candidate_epoch: `repo=o/r|base=main|pr=1|head=${shaH}|advance=r` },
+      shaH,
+    ),
+    true,
+  );
+  assert.equal(
+    attemptBelongsToCandidateEpoch({ candidate_identity: `head=${shaH}|attempt=0` }, shaH),
+    true,
+  );
+  assert.equal(attemptBelongsToCandidateEpoch({ candidate_epoch: shaS }, shaH), false);
+  assert.equal(
+    attemptBelongsToCandidateEpoch(
+      { candidate_epoch: `repo=o/r|head=${shaS}|advance=r` },
+      shaH,
+    ),
+    false,
+  );
+});
+
+test("coolingIsStaleForNewCandidateEpoch ignores S-episode Cooling after HEAD moves (#1462)", () => {
+  const shaS = "a".repeat(40);
+  const shaH = "b".repeat(40);
+  const cooling = buildCoolingRecord({
+    reason: "strategy_cursor_exhausted",
+    time: "2026-09-05T00:00:00.000Z",
+    nextEligibleAt: "2026-09-05T01:00:00.000Z",
+    itemId: "100",
+    theme: "review-findings",
+    candidateEpoch: shaS,
+    historicalEvidence: "recovery_exhausted",
+  });
+  const sAttempts = [
+    {
+      item_id: "100",
+      candidate_epoch: shaS,
+      candidate_identity: `head=${shaS}`,
+    },
+  ];
+  assert.equal(coolingIsStaleForNewCandidateEpoch(cooling, sAttempts, "100", shaH), true);
+  assert.equal(coolingIsStaleForNewCandidateEpoch(cooling, sAttempts, "100", shaS), false);
+  const afterFirstHAttempt = [
+    ...sAttempts,
+    {
+      item_id: "100",
+      candidate_epoch: shaH,
+      candidate_identity: `head=${shaH}`,
+    },
+  ];
+  assert.equal(
+    coolingIsStaleForNewCandidateEpoch(cooling, afterFirstHAttempt, "100", shaH),
+    true,
+    "an H attempt must not transfer S-era Cooling authority onto H",
+  );
+  assert.equal(cooling.candidate_epoch, shaS);
+  assert.equal(coolingIsStaleForNewCandidateEpoch(null, sAttempts, "100", shaH), false);
+});
+
+test("legacy Cooling binds to the attempt present at creation, not a later H attempt (#1462)", () => {
+  const shaS = "a".repeat(40);
+  const shaH = "b".repeat(40);
+  const legacyCooling = {
+    reason: "strategy_cursor_exhausted" as const,
+    time: "2026-09-05T00:10:00.000Z",
+    next_eligible_at: "2026-09-05T01:00:00.000Z",
+    item_id: "100",
+  };
+  const attempts = [
+    {
+      item_id: "100",
+      candidate_epoch: shaS,
+      candidate_identity: `head=${shaS}`,
+      time: "2026-09-05T00:00:00.000Z",
+      next_eligible_at: legacyCooling.next_eligible_at,
+    },
+    {
+      item_id: "100",
+      candidate_epoch: shaH,
+      candidate_identity: `head=${shaH}`,
+      time: "2026-09-05T00:20:00.000Z",
+    },
+  ];
+  assert.equal(coolingIsStaleForNewCandidateEpoch(legacyCooling, attempts, "100", shaH), true);
+});
+
+test("legacy Cooling at an internal-only tip survives logical-epoch upgrade (#1462)", () => {
+  const logicalSha = "a".repeat(40);
+  const archiveTip = "b".repeat(40);
+  const movedHead = "c".repeat(40);
+  const legacyCooling = {
+    reason: "strategy_cursor_exhausted" as const,
+    time: "2026-09-05T00:10:00.000Z",
+    next_eligible_at: "2026-09-05T01:00:00.000Z",
+    item_id: "100",
+  };
+  const attempts = [{
+    item_id: "100",
+    candidate_epoch: `repo=o/r|head=${archiveTip}|advance=legacy`,
+    candidate_identity: `repo=o/r|head=${archiveTip}|advance=legacy`,
+    time: "2026-09-05T00:00:00.000Z",
+    next_eligible_at: legacyCooling.next_eligible_at,
+  }];
+
+  assert.equal(
+    coolingIsStaleForNewCandidateEpoch(legacyCooling, attempts, "100", logicalSha, archiveTip),
+    false,
+    "an unchanged raw archive tip must retain legacy Cooling after logical epochs are introduced",
+  );
+  assert.equal(
+    coolingIsStaleForNewCandidateEpoch(legacyCooling, attempts, "100", logicalSha, movedHead),
+    true,
+    "a later raw HEAD movement must invalidate the legacy Cooling owner",
+  );
+});
+
+test("startRecoveryAttempt: new candidate epoch does not reuse S-episode cursor (#1462)", async () => {
+  const { deps, contract, token } = await setup();
+  await blockCi(deps, contract, token);
+  const shaS = "a".repeat(40);
+  const shaH = "b".repeat(40);
+  const first = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "repair_pipeline_item",
+    candidateIdentity: `head=${shaS}`,
+    candidateEpoch: shaS,
+  });
+  assert.equal(first.attempt.candidate_epoch, shaS);
+  const next = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "repair_pipeline_item",
+    candidateIdentity: `head=${shaH}`,
+    candidateEpoch: shaH,
+  });
+  assert.equal(next.attempt.candidate_epoch, shaH);
+  assert.notEqual(next.attempt.episode_id, first.attempt.episode_id);
+  assert.notEqual(next.attempt.attempt_id, first.attempt.attempt_id);
+  assert.ok(next.ledger.recovery_attempts.length >= 2);
+  assert.equal(
+    resumeEpisodeFromAttempts(next.ledger.recovery_attempts, {
+      operation: "loop_recovery",
+      invariant: "implementation-ci",
+      candidate_epoch: shaH,
+      evidence_identity: first.attempt.evidence_fingerprint ?? "",
+    })?.candidate_epoch,
+    shaH,
+  );
 });

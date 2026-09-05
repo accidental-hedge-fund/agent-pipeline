@@ -123,6 +123,13 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
       "Pre-fix cleanliness refuses any porcelain before git reset --hard (destructive rollback safety #235). Does not setBlocked; returns error. Not a scratch-classification gate — any residual dirt is unsafe for hard reset.",
   },
   {
+    site_id: "stages.later-stage-review-currency",
+    module: "scripts/stages/later-stage-review-currency.ts",
+    disposition: "explicit-exception",
+    notes:
+      "Epoch-restart bind refuses any porcelain before ff-only / reset --hard onto verified PR HEAD (#1462). Does not setBlocked; fail-closed. Not a scratch-classification gate — residual dirt is unsafe for hard reset.",
+  },
+  {
     site_id: "stages.pre-merge-conflict-rebase",
     module: "scripts/stages/pre-merge-conflict-rebase.ts",
     disposition: "not-porcelain-dirt-gate",
