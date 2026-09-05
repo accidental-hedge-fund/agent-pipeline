@@ -123,7 +123,7 @@ pipeline doctor
 4. `pipeline doctor` reports pin target, installed version, and track coherence
    (`install:engine-track`). Run evidence records `engine.track` at run start.
 
-## Unique-operation reliability (#1368 / #1428 / #1434 / #1440)
+## Unique-operation reliability (#1368 / #1428 / #1434 / #1440 / #1446)
 
 Release-eligible FRG evidence with `pass: true` includes a versioned
 `operation_reliability` section. That section is the unique-operation contract.
@@ -146,20 +146,30 @@ same durable `run_id` in both roots is scored once. GitHub labels, comment
 prose, and factory-gate 2-item pack proofs are not unique-operation proof.
 
 Public `pipeline single`, `pipeline merge`, and `pipeline merge-queue`
-admissions persist recognizable control-host run artifacts through the existing
-generic store: `run.json.kind`, `run_start.entrypoint`, and a documented
-run-id prefix (`single-`, `merge-`, `merge-queue-` / `mq-`). Numeric drive
-ids stay `drive`. `kind: "advance"` is not `single`. Nested `train_merge_*`
-events and `merge-queue-repair-pr-*` helper ids are not public `merge` /
-`merge-queue` coverage. Collection does not invent those entrypoints when the
-artifacts are absent.
+admissions persist recognizable run artifacts into the same dual-root pair
+unique-operation collection scores: `runsDir(resolveFactoryControlRoot(...))`
+when that factory-control root is known, plus loop state-home
+`<resolveStateHome()>/runs`. Persist uses the existing generic store
+(`run.json.kind`, `run_start.entrypoint`, documented prefixes `single-`,
+`merge-`, `merge-queue-` / `mq-`). Persist does not write only to a
+candidate-worktree `repoDir` that collection does not read and then treat
+that write as coverage. When the factory-control root is unknown, the public
+command still runs and unique-operation coverage stays fail-closed. Numeric
+drive ids stay `drive`. `kind: "advance"` is not `single`. Nested
+`train_merge_*` events and `merge-queue-repair-pr-*` helper ids are not
+public `merge` / `merge-queue` coverage. Collection does not invent those
+entrypoints when the artifacts are absent from the approved roots.
 
 #1301 live train-link increments from a followable `train_loop_linked` event
 on the control-host train stream: nonempty child loop run id, an absolute
 events path that loads inside the approved control-host roots, and a child
-logical id from that event or the loaded child. A `train` entrypoint without
-that followable child does not count. The join does not require the child's
-`run_id` fallback identity to equal the train minted id.
+logical id inherited from the parent train operation (child minted id when it
+differs from the train identity; otherwise the event's `logical_operation_id`;
+otherwise the parent train logical id). The scored train operation carries
+that followable child logical id. Observing entrypoint `train` alone does
+not satisfy #1301. A `train` attempt without that followable child does not
+count. The join does not require the child's `run_id` fallback identity to
+equal the train minted id.
 
 When Factory Reliability Gate unique-operation scoring runs as a phase of an
 admitted in-flight `ship` (`opts.inFlightShip === true`):

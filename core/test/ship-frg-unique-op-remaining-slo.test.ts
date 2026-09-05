@@ -234,21 +234,193 @@ test("persistPublicEntrypointAdmission plus mapping observes all three public co
   };
   const startedAt = new Date("2026-09-04T21:00:15.000Z");
   await persistPublicEntrypointAdmission(
-    { repoDir: "/repo", kind: "single", repo: "o/r", issue: 42, startedAt },
+    { repoDir: "/repo", kind: "single", repo: "o/r", issue: 42, startedAt, factoryControlRoot: "/repo" },
     deps,
   );
   await persistPublicEntrypointAdmission(
-    { repoDir: "/repo", kind: "merge", repo: "o/r", startedAt },
+    { repoDir: "/repo", kind: "merge", repo: "o/r", startedAt, factoryControlRoot: "/repo" },
     deps,
   );
   await persistPublicEntrypointAdmission(
-    { repoDir: "/repo", kind: "merge-queue", repo: "o/r", startedAt },
+    { repoDir: "/repo", kind: "merge-queue", repo: "o/r", startedAt, factoryControlRoot: "/repo" },
     deps,
   );
   const kinds = [...files.keys()]
     .filter((k) => k.endsWith("/run.json"))
     .map((k) => JSON.parse(files.get(k)!).kind);
   assert.deepEqual(kinds.sort(), ["merge", "merge-queue", "single"]);
+});
+
+function persistMemDeps(files: Map<string, string>) {
+  return {
+    async readFile(p: string) {
+      const v = files.get(p);
+      if (v === undefined) {
+        const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return v;
+    },
+    async writeFile(p: string, data: string) {
+      files.set(p, data);
+    },
+    async appendFile(p: string, data: string) {
+      files.set(p, (files.get(p) ?? "") + data);
+    },
+    async rename() {},
+    async mkdir() {},
+    async readdir() {
+      return [];
+    },
+    async stat(p: string) {
+      if (!files.has(p)) {
+        const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return { mtime: new Date(0) };
+    },
+  };
+}
+
+test("persist into factory-control generic store is observed by in-flight ship scoring (#1446)", async () => {
+  const files = new Map<string, string>();
+  const startedAt = new Date("2026-09-04T23:26:39.000Z");
+  const persistDeps = persistMemDeps(files);
+  for (const kind of ["single", "merge", "merge-queue"] as const) {
+    const { runDir } = await persistPublicEntrypointAdmission(
+      {
+        repoDir: "/candidate-worktree",
+        kind,
+        repo: "o/r",
+        issue: kind === "single" ? 42 : undefined,
+        startedAt,
+        factoryControlRoot: "/control-repo",
+      },
+      persistDeps,
+    );
+    assert.ok(runDir.startsWith("/control-repo/.agent-pipeline/runs/"));
+    assert.equal(runDir.includes("/candidate-worktree/"), false);
+  }
+  writeUnboundPrefixRun(files, GENERIC, "train-host");
+  writeUnboundPrefixRun(files, GENERIC, "loop-host");
+  writeUnboundPrefixRun(files, GENERIC, "1446-2026-09-04T23-26-39-000Z");
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/candidate-worktree",
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => [STATE_HOME, GENERIC],
+      scoreInput: scoreInput("c".repeat(40)),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const observed = result.evidence.operation_reliability!.entrypoint_coverage.observed;
+  assert.ok(observed.includes("single"));
+  assert.ok(observed.includes("merge"));
+  assert.ok(observed.includes("merge-queue"));
+});
+
+test("candidate-worktree-only persist is not unique-operation coverage (#1446)", async () => {
+  const files = new Map<string, string>();
+  const startedAt = new Date("2026-09-04T23:26:39.000Z");
+  const persistDeps = persistMemDeps(files);
+  for (const kind of ["single", "merge", "merge-queue"] as const) {
+    const { runDir } = await persistPublicEntrypointAdmission(
+      {
+        repoDir: "/candidate-worktree",
+        kind,
+        repo: "o/r",
+        issue: kind === "single" ? 42 : undefined,
+        startedAt,
+        factoryControlRoot: null,
+      },
+      persistDeps,
+    );
+    assert.ok(runDir.startsWith("/candidate-worktree/.agent-pipeline/runs/"));
+  }
+  writeUnboundPrefixRun(files, GENERIC, "train-host");
+  writeUnboundPrefixRun(files, GENERIC, "1446-2026-09-04T23-26-39-000Z");
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/candidate-worktree",
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => [STATE_HOME, GENERIC],
+      scoreInput: scoreInput("c".repeat(40)),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  assert.ok(section.entrypoint_coverage.missing.includes("single"));
+  assert.ok(section.entrypoint_coverage.missing.includes("merge"));
+  assert.ok(section.entrypoint_coverage.missing.includes("merge-queue"));
+  assert.ok(section.integrity.missing_required_coverage > 0);
+  assert.match(uniqueOperationSloFailure(section) ?? "", /missing required coverage/);
+});
+
+test("in-flight ship inherits parent train logical id onto scored operation (#1446)", async () => {
+  const files = new Map<string, string>();
+  const childEvents = `${GENERIC}/loop-1/events.jsonl`;
+  files.set(
+    `${GENERIC}/train-T/run.json`,
+    JSON.stringify({ run_id: "train-T", kind: "train", logical_operation_id: "T" }),
+  );
+  files.set(
+    `${GENERIC}/train-T/events.jsonl`,
+    [
+      { type: "run_start", entrypoint: "train", logical_operation_id: "T" },
+      {
+        type: "train_loop_linked",
+        loop_run_id: "loop-1",
+        events: childEvents,
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n"),
+  );
+  files.set(`${GENERIC}/loop-1/run.json`, JSON.stringify({ run_id: "loop-1", kind: "loop" }));
+  files.set(
+    `${GENERIC}/loop-1/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop" }) + "\n",
+  );
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/candidate-worktree",
+      inFlightShip: true,
+      resolveUniqueOperationRunsRoots: () => [STATE_HOME, GENERIC],
+      loadCandidateFaultRecoveryInventory: async () => ({
+        rows: FAULT_RECOVERY_MATRIX,
+        sourceSha: "c".repeat(40),
+      }),
+      scoreInput: {
+        ...scoreInput("c".repeat(40)),
+        unique_operation_manifest: {
+          ...passingUniqueOperationManifest({
+            release_identity: "1.29.1",
+            candidate_sha: "c".repeat(40),
+          }),
+          required_entrypoints: ["train", "loop"],
+          required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+          live_train_linkage_present: false,
+          in_flight_ship: true,
+        },
+      },
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  const section = result.evidence.operation_reliability!;
+  const train = section.operations.find((o) => o.entrypoints.includes("train"));
+  assert.equal(train!.child_logical_operation_id, "T");
+  assert.equal(section.integrity.missing_required_coverage, 0);
 });
 
 async function git(cwd: string, args: string[]): Promise<string> {
