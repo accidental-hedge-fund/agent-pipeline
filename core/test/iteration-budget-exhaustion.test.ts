@@ -227,6 +227,13 @@ async function driveAdvance(opts: DriveOpts): Promise<DriveResult> {
       listChangedPaths: async () => ({ paths: [] }),
       resolveBaseSha: async () => PIN,
     },
+    rebindTesterEvidenceAfterPr: async () => ({
+      ok: true,
+      action: "already-bound",
+      candidateSha: PIN,
+      evidence: { candidate_sha: PIN } as never,
+      suiteCommandInvoked: false,
+    }),
     dispatch: async (_cfg, _n, stage) => {
       dispatchStages.push(stage);
       if (advanceIdx < opts.advances.length) {

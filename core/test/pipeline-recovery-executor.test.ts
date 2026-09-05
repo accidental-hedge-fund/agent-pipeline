@@ -592,6 +592,69 @@ test("rebind_tester_evidence_after_pr executes the shared bind and does not repa
   assert.match(result.evidence, /rebind_tester_evidence_after_pr/);
 });
 
+test("rebind_tester_evidence_after_pr passes pushed worktree HEAD for the mismatch guard", async () => {
+  const pushed = "a".repeat(40);
+  const prHead = "b".repeat(40);
+  let receivedPushed: string | null | undefined;
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never),
+    gitHead: async () => pushed,
+    getPrForIssue: async () => 99,
+    getPrDetail: async () => ({ number: 99, head_sha: prHead } as never),
+    readTrustedSurfaceDecision: async () => ({
+      outcome: "passthrough",
+      candidate_sha: prHead,
+      effective_verifier_hash: "c".repeat(64),
+    }) as never,
+    rebindTesterEvidenceAfterPr: async (input) => {
+      receivedPushed = input.pushedHeadSha ?? null;
+      return {
+        ok: false,
+        code: "tester_rebind_pr_head_mismatch",
+        summary: `tester rebind: linked PR head ${prHead} disagrees with pushed head ${pushed}`,
+        candidateSha: prHead,
+        evidence: null,
+        diagnostic: buildStageDiagnostic({
+          reasonCode: "workflow-engine-defect",
+          blockerKind: "harness-failure",
+          reason: "mismatch",
+          stage: "design-gate",
+        }),
+        blocker: {
+          schema_version: 1,
+          kind: "tester_rebind_blocker",
+          code: "tester_rebind_pr_head_mismatch",
+          candidate_sha: prHead,
+          pr: 99,
+          summary: "mismatch",
+        },
+      };
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "required implementation evidence role, observed missing",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      trusted_surface_outcome: "passthrough",
+      pr_head: prHead,
+    },
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "rebind_tester_evidence_after_pr",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+  assert.equal(receivedPushed, pushed);
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /tester_rebind_pr_head_mismatch/);
+});
+
 test("rebind_tester_evidence_after_pr fail-closed does not report recovered", async () => {
   let clears = 0;
   const execute = realExecuteRecovery(cfg(), {

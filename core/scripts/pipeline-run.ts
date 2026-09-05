@@ -202,10 +202,13 @@ import { observeImplementDeliverablePaths } from "./unpublished-stage-commit.ts"
 import {
   observeTesterImplementationRole,
   rebindTesterEvidenceAfterPr,
+  testerEvidenceOrderingDiagnosticForRefuse,
+  testerSubjectOmittedBecauseUnobservable,
   type RebindTesterEvidenceAfterPrInput,
   type RebindTesterEvidenceResult,
 } from "./rebind-tester-evidence-after-pr.ts";
 import {
+  normalizeCandidateSha,
   readTesterEvidence,
   type TesterEvidenceIoDeps,
 } from "./tester-evidence.ts";
@@ -2556,6 +2559,8 @@ export async function runAdvance(
     // Tracks the most recently seen branch so the finally block can patch bundle
     // identity even when deployReady.finalize() has already removed the worktree.
     let lastKnownBranch: string | null = null;
+    // SHA implementing just pushed. Rebind compares it to the linked PR head.
+    let lastPushedImplementationSha: string | null = null;
     // Whether deploy_ready.finalize ran this invocation (#773). Residual re-entry
     // can exhaust MAX_ITERATIONS on the advance that labels the issue R2D, leaving
     // PR tagging / Pipeline Complete unrun unless we defer-finalize after the loop.
@@ -2959,92 +2964,110 @@ export async function runAdvance(
           ).catch(() => {});
         }
       }
-      // #1468: after implementing has pushed and a linked PR exists, re-resolve
-      // trusted-surface and bind or reproduce SHA-matched Tester evidence before
-      // the next consumer delivery-stage observer. Nested/single/loop/FRG share
-      // this path because they enter runAdvance.
+      // #1468: after implementing has pushed, re-resolve trusted-surface and
+      // bind or reproduce SHA-matched Tester evidence before the next consumer
+      // delivery-stage observer. Nested/single/loop/FRG share this path because
+      // they enter runAdvance. Always invoke the helper: missing records
+      // reproduce, and a missing/unobservable PR fails closed.
+      let handoffPrHeadSha: string | null = null;
+      let testerSubjectOmitted = false;
       if (stage === "design-gate" && runDir && !opts.dryRun) {
         const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
           () => null,
         );
-        if (prNumber) {
-          const existingTester = await readTesterEvidence(runDir, deps.testerIo);
-          if (existingTester.status === "missing") {
-            // No Tester record to rebind. Path-exact implementation proof remains
-            // sufficient for later consumers; do not fail-closed this stage.
-          } else {
-          const prDetail = await (deps.getPrDetail ?? getPrDetail)(cfg, prNumber).catch(() => null);
-          const prHeadSha = prDetail?.head_sha ?? null;
-          const engineFp = pinnedEngine
-            ? buildEngineFingerprint({
-                version: pinnedEngine.version,
-                templates_fingerprint: pinnedEngine.templates_fingerprint,
-                ...(pinnedEngine.commit_sha ? { commit_sha: pinnedEngine.commit_sha } : {}),
-              })
-            : null;
-          const rebindFn = deps.rebindTesterEvidenceAfterPr ?? rebindTesterEvidenceAfterPr;
-          const rebind = await rebindFn({
-            cfg,
+        const prDetail = prNumber
+          ? await (deps.getPrDetail ?? getPrDetail)(cfg, prNumber).catch(() => null)
+          : null;
+        const prHeadSha = prDetail?.head_sha ?? null;
+        handoffPrHeadSha = normalizeCandidateSha(prHeadSha);
+        const existingTester = await readTesterEvidence(runDir, deps.testerIo);
+        testerSubjectOmitted = testerSubjectOmittedBecauseUnobservable(
+          existingTester.status === "ok" ? existingTester.evidence : null,
+        );
+        let pushedHeadSha = lastPushedImplementationSha;
+        if (!pushedHeadSha) {
+          const wtForPush = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
+            () => null,
+          );
+          if (wtForPush) {
+            const gitFn: GitRunner = deps.gitInWorktree ?? gitInWorktree;
+            pushedHeadSha = normalizeCandidateSha(
+              (await gitFn(wtForPush.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim(),
+            );
+          }
+        }
+        if (!pushedHeadSha) {
+          pushedHeadSha = normalizeCandidateSha(lastTrustedSurfaceCandidateSha);
+        }
+        const engineFp = pinnedEngine
+          ? buildEngineFingerprint({
+              version: pinnedEngine.version,
+              templates_fingerprint: pinnedEngine.templates_fingerprint,
+              ...(pinnedEngine.commit_sha ? { commit_sha: pinnedEngine.commit_sha } : {}),
+            })
+          : null;
+        const rebindFn = deps.rebindTesterEvidenceAfterPr ?? rebindTesterEvidenceAfterPr;
+        const rebind = await rebindFn({
+          cfg,
+          issueNumber,
+          stage,
+          runDir,
+          prNumber,
+          prHeadSha,
+          pushedHeadSha,
+          trustedSurface: currentTrustedSurface,
+          domain: (cfg.domain || cfg.repo || "").trim() || undefined,
+          engineFingerprint: engineFp,
+          io: deps.testerIo,
+          reproduce: async ({ runDir: dest }) => {
+            const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
+              () => null,
+            );
+            if (!wt || !cfg.test_gate) return { ok: false };
+            try {
+              const { runTestGate } = await import("./testgate.ts");
+              const gate = await runTestGate(
+                cfg,
+                issueNumber,
+                wt.path,
+                {},
+                pipelineRunId,
+                evidenceStageName(stage),
+                stateDir,
+                dest,
+                runStoreDeps,
+              );
+              return { ok: gate.passed === true, candidate_sha: gate.persist?.candidate_sha ?? null };
+            } catch {
+              return { ok: false };
+            }
+          },
+        });
+        if (!rebind.ok) {
+          tlog(`[pipeline] #${issueNumber}: ${rebind.summary}`);
+          const blockedOut: Outcome = {
+            advanced: false,
+            status: "blocked",
+            reason: rebind.summary,
+            blockerKind: "harness-failure",
+            diagnostic: rebind.diagnostic,
+          };
+          await emitBlockedOutcomeEvents(
+            runDir,
             issueNumber,
             stage,
-            runDir,
-            prNumber,
-            prHeadSha,
-            trustedSurface: currentTrustedSurface,
-            domain: (cfg.domain || cfg.repo || "").trim() || undefined,
-            engineFingerprint: engineFp,
-            io: deps.testerIo,
-            reproduce: async ({ runDir: dest }) => {
-              const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
-                () => null,
-              );
-              if (!wt || !cfg.test_gate) return { ok: false };
-              try {
-                const { runTestGate } = await import("./testgate.ts");
-                const gate = await runTestGate(
-                  cfg,
-                  issueNumber,
-                  wt.path,
-                  {},
-                  pipelineRunId,
-                  evidenceStageName(stage),
-                  stateDir,
-                  dest,
-                  runStoreDeps,
-                );
-                return { ok: gate.passed === true, candidate_sha: gate.persist?.candidate_sha ?? null };
-              } catch {
-                return { ok: false };
-              }
-            },
-          });
-          if (!rebind.ok) {
-            tlog(`[pipeline] #${issueNumber}: ${rebind.summary}`);
-            const blockedOut: Outcome = {
-              advanced: false,
-              status: "blocked",
-              reason: rebind.summary,
-              blockerKind: "harness-failure",
-              diagnostic: rebind.diagnostic,
-            };
-            await emitBlockedOutcomeEvents(
-              runDir,
-              issueNumber,
-              stage,
-              blockedOut,
-              runStoreDeps,
-            ).catch(() => {});
-            await (deps.setBlocked ?? setBlocked)(
-              cfg,
-              issueNumber,
-              rebind.summary,
-              stage,
-              "harness-failure",
-            ).catch(() => {});
-            printOutcome(issueNumber, stage, blockedOut, tlog);
-            return blockedOut;
-          }
-          }
+            blockedOut,
+            runStoreDeps,
+          ).catch(() => {});
+          await (deps.setBlocked ?? setBlocked)(
+            cfg,
+            issueNumber,
+            rebind.summary,
+            stage,
+            "harness-failure",
+          ).catch(() => {});
+          printOutcome(issueNumber, stage, blockedOut, tlog);
+          return blockedOut;
         }
       }
 
@@ -3128,6 +3151,12 @@ export async function runAdvance(
             { ignoreFailure: true },
           );
           stageCommits = logResult.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+          if (stage === "implementing" && out.advanced) {
+            const headAfter = (
+              await gitFn(wtAfter.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+            ).stdout.trim();
+            lastPushedImplementationSha = normalizeCandidateSha(headAfter);
+          }
         }
         await recordStage(stateDir, issueNumber, {
           stage: auditStage,
@@ -3193,6 +3222,37 @@ export async function runAdvance(
                 at: stageExitedAt,
               },
               runStoreDeps,
+            ).catch(() => {});
+          }
+        }
+      }
+      if (
+        !out.advanced &&
+        out.status === "waiting" &&
+        stage === "design-gate"
+      ) {
+        const orderingDiagnostic = testerEvidenceOrderingDiagnosticForRefuse({
+          stage,
+          bindingFailure: out.reason,
+          prHead: handoffPrHeadSha,
+          trustedSurface: currentTrustedSurface,
+          subjectOmittedBecauseUnobservable: testerSubjectOmitted,
+        });
+        if (orderingDiagnostic) {
+          out = {
+            advanced: false,
+            status: "blocked",
+            reason: out.reason,
+            blockerKind: "harness-failure",
+            diagnostic: orderingDiagnostic,
+          };
+          if (!opts.dryRun) {
+            await (deps.setBlocked ?? setBlocked)(
+              cfg,
+              issueNumber,
+              out.reason,
+              stage,
+              "harness-failure",
             ).catch(() => {});
           }
         }

@@ -312,6 +312,13 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
       listChangedPaths: async () => ({ paths: [] }),
       resolveBaseSha: async () => SHA_S,
     },
+    rebindTesterEvidenceAfterPr: async () => ({
+      ok: true,
+      action: "already-bound",
+      candidateSha: opts.prHead ?? SHA_H,
+      evidence: { candidate_sha: opts.prHead ?? SHA_H } as never,
+      suiteCommandInvoked: false,
+    }),
     transition: async (_cfg, _n, from, to, reason) => {
       transitions.push({ from, to, reason });
       const idx = labels.findIndex((l) => l.startsWith("pipeline:"));

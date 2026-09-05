@@ -1,7 +1,9 @@
 // #1468 post-PR Tester rebind. Injected I/O only — no live network, git, or subprocess.
 
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import { readFile } from "node:fs/promises";
+import * as os from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -19,7 +21,13 @@ import {
 } from "../scripts/loop/types.ts";
 import {
   createDeliveryStageEvidenceObserver,
+  runAdvance,
+  type AdvanceDeps,
 } from "../scripts/pipeline-run.ts";
+import {
+  FACTORY_CONTROL_DIR_ENV,
+  PRODUCTION_PIN_ENV,
+} from "../scripts/production-engine-pin.ts";
 import {
   buildTesterEvidenceOrderingDiagnostic,
   filterRecipesForTesterEvidenceOrdering,
@@ -30,12 +38,15 @@ import {
   observeTesterImplementationRole,
   REBIND_TESTER_EVIDENCE_AFTER_PR,
   rebindTesterEvidenceAfterPr,
+  testerEvidenceOrderingDiagnosticForRefuse,
   testerRebindBlockerPath,
+  testerSubjectOmittedBecauseUnobservable,
   TESTER_EVIDENCE_ORDERING_INAPPLICABLE_RECIPES,
   TESTER_REBIND_BLOCKER_CODES,
   type RebindTesterEvidenceAfterPrInput,
   type TesterEvidenceOrderingFields,
 } from "../scripts/rebind-tester-evidence-after-pr.ts";
+import { runDirPath } from "../scripts/run-store.ts";
 import {
   computeConfigDigest,
   TESTER_EVIDENCE_KIND,
@@ -530,11 +541,15 @@ test("3.3 nested advance, single, loop, and FRG share runAdvance rebind", async 
   const runAdvanceSrc = await readFile(join(__dirname, "../scripts/pipeline-run.ts"), "utf8");
   assert.match(runAdvanceSrc, /rebindTesterEvidenceAfterPr/);
   assert.match(runAdvanceSrc, /stage === "design-gate"/);
+  assert.match(runAdvanceSrc, /pushedHeadSha/);
+  assert.match(runAdvanceSrc, /testerEvidenceOrderingDiagnosticForRefuse/);
+  assert.doesNotMatch(runAdvanceSrc, /existingTester\.status === "missing"/);
   const nestedSrc = await readFile(join(__dirname, "../scripts/nested-advance.ts"), "utf8");
   assert.match(nestedSrc, /runAdvance/);
   assert.doesNotMatch(nestedSrc, /skip.*rebind|rebind.*skip/i);
   const pipelineSrc = await readFile(join(__dirname, "../scripts/pipeline.ts"), "utf8");
   assert.match(pipelineSrc, /runAdvance/);
+  assert.match(pipelineSrc, /pushedHeadSha/);
 });
 
 test("1.4 / 4.2 evidence-ordering diagnostic does not charge scratch or publish", () => {
@@ -644,4 +659,275 @@ test("policy-order: unlink, checkpoint, publish, rebind, then repair", () => {
   assert.ok(unlink < checkpoint && checkpoint < publish, recipes.join(" → "));
   assert.ok(publish < rebind && rebind < repair, recipes.join(" → "));
   assert.notEqual(recipes[0], "repair_pipeline_item");
+});
+
+test("4.2 production missing-role refuse attaches structured evidence-ordering diagnostic", () => {
+  assert.equal(testerSubjectOmittedBecauseUnobservable(subjectlessPassed()), true);
+  const attached = testerEvidenceOrderingDiagnosticForRefuse({
+    stage: "design-gate",
+    bindingFailure: "delivery-stage evidence binding refused before execution: required implementation evidence role, observed missing",
+    prHead: SHA_S,
+    trustedSurface: passthrough(),
+    subjectOmittedBecauseUnobservable: true,
+  });
+  assert.ok(attached);
+  assert.equal(isTesterEvidenceOrderingDiagnostic(attached), true);
+  assert.equal(attached!.detail.evidence_ordering?.kind, "tester_rebind_after_pr");
+  assert.equal(attached!.detail.evidence_ordering?.observed_role, "missing");
+  const proseOnly = testerEvidenceOrderingDiagnosticForRefuse({
+    stage: "design-gate",
+    bindingFailure: "delivery-stage evidence binding refused before execution: required implementation evidence role, observed missing",
+    prHead: SHA_S,
+    trustedSurface: blockedTs(),
+  });
+  assert.equal(proseOnly, null);
+});
+
+function withoutHostPinAuthorityEnv<T>(fn: () => T | Promise<T>): Promise<T> {
+  const savedPin = process.env[PRODUCTION_PIN_ENV];
+  const savedControl = process.env[FACTORY_CONTROL_DIR_ENV];
+  delete process.env[PRODUCTION_PIN_ENV];
+  delete process.env[FACTORY_CONTROL_DIR_ENV];
+  return Promise.resolve()
+    .then(() => fn())
+    .finally(() => {
+      if (savedPin === undefined) delete process.env[PRODUCTION_PIN_ENV];
+      else process.env[PRODUCTION_PIN_ENV] = savedPin;
+      if (savedControl === undefined) delete process.env[FACTORY_CONTROL_DIR_ENV];
+      else process.env[FACTORY_CONTROL_DIR_ENV] = savedControl;
+    });
+}
+
+const ENGINE = {
+  version: "1.40.1",
+  root: "/skill/core",
+  templates_fingerprint: "e".repeat(64),
+  commit_sha: "f".repeat(40),
+};
+
+async function driveDesignGateAdvance(opts: {
+  prNumber: number | null;
+  prHeadSha?: string | null;
+  worktreeHead?: string | null;
+  tester?: TesterEvidence | null;
+  rebind?: AdvanceDeps["rebindTesterEvidenceAfterPr"];
+  dispatch?: AdvanceDeps["dispatch"];
+}): Promise<{
+  rebindCalls: RebindTesterEvidenceAfterPrInput[];
+  setBlocked: Array<{ reason: string; kind: string | undefined }>;
+  blockerEvents: Array<Record<string, unknown>>;
+}> {
+  const repoDir = fs.mkdtempSync(join(os.tmpdir(), "rebind-run-advance-"));
+  const domain = `rebind-adv-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const stateDir = `/tmp/pipeline-${domain}`;
+  const issue = 1468;
+  const runId = `${issue}-2026-09-05T21-12-47-000Z`;
+  const runDir = runDirPath(repoDir, runId);
+  const io = memoryIo();
+  if (opts.tester) plant(io, runDir, opts.tester);
+  const rebindCalls: RebindTesterEvidenceAfterPrInput[] = [];
+  const setBlocked: Array<{ reason: string; kind: string | undefined }> = [];
+  const labels = ["pipeline:design-gate"];
+  const pipelineCfg = {
+    repo: "acme/widget",
+    domain,
+    repo_dir: repoDir,
+    worktree_root: ".worktrees",
+    base_branch: "main",
+    invocation: "pipeline",
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    harnesses: {
+      implementer: "claude",
+      implementerSource: "default",
+      reviewer: "codex",
+      reviewerSource: "default",
+    },
+    steps: { standard_review: true, adversarial_review: true },
+    auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
+    papercuts: { enabled: false, auto_file: false },
+    corrections: { auto_file: false },
+  } as unknown as PipelineConfig;
+  const deps: AdvanceDeps = {
+    resolvePinnedEngineIdentity: () => ENGINE,
+    probeEngineIdentity: () => null,
+    enforceEngineTrack: async () => ({ ok: true as const, track: "candidate" as const }),
+    releaseParkedWorktree: async () => ({
+      action: "absent",
+      reason: "no managed worktree",
+      branch: null,
+      worktree: null,
+    }),
+    ensurePipelineLabels: async () => {},
+    getIssueDetail: (async () => ({
+      number: issue,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: `https://example.test/${issue}`,
+      labels,
+      comments: [
+        {
+          author: "pipeline-bot",
+          body: `## Pipeline: design-gate\n<!-- pipeline-audit: run=${runId} state=design-gate -->`,
+        },
+        {
+          author: "pipeline-bot",
+          body: `## Pipeline: review-1\n<!-- pipeline-audit: run=${runId} state=review-1 -->`,
+        },
+      ],
+    })) as AdvanceDeps["getIssueDetail"],
+    getGhActor: async () => "pipeline-bot",
+    getPrForIssue: async () => opts.prNumber,
+    getPrDetail: async () =>
+      opts.prNumber
+        ? ({ number: opts.prNumber, head_sha: opts.prHeadSha ?? SHA_S } as never)
+        : null,
+    getOnDiskForIssue: async () =>
+      opts.worktreeHead ? ({ path: "/wt/1468", slug: "1468-x" } as never) : null,
+    gitInWorktree: async (_cwd, args) => {
+      if (args[0] === "rev-parse" && args.includes("HEAD")) {
+        return { stdout: `${opts.worktreeHead ?? ""}\n`, stderr: "", code: opts.worktreeHead ? 0 : 1 };
+      }
+      if (args[0] === "diff" || args[0] === "log" || args[0] === "show") {
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    lastAdvancedCandidateSha: opts.worktreeHead ?? opts.prHeadSha ?? SHA_S,
+    trustedSurfaceObjectSource: {
+      listChangedPaths: async () => ({ paths: [] }),
+      resolveBaseSha: async () => SHA_S,
+    },
+    testerIo: io,
+    rebindTesterEvidenceAfterPr: async (input) => {
+      rebindCalls.push(input);
+      if (opts.rebind) return opts.rebind(input);
+      return rebindTesterEvidenceAfterPr(input);
+    },
+    setBlocked: (async (_c, _n, reason, _stage, kind) => {
+      setBlocked.push({ reason, kind });
+      if (!labels.includes("blocked")) labels.push("blocked");
+    }) as AdvanceDeps["setBlocked"],
+    postComment: async () => {},
+    postPrComment: async () => {},
+    dispatch: async (_c, _n, stage, ...rest) => {
+      const result = opts.dispatch
+        ? await opts.dispatch(_c, _n, stage, ...rest)
+        : {
+            advanced: false as const,
+            status: "waiting" as const,
+            reason: "delivery-stage evidence binding refused before execution: required implementation evidence role, observed missing",
+          };
+      if (result.advanced) {
+        const idx = labels.findIndex((label) => label.startsWith("pipeline:"));
+        if (idx >= 0) labels[idx] = `pipeline:${result.to}`;
+        else labels.push(`pipeline:${result.to}`);
+      }
+      return result;
+    },
+  };
+  try {
+    await withoutHostPinAuthorityEnv(() =>
+      runAdvance(pipelineCfg, issue, { runId, once: true }, deps),
+    );
+    const eventsPath = join(runDir, "events.jsonl");
+    const blockerEvents = fs.existsSync(eventsPath)
+      ? fs
+          .readFileSync(eventsPath, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((event) => event.type === "blocker_set")
+      : [];
+    return { rebindCalls, setBlocked, blockerEvents };
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+}
+
+test("runAdvance invokes rebind when Tester evidence is missing", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    rebind: async (input) => ({
+      ok: true,
+      action: "reproduce",
+      candidateSha: SHA_S,
+      evidence: subjectlessPassed(),
+      suiteCommandInvoked: true,
+    }),
+    dispatch: async (_c, _n, stage) =>
+      stage === "design-gate"
+        ? {
+            advanced: true,
+            from: "design-gate",
+            to: "review-1",
+            summary: "design-gate passed",
+          }
+        : { advanced: false, status: "waiting", reason: "stop after rebind" },
+  });
+  assert.equal(driven.rebindCalls.length, 1);
+  assert.equal(driven.rebindCalls[0]?.prNumber, 99);
+  assert.equal(driven.rebindCalls[0]?.prHeadSha, SHA_S);
+});
+
+test("runAdvance fail-closes when the linked PR is unobservable", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: null,
+    worktreeHead: SHA_S,
+  });
+  assert.equal(driven.rebindCalls.length, 1);
+  assert.equal(driven.rebindCalls[0]?.prNumber, null);
+  assert.equal(driven.rebindCalls[0]?.prHeadSha, null);
+  assert.ok(driven.setBlocked.some((row) => /PR head|unobservable/i.test(row.reason)));
+  assert.equal(driven.blockerEvents[0]?.blocker_kind, "harness-failure");
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_unobservable",
+  );
+});
+
+test("runAdvance fail-closes when PR head disagrees with the pushed head", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_B,
+    worktreeHead: SHA_S,
+  });
+  assert.equal(driven.rebindCalls.length, 1);
+  assert.equal(driven.rebindCalls[0]?.pushedHeadSha, SHA_S);
+  assert.equal(driven.rebindCalls[0]?.prHeadSha, SHA_B);
+  assert.ok(driven.setBlocked.some((row) => /disagrees with pushed head/.test(row.reason)));
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_mismatch",
+  );
+});
+
+test("runAdvance attaches evidence-ordering diagnostic to a missing-role refuse", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    tester: subjectlessPassed(),
+    rebind: async () => ({
+      ok: true,
+      action: "bind",
+      candidateSha: SHA_S,
+      evidence: subjectlessPassed(),
+      suiteCommandInvoked: false,
+    }),
+  });
+  assert.equal(driven.rebindCalls.length, 1);
+  assert.ok(
+    driven.setBlocked.some((row) =>
+      /required implementation evidence role, observed missing/.test(row.reason),
+    ),
+  );
+  const diagnostic = driven.blockerEvents[0]?.diagnostic;
+  assert.equal(isTesterEvidenceOrderingDiagnostic(diagnostic), true);
 });

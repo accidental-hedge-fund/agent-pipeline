@@ -265,8 +265,8 @@ export function buildTesterRebindFailClosedDiagnostic(input: {
 
 export function buildTesterEvidenceOrderingDiagnostic(input: {
   stage: string;
-  prHead: string;
-  trustedSurfaceOutcome: "passthrough" | "rebound";
+  prHead?: string | null;
+  trustedSurfaceOutcome?: "passthrough" | "rebound" | "blocked" | string;
   subjectOmittedBecauseUnobservable?: boolean;
 }): StageDiagnostic {
   return buildStageDiagnostic({
@@ -278,12 +278,49 @@ export function buildTesterEvidenceOrderingDiagnostic(input: {
       kind: TESTER_EVIDENCE_ORDERING_KIND,
       required_role: "implementation",
       observed_role: "missing",
-      trusted_surface_outcome: input.trustedSurfaceOutcome,
-      pr_head: input.prHead,
+      ...(input.trustedSurfaceOutcome
+        ? { trusted_surface_outcome: input.trustedSurfaceOutcome }
+        : {}),
+      ...(input.prHead ? { pr_head: input.prHead } : {}),
       ...(input.subjectOmittedBecauseUnobservable
         ? { subject_omitted_because_unobservable: true }
         : {}),
     },
+  });
+}
+
+export function testerSubjectOmittedBecauseUnobservable(
+  evidence: TesterEvidence | null | undefined,
+): boolean {
+  if (!evidence) return false;
+  return parseEvidenceSubjectDetailed(evidence.evidence_subject).status !== "ok";
+}
+
+/** Attach structured evidence-ordering fields to a real missing-role refuse. */
+export function testerEvidenceOrderingDiagnosticForRefuse(input: {
+  stage: string;
+  bindingFailure: string | null | undefined;
+  prHead: string | null | undefined;
+  trustedSurface: TrustedSurfaceRebindDecision | null | undefined;
+  subjectOmittedBecauseUnobservable?: boolean;
+}): StageDiagnostic | null {
+  const failure = input.bindingFailure ?? "";
+  if (!failure.includes("required implementation evidence role, observed missing")) {
+    return null;
+  }
+  const prHead = normalizeCandidateSha(input.prHead);
+  const pin = trustworthyTrustedSurfacePin(input.trustedSurface, prHead);
+  const subjectOmitted = input.subjectOmittedBecauseUnobservable === true;
+  if (!pin.ok && !subjectOmitted) return null;
+  return buildTesterEvidenceOrderingDiagnostic({
+    stage: input.stage,
+    ...(prHead ? { prHead } : {}),
+    ...(pin.ok
+      ? { trustedSurfaceOutcome: pin.outcome }
+      : input.trustedSurface?.outcome
+        ? { trustedSurfaceOutcome: input.trustedSurface.outcome }
+        : {}),
+    ...(subjectOmitted ? { subjectOmittedBecauseUnobservable: true } : {}),
   });
 }
 

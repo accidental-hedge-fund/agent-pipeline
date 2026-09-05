@@ -2758,6 +2758,13 @@ export function realExecuteRecovery(
         const runDir = runId ? runDirPath(cfg.repo_dir, runId) : "";
         const readTs = deps.readTrustedSurfaceDecision ?? readTrustedSurfaceDecision;
         const trustedSurface = runDir ? await readTs(runDir).catch(() => null) : null;
+        let pushedHeadSha: string | null = null;
+        try {
+          const wt = await getWorktree(cfg, issueNumber);
+          if (wt) pushedHeadSha = await gitHead(wt.path);
+        } catch {
+          pushedHeadSha = null;
+        }
         const rebind = await rebindFn({
           cfg,
           issueNumber,
@@ -2765,6 +2772,7 @@ export function realExecuteRecovery(
           runDir,
           prNumber,
           prHeadSha: prDetail?.head_sha ?? null,
+          pushedHeadSha,
           trustedSurface,
           reproduce: async ({ runDir: dest }) => {
             const wt = await getWorktree(cfg, issueNumber);
