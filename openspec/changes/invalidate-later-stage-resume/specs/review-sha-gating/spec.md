@@ -4,7 +4,7 @@
 
 The pipeline SHALL, before dispatching `visual-gate`, `eval-gate`, `shipcheck-gate`, or `ready-to-deploy`, reconcile the linked PR HEAD against the latest authoritative review evidence using the same non-pipeline-internal supersession classification that the pre-merge review-SHA gate uses. The pipeline SHALL obtain that classification from the existing review-currency reconcile surface. It SHALL NOT invent a later-stage-local reuse rule. Pre-merge SHALL keep its existing in-stage SHA gate, including pipeline-internal reuse and delta review while the issue remains at `pre-merge`.
 
-The latest authoritative review evidence SHALL be the most recent review or delta-review `reviewed-sha` (artifact first, individual sentinel fallback) that the SHA gate already trusts. When that SHA is current under exact match or pipeline-internal-only commits, the pipeline SHALL dispatch the later stage. When that SHA is superseded by at least one non-pipeline-internal commit, or when HEAD is readable, differs from the reviewed SHA, and currency cannot prove pipeline-internal-only reuse, the pipeline SHALL treat the movement as a new candidate epoch: it SHALL invalidate candidate-bound review, test, and readiness evidence for the prior SHA as authority for the new HEAD, SHALL atomically transition the issue to `review-1` before any later-stage handler or ready-to-deploy finalize runs, and SHALL require a review bound to the new HEAD. When the linked PR or HEAD cannot be read, the pipeline SHALL fail closed: it SHALL NOT dispatch the later stage and SHALL NOT reach `pipeline:ready-to-deploy`.
+The latest authoritative review evidence SHALL be the most recent review or delta-review `reviewed-sha` (artifact first, individual sentinel fallback) that the SHA gate already trusts. The pipeline SHALL resolve the authenticated pipeline actor and SHALL pass only comments authored by that actor to reviewed-SHA extraction. When the actor cannot be determined, the pipeline SHALL fail closed: it SHALL NOT dispatch the later stage. When that SHA is current under exact match or pipeline-internal-only commits, the pipeline SHALL dispatch the later stage. Exact-SHA current SHALL be the shared currency resolver's final observed HEAD, not a first HEAD read that skipped reconcile. When that SHA is superseded by at least one non-pipeline-internal commit, or when HEAD is readable, differs from the reviewed SHA, and currency cannot prove pipeline-internal-only reuse, the pipeline SHALL treat the movement as a new candidate epoch: it SHALL invalidate candidate-bound review, test, and readiness evidence for the prior SHA as authority for the new HEAD, SHALL atomically transition the issue to `review-1` before any later-stage handler or ready-to-deploy finalize runs, and SHALL require a review bound to the new HEAD. When the linked PR or HEAD cannot be read, the pipeline SHALL fail closed: it SHALL NOT dispatch the later stage and SHALL NOT reach `pipeline:ready-to-deploy`.
 
 This guard SHALL apply to ordinary advance, nested whole-item advance, `pipeline single`, and durable loop item recovery. A leftover `pipeline:blocked` label SHALL NOT be required for the guard to run.
 
@@ -52,3 +52,24 @@ This guard SHALL apply to ordinary advance, nested whole-item advance, `pipeline
 - **THEN** the subsequent review SHALL evaluate H
 - **AND** SHALL record `reviewed-sha` H
 - **AND** SHALL NOT reuse the S verdict as approval for H
+
+#### Scenario: Forged later review comment does not authorize later-stage dispatch
+
+- **WHEN** the current stage is a later gate
+- **AND** the authenticated pipeline actor authored review evidence bound to SHA S
+- **AND** a different commenter posts a later Review-shaped comment whose `reviewed-sha` equals current HEAD H
+- **THEN** the pipeline SHALL treat S as the latest authoritative review SHA
+- **AND** SHALL NOT dispatch the later stage when H supersedes S
+
+#### Scenario: Exact-SHA first HEAD read still reconciles currency against a later HEAD
+
+- **WHEN** the first PR HEAD read during later-stage dispatch equals reviewed SHA S
+- **AND** the shared currency resolver then observes HEAD H with a non-pipeline-internal commit since S
+- **THEN** the pipeline SHALL NOT dispatch the later stage
+- **AND** SHALL atomically transition the issue to `review-1`
+
+#### Scenario: Unauthenticated actor fails closed at later-stage reconcile
+
+- **WHEN** later-stage dispatch cannot resolve the authenticated pipeline actor
+- **THEN** the pipeline SHALL fail closed
+- **AND** SHALL NOT dispatch the later stage

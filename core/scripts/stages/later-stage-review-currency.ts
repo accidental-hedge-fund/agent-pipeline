@@ -7,6 +7,7 @@
 // Unreadable PR/HEAD fails closed. This is not a second SHA-gate product.
 
 import {
+  getGhActor,
   getPrCommits,
   getPrDetail,
   getPrForIssue,
@@ -53,6 +54,7 @@ export interface LaterStageReviewCurrencyDeps {
   getPrForIssue?: typeof getPrForIssue;
   getPrDetail?: typeof getPrDetail;
   getPrCommits?: typeof getPrCommits;
+  getGhActor?: typeof getGhActor;
   extractReviewedSha?: typeof extractReviewedSha;
   resolveCurrency?: typeof resolveReviewedShaCurrency;
 }
@@ -114,7 +116,7 @@ export async function reconcileLaterStageReviewCurrency(
   cfg: PipelineConfig,
   issueNumber: number,
   stage: string | null | undefined,
-  detail: { comments: { body: string }[] },
+  detail: { comments: { body: string; author?: string | null }[] },
   deps: LaterStageReviewCurrencyDeps = {},
 ): Promise<LaterStageReviewCurrencyResult> {
   if (!isLaterStageForReviewCurrency(stage)) {
@@ -124,8 +126,22 @@ export async function reconcileLaterStageReviewCurrency(
     };
   }
 
+  // Same actor-only trust as the pre-merge SHA gate: any commenter can post a
+  // Review-headed body with `reviewed-sha` equal to HEAD. Fail closed when the
+  // authenticated pipeline actor cannot be determined.
+  const getActor = deps.getGhActor ?? getGhActor;
+  const actor = await getActor();
+  if (actor === null) {
+    return {
+      kind: "fail-closed",
+      reason:
+        "later-stage review-currency: authenticated gh actor unavailable; refusing to dispatch",
+    };
+  }
+
   const extractSha = deps.extractReviewedSha ?? extractReviewedSha;
-  const reviewed = extractSha(detail.comments);
+  const trustedComments = detail.comments.filter((c) => c.author === actor);
+  const reviewed = extractSha(trustedComments);
   if (!reviewed?.sha) {
     return {
       kind: "fail-closed",
@@ -172,18 +188,20 @@ export async function reconcileLaterStageReviewCurrency(
     };
   }
 
-  if (headSha === reviewedSha) {
-    return mapReconcileToLaterStageAction({
-      reviewedSha,
-      headSha,
-      currency: { status: "current" },
-    });
-  }
-
+  // Always re-read via the shared resolver, including after an initial exact-SHA
+  // match. A developer push between the first HEAD read and later-stage dispatch
+  // must not reuse the first observation as current.
   const currency = await resolveCurrency(cfg, prNumber, reviewedSha, {
     getPrDetail: getDetailPr,
     getPrCommits: getCommits,
   });
 
-  return mapReconcileToLaterStageAction({ reviewedSha, headSha, currency });
+  const observedHead =
+    currency.status === "superseded" ? currency.headSha : headSha;
+
+  return mapReconcileToLaterStageAction({
+    reviewedSha,
+    headSha: observedHead,
+    currency,
+  });
 }

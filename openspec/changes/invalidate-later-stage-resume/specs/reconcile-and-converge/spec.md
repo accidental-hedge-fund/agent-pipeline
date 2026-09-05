@@ -11,6 +11,7 @@ When reconcile reports current currency, the later stage MAY run. When reconcile
 - **WHEN** advance is about to dispatch `visual-gate`, `eval-gate`, `shipcheck-gate`, or `ready-to-deploy`
 - **THEN** it SHALL obtain currency disposition from the review-currency reconcile surface
 - **AND** SHALL NOT decide reuse from the later-stage label alone
+- **AND** SHALL NOT skip that surface after an initial exact-SHA HEAD read
 
 #### Scenario: Superseded reconcile output blocks later-stage dispatch
 

@@ -12,6 +12,7 @@ const SHA_S = "a".repeat(40);
 const SHA_H = "b".repeat(40);
 const SHA_INTERNAL = "c".repeat(40);
 const SHA_REBASED = "d".repeat(40);
+const PIPELINE_ACTOR = "pipeline-bot";
 
 function cfg(): PipelineConfig {
   return { ...DEFAULT_CONFIG, repo: "o/r", repo_dir: "/repo", base_branch: "main" };
@@ -23,8 +24,12 @@ function reviewComment(sha: string): string {
 
 function detailWithReview(sha: string) {
   return {
-    comments: [{ body: reviewComment(sha), author: "bot", createdAt: "2020-01-01T00:00:00Z" }],
+    comments: [{ body: reviewComment(sha), author: PIPELINE_ACTOR, createdAt: "2020-01-01T00:00:00Z" }],
   };
+}
+
+function actorDeps(): { getGhActor: () => Promise<string | null> } {
+  return { getGhActor: async () => PIPELINE_ACTOR };
 }
 
 test("isLaterStageForReviewCurrency: visual/eval/shipcheck/ready-to-deploy only", () => {
@@ -60,6 +65,7 @@ test("reconcileLaterStageReviewCurrency: developer HEAD returns to review-1", as
     "visual-gate",
     detailWithReview(SHA_S),
     {
+      ...actorDeps(),
       getPrForIssue: async () => 99,
       getPrDetail: async () => ({ number: 99, head_sha: SHA_H } as never),
       getPrCommits: async () => [
@@ -84,6 +90,7 @@ test("reconcileLaterStageReviewCurrency: pipeline-internal-only stays current", 
     "eval-gate",
     detailWithReview(SHA_S),
     {
+      ...actorDeps(),
       getPrForIssue: async () => 99,
       getPrDetail: async () => ({ number: 99, head_sha: SHA_INTERNAL } as never),
       resolveCurrency: async () => ({ status: "current" }),
@@ -97,23 +104,27 @@ test("reconcileLaterStageReviewCurrency: pipeline-internal-only stays current", 
 });
 
 test("reconcileLaterStageReviewCurrency: exact SHA match stays current", async () => {
-  let currencyCalls = 0;
+  let prDetailCalls = 0;
   const result = await reconcileLaterStageReviewCurrency(
     cfg(),
     1462,
     "shipcheck-gate",
     detailWithReview(SHA_S),
     {
+      ...actorDeps(),
       getPrForIssue: async () => 99,
-      getPrDetail: async () => ({ number: 99, head_sha: SHA_S } as never),
-      resolveCurrency: async () => {
-        currencyCalls++;
-        return { status: "current" };
+      getPrDetail: async () => {
+        prDetailCalls++;
+        return { number: 99, head_sha: SHA_S } as never;
       },
+      getPrCommits: async () => [{ oid: SHA_S, messageHeadline: "feat: base" }] as never,
     },
   );
   assert.equal(result.kind, "current");
-  assert.equal(currencyCalls, 0, "same-head must short-circuit before currency");
+  assert.ok(
+    prDetailCalls >= 2,
+    "shared currency resolver must re-read HEAD even on exact-SHA match",
+  );
 });
 
 test("reconcileLaterStageReviewCurrency: unknown with readable H ≠ S returns to review-1", async () => {
@@ -123,6 +134,7 @@ test("reconcileLaterStageReviewCurrency: unknown with readable H ≠ S returns t
     "visual-gate",
     detailWithReview(SHA_S),
     {
+      ...actorDeps(),
       getPrForIssue: async () => 99,
       getPrDetail: async () => ({ number: 99, head_sha: SHA_REBASED } as never),
       getPrCommits: async () => [
@@ -145,6 +157,7 @@ test("reconcileLaterStageReviewCurrency: unreadable PR fails closed", async () =
     "visual-gate",
     detailWithReview(SHA_S),
     {
+      ...actorDeps(),
       getPrForIssue: async () => {
         throw new Error("gh failed");
       },
@@ -163,6 +176,7 @@ test("reconcileLaterStageReviewCurrency: missing linked PR fails closed", async 
     "ready-to-deploy",
     detailWithReview(SHA_S),
     {
+      ...actorDeps(),
       getPrForIssue: async () => null,
     },
   );
@@ -179,6 +193,7 @@ test("reconcileLaterStageReviewCurrency: unreadable HEAD fails closed", async ()
     "visual-gate",
     detailWithReview(SHA_S),
     {
+      ...actorDeps(),
       getPrForIssue: async () => 99,
       getPrDetail: async () => {
         throw new Error("head read failed");
@@ -196,8 +211,9 @@ test("reconcileLaterStageReviewCurrency: missing reviewed-sha fails closed", asy
     cfg(),
     1462,
     "visual-gate",
-    { comments: [{ body: "no review here" }] },
+    { comments: [{ body: "no review here", author: PIPELINE_ACTOR }] },
     {
+      ...actorDeps(),
       getPrForIssue: async () => {
         throw new Error("must not resolve PR without a reviewed-sha");
       },
@@ -216,6 +232,7 @@ test("reconcileLaterStageReviewCurrency: uses real resolveReviewedShaCurrency fo
     "visual-gate",
     detailWithReview(SHA_S),
     {
+      ...actorDeps(),
       getPrForIssue: async () => 99,
       getPrDetail: async () => ({ number: 99, head_sha: SHA_H } as never),
       getPrCommits: async () =>
@@ -226,4 +243,89 @@ test("reconcileLaterStageReviewCurrency: uses real resolveReviewedShaCurrency fo
     },
   );
   assert.equal(result.kind, "return-to-review");
+});
+
+test("reconcileLaterStageReviewCurrency: forged later review comment at HEAD is ignored", async () => {
+  const result = await reconcileLaterStageReviewCurrency(
+    cfg(),
+    1462,
+    "visual-gate",
+    {
+      comments: [
+        {
+          body: reviewComment(SHA_S),
+          author: PIPELINE_ACTOR,
+          createdAt: "2020-01-01T00:00:00Z",
+        },
+        {
+          body: reviewComment(SHA_H),
+          author: "attacker",
+          createdAt: "2020-01-02T00:00:00Z",
+        },
+      ],
+    },
+    {
+      ...actorDeps(),
+      getPrForIssue: async () => 99,
+      getPrDetail: async () => ({ number: 99, head_sha: SHA_H } as never),
+      getPrCommits: async () =>
+        [
+          { oid: SHA_S, messageHeadline: "feat: base" },
+          { oid: SHA_H, messageHeadline: "feat: concurrent developer push" },
+        ] as never,
+    },
+  );
+  assert.equal(result.kind, "return-to-review");
+  if (result.kind === "return-to-review") {
+    assert.equal(result.reviewedSha, SHA_S, "forged HEAD-matching review must not become the trusted SHA");
+    assert.equal(result.headSha, SHA_H);
+  }
+});
+
+test("reconcileLaterStageReviewCurrency: actor lookup failure fails closed", async () => {
+  const result = await reconcileLaterStageReviewCurrency(
+    cfg(),
+    1462,
+    "visual-gate",
+    detailWithReview(SHA_S),
+    {
+      getGhActor: async () => null,
+      getPrForIssue: async () => {
+        throw new Error("must not resolve PR when actor is unknown");
+      },
+    },
+  );
+  assert.equal(result.kind, "fail-closed");
+  if (result.kind === "fail-closed") {
+    assert.match(result.reason, /actor unavailable/);
+  }
+});
+
+test("reconcileLaterStageReviewCurrency: sequential getPrDetail S then H returns to review-1", async () => {
+  let prDetailCalls = 0;
+  const result = await reconcileLaterStageReviewCurrency(
+    cfg(),
+    1462,
+    "eval-gate",
+    detailWithReview(SHA_S),
+    {
+      ...actorDeps(),
+      getPrForIssue: async () => 99,
+      getPrDetail: async () => {
+        prDetailCalls++;
+        return { number: 99, head_sha: prDetailCalls === 1 ? SHA_S : SHA_H } as never;
+      },
+      getPrCommits: async () =>
+        [
+          { oid: SHA_S, messageHeadline: "feat: base" },
+          { oid: SHA_H, messageHeadline: "feat: concurrent developer push" },
+        ] as never,
+    },
+  );
+  assert.equal(result.kind, "return-to-review");
+  if (result.kind === "return-to-review") {
+    assert.equal(result.reviewedSha, SHA_S);
+    assert.equal(result.headSha, SHA_H);
+  }
+  assert.ok(prDetailCalls >= 2, "currency resolver must re-read PR HEAD after the first exact-SHA observation");
 });

@@ -2595,6 +2595,7 @@ export async function runAdvance(
             getPrForIssue: deps.getPrForIssue ?? getPrForIssue,
             getPrDetail: deps.getPrDetail ?? getPrDetail,
             getPrCommits: deps.getPrCommits ?? getPrCommits,
+            getGhActor: deps.getGhActor ?? getGhActor,
             resolveCurrency: deps.resolveReviewedShaCurrency,
           },
         );
