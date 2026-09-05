@@ -18,6 +18,7 @@ import {
 } from "../scripts/loop/store.ts";
 import { reconcile, transitionItem, type ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import { DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.ts";
+import { admitLifecycleRecord } from "../scripts/recovery-lifecycle-ownership.ts";
 import {
   classifyOutstandingItem,
   classifyRunFatalResumeEligibility,
@@ -835,6 +836,10 @@ test("resume of recovery_exhausted repair-forwards verified merged identity (#12
     { "1290": { ...itemEntry("1290", "blocked"), blocked_theme: "implementation-ci" } },
     stop,
   );
+  ledger.lifecycle = admitLifecycleRecord({
+    logical_operation_id: logicalOperationId,
+    updated_at: ORIGINAL_STOP_TIME,
+  });
   const { deps } = await seedStoppedRun(contract, ledger);
   const observe = observeWithIdentities({
     "1290": identity({
