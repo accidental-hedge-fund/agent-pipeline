@@ -51,15 +51,28 @@ export interface LinkedPrIntegrationFact {
   artifact_identity?: string | null;
   candidate_sha?: string | null;
   candidate_epoch?: string | null;
+  logical_operation_id?: string | null;
 }
 
-function isExactLinkedImplementation(pr: LinkedPrIntegrationFact): boolean {
+export interface ExpectedLinkedPrBinding {
+  candidateSha?: string | null;
+  logicalOperationId?: string | null;
+}
+
+function isExactLinkedImplementation(
+  pr: LinkedPrIntegrationFact,
+  expected?: ExpectedLinkedPrBinding,
+): boolean {
   const sha = pr.candidate_sha?.trim().toLowerCase() ?? "";
   const epoch = pr.candidate_epoch?.trim().toLowerCase() ?? "";
+  const expectedSha = expected?.candidateSha?.trim().toLowerCase() ?? "";
+  const expectedOperation = expected?.logicalOperationId?.trim() ?? "";
   return pr.artifact_role === "implementation" &&
     Boolean(pr.artifact_identity?.trim()) &&
     Boolean(sha) &&
-    sha === epoch;
+    sha === epoch &&
+    (!expectedSha || sha === expectedSha) &&
+    (!expectedOperation || pr.logical_operation_id?.trim() === expectedOperation);
 }
 
 /**
@@ -71,10 +84,10 @@ function isExactLinkedImplementation(pr: LinkedPrIntegrationFact): boolean {
  */
 export function integrationSideEffectCertainty(
   linked: readonly LinkedPrIntegrationFact[],
-  opts?: { truncated?: boolean; incompleteDetails?: boolean },
+  opts?: { truncated?: boolean; incompleteDetails?: boolean } & ExpectedLinkedPrBinding,
 ): SideEffectCertainty {
   if (linked.some((pr) =>
-    pr.state === "merged" && pr.contained === true && isExactLinkedImplementation(pr)
+    pr.state === "merged" && pr.contained === true && isExactLinkedImplementation(pr, opts)
   )) {
     return "known_complete";
   }
@@ -97,9 +110,10 @@ export function successorMutationsAllowed(certainty: SideEffectCertainty): {
 /** Prefer a merged-and-contained PR as integration authority over a later open PR. */
 export function selectAuthoritativeLinkedPr(
   linked: readonly LinkedPrIntegrationFact[],
+  expected?: ExpectedLinkedPrBinding,
 ): LinkedPrIntegrationFact | null {
   const containedMerged = linked.find((pr) =>
-    pr.state === "merged" && pr.contained === true && isExactLinkedImplementation(pr)
+    pr.state === "merged" && pr.contained === true && isExactLinkedImplementation(pr, expected)
   );
   if (containedMerged) return containedMerged;
   const open = linked.find((pr) => pr.state === "open" && pr.artifact_role === "implementation");
@@ -107,6 +121,22 @@ export function selectAuthoritativeLinkedPr(
   const ambiguousMerged = linked.find((pr) => pr.state === "merged");
   if (ambiguousMerged) return ambiguousMerged;
   return linked[0] ?? null;
+}
+
+const LOGICAL_OPERATION_BODY_MARKER_RE =
+  /<!--\s*pipeline-logical-operation:\s*([A-Za-z0-9._:-]+)\s*-->/;
+
+export function logicalOperationIdFromArtifactBody(body: string): string | null {
+  return LOGICAL_OPERATION_BODY_MARKER_RE.exec(body)?.[1] ?? null;
+}
+
+export function bindArtifactBodyToLogicalOperation(
+  body: string,
+  logicalOperationId?: string | null,
+): string {
+  const id = logicalOperationId?.trim();
+  if (!id || logicalOperationIdFromArtifactBody(body)) return body;
+  return `${body.trimEnd()}\n\n<!-- pipeline-logical-operation: ${id} -->`;
 }
 
 /**

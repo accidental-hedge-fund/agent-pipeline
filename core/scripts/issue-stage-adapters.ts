@@ -496,6 +496,7 @@ export interface AdapterAttemptInput {
   artifactIdentity?: string | null;
   exitCode?: number | null;
   postconditionProven?: boolean;
+  requireEvidenceBeforeAttempt?: boolean;
   outcome?: Outcome;
   error?: unknown;
 }
@@ -726,28 +727,82 @@ export interface RunDeliveryStageAdapterInput {
   evidenceRole?: ArtifactEvidenceRole | string | null;
   artifactIdentity?: string | null;
   postconditionProven?: boolean;
+  observeEvidence?: (
+    phase: "before" | "after",
+    outcome?: Outcome,
+  ) => Promise<Pick<
+    AdapterAttemptInput,
+    "candidateSha" | "candidateEpoch" | "evidenceRole" | "artifactIdentity" | "postconditionProven"
+  >>;
   attempt: () => Promise<Outcome>;
 }
 
+export type DeliveryStageEvidenceObserver = NonNullable<
+  RunDeliveryStageAdapterInput["observeEvidence"]
+>;
+
 export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInput): Promise<Outcome> {
-  const base = {
+  let evidence = {
+    candidateSha: input.candidateSha,
+    candidateEpoch: input.candidateEpoch,
+    evidenceRole: input.evidenceRole,
+    artifactIdentity: input.artifactIdentity,
+    postconditionProven: input.postconditionProven,
+  };
+  const baseIdentity = {
     stage: input.stage,
     domain: input.cfg.domain ?? "unknown",
     logical_operation_id: input.logicalOperationId,
     repository: input.cfg.repo,
     issue: input.issueNumber,
     run_id: input.pipelineRunId ?? null,
-    candidateSha: input.candidateSha,
-    candidateEpoch: input.candidateEpoch,
-    evidenceRole: input.evidenceRole,
-    artifactIdentity: input.artifactIdentity,
   };
   try {
+    if (input.requireEvidenceBeforeAttempt && !input.observeEvidence) {
+      const outcome: Outcome = {
+        advanced: false,
+        status: "waiting",
+        reason: "delivery-stage evidence observer is required before execution",
+      };
+      const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+        ...baseIdentity,
+        ...evidence,
+        outcome,
+        postconditionProven: false,
+      }));
+      consumeReportedOwned(obs);
+      return outcome;
+    }
+    if (input.observeEvidence) {
+      evidence = await input.observeEvidence("before");
+      const bindingFailure = completingEvidenceBindingFailure({
+        stage: input.stage,
+        ...evidence,
+      });
+      if (bindingFailure) {
+        const outcome: Outcome = {
+          advanced: false,
+          status: "waiting",
+          reason: `delivery-stage evidence binding refused before execution: ${bindingFailure}`,
+        };
+        const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+          ...baseIdentity,
+          ...evidence,
+          outcome,
+          postconditionProven: false,
+        }));
+        consumeReportedOwned(obs);
+        return outcome;
+      }
+    }
     const outcome = await input.attempt();
+    if (input.observeEvidence) {
+      evidence = await input.observeEvidence("after", outcome);
+    }
     const obs = observationFromAdapterAttempt({
-      ...base,
+      ...baseIdentity,
+      ...evidence,
       outcome,
-      postconditionProven: input.postconditionProven,
     });
     const reported = reportOwnedOperation(input.reportObservation, obs);
     if (!reported.complete) consumeReportedOwned(reported);
@@ -766,10 +821,13 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
       mayReplaySideEffect(reported.certainty)
     ) {
       const retry = await input.attempt();
+      if (input.observeEvidence) {
+        evidence = await input.observeEvidence("after", retry);
+      }
       const retryObs = observationFromAdapterAttempt({
-        ...base,
+        ...baseIdentity,
+        ...evidence,
         outcome: retry,
-        postconditionProven: input.postconditionProven,
       });
       const reportedRetry = reportOwnedOperation(input.reportObservation, retryObs);
       if (!reportedRetry.complete) consumeReportedOwned(reportedRetry);

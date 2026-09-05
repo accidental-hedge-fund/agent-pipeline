@@ -1511,6 +1511,15 @@ test("reconcile: observer-backed ledger-behind repair binds succeeded in the sam
     async getPrDetail() {
       return { state: "merged", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: "mergesha" };
     },
+    async getPrArtifactBinding(prNumber, detail) {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+        candidateSha: detail.head_sha,
+        candidateEpoch: detail.head_sha,
+        logicalOperationId: "lop-reconcile-1322",
+      };
+    },
   });
   await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
   const restarted = await readLedger(deps, "run-1");

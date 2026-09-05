@@ -110,6 +110,19 @@ function memRunStore() {
     fsyncFile: async () => {},
     fsyncDirectory: async () => {},
     realpath: async (p) => path.resolve(p),
+    link: async (existingPath, newPath) => {
+      if (files.has(newPath)) {
+        const error = new Error(`EEXIST: ${newPath}`) as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+      const contents = files.get(existingPath);
+      if (contents === undefined) throw enoent(existingPath);
+      files.set(newPath, contents);
+    },
+    unlink: async (p) => {
+      if (!files.delete(p)) throw enoent(p);
+    },
   };
   function readFile(p: string): string {
     return (files.get(p) ?? "") + (appends.get(p) ?? []).join("");

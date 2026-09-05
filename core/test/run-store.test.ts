@@ -188,6 +188,19 @@ function memRunStore() {
     fsyncFile: async (p) => { flushes.push(p); },
     fsyncDirectory: async (p) => { directoryFlushes.push(p); },
     realpath: async (p) => path.resolve(p),
+    link: async (existingPath, newPath) => {
+      if (files.has(newPath)) {
+        const error = new Error(`EEXIST: ${newPath}`) as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+      const contents = files.get(existingPath);
+      if (contents === undefined) throw enoent(existingPath);
+      files.set(newPath, contents);
+    },
+    unlink: async (p) => {
+      if (!files.delete(p)) throw enoent(p);
+    },
     stdoutWrite: (line) => {
       stdoutLines.push(line);
     },
@@ -602,6 +615,106 @@ test("persistPublicEntrypointAdmission: direct retries reuse the durable operati
   assert.equal(retry.logicalOperationId, first.logicalOperationId);
   assert.notEqual(retry.runId, first.runId);
   assert.equal(mintCalls, 1);
+});
+
+test("persistPublicEntrypointAdmission: interrupted claim publication is recovered without reminting (#1454)", async () => {
+  const store = memRunStore();
+  let mintCalls = 0;
+  let linkCalls = 0;
+  const opts = {
+    repoDir: "/candidate",
+    factoryControlRoot: "/control",
+    kind: "single" as const,
+    route: "single.direct" as const,
+    repo: "owner/repo",
+    domain: "github.com/owner/repo",
+    issue: 1454,
+    operationKey: "single:owner/repo:claim-recovery:1454",
+    mintLogicalOperationId: () => `lop-claim-recovery-${++mintCalls}`,
+  };
+  const failed = await persistPublicEntrypointAdmission(opts, {
+    ...store.deps,
+    link: async (existingPath, newPath) => {
+      linkCalls += 1;
+      if (linkCalls === 1) throw new Error("injected crash before exclusive claim publication");
+      await store.deps.link(existingPath, newPath);
+    },
+  });
+  assert.equal(failed.acknowledged, false);
+  assert.equal(failed.logicalOperationId, "lop-claim-recovery-1");
+
+  const retry = await persistPublicEntrypointAdmission(opts, store.deps);
+  assert.equal(retry.acknowledged, true);
+  assert.equal(retry.logicalOperationId, failed.logicalOperationId);
+  assert.equal(mintCalls, 1);
+});
+
+test("persistPublicEntrypointAdmission: legacy empty claim directory cannot poison atomic claim-file retry (#1454)", async () => {
+  const store = memRunStore();
+  const operationKey = "single:owner/repo:legacy-empty-claim:1454";
+  const legacyDigest = await import("node:crypto").then(({ createHash }) =>
+    createHash("sha256").update(operationKey).digest("hex")
+  );
+  await store.deps.mkdir(path.join("/control", ".agent-pipeline", "admissions", legacyDigest), {
+    recursive: false,
+  });
+  const retry = await persistPublicEntrypointAdmission(
+    {
+      repoDir: "/candidate",
+      factoryControlRoot: "/control",
+      kind: "single",
+      route: "single.direct",
+      repo: "owner/repo",
+      issue: 1454,
+      operationKey,
+      mintLogicalOperationId: () => "lop-after-empty-claim-dir",
+    },
+    store.deps,
+  );
+  assert.equal(retry.acknowledged, true);
+  assert.equal(retry.logicalOperationId, "lop-after-empty-claim-dir");
+});
+
+test("persistPublicEntrypointAdmission: direct and train-nested merge routes keep isolated claims in either order (#1454)", async () => {
+  for (const nestedFirst of [false, true]) {
+    const store = memRunStore();
+    const direct = {
+      repoDir: "/candidate",
+      factoryControlRoot: "/control",
+      kind: "merge" as const,
+      route: "merge.direct" as const,
+      repo: "owner/repo",
+      issue: 1454,
+      operationKey: "merge:owner/repo:pr:2454",
+      runId: `merge-direct-${nestedFirst}`,
+      logicalOperationId: "lop-direct-merge",
+    };
+    const nested = {
+      repoDir: "/candidate",
+      factoryControlRoot: "/control",
+      kind: "merge" as const,
+      route: "merge.train-nested" as const,
+      repo: "owner/repo",
+      issue: 1454,
+      operationKey: "merge:owner/repo:train:lop-train-root:pr:2454",
+      runId: `merge-nested-${nestedFirst}`,
+      logicalOperationId: "lop-train-root",
+      admissionMode: "nested" as const,
+    };
+    const ordered = nestedFirst ? [nested, direct] : [direct, nested];
+    const first = await persistPublicEntrypointAdmission(ordered[0]!, store.deps);
+    const second = await persistPublicEntrypointAdmission(ordered[1]!, store.deps);
+    assert.equal(first.acknowledged, true);
+    assert.equal(second.acknowledged, true);
+    assert.equal(
+      nestedFirst ? first.logicalOperationId : second.logicalOperationId,
+      "lop-train-root",
+    );
+    assert.equal(
+      nestedFirst ? second.logicalOperationId : first.logicalOperationId,
+      "lop-direct-merge",
+    );
+  }
 });
 
 test("persistPublicEntrypointAdmission: concurrent shared run id cannot overwrite an acknowledged stamp (#1454)", async () => {

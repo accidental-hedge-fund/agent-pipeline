@@ -6,7 +6,7 @@
 // auto-loop helpers and AdvanceDeps so existing import paths continue to work.
 
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   GhMetricsCollector,
   addLabelToPr,
@@ -16,6 +16,7 @@ import {
   getGhActor,
   getIssueDetail,
   getPrDetail,
+  getPrDiff,
   getPrForIssue,
   getPrForIssueAnyState,
   isBlocked,
@@ -178,13 +179,22 @@ import * as preCodeAttestationStage from "./stages/pre_code_attestation.ts";
 import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
-import { isDeliveryStage, runDeliveryStageAdapter } from "./issue-stage-adapters.ts";
+import {
+  isDeliveryStage,
+  requiredEvidenceRoleForStage,
+  runDeliveryStageAdapter,
+  type DeliveryStage,
+  type DeliveryStageEvidenceObserver,
+} from "./issue-stage-adapters.ts";
+import { diffFilePaths } from "./stages/review-parsing.ts";
+import { observeImplementDeliverablePaths } from "./unpublished-stage-commit.ts";
 import {
   reviewStageSkipTarget,
   type BlockerKind,
   type EvidenceBundle,
   type Outcome,
   type PipelineConfig,
+  STAGES,
   type Stage,
   type StageOutcome,
 } from "./types.ts";
@@ -249,6 +259,8 @@ export interface AdvanceOpts {
    * initRunDir mints a new identity unless run.json already stores one.
    */
   logicalOperationId?: string | null;
+  /** Exact observer run before and after a delivery-stage attempt. */
+  observeDeliveryStageEvidence?: DeliveryStageEvidenceObserver;
 }
 
 /** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
@@ -700,6 +712,7 @@ export interface AdvanceDeps {
   getGhActor?: typeof getGhActor;
   getPrForIssue?: typeof getPrForIssue;
   getPrDetail?: typeof getPrDetail;
+  getPrDiff?: typeof getPrDiff;
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   gitInWorktree?: typeof gitInWorktree;
   postComment?: typeof postComment;
@@ -1012,6 +1025,88 @@ async function notifyBundlePath(
 // Stage dispatch
 // ---------------------------------------------------------------------------
 
+function evidenceDigest(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+/**
+ * Candidate/artifact observer used on both sides of the delivery handler.
+ * Every external read uses the run's injectable deps, so hermetic drives do
+ * not inherit ambient git or GitHub authentication.
+ */
+export function createDeliveryStageEvidenceObserver(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  stage: DeliveryStage,
+  dryRun: boolean,
+  deps: Pick<
+    AdvanceDeps,
+    "getIssueDetail" | "getPrForIssue" | "getPrDetail" | "getPrDiff" | "getOnDiskForIssue" | "gitInWorktree"
+  > = {},
+): DeliveryStageEvidenceObserver {
+  return async (phase) => {
+    const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
+    const observedStage = pickStage(detail.labels);
+    const progressed = dryRun || (
+      observedStage !== null && STAGES.indexOf(observedStage) > STAGES.indexOf(stage)
+    ) || (stage === "ready-to-deploy" && observedStage === stage);
+    const role = requiredEvidenceRoleForStage(stage);
+
+    if (role === "planning") {
+      const plan = [...(detail.comments ?? [])]
+        .reverse()
+        .find((comment) =>
+          comment.body.startsWith("## Implementation Plan") ||
+          comment.body.startsWith("## Revised Implementation Plan")
+        )?.body;
+      const source = plan ?? `${cfg.repo}#${issueNumber}:planning-target`;
+      const identity = evidenceDigest(source);
+      return {
+        candidateSha: identity,
+        candidateEpoch: identity,
+        evidenceRole: "planning",
+        artifactIdentity: plan ? `planning:${identity}` : `planning-target:${identity}`,
+        postconditionProven: phase === "after" && progressed && Boolean(plan),
+      };
+    }
+
+    let candidateSha = "";
+    let paths: string[] = [];
+    const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(() => null);
+    if (wt) {
+      const git = deps.gitInWorktree ?? gitInWorktree;
+      const [head, changed] = await Promise.all([
+        git(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true }),
+        git(wt.path, ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`], {
+          ignoreFailure: true,
+        }),
+      ]);
+      candidateSha = head.stdout.trim().toLowerCase();
+      if (changed.code === 0) paths = changed.stdout.split("\n").filter(Boolean);
+    } else {
+      const pr = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(() => null);
+      if (pr) {
+        const prDetail = await (deps.getPrDetail ?? getPrDetail)(cfg, pr).catch(() => null);
+        candidateSha = prDetail?.head_sha.trim().toLowerCase() ?? "";
+        const diff = await (deps.getPrDiff ?? getPrDiff)(cfg, pr).catch(() => "");
+        paths = diffFilePaths(diff);
+      }
+    }
+    if (!candidateSha) candidateSha = evidenceDigest(`${cfg.repo}#${issueNumber}:implementation-target`);
+    const implementation = observeImplementDeliverablePaths({ paths, candidateSha });
+    const exactImplementation = implementation.role === "implementation" && Boolean(implementation.artifact_id);
+    return {
+      candidateSha,
+      candidateEpoch: candidateSha,
+      evidenceRole: "implementation",
+      artifactIdentity: exactImplementation
+        ? implementation.artifact_id
+        : `implementation-target:${cfg.repo}#${issueNumber}:${candidateSha}`,
+      postconditionProven: phase === "after" && progressed && exactImplementation,
+    };
+  };
+}
+
 export async function dispatch(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -1043,6 +1138,8 @@ export async function dispatch(
       pipelineRunId,
       logicalOperationId: opts.logicalOperationId,
       reportObservation: opts.reportObservation,
+      requireEvidenceBeforeAttempt: true,
+      observeEvidence: opts.observeDeliveryStageEvidence,
       attempt,
     });
   }
@@ -1134,7 +1231,15 @@ async function dispatchStageHandler(
           reason: `planning is active under a different domain — waiting for it to complete`,
         };
       }
-      return readyDeps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+      return readyDeps.planningAdvance(cfg, issueNumber, {
+        dryRun,
+        model,
+        pipelineRunId,
+        stateDir,
+        runDir,
+        runStoreDeps,
+        logicalOperationId: opts.logicalOperationId,
+      });
     }
     case "needs-spec":
       return {
@@ -1242,6 +1347,7 @@ async function dispatchStageHandler(
             runDir,
             runStoreDeps,
             resumePlanReview: true,
+            logicalOperationId: opts.logicalOperationId,
           });
         }
       }
@@ -1251,7 +1357,15 @@ async function dispatchStageHandler(
       if (!dryRun) {
         await deps.transition(cfg, issueNumber, stage, "ready", "recovered crashed planning attempt — restarting");
       }
-      return deps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+      return deps.planningAdvance(cfg, issueNumber, {
+        dryRun,
+        model,
+        pipelineRunId,
+        stateDir,
+        runDir,
+        runStoreDeps,
+        logicalOperationId: opts.logicalOperationId,
+      });
     }
     case "implementing": {
       // Re-entry: gated on the same repo-stable live-planning marker as the
@@ -1260,7 +1374,15 @@ async function dispatchStageHandler(
       // live owner + no commits → crash-stranded, roll back to `ready` and
       // restart planning.
       const implDeps = recoveryDeps ?? realPlanningRecoveryDeps();
-      return planningStage.dispatchResume(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps }, {
+      return planningStage.dispatchResume(cfg, issueNumber, {
+        dryRun,
+        model,
+        pipelineRunId,
+        stateDir,
+        runDir,
+        runStoreDeps,
+        logicalOperationId: opts.logicalOperationId,
+      }, {
         isLivePlanningActive: implDeps.isLivePlanningActive,
         transition: implDeps.transition,
         planningAdvance: implDeps.planningAdvance,
@@ -2605,7 +2727,24 @@ export async function runAdvance(
       }
       let out: Outcome;
       try {
-        out = await (deps.dispatch ?? dispatch)(cfg, issueNumber, stage, opts, pipelineRunId, stateDir, runDir, runStoreDeps);
+        const dispatchOpts: AdvanceOpts = {
+          ...opts,
+          observeDeliveryStageEvidence:
+            opts.observeDeliveryStageEvidence ??
+            (isDeliveryStage(stage)
+              ? createDeliveryStageEvidenceObserver(cfg, issueNumber, stage, !!opts.dryRun, deps)
+              : undefined),
+        };
+        out = await (deps.dispatch ?? dispatch)(
+          cfg,
+          issueNumber,
+          stage,
+          dispatchOpts,
+          pipelineRunId,
+          stateDir,
+          runDir,
+          runStoreDeps,
+        );
       } catch (err) {
         // Stage threw — record an error outcome before rethrowing so the bundle
         // never shows a perpetually in-progress stage.

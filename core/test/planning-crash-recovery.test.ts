@@ -35,7 +35,14 @@ function makeCfg(): PipelineConfig {
 }
 
 const ISSUE = 271;
-const OPTS = { dryRun: false };
+const PLANNING_EVIDENCE = async () => ({
+  candidateSha: "a".repeat(40),
+  candidateEpoch: "a".repeat(40),
+  evidenceRole: "planning" as const,
+  artifactIdentity: "planning:test-owner/test-repo#271",
+  postconditionProven: false,
+});
+const OPTS = { dryRun: false, observeDeliveryStageEvidence: PLANNING_EVIDENCE };
 const RUN_ID = "271-2026-01-01T00:00:00Z";
 
 function makeDeps(planningResult: Outcome): {
@@ -196,7 +203,17 @@ test("planning crash recovery: dry-run does not call transition for planning", a
     },
   };
 
-  const out = await dispatch(cfg, ISSUE, "planning", { dryRun: true }, RUN_ID, undefined, undefined, undefined, trackingDeps);
+  const out = await dispatch(
+    cfg,
+    ISSUE,
+    "planning",
+    { dryRun: true, observeDeliveryStageEvidence: PLANNING_EVIDENCE },
+    RUN_ID,
+    undefined,
+    undefined,
+    undefined,
+    trackingDeps,
+  );
 
   assert.equal(transitionCalls.length, 0, "dry-run must not call transition for planning");
   assert.equal(planningCalled, 1, "dry-run must still call planningAdvance");
@@ -215,7 +232,17 @@ test("planning crash recovery: dry-run does not call transition for plan-review"
     },
   };
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", { dryRun: true }, RUN_ID, undefined, undefined, undefined, trackingDeps);
+  const out = await dispatch(
+    cfg,
+    ISSUE,
+    "plan-review",
+    { dryRun: true, observeDeliveryStageEvidence: PLANNING_EVIDENCE },
+    RUN_ID,
+    undefined,
+    undefined,
+    undefined,
+    trackingDeps,
+  );
 
   assert.equal(transitionCalls.length, 0, "dry-run must not call transition for plan-review");
   assert.equal(planningCalled, 1, "dry-run must still call planningAdvance");

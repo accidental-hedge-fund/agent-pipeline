@@ -28,7 +28,9 @@ import {
 import { isLoopNextAction, type LoopExternalIdentity } from "../scripts/loop/types.ts";
 import {
   archiveReplayDecision,
+  bindArtifactBodyToLogicalOperation,
   integrationSideEffectCertainty,
+  logicalOperationIdFromArtifactBody,
   mayReplaySideEffect,
   successorMutationsAllowed,
   treatmentForSideEffectCertainty,
@@ -39,6 +41,12 @@ import { pipelineStageFromLabels as trainPipelineStageFromLabels } from "../scri
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CORE_ROOT = join(__dirname, "..");
+
+test("implementation artifact bodies retain their admitted operation identity (#1454)", () => {
+  const body = bindArtifactBodyToLogicalOperation("Closes #1454", "lop-current-1454");
+  assert.equal(logicalOperationIdFromArtifactBody(body), "lop-current-1454");
+  assert.equal(bindArtifactBodyToLogicalOperation(body, "lop-other"), body);
+});
 
 function identity(overrides: Partial<LoopExternalIdentity> = {}): LoopExternalIdentity {
   return {
@@ -207,12 +215,48 @@ test("4.1 later open PR does not hide a prior merged-and-contained PR", () => {
       artifact_identity: "pr:10:head",
       candidate_sha: "a".repeat(40),
       candidate_epoch: "a".repeat(40),
+      logical_operation_id: "lop-current",
     },
-    { number: 99, state: "open", merge_commit_sha: null, contained: null },
-  ]);
+    {
+      number: 99,
+      state: "open",
+      merge_commit_sha: null,
+      contained: null,
+      candidate_sha: "a".repeat(40),
+      candidate_epoch: "a".repeat(40),
+      logical_operation_id: "lop-current",
+    },
+  ], { candidateSha: "a".repeat(40), logicalOperationId: "lop-current" });
   assert.equal(certainty, "known_complete");
   assert.equal(successorMutationsAllowed(certainty).openSuccessorPr, false);
   assert.equal(successorMutationsAllowed(certainty).rebaseContainedCommits, false);
+});
+
+test("4.1 merged completion must match the active operation and candidate (#1454)", () => {
+  const merged = {
+    number: 10,
+    state: "merged" as const,
+    contained: true,
+    artifact_role: "implementation" as const,
+    artifact_identity: "pr:10:head",
+    candidate_sha: "a".repeat(40),
+    candidate_epoch: "a".repeat(40),
+    logical_operation_id: "lop-old",
+  };
+  assert.equal(
+    integrationSideEffectCertainty([merged], {
+      candidateSha: "b".repeat(40),
+      logicalOperationId: "lop-current",
+    }),
+    "uncertain",
+  );
+  assert.equal(
+    integrationSideEffectCertainty([merged], {
+      candidateSha: "a".repeat(40),
+      logicalOperationId: "lop-current",
+    }),
+    "uncertain",
+  );
 });
 
 test("4.1 truncated linked-PR scan is uncertain, never known_absent", () => {
@@ -257,7 +301,7 @@ test("4.2/4.3 squash-merge while fix-2 is known_complete even if the issue is st
       return {
         state: "open",
         head_ref: "pipeline/1369-fix",
-        head_sha: "b".repeat(40),
+        head_sha: "a".repeat(40),
         merge_commit_sha: null,
       };
     },
@@ -272,6 +316,39 @@ test("4.2/4.3 squash-merge while fix-2 is known_complete even if the issue is st
   assert.equal(observed.pipeline_stage, "fix-2");
   assert.equal(observed.issue_open, true);
   assert.equal(successorMutationsAllowed(observed.integration_certainty!).openSuccessorPr, false);
+});
+
+test("4.2 merged candidate A cannot complete later active candidate B (#1454)", async () => {
+  const deps = fakeObserve({
+    async findPrForIssue() {
+      return 99;
+    },
+    async listLinkedPrs() {
+      return [10, 99];
+    },
+    async getPrDetail(pr) {
+      return pr === 10
+        ? {
+            state: "merged",
+            head_ref: "pipeline/1369-fix",
+            head_sha: "a".repeat(40),
+            merge_commit_sha: "c".repeat(40),
+          }
+        : {
+            state: "open",
+            head_ref: "pipeline/1369-fix",
+            head_sha: "b".repeat(40),
+            merge_commit_sha: null,
+          };
+    },
+    async baseBranchContainsSha() {
+      return true;
+    },
+  });
+  const observed = await observeExternalIdentity(deps, "1369");
+  assert.equal(observed.integration_certainty, "uncertain");
+  assert.equal(observed.pr_number, 99);
+  assert.equal(observed.head_sha, "b".repeat(40));
 });
 
 test("4.1 truncated listLinkedPrs does not declare integration absent", async () => {
@@ -439,8 +516,8 @@ test("6.1/6.2 #1369 dogfood fixture: squash-merge, contradictory labels, SHA dri
   });
   const observed = await observeExternalIdentity(deps, "1369");
   assert.equal(observed.pipeline_stage, "pre-merge");
-  assert.equal(observed.pr_state, "merged");
-  assert.equal(observed.integration_certainty, "known_complete");
+  assert.equal(observed.pr_state, "open");
+  assert.equal(observed.integration_certainty, "uncertain");
   assert.equal(observed.rebase_in_progress, true);
   assert.equal(observed.product_dirt, true);
 

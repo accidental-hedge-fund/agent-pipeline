@@ -298,6 +298,7 @@ export interface PublishUnpublishedExecutorDeps {
       prBody: string;
       transitionMessage: (prNumber: number) => string;
       pipelineRunId: string;
+      logicalOperationId?: string | null;
     },
     resumeDeps?: Record<string, unknown>,
   ) => Promise<Outcome>;
@@ -312,6 +313,7 @@ export interface PublishUnpublishedExecutorDeps {
     issueNumber: number,
   ) => Promise<ImplementDeliverableObservation>;
   pipelineRunId?: string;
+  logicalOperationId?: string | null;
 }
 
 export type DeliverableArtifactRole = "planning" | "implementation" | "unknown";
@@ -356,6 +358,14 @@ export function isPlanningOnlyArtifactPath(filePath: string): boolean {
 export function isProductImplementationArtifactPath(filePath: string): boolean {
   const normalized = filePath.trim().replace(/^\.\//, "");
   if (!normalized || isPlanningOnlyArtifactPath(normalized)) return false;
+  if (
+    /(?:^|\/)(?:test|tests|__tests__|fixtures?|examples?)(?:\/|$)/i.test(normalized) ||
+    /(?:^|\/)(?:scripts?|tools?)(?:\/|$)/i.test(normalized) && !/^core\/scripts\//.test(normalized) ||
+    /(?:^|\/)__mocks__(?:\/|$)/i.test(normalized) ||
+    /(?:^|\/)[^/]+\.(?:test|spec)\.[^/]+$/i.test(normalized)
+  ) {
+    return false;
+  }
   const basename = normalized.split("/").at(-1) ?? "";
   if (
     /^(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.(?:toml|lock)|go\.(?:mod|sum)|Gemfile(?:\.lock)?|requirements[^/]*\.txt|pyproject\.toml|Dockerfile)$/i.test(
@@ -537,6 +547,7 @@ export async function executePublishUnpublishedStageCommit(
       transitionMessage: (prNumber) =>
         `PR #${prNumber} published from unpublished stage commit for #${issueNumber}.`,
       pipelineRunId,
+      logicalOperationId: deps.logicalOperationId,
     },
     resumeDeps,
   );

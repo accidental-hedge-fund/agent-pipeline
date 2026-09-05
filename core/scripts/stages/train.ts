@@ -1364,7 +1364,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         repo: opts.repo,
         domain: opts.pipelineConfig?.domain ?? opts.repo,
         issue,
-        operationKey: `merge:${opts.repo}:pr:${pr}`,
+        operationKey: `merge:${opts.repo}:train:${session.logicalOperationId}:pr:${pr}`,
         route: "merge.train-nested",
         runId: `merge-${session.runId}-${issue}-${pr}`,
         logicalOperationId: session.logicalOperationId,

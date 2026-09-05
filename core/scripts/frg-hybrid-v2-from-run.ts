@@ -19,6 +19,7 @@ import type { LoopContract, LoopLedger } from "./loop/types.ts";
 import { defaultLoopStoreDeps, runDir } from "./loop/store.ts";
 import {
   defaultResolveAndPrepareDeps,
+  revalidateCandidateEngineBeforeSpawn,
   resolveAndPrepareCandidateEngine,
   type CandidateEngineResult,
 } from "./ship-end-candidate.ts";
@@ -386,7 +387,7 @@ export async function defaultCollectHybridV2FromRun(
   if (!engineResult.ok) {
     throw new Error(`pipeline factory-gate: hybrid-v2 collect ${engineResult.error}`);
   }
-  const candidateEngineDir = engineResult.engine.engineRoot;
+  let candidateEngine = engineResult.engine;
 
   let repository = "";
   try {
@@ -498,11 +499,16 @@ export async function defaultCollectHybridV2FromRun(
 
   const probes: VerifiedFrgPackRun["probes"] = [];
   for (const probe of pack.manifest.pilot_policy.layer_a_probes) {
+    const checked = await revalidateCandidateEngineBeforeSpawn(candidateEngine);
+    if (!checked.ok) {
+      throw new Error(`pipeline factory-gate: hybrid-v2 collect ${checked.error}`);
+    }
+    candidateEngine = checked.engine;
     probes.push(
       await runProbe(probe, {
         repoDir: args.repoDir,
         candidateGitSha,
-        candidateEngineDir,
+        candidateEngineDir: candidateEngine.engineRoot,
       }),
     );
   }

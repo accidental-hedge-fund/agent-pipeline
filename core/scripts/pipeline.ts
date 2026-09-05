@@ -2715,6 +2715,7 @@ export function realExecuteRecovery(
           },
           getIssueDetail: getDetail,
           clearBlocked: clear,
+          logicalOperationId: input.logicalOperationId,
           probeImplementDeliverable:
             deps.publishUnpublished?.probeImplementDeliverable ?? probeImplementDeliverable,
         });

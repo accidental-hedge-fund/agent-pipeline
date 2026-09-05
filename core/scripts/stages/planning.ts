@@ -10,7 +10,10 @@
 //   7. Run the primary implementer harness in the worktree against the revised impl prompt.
 //   8. Verify commits exist, push branch, create PR, transition implementing → review-1.
 
-import { successorMutationsAllowed } from "../operation-observation.ts";
+import {
+  bindArtifactBodyToLogicalOperation,
+  successorMutationsAllowed,
+} from "../operation-observation.ts";
 import {
   addLabel,
   createPr,
@@ -308,6 +311,7 @@ export interface AdvanceOpts {
   model?: string;
   /** Dispatch-wide run id for the commit traceability trailers (#20). */
   pipelineRunId?: string;
+  logicalOperationId?: string | null;
   /** Evidence-bundle run/state dir (#147); when set, the test gate records its
    *  command runs under the active implementation stage. Undefined → recording disabled. */
   stateDir?: string;
@@ -1832,7 +1836,10 @@ export async function runPlanningPhases(
 
       // ---- Build PR body and hand off to post-implementation steps ----
       const planExcerpt = revisedPlan.length > 2000 ? revisedPlan.slice(0, 2000) + "\n\n[…plan truncated]" : revisedPlan;
-      const prBody = hooks.buildPrBody(cfg, issueNumber, title, planExcerpt, primary, reviewer);
+      const prBody = bindArtifactBodyToLogicalOperation(
+        hooks.buildPrBody(cfg, issueNumber, title, planExcerpt, primary, reviewer),
+        opts.logicalOperationId,
+      );
 
       return resumeFromImplementing(cfg, issueNumber, wt, {
         prTitle: `[Pipeline] ${title} (#${issueNumber})`,
@@ -1842,6 +1849,7 @@ export async function runPlanningPhases(
         stateDir: opts.stateDir,
         runDir: opts.runDir,
         runStoreDeps: opts.runStoreDeps,
+        logicalOperationId: opts.logicalOperationId,
       }, deps);
     },
   });
@@ -2594,6 +2602,7 @@ export async function resumeFromImplementing(
     /** Run-store deps carrying `stdoutWrite` so events also stream to stdout under
      *  `--json-events` (#155). Undefined → events go to events.jsonl only. */
     runStoreDeps?: RunStoreDeps;
+    logicalOperationId?: string | null;
   },
   deps: ResumeFromImplementingDeps = {},
 ): Promise<Outcome> {
@@ -2769,7 +2778,11 @@ export async function resumeFromImplementing(
     console.log(`[pipeline] #${issueNumber}: PR #${prNumber} already exists for branch ${branch} — reusing`);
   } else {
     try {
-      prNumber = await prCreator(cfg, { branch, title: opts.prTitle, body: opts.prBody });
+      prNumber = await prCreator(cfg, {
+        branch,
+        title: opts.prTitle,
+        body: bindArtifactBodyToLogicalOperation(opts.prBody, opts.logicalOperationId),
+      });
       prIsNew = true;
       console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
     } catch (err) {
@@ -2976,6 +2989,7 @@ export async function dispatchResume(
         runDir: opts.runDir,
         runStoreDeps: opts.runStoreDeps,
         resumeImplementing: true,
+        logicalOperationId: opts.logicalOperationId,
       });
     }
     if (recovered.action === "post-implement") {
@@ -2998,6 +3012,7 @@ export async function dispatchResume(
       stateDir: opts.stateDir,
       runDir: opts.runDir,
       runStoreDeps: opts.runStoreDeps,
+      logicalOperationId: opts.logicalOperationId,
     });
   }
 
@@ -3014,6 +3029,7 @@ export async function dispatchResume(
       runDir: opts.runDir,
       runStoreDeps: opts.runStoreDeps,
       resumeImplementing: true,
+      logicalOperationId: opts.logicalOperationId,
     });
   }
 
@@ -3045,6 +3061,7 @@ export async function dispatchResume(
     stateDir: opts.stateDir,
     runDir: opts.runDir,
     runStoreDeps: opts.runStoreDeps,
+    logicalOperationId: opts.logicalOperationId,
   });
 }
 

@@ -100,6 +100,7 @@ import {
 import {
   defaultResolveAndPrepareDeps,
   resolveAndPrepareCandidateEngine,
+  revalidateCandidateEngineBeforeSpawn,
   type ResolveAndPrepareCandidateEngineDeps,
 } from "./ship-end-candidate.ts";
 import {
@@ -2651,6 +2652,10 @@ export async function productionDispatchPackLoop(
       ));
   let spawnResult: void | PackLoopSpawnResult;
   try {
+    const finalCandidate = await revalidateCandidateEngineBeforeSpawn(resolved.engine);
+    if (!finalCandidate.ok) {
+      throw new Error(`pack-loop dispatch: ${finalCandidate.error}`);
+    }
     spawnResult = await spawn({
       repoDir: input.repoDir,
       loop_run_id,

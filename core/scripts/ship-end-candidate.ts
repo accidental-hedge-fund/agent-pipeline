@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import {
   defaultPrepareCandidateEngineDeps,
   prepareCandidateEngine,
+  revalidatePreparedCandidateEngineForSpawn,
   type PrepareCandidateEngineDeps,
   type ResolveAndPrepareDeps,
 } from "./candidate-engine-readiness.ts";
@@ -25,6 +26,8 @@ export interface CandidateEngine {
   engineRoot: string;
   launcherPath: string;
   commitSha: string;
+  /** Prepared proof is intentionally single-use at the spawn boundary. */
+  revalidateBeforeSpawn?: () => Promise<CandidateEngineResult>;
 }
 
 export interface CandidateEngineConsumerRoute {
@@ -229,7 +232,47 @@ export async function resolveAndPrepareCandidateEngine(
   assertCandidateEngineConsumerRoute(opts.consumer);
   const resolved = resolveCandidateEngine(opts, deps);
   if (!resolved.ok) return resolved;
-  return prepareCandidateEngine(resolved.engine, deps as ResolveAndPrepareDeps);
+  const prepared = await prepareCandidateEngine(resolved.engine, deps as ResolveAndPrepareDeps);
+  if (!prepared.ok) return prepared;
+  const bindRevalidation = (engine: CandidateEngine): CandidateEngine => ({
+    ...engine,
+    revalidateBeforeSpawn: async () => {
+      const checked = revalidatePreparedCandidateEngineForSpawn(
+        engine,
+        deps as ResolveAndPrepareDeps,
+      );
+      if (!checked.ok) return checked;
+      return { ok: true, engine: bindRevalidation(checked.engine) };
+    },
+  });
+  return { ok: true, engine: bindRevalidation(prepared.engine) };
+}
+
+/** Consume the prepared proof immediately before an inventoried spawn. */
+export async function revalidateCandidateEngineBeforeSpawn(
+  engine: CandidateEngine,
+): Promise<CandidateEngineResult> {
+  if (!engine.revalidateBeforeSpawn) {
+    return {
+      ok: false,
+      kind: "readiness",
+      error: "candidate engine has no final pre-spawn revalidation proof",
+    };
+  }
+  const checked = await engine.revalidateBeforeSpawn();
+  if (!checked.ok) return checked;
+  if (
+    checked.engine.commitSha !== engine.commitSha ||
+    checked.engine.engineRoot !== engine.engineRoot ||
+    checked.engine.launcherPath !== engine.launcherPath
+  ) {
+    return {
+      ok: false,
+      kind: "identity",
+      error: "candidate identity changed during final pre-spawn revalidation",
+    };
+  }
+  return checked;
 }
 
 export function defaultResolveAndPrepareDeps(): ResolveAndPrepareCandidateEngineDeps {

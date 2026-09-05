@@ -278,6 +278,30 @@ function matchingReady(
   return record.commitSha === engine.commitSha && record.lockfileDigest === digest;
 }
 
+/** Final non-mutating identity, cleanliness, and readiness check at spawn time. */
+export function revalidatePreparedCandidateEngineForSpawn(
+  engine: PreparedCandidateEngine,
+  deps: ResolveAndPrepareDeps,
+): PreparedCandidateResult {
+  const checked = revalidateEngine(engine, deps, "post-bootstrap");
+  if (!checked.ok) return checked;
+  const lockfilePath = nestedLockfilePath(engine.engineRoot);
+  if (!deps.fileExists(lockfilePath)) {
+    return closedError("readiness", engine.engineRoot, `missing nested ${CANDIDATE_CORE_LOCKFILE_REL} at spawn`);
+  }
+  let lockBytes: Buffer;
+  try {
+    lockBytes = deps.readFile(lockfilePath);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return closedError("readiness", engine.engineRoot, `unreadable nested lockfile at spawn (${msg})`);
+  }
+  if (!matchingReady(engine, deps.digest(lockBytes), deps)) {
+    return closedError("readiness", engine.engineRoot, "candidate readiness proof is missing or stale at spawn");
+  }
+  return checked;
+}
+
 function writeReadyRecord(
   engine: PreparedCandidateEngine,
   digest: string,

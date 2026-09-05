@@ -239,6 +239,7 @@ export interface SupervisorDeps {
     action: RecoveryRecipe;
     diagnostic: StageDiagnostic;
     evidence: LoopEvidencePointer;
+    logicalOperationId?: string;
   }): Promise<{ succeeded: boolean; evidence: string; error?: string; candidateHead?: string }>;
   /** Waits between otherwise-idle supervisor cycles until a durable recovery
    *  deadline is eligible. Never called from the item recovery path while a
@@ -1216,6 +1217,7 @@ async function executeBlockedRecovery(
       action: attempt.action,
       diagnostic: persisted.diagnostic,
       evidence: persisted.transport,
+      logicalOperationId: ledger.lifecycle?.logical_operation_id,
     });
     if (!execution.evidence.trim()) {
       execution = {

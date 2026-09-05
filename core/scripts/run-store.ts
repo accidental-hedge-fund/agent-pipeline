@@ -1281,6 +1281,9 @@ export interface PublicAdmissionStoreDeps extends RunStoreDeps {
   fsyncFile: (p: string) => Promise<void>;
   fsyncDirectory: (p: string) => Promise<void>;
   realpath: (p: string) => Promise<string>;
+  /** Atomically publish an already-durable claim without replacing a winner. */
+  link: (existingPath: string, newPath: string) => Promise<void>;
+  unlink: (p: string) => Promise<void>;
 }
 
 export const PUBLIC_ADMISSION_CLAIM_VERSION = "public-admission-claim.v1" as const;
@@ -1316,6 +1319,8 @@ export const defaultPublicAdmissionStoreDeps: PublicAdmissionStoreDeps = {
     }
   },
   realpath: (p) => fsp.realpath(p),
+  link: (existingPath, newPath) => fsp.link(existingPath, newPath),
+  unlink: (p) => fsp.unlink(p),
 };
 
 function publicAdmissionBindingDigest(
@@ -1434,9 +1439,13 @@ function admissionOperationKey(opts: {
   return [opts.kind, opts.repo, opts.domain?.trim() || opts.repo, opts.issue ?? "none"].join(":");
 }
 
-function admissionClaimDir(approvedRoot: string, operationKey: string): string {
+function admissionClaimDigest(operationKey: string): string {
+  return createHash("sha256").update(operationKey).digest("hex");
+}
+
+function admissionClaimPath(approvedRoot: string, operationKey: string): string {
   const digest = createHash("sha256").update(operationKey).digest("hex");
-  return path.join(approvedRoot, ".agent-pipeline", "admissions", digest);
+  return path.join(approvedRoot, ".agent-pipeline", "admissions", `${digest}.json`);
 }
 
 function verifyAdmissionClaim(
@@ -1465,18 +1474,11 @@ async function claimPublicLogicalOperation(input: {
   issue: number | null;
   claimedAt: string;
   deps: PublicAdmissionStoreDeps;
-}): Promise<{ logicalOperationId: string; claimDir: string }> {
+}): Promise<{ logicalOperationId: string; claimPath: string }> {
   const claimsRoot = path.join(input.approvedRoot, ".agent-pipeline", "admissions");
-  const claimDir = admissionClaimDir(input.approvedRoot, input.operationKey);
-  const claimPath = path.join(claimDir, "claim.json");
+  const digest = admissionClaimDigest(input.operationKey);
+  const claimPath = admissionClaimPath(input.approvedRoot, input.operationKey);
   await input.deps.mkdir(claimsRoot, { recursive: true });
-  let created = false;
-  try {
-    await input.deps.mkdir(claimDir, { recursive: false });
-    created = true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-  }
   const expected = {
     operation_key: input.operationKey,
     entrypoint: input.kind,
@@ -1485,33 +1487,80 @@ async function claimPublicLogicalOperation(input: {
     issue: input.issue,
     approved_root: input.approvedRoot,
   };
-  if (created) {
+  const readClaim = async (filePath: string): Promise<PublicAdmissionClaim | null> => {
+    try {
+      const claim = JSON.parse(await input.deps.readFile(filePath)) as PublicAdmissionClaim;
+      verifyAdmissionClaim(claim, expected);
+      return claim;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  };
+  const acceptClaim = async (claim: PublicAdmissionClaim): Promise<{ logicalOperationId: string; claimPath: string }> => {
+    if (
+      input.suppliedLogicalOperationId &&
+      input.suppliedLogicalOperationId !== claim.logical_operation_id
+    ) {
+      throw new Error("supplied Logical Operation conflicts with immutable admission claim");
+    }
+    input.onBound(claim.logical_operation_id);
+    await input.deps.fsyncFile(claimPath);
+    await input.deps.fsyncDirectory(claimsRoot);
+    return { logicalOperationId: claim.logical_operation_id, claimPath };
+  };
+
+  const published = await readClaim(claimPath);
+  if (published) return acceptClaim(published);
+
+  const pendingPrefix = `${digest}.pending-`;
+  let pendingPath: string | null = null;
+  let claim: PublicAdmissionClaim | null = null;
+  const entries = await input.deps.readdir(claimsRoot);
+  for (const entry of entries) {
+    if (!entry.name.startsWith(pendingPrefix) || !entry.name.endsWith(".json")) continue;
+    const candidatePath = path.join(claimsRoot, entry.name);
+    try {
+      const candidate = await readClaim(candidatePath);
+      if (!candidate) continue;
+      pendingPath = candidatePath;
+      claim = candidate;
+      break;
+    } catch {
+      // An interrupted partial temp is not an exposed claim. A complete
+      // sibling temp or a fresh temp may still recover this operation.
+    }
+  }
+
+  if (!claim || !pendingPath) {
     const logicalOperationId = input.proposedLogicalOperationId ?? input.mintLogicalOperationId();
     if (!isLogicalOperationId(logicalOperationId)) {
       throw new Error("logical operation mint returned an invalid identity");
     }
     input.onBound(logicalOperationId);
-    const claim: PublicAdmissionClaim = {
+    claim = {
       schema_version: PUBLIC_ADMISSION_CLAIM_VERSION,
       ...expected,
       logical_operation_id: logicalOperationId,
       claimed_at: input.claimedAt,
     };
-    await atomicallyPublishAdmissionFile(claimPath, `${JSON.stringify(claim, null, 2)}\n`, input.deps);
-    await input.deps.fsyncDirectory(claimDir);
-    await input.deps.fsyncDirectory(claimsRoot);
-    return { logicalOperationId: claim.logical_operation_id, claimDir };
+    pendingPath = path.join(
+      claimsRoot,
+      `${pendingPrefix}${process.pid}-${randomBytes(8).toString("hex")}.json`,
+    );
+    await input.deps.writeFile(pendingPath, `${JSON.stringify(claim, null, 2)}\n`);
   }
-  const claim = JSON.parse(await input.deps.readFile(claimPath)) as PublicAdmissionClaim;
-  verifyAdmissionClaim(claim, expected);
-  if (
-    input.suppliedLogicalOperationId &&
-    input.suppliedLogicalOperationId !== claim.logical_operation_id
-  ) {
-    throw new Error("supplied Logical Operation conflicts with immutable admission claim");
+  await input.deps.fsyncFile(pendingPath);
+  try {
+    await input.deps.link(pendingPath, claimPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
   }
-  input.onBound(claim.logical_operation_id);
-  return { logicalOperationId: claim.logical_operation_id, claimDir };
+  const winner = await readClaim(claimPath);
+  if (!winner) throw new Error("admission claim publication produced no durable winner");
+  const accepted = await acceptClaim(winner);
+  await input.deps.unlink(pendingPath).catch(() => {});
+  return accepted;
 }
 
 /**

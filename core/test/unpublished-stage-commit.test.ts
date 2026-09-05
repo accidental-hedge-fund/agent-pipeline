@@ -257,6 +257,7 @@ test("executor: does not force-push, does not triage or raw issue-edit, transiti
     resumeFromImplementing: async (_c, _n, wt, opts, resumeDeps) => {
       assert.equal(wt.branch, "pipeline/268-x");
       assert.match(opts.prBody, /Closes #268/);
+      assert.equal(opts.logicalOperationId, "lop-unpublished-268");
       const git = (resumeDeps as { gitInWorktree?: typeof import("../scripts/worktree.ts").gitInWorktree })
         ?.gitInWorktree;
       if (git) {
@@ -289,6 +290,7 @@ test("executor: does not force-push, does not triage or raw issue-edit, transiti
       throw new Error("executor must not setBlocked on success");
     },
     probeImplementDeliverable: async () => implementationObservation(),
+    logicalOperationId: "lop-unpublished-268",
   });
   assert.equal(result.succeeded, true, result.error ?? result.evidence);
   assert.ok(!pushArgs.some((a) => a.includes("--force") || a.includes("--force-with-lease")));
@@ -394,6 +396,12 @@ test("implement deliverable observer keeps planning identity distinct and invali
     "docs/cli.md",
     ".github/workflows/ci.yml",
     "config/policy.yml",
+    "core/test/recovery.test.ts",
+    "test/recovery.spec.js",
+    "fixtures/recovery.ts",
+    "examples/recovery.py",
+    "scripts/recovery.sh",
+    "tools/recovery.ts",
   ]) {
     const unproved = observeImplementDeliverablePaths({
       paths: [unprovedPath],

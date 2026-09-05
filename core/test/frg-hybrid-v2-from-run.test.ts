@@ -26,13 +26,15 @@ const CONTROL_REPO = "/control-repo";
 const CANDIDATE_ENGINE = "/candidate-engine";
 
 function fakeEngine(engineRoot: string, commitSha: string) {
+  const engine: import("../scripts/ship-end-candidate.ts").CandidateEngine = {
+    engineRoot,
+    launcherPath: path.join(engineRoot, LAUNCHER_REL),
+    commitSha,
+    revalidateBeforeSpawn: async () => ({ ok: true, engine }),
+  };
   return {
     ok: true as const,
-    engine: {
-      engineRoot,
-      launcherPath: path.join(engineRoot, LAUNCHER_REL),
-      commitSha,
-    },
+    engine,
   };
 }
 

@@ -25,6 +25,7 @@ import {
   emptyLedger,
   grillStatusCounts,
   initGrillRun,
+  loadGrillLedger,
   loadGrillManifest,
   type GrillStoreDeps,
 } from "../scripts/grill-store.ts";
@@ -45,6 +46,7 @@ import { evaluateIssueReadiness } from "../scripts/issue-readiness.ts";
 import type { GrillProposalKeyDeps } from "../scripts/grill-proposal.ts";
 import type { HandoffStoreDeps } from "../scripts/human-question-handoff.ts";
 import { makeNode } from "../scripts/grill-decisions.ts";
+import { IssueBodyPublicationError } from "../scripts/issue-body-publisher.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
@@ -1087,6 +1089,65 @@ test("grill: mutating --issue writes Decisions once and replay is idempotent", a
   assert.equal(second, 0);
   assert.equal(world.labelsWritten.length, labelsAfterFirst);
   assert.equal(world.labelsWritten.some((w) => w.label === "pipeline:ready"), false);
+});
+
+test("grill: publication failure stays waiting under the admitted operation and resume replays it (#1454)", async () => {
+  const world: FakeWorld = {
+    issues: new Map([[10, openIssue(10)]]),
+    bodies: [],
+    labelsWritten: [],
+    labelsRemoved: [],
+    implementerCalls: [],
+    gitWrites: [],
+    docsPrs: [],
+    callLog: [],
+    milestoneMembers: [],
+    labelMembers: new Map(),
+  };
+  const store = memoryStore();
+  const deps = makeDeps(world, store);
+  const observations: import("../scripts/operation-observation.ts").OperationObservation[] = [];
+  let publicationAttempts = 0;
+  deps.reportObservation = (observation) => observations.push(observation);
+  deps.updateIssueBody = async (n, body) => {
+    publicationAttempts += 1;
+    if (publicationAttempts === 1) {
+      throw new IssueBodyPublicationError({
+        acknowledged: false,
+        kind: "spawn_failure",
+        diagnostic: "injected E2BIG",
+        exitCode: null,
+      });
+    }
+    world.bodies.push(body);
+    const current = world.issues.get(n);
+    if (current) world.issues.set(n, { ...current, body });
+  };
+
+  const firstCode = await runGrill({ issue: 10 }, deps);
+  assert.equal(firstCode, 0);
+  const firstLedgerPath = [...store.files.keys()].find((p) => p.endsWith("/ledger.json"));
+  assert.ok(firstLedgerPath);
+  const firstLedger = JSON.parse(store.files.get(firstLedgerPath!)!) as {
+    run_id: string;
+    issues: Record<string, { status: string; logical_operation_id?: string }>;
+  };
+  const logicalOperationId = firstLedger.issues["10"]?.logical_operation_id;
+  assert.equal(firstLedger.issues["10"]?.status, "waiting");
+  assert.ok(logicalOperationId?.startsWith("lop-"));
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0]!.logical_operation_id, logicalOperationId);
+  assert.equal(observations[0]!.lifecycle, "cooling");
+  assert.equal(observations[0]!.fault, "issue_body_publication.spawn_failure");
+
+  const secondCode = await runGrill({ resume: firstLedger.run_id }, deps);
+  assert.equal(secondCode, 0);
+  assert.equal(publicationAttempts, 2);
+  assert.equal(world.bodies.length, 1);
+  const resumed = await loadGrillLedger(store, firstLedger.run_id);
+  assert.equal(resumed.issues["10"]?.logical_operation_id, logicalOperationId);
+  assert.notEqual(resumed.issues["10"]?.status, "failed");
+  assert.equal(observations.length, 1, "successful resume must not mint/report a replacement operation");
 });
 
 test("grill: two issues settling the same term open one docs PR", async () => {

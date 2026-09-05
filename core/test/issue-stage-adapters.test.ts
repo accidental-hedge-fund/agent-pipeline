@@ -200,6 +200,62 @@ test("1.4 advanced handler output without exact evidence returns owned waiting (
   assert.equal(sink.observations[0]?.certainty, "uncertain");
 });
 
+test("1.4 protected dispatch does not invoke its handler before exact evidence is bound (#1454)", async () => {
+  let attempts = 0;
+  const out = await runDeliveryStageAdapter({
+    stage: "implementing",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-prebound-1454",
+    requireEvidenceBeforeAttempt: true,
+    attempt: async () => {
+      attempts++;
+      return {
+        advanced: true,
+        from: "implementing",
+        to: "design-gate",
+        summary: "must not mutate",
+      };
+    },
+  });
+  assert.equal(attempts, 0);
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /observer is required before execution/);
+});
+
+test("1.4 protected dispatch binds before mutation and re-observes completion (#1454)", async () => {
+  const order: string[] = [];
+  const sha = "a".repeat(40);
+  const out = await runDeliveryStageAdapter({
+    stage: "implementing",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-prebound-1454",
+    requireEvidenceBeforeAttempt: true,
+    observeEvidence: async (phase) => {
+      order.push(`observe:${phase}`);
+      return {
+        candidateSha: sha,
+        candidateEpoch: sha,
+        evidenceRole: "implementation",
+        artifactIdentity: `implementation:${sha}`,
+        postconditionProven: phase === "after",
+      };
+    },
+    attempt: async () => {
+      order.push("attempt");
+      return {
+        advanced: true,
+        from: "implementing",
+        to: "design-gate",
+        summary: "proved implementation",
+      };
+    },
+  });
+  assert.equal(out.advanced, true);
+  assert.deepEqual(order, ["observe:before", "attempt", "observe:after"]);
+});
+
 test("2.1 fixture that retries after uncertain side effects or candidate movement fails", () => {
   const uncertain = collectForbiddenLifecycleRetries(
     `

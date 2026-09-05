@@ -322,6 +322,19 @@ function persistMemDeps(files: Map<string, string>) {
       files.set(to, value);
       files.delete(from);
     },
+    async link(from: string, to: string) {
+      const value = files.get(from);
+      if (value === undefined) throw new Error(`ENOENT: ${from}`);
+      if (files.has(to)) {
+        const err = new Error(`EEXIST: ${to}`) as NodeJS.ErrnoException;
+        err.code = "EEXIST";
+        throw err;
+      }
+      files.set(to, value);
+    },
+    async unlink(p: string) {
+      files.delete(p);
+    },
     async mkdir() {},
     async fsyncFile() {},
     async fsyncDirectory() {},

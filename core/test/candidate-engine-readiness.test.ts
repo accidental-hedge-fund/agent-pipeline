@@ -20,6 +20,7 @@ import {
   CANDIDATE_ENGINE_CONSUMERS,
   assertCandidateEngineConsumerInventoryComplete,
   candidateEngineConsumerInventoryGaps,
+  revalidateCandidateEngineBeforeSpawn,
   resolveAndPrepareCandidateEngine as sharedResolveAndPrepareCandidateEngine,
   resolveCandidateEngine,
   type ResolveAndPrepareCandidateEngineDeps,
@@ -365,15 +366,38 @@ async function resolveThenSpawn(
   );
   if (result.ok) {
     h.events.push("ready");
+    const checked = await revalidateCandidateEngineBeforeSpawn(result.engine);
+    if (!checked.ok) return checked;
     recordSpawn(h.events, h.spawned, [
       "node",
-      result.engine.launcherPath,
+      checked.engine.launcherPath,
       "factory-release",
       "prepare",
     ]);
   }
   return result;
 }
+
+test("candidate movement after preparation refuses the final spawn (#1454)", async () => {
+  const repo = "/repo";
+  const root = { head: SHA, porcelain: "" };
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: root },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  const prepared = await resolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  root.head = OTHER;
+  if (prepared.ok) {
+    const checked = await revalidateCandidateEngineBeforeSpawn(prepared.engine);
+    assert.equal(checked.ok, false);
+  }
+  assert.equal(h.spawned.length, 0);
+});
 
 test("spawn ordering fails if a candidate command precedes readiness success", () => {
   const events: EventLog = [];
@@ -789,9 +813,9 @@ test("pre-existing untrusted ready record does not skip install", async () => {
     untrustedPaths: [readyPath],
   });
   const r = await resolveThenSpawn(h, { repoDir: repo });
-  assert.equal(r.ok, true);
+  assert.equal(r.ok, false);
   assert.equal(h.installs.length, 1, "untrusted record must not skip nested-core install");
-  assert.equal(h.spawned.length, 1);
+  assert.equal(h.spawned.length, 0, "untrusted final readiness proof must refuse spawn");
 });
 
 test("pre-existing untrusted setup lock is not treated as ownership", async () => {

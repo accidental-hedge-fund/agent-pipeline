@@ -2567,14 +2567,15 @@ function testInvocation(loopRunId: string, sha = CANDIDATE): CandidateInvocation
 }
 
 function preparedCandidateResolver() {
-  return async () => ({
-    ok: true as const,
-    engine: {
+  return async () => {
+    const engine = {
       engineRoot: "/candidate-engine",
       launcherPath: CANDIDATE_LAUNCHER,
       commitSha: CANDIDATE,
-    },
-  });
+      revalidateBeforeSpawn: async () => ({ ok: true as const, engine }),
+    };
+    return { ok: true as const, engine };
+  };
 }
 
 function capturingCandidateSpawn(captured: {

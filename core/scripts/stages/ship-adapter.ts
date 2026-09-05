@@ -23,6 +23,7 @@ import {
   shipEndLeafArgv,
   uncredentialedPrepareEnv,
   resolveAndPrepareCandidateEngine,
+  revalidateCandidateEngineBeforeSpawn,
   type CandidateEngine,
   type CandidateEngineResult,
   type PresentFrgAttestorCredentialDeps,
@@ -1553,7 +1554,9 @@ async function spawnLeaf(
   leaf: string[],
   env: NodeJS.ProcessEnv,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  const argv = [...shipEndCliPrefix(engine, ctx.nodeBin ?? "node"), ...leaf];
+  const checked = await revalidateCandidateEngineBeforeSpawn(engine);
+  if (!checked.ok) throw candidateReadinessError(checked.kind === "lock" ? "lock" : "readiness", checked.error);
+  const argv = [...shipEndCliPrefix(checked.engine, ctx.nodeBin ?? "node"), ...leaf];
   assertShipEndLeafArgv(argv);
   return ctx.spawn(argv, env);
 }
@@ -2413,7 +2416,11 @@ export function bindCandidateShipEndOperations(
       const existing = await pinOps.observeTag(intent, release);
       if (existing) return existing;
       if (typeof ctx.spawnEnsureTag === "function") {
-        await ctx.spawnEnsureTag(engine, {
+        const checked = await revalidateCandidateEngineBeforeSpawn(engine);
+        if (!checked.ok) {
+          throw candidateReadinessError(checked.kind === "lock" ? "lock" : "readiness", checked.error);
+        }
+        await ctx.spawnEnsureTag(checked.engine, {
           version: intent.version,
           mergeCommitOid: release.merge_commit_oid,
           packedCandidate: release.candidate_head_oid,

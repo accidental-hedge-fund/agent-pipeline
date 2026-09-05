@@ -690,7 +690,10 @@ test("resume of recovery_exhausted does not clear that stop or dispatch", async 
   await releaseLock(deps, RUN_ID, token);
 });
 
-function observeWithIdentities(byId: Record<string, LoopExternalIdentity>): ReconcileObserveDeps {
+function observeWithIdentities(
+  byId: Record<string, LoopExternalIdentity>,
+  logicalOperationId?: string,
+): ReconcileObserveDeps {
   const byPr = new Map<number, LoopExternalIdentity>();
   for (const row of Object.values(byId)) {
     if (row.pr_number != null) byPr.set(row.pr_number, row);
@@ -728,6 +731,7 @@ function observeWithIdentities(byId: Record<string, LoopExternalIdentity>): Reco
         artifactIdentity: row?.artifact_identity ?? null,
         candidateSha: row?.head_sha ?? detail.head_sha,
         candidateEpoch: row?.candidate_epoch ?? null,
+        logicalOperationId,
       };
     },
     async getLocalHead() {
@@ -815,7 +819,11 @@ test("resume of recovery_exhausted repair-forwards GitHub-ready blocked item (#1
 });
 
 test("resume of recovery_exhausted repair-forwards verified merged identity (#1297)", async () => {
-  const contract = testContract({ items: [{ id: "1290", depends_on: [], external_depends_on: [] }] });
+  const logicalOperationId = "lop-run-fatal-resume-1290";
+  const contract = testContract({
+    logical_operation_id: logicalOperationId,
+    items: [{ id: "1290", depends_on: [], external_depends_on: [] }],
+  });
   const stop: LoopStopRecord = {
     reason: "recovery_exhausted",
     time: ORIGINAL_STOP_TIME,
@@ -835,7 +843,7 @@ test("resume of recovery_exhausted repair-forwards verified merged identity (#12
       pr_state: "merged",
       merge_commit_sha: "f".repeat(40),
     }),
-  });
+  }, logicalOperationId);
   const calls: LoopExecutionRequest[] = [];
   const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
     calls.push(request);

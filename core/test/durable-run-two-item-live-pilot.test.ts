@@ -47,6 +47,7 @@ const READY_LABEL = "pipeline:ready-to-deploy";
 // pending item with no `pipeline:*` label — this file's items are otherwise ready to dispatch, so
 // they default to `pipeline:ready` (orthogonal to the recovery/resume behavior under test).
 const PIPELINE_READY_LABEL = "pipeline:ready";
+const LOGICAL_OPERATION_ID = "lop-pilot-run-1";
 const ITEM_A = "100";
 const ITEM_B = "200";
 const PR_A = 501;
@@ -126,6 +127,7 @@ function pilotContract(): LoopContract {
   return {
     schema: LOOP_CONTRACT_SCHEMA,
     run_id: "pilot-run-1",
+    logical_operation_id: LOGICAL_OPERATION_ID,
     engine: "claude",
     repo: { name: "acme/widgets", base_branch: "main" },
     selector: { type: "issue-set", value: [ITEM_A, ITEM_B] },
@@ -222,6 +224,7 @@ function pilotFakes(deps: LoopStoreDeps, contract: LoopContract) {
         artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
         candidateSha: detail.head_sha,
         candidateEpoch: detail.head_sha,
+        logicalOperationId: LOGICAL_OPERATION_ID,
       };
     },
     async getLocalHead() {

@@ -2151,10 +2151,11 @@ test("production ship adapter wires multi-item advanceWave, not N×single (revie
 });
 
 const PIN_SHA = "9".repeat(40);
-const candidateEngine = {
+const candidateEngine: import("../scripts/ship-end-candidate.ts").CandidateEngine = {
   engineRoot: "/cand",
   launcherPath: "/cand/scripts/pipeline-launcher.mjs",
   commitSha: head,
+  revalidateBeforeSpawn: async () => ({ ok: true, engine: candidateEngine }),
 };
 
 function memoryShipStore(): ShipStateStore & { status: ShipStatus | null; events: ShipPhaseEvent[] } {
