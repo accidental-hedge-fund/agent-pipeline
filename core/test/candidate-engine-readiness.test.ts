@@ -31,7 +31,11 @@ import {
   type ResolveCandidateEngineDeps,
 } from "../scripts/ship-end-candidate.ts";
 import { BLOCKER_KINDS } from "../scripts/types.ts";
-import { verifyCandidateProcessGuard } from "../../scripts/candidate-process-guard.mjs";
+
+// The guard module exits on import when PIPELINE_CANDIDATE_PROCESS_GUARD=1
+// binds a parent ship root. Drop that inherited binding before loading it.
+delete process.env.PIPELINE_CANDIDATE_PROCESS_GUARD;
+const { verifyCandidateProcessGuard } = await import("../../scripts/candidate-process-guard.mjs");
 
 const SHA = "b".repeat(40);
 const OTHER = "d".repeat(40);

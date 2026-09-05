@@ -123,6 +123,35 @@ export function envPreferringNode(nodePath, base = process.env) {
   };
 }
 
+/** Parent pack-loop / ship bindings. `npm run ci` is not that child; inheriting
+ *  them fail-closes hermetic tests (candidate-process-guard on import, factory
+ *  pin REPO_DIR fallback, tugboat unavailable-engine). */
+export const PARENT_SHIP_CI_LEAK_KEYS = [
+  "PIPELINE_CANDIDATE_PROCESS_GUARD",
+  "PIPELINE_CANDIDATE_PROCESS_ROOT",
+  "PIPELINE_CANDIDATE_PROCESS_SHA",
+  "PIPELINE_CANDIDATE_PROCESS_READY_RECORD",
+  "PIPELINE_CANDIDATE_PROCESS_LOCKFILE_DIGEST",
+  "PIPELINE_CANDIDATE_PROCESS_LOCK",
+  "PIPELINE_CANDIDATE_PROCESS_LOCK_DIGEST",
+  "PIPELINE_CANDIDATE_ENGINE_ROOT",
+  "AGENT_PIPELINE_FACTORY_CONTROL",
+  "AGENT_PIPELINE_PRODUCTION_PIN",
+];
+
+/**
+ * Drop inherited parent-ship candidate/factory bindings from a child env.
+ * @param {NodeJS.ProcessEnv} [base]
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function envWithoutParentShipControl(base = {}) {
+  const env = { ...base };
+  for (const key of PARENT_SHIP_CI_LEAK_KEYS) {
+    delete env[key];
+  }
+  return env;
+}
+
 /**
  * Fail-closed diagnostic when no engines-compliant Node can be resolved.
  * Names the invoking version, /usr/bin/node, and AGENT_PIPELINE_NODE.
@@ -241,7 +270,9 @@ export function runUnderEnginesNode(argv, opts = {}) {
     return 1;
   }
 
-  const env = envPreferringNode(resolved.path, baseEnv);
+  const env = envWithoutParentShipControl(
+    envPreferringNode(resolved.path, baseEnv),
+  );
   const tokens = [...argv];
   if (tokens[0] === "--") tokens.shift();
 

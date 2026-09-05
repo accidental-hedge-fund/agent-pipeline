@@ -50,9 +50,24 @@ function tugboatReleaseCiParentEnv(): NodeJS.ProcessEnv {
   return { ...process.env, TUGBOAT_SKIP_TRAIN: "1" };
 }
 
+/** Parent pack-loop / ship bindings that fail-close hermetic tugboat fixtures. */
+const PARENT_SHIP_SPAWN_LEAK_KEYS = [
+  "PIPELINE_CANDIDATE_PROCESS_GUARD",
+  "PIPELINE_CANDIDATE_PROCESS_ROOT",
+  "PIPELINE_CANDIDATE_PROCESS_SHA",
+  "PIPELINE_CANDIDATE_PROCESS_READY_RECORD",
+  "PIPELINE_CANDIDATE_PROCESS_LOCKFILE_DIGEST",
+  "PIPELINE_CANDIDATE_PROCESS_LOCK",
+  "PIPELINE_CANDIDATE_PROCESS_LOCK_DIGEST",
+  "PIPELINE_CANDIDATE_ENGINE_ROOT",
+  "AGENT_PIPELINE_FACTORY_CONTROL",
+  "AGENT_PIPELINE_PRODUCTION_PIN",
+] as const;
+
 /**
  * Spawn env for real `tugboat.sh`. Omits inherited skip-train / candidate
- * composer unless the check is asserting skip-train (#1192).
+ * composer unless the check is asserting skip-train (#1192). Also omits
+ * inherited parent-ship candidate-guard / factory-pin bindings (#1456).
  */
 function tugboatSpawnEnv(
   extra: NodeJS.ProcessEnv = {},
@@ -62,6 +77,9 @@ function tugboatSpawnEnv(
   if (!opts.inheritParentSkipTrain) {
     delete env.TUGBOAT_SKIP_TRAIN;
     delete env.TUGBOAT_CANDIDATE_COMPOSER;
+  }
+  for (const key of PARENT_SHIP_SPAWN_LEAK_KEYS) {
+    delete env[key];
   }
   Object.assign(env, extra);
   return env;
@@ -3679,6 +3697,7 @@ test("host pipeline-launcher.sh exports factory pin when unset and preserves ove
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "unset AGENT_PIPELINE_PRODUCTION_PIN",
+        "unset AGENT_PIPELINE_FACTORY_CONTROL",
         'REPO_DIR="/factory/control"',
         snippet[0],
         'printf "%s" "$AGENT_PIPELINE_PRODUCTION_PIN"',
@@ -5258,6 +5277,27 @@ test("tugboatSpawnEnv omits inherited skip-train unless asserting skip-train (#1
     { inheritParentSkipTrain: true, parentEnv: tugboatReleaseCiParentEnv() },
   );
   assert.equal(inherited.TUGBOAT_SKIP_TRAIN, "1");
+});
+
+test("tugboatSpawnEnv omits inherited parent-ship candidate and factory bindings (#1456)", () => {
+  const isolated = tugboatSpawnEnv(
+    { PIPELINE_CANDIDATE_ENGINE_ROOT: "/fixture/cand" },
+    {
+      parentEnv: {
+        PIPELINE_CANDIDATE_PROCESS_GUARD: "1",
+        PIPELINE_CANDIDATE_PROCESS_ROOT: "/parent/ship",
+        PIPELINE_CANDIDATE_ENGINE_ROOT: "/parent/ship",
+        AGENT_PIPELINE_FACTORY_CONTROL: "/parent/ship",
+        AGENT_PIPELINE_PRODUCTION_PIN: "/parent/pin.json",
+        PATH: "/usr/bin",
+      },
+    },
+  );
+  assert.equal(isolated.PIPELINE_CANDIDATE_PROCESS_GUARD, undefined);
+  assert.equal(isolated.PIPELINE_CANDIDATE_PROCESS_ROOT, undefined);
+  assert.equal(isolated.AGENT_PIPELINE_FACTORY_CONTROL, undefined);
+  assert.equal(isolated.AGENT_PIPELINE_PRODUCTION_PIN, undefined);
+  assert.equal(isolated.PIPELINE_CANDIDATE_ENGINE_ROOT, "/fixture/cand");
 });
 
 test("named #1150 / #1151 spawn-real tugboat tests keep original FRG and candidate assertions (#1192)", () => {

@@ -9,7 +9,9 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   ENGINES_NODE_FLOOR_MAJOR,
+  PARENT_SHIP_CI_LEAK_KEYS,
   envPreferringNode,
+  envWithoutParentShipControl,
   formatMissingEnginesNodeDiagnostic,
   parseNodeMajor,
   probeNodeMajor,
@@ -120,6 +122,55 @@ test("envPreferringNode: puts node bin dir first on PATH", () => {
   assert.equal(env.AGENT_PIPELINE_ENGINES_NODE, "/usr/bin/node");
   assert.equal(env.AGENT_PIPELINE_ENGINES_NODE_OK, "1");
   assert.equal(env.HOME, "/h");
+});
+
+test("envWithoutParentShipControl: drops candidate-guard and factory-pin bindings (#1456)", () => {
+  const env = envWithoutParentShipControl({
+    PIPELINE_CANDIDATE_PROCESS_GUARD: "1",
+    PIPELINE_CANDIDATE_PROCESS_ROOT: "/parent/ship",
+    PIPELINE_CANDIDATE_ENGINE_ROOT: "/parent/ship",
+    AGENT_PIPELINE_FACTORY_CONTROL: "/parent/ship",
+    AGENT_PIPELINE_PRODUCTION_PIN: "/parent/ship/.agent-pipeline/production-engine-pin.json",
+    PATH: "/bin",
+    HOME: "/h",
+  });
+  assert.equal(env.PIPELINE_CANDIDATE_PROCESS_GUARD, undefined);
+  assert.equal(env.PIPELINE_CANDIDATE_PROCESS_ROOT, undefined);
+  assert.equal(env.PIPELINE_CANDIDATE_ENGINE_ROOT, undefined);
+  assert.equal(env.AGENT_PIPELINE_FACTORY_CONTROL, undefined);
+  assert.equal(env.AGENT_PIPELINE_PRODUCTION_PIN, undefined);
+  assert.equal(env.PATH, "/bin");
+  assert.equal(env.HOME, "/h");
+  assert.ok(PARENT_SHIP_CI_LEAK_KEYS.includes("PIPELINE_CANDIDATE_PROCESS_GUARD"));
+  assert.ok(PARENT_SHIP_CI_LEAK_KEYS.includes("AGENT_PIPELINE_FACTORY_CONTROL"));
+});
+
+test("runUnderEnginesNode: inherited parent-ship bindings are not passed to CI children (#1456)", () => {
+  /** @type {Array<{ cmd: string, args: string[], opts: object }>} */
+  const calls = [];
+  const code = runUnderEnginesNode(["-c", "npm run ci:core"], {
+    resolve: () => ({ path: "/usr/bin/node", major: 24 }),
+    spawn: (cmd, args, opts) => {
+      calls.push({ cmd, args: [...args], opts });
+      return { status: 0 };
+    },
+    env: {
+      PATH: "/home/user/.local/bin:/usr/bin",
+      PIPELINE_CANDIDATE_PROCESS_GUARD: "1",
+      PIPELINE_CANDIDATE_ENGINE_ROOT: "/parent/ship",
+      AGENT_PIPELINE_FACTORY_CONTROL: "/parent/ship",
+      AGENT_PIPELINE_PRODUCTION_PIN: "/parent/pin.json",
+      HOME: "/h",
+    },
+  });
+  assert.equal(code, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].opts.env.PIPELINE_CANDIDATE_PROCESS_GUARD, undefined);
+  assert.equal(calls[0].opts.env.PIPELINE_CANDIDATE_ENGINE_ROOT, undefined);
+  assert.equal(calls[0].opts.env.AGENT_PIPELINE_FACTORY_CONTROL, undefined);
+  assert.equal(calls[0].opts.env.AGENT_PIPELINE_PRODUCTION_PIN, undefined);
+  assert.equal(calls[0].opts.env.HOME, "/h");
+  assert.equal(calls[0].opts.env.PATH.split(":")[0], "/usr/bin");
 });
 
 test("runUnderEnginesNode: -c runs bash with PATH preferring engines node", () => {
