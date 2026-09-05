@@ -25,6 +25,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
 const PROFILE = "__PROFILE__";
+const HOST = "__HOST__";
 
 // Update-lock reservation (#450 round 2) — mirrors scripts/install.mjs's
 // acquireUpdateLock()/findLiveRunLocks(). Filed under the same pipeline-*.lock
@@ -513,6 +514,7 @@ const args = ["--experimental-strip-types", entry, ...passthrough];
 if (!passthrough.includes("--profile")) args.push("--profile", PROFILE);
 
 const childEnv = { ...process.env };
+childEnv.PIPELINE_GENERATED_HOST = HOST;
 if (reserved) {
   // Let a nested engine-promote identify only this launcher's reservation.
   // The installer validates the PID against the exact lock path and contents.

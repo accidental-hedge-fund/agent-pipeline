@@ -23,3 +23,18 @@ Every production route that executes candidate-engine code SHALL obtain its laun
 - **WHEN** a production route capable of spawning candidate-engine code is added without an exercised resolve-and-prepare binding
 - **THEN** the repository hard validation gate SHALL fail
 - **AND** the failure SHALL identify that consumer
+
+#### Scenario: Aliased candidate process start fails validation
+
+- **WHEN** a production route starts a candidate-engine process through an aliased spawn or exec callee of the launcher path
+- **AND** that start is not the registered resolve-and-prepare process boundary
+- **THEN** the repository hard validation gate SHALL fail
+- **AND** the failure SHALL identify that consumer
+
+#### Scenario: Detached pack loop retains candidate-root exclusion until child exit
+
+- **WHEN** a pack-loop consumer hands off a detached candidate supervisor
+- **THEN** the candidate-root process lease SHALL remain held by that supervisor
+- **AND** a later start on the same canonical root SHALL fail closed while the supervisor is live
+- **AND** a dead supervisor SHALL be reclaimable
+- **AND** distinct candidate SHAs sharing one canonical root SHALL contend on that same lease

@@ -12,11 +12,13 @@
 - [x] 2.3 Route `pipeline merge-queue --apply` through acknowledged admission after input validation but before merge or repair work while keeping dry-run read-only; verify tests prove no apply side effect begins after persistence failure and that admission grants no merge/release authority.
 - [x] 2.4 Pre-bind train's outer physical and Logical Operation identities, require a durably published matching outer train session for merge mode, and persist a distinct nested `merge` artifact before each submission; verify outer `train` and nested `merge` records retain distinct run ids and one root logical id, while degraded outer or nested persistence invokes no merge and mints no replacement root.
 - [x] 2.5 Build the executable admission route inventory for every `REQUIRED_PUBLIC_ENTRYPOINTS` member, direct and nested producers, resume/recovery routes, and applicable generated hosts; verify set-correspondence and behavioral tests fail missing, duplicate, unknown, name-only, and bypassing routes while generated hosts remain thin CLI delegates.
+- [x] 2.6 Make generated host launchers forward host identity into CLI drive admission and exercise each inventoried host route through that production path rather than a test-only delegation surrogate.
 
 ## 3. Candidate-Engine Gate Coverage
 
 - [x] 3.1 Inventory every production candidate-engine consumer and route it through the existing `resolveAndPrepareCandidateEngine` seam; verify injected call traces prove no ship, FRG, release, recovery, or host-adapter candidate process spawns from identity-only resolution or a caller-supplied launcher.
 - [x] 3.2 Add the hard correspondence test between candidate-engine consumers and the shared gate; verify it fails a consumer missing exact-SHA, approved canonical root, SHA-plus-lockfile readiness, or pre/post-bootstrap cleanliness proof, including a root that moves before spawn.
+- [x] 3.3 Close aliased candidate process starts and retain the detached pack-loop root lease until child exit; verify aliased spawn fails the hard gate and post-handoff concurrent starts contend on one canonical root.
 
 ## 4. Role-Exact Implementation and Recovery Evidence
 

@@ -59,6 +59,8 @@ export interface CandidateProcessGuardProof {
 export interface CandidateProcessLease {
   proof: CandidateProcessGuardProof;
   release(): void;
+  /** Rewrite the held lock to a detached supervisor. Missing keeps parent ownership. */
+  transferTo?(owner: { pid: number; starttime: string | null }): boolean;
 }
 
 /** Environment consumed by the candidate's child-side first-operation guard. */
@@ -179,6 +181,33 @@ export function assertCandidateEnginePreparationRoute(route: CandidateEngineRout
   assertCandidateEngineConsumerRoute(route);
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Collect spawn/exec callees, including `const start = spawn` aliases. */
+function candidateProcessStartCallees(source: string): readonly string[] {
+  const names = new Set(["spawn", "spawnSync", "execFile", "execFileSync"]);
+  for (const match of source.matchAll(
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:[\w$.]*\.)?(spawn(?:Sync)?|execFile(?:Sync)?)\b/g,
+  )) {
+    names.add(match[1]!);
+  }
+  for (const match of source.matchAll(
+    /\b(?:spawn(?:Sync)?|execFile(?:Sync)?)\s+as\s+([A-Za-z_$][\w$]*)\b/g,
+  )) {
+    names.add(match[1]!);
+  }
+  return [...names];
+}
+
+function sourceHasRawCandidateProcessStart(source: string): boolean {
+  const callees = candidateProcessStartCallees(source).map(escapeRegExp).join("|");
+  return new RegExp(
+    String.raw`\b(?:${callees})\s*\(\s*[^,\n;]{0,160}(?:\.launcherPath|candidateInvocation\.executable)\b`,
+  ).test(source);
+}
+
 /** Discover actual production resolve/start bindings; declarations alone do not satisfy CI. */
 export function candidateEngineRuntimeBindingGaps(
   sources: Readonly<Record<string, string>>,
@@ -199,14 +228,8 @@ export function candidateEngineRuntimeBindingGaps(
     ) {
       gaps.push(`raw parent-only candidate revalidation in ${file}`);
     }
-    if (file !== "ship-end-candidate.ts") {
-      const directStarts = [
-        /\b(?:spawn|spawnSync|execFile|execFileSync)\s*\(\s*[^,\n;]{0,160}\.launcherPath\b/g,
-        /\b(?:spawn|spawnSync|execFile|execFileSync)\s*\(\s*[^,\n;]{0,160}candidateInvocation\.executable\b/g,
-      ];
-      if (directStarts.some((pattern) => pattern.test(source))) {
-        gaps.push(`raw candidate process start in ${file}`);
-      }
+    if (file !== "ship-end-candidate.ts" && sourceHasRawCandidateProcessStart(source)) {
+      gaps.push(`raw candidate process start in ${file}`);
     }
   }
   for (const consumer of EXPECTED_CANDIDATE_ENGINE_CONSUMERS) {
@@ -375,7 +398,7 @@ export async function resolveAndPrepareCandidateEngine(
       const lockPath = path.join(
         stateDir,
         `pipeline-candidate-process-${createHash("sha256")
-          .update(`${engine.engineRoot}\n${engine.commitSha}`)
+          .update(engine.engineRoot)
           .digest("hex")
           .slice(0, 32)}.lock`,
       );
@@ -385,13 +408,15 @@ export async function resolveAndPrepareCandidateEngine(
       // then verify the created file before treating it as ownership.
       if (!d.ensureStateDir(stateDir) || !d.statePathTrusted(stateDir)) return null;
       const owner = d.parentIdentity();
-      const body = `${JSON.stringify({
-        schema: "pipeline-candidate-process-lock/v1",
-        engineRoot: engine.engineRoot,
-        commitSha: engine.commitSha,
-        pid: owner.pid,
-        starttime: owner.starttime,
-      })}\n`;
+      const lockRecord = (holder: { pid: number; starttime: string | null }) =>
+        `${JSON.stringify({
+          schema: "pipeline-candidate-process-lock/v1",
+          engineRoot: engine.engineRoot,
+          commitSha: engine.commitSha,
+          pid: holder.pid,
+          starttime: holder.starttime,
+        })}\n`;
+      let body = lockRecord(owner);
       if (!d.writeText(lockPath, body, "wx")) {
         try {
           const existing = JSON.parse(d.readText(lockPath) ?? "null") as {
@@ -429,6 +454,14 @@ export async function resolveAndPrepareCandidateEngine(
               d.remove(lockPath);
             }
           },
+          transferTo: (nextOwner) => {
+            if (!d.statePathTrusted(lockPath) || d.readText(lockPath) !== body) return false;
+            const next = lockRecord(nextOwner);
+            if (!d.writeText(lockPath, next, "w")) return false;
+            if (!d.statePathTrusted(lockPath) || d.readText(lockPath) !== next) return false;
+            body = next;
+            return true;
+          },
         };
       } catch {
         if (d.statePathTrusted(lockPath) && d.readText(lockPath) === body) d.remove(lockPath);
@@ -446,6 +479,11 @@ export type CandidateEngineProcessResult<T> =
 export interface CandidateEngineStartInput<T> {
   engine: CandidateEngine;
   start: (engine: CandidateEngine, childEnv: NodeJS.ProcessEnv) => Promise<T>;
+  /**
+   * When start() hands off a live detached supervisor, transfer and retain the
+   * root lease until that child exits. Awaited starts omit this and release on return.
+   */
+  detachedSupervisor?: (value: T) => { pid: number; starttime?: string | null } | null;
 }
 
 /**
@@ -457,13 +495,18 @@ export async function runCandidateEngineProcess<T>(input: {
   consumer: CandidateEngineConsumer;
   engine: CandidateEngine;
   start: (engine: CandidateEngine, childEnv: NodeJS.ProcessEnv) => Promise<T>;
+  detachedSupervisor?: (value: T) => { pid: number; starttime?: string | null } | null;
 }): Promise<CandidateEngineProcessResult<T>> {
   const route = CANDIDATE_ENGINE_CONSUMERS.find((row) => row.consumer === input.consumer);
   if (!route) {
     assertCandidateEngineConsumerRoute(input.consumer);
     throw new Error(`candidate-engine consumer has no executable boundary: ${input.consumer}`);
   }
-  return route.execute({ engine: input.engine, start: input.start });
+  return route.execute({
+    engine: input.engine,
+    start: input.start,
+    detachedSupervisor: input.detachedSupervisor,
+  });
 }
 
 async function runBoundCandidateEngineProcess<T>(
@@ -482,19 +525,40 @@ async function runBoundCandidateEngineProcess<T>(
   if (!lease) {
     return { ok: false, kind: "lock", error: "candidate process-start lock is unavailable" };
   }
+  let retainLease = false;
   try {
     const checked = revalidateCandidateEngineBeforeSpawn(input.engine);
     if (!checked.ok) return checked;
     // Invoke the process-start seam in the same turn as the synchronous final
-    // check while retaining the shared lease through process completion.
+    // check while retaining the shared lease through process completion, or
+    // through detached-child lifetime after a verified supervisor handoff.
     const started = input.start(checked.engine, candidateProcessGuardEnv(lease.proof));
+    const value = await started;
+    const supervisor = input.detachedSupervisor?.(value) ?? null;
+    if (supervisor && Number.isInteger(supervisor.pid) && supervisor.pid > 0) {
+      if (
+        typeof lease.transferTo === "function" &&
+        !lease.transferTo({
+          pid: supervisor.pid,
+          starttime: supervisor.starttime ?? null,
+        })
+      ) {
+        retainLease = true;
+        return {
+          ok: false,
+          kind: "lock",
+          error: "failed to transfer candidate lease to detached supervisor",
+        };
+      }
+      retainLease = true;
+    }
     return {
       ok: true,
-      value: await started,
+      value,
       engine: checked.engine,
     };
   } finally {
-    lease.release();
+    if (!retainLease) lease.release();
   }
 }
 

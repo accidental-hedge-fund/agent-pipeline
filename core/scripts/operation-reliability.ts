@@ -168,22 +168,42 @@ const GENERATED_HOST_ADMISSION_ROUTES = {
   opencode: "host.opencode",
 } as const;
 
+export const GENERATED_HOST_ENV = "PIPELINE_GENERATED_HOST";
+
+export type GeneratedHostId = keyof typeof GENERATED_HOST_ADMISSION_ROUTES;
+
 /** Bind generated host packaging to the corresponding durable drive route. */
 export function assertGeneratedHostAdmissionRoute(
-  host: keyof typeof GENERATED_HOST_ADMISSION_ROUTES,
+  host: GeneratedHostId,
 ): void {
   const route = GENERATED_HOST_ADMISSION_ROUTES[host];
   assertRequiredAdmissionRoute(route, "drive", "cli-delegate");
 }
 
-/** Production generated-host adapter: stamp the host route, then delegate to CLI. */
-export async function delegateGeneratedHostNumericDrive(
-  host: keyof typeof GENERATED_HOST_ADMISSION_ROUTES,
-  argv: readonly string[],
-  invokeCli: (argv: readonly string[]) => Promise<boolean>,
-): Promise<boolean> {
+export function generatedHostFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): GeneratedHostId | null {
+  const value = env[GENERATED_HOST_ENV]?.trim();
+  if (!value) return null;
+  if (value in GENERATED_HOST_ADMISSION_ROUTES) return value as GeneratedHostId;
+  return null;
+}
+
+/** Production generated-host stamp used by CLI drive routes. */
+export function admitGeneratedHostLaunch(host: GeneratedHostId): void {
   assertGeneratedHostAdmissionRoute(host);
-  return invokeCli(argv);
+}
+
+/**
+ * When a generated host launcher forwarded its identity, stamp that host route
+ * before the CLI drive admission. Unknown or absent host ids are not host routes.
+ */
+export function admitGeneratedHostLaunchFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const host = generatedHostFromEnv(env);
+  if (!host) return;
+  admitGeneratedHostLaunch(host);
 }
 
 /** #1333 mechanical fault-matrix lifecycle classes required for FRG promotion. */

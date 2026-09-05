@@ -40,6 +40,7 @@ import {
   isPendingLoopDispatch,
   isPostPilotReleaseVersion,
   observeDetachedChildStart,
+  packLoopDetachedSupervisor,
   parseFactoryReleasePrepareRequest,
   persistFactoryReleaseLoopBinding,
   productionCreateOrReusePackIssues,
@@ -2820,6 +2821,16 @@ test("missing candidate invocation fails closed and does not exec PATH pipeline"
       ),
     /missing typed candidate invocation/,
   );
+});
+
+test("pack-loop detached supervisor is the dispatched child pid (#1454)", () => {
+  assert.deepEqual(
+    packLoopDetachedSupervisor({ dispatch_state: "dispatched", pid: 4242 }),
+    { pid: 4242, starttime: null },
+  );
+  assert.equal(packLoopDetachedSupervisor({ dispatch_state: "bound", pid: 4242 }), null);
+  assert.equal(packLoopDetachedSupervisor({ dispatch_state: "dispatched" }), null);
+  assert.equal(packLoopDetachedSupervisor(undefined), null);
 });
 
 test("raw pack-loop consumer cannot spawn without an executable process-boundary proof (#1454)", async () => {

@@ -128,6 +128,26 @@ test("candidate-engine hard gate discovers and exercises every production proces
     "a raw new spawn in a file that already has a valid consumer must still fail the hard gate",
   );
 
+  const aliasedSpawn = {
+    ...sources,
+    "aliased-consumer.ts": `const start = spawn;\nstart(engine.launcherPath, args);`,
+  };
+  assert.ok(
+    candidateEngineRuntimeBindingGaps(aliasedSpawn)
+      .includes("raw candidate process start in aliased-consumer.ts"),
+    "an aliased spawn of the candidate launcher must fail the hard gate",
+  );
+
+  const renamedImport = {
+    ...sources,
+    "aliased-import.ts": `import { spawn as start } from "node:child_process";\nstart(engine.launcherPath);`,
+  };
+  assert.ok(
+    candidateEngineRuntimeBindingGaps(renamedImport)
+      .includes("raw candidate process start in aliased-import.ts"),
+    "a renamed spawn import of the candidate launcher must fail the hard gate",
+  );
+
   for (const row of CANDIDATE_ENGINE_CONSUMERS) {
     let starts = 0;
     const engine = {
@@ -552,6 +572,131 @@ test("candidate movement after final parent validation is refused by the child-s
   assert.equal(started.ok, true);
   if (started.ok) assert.equal(started.value, 78);
   assert.equal(candidateStarts, 0);
+});
+
+function candidateRootLockPath(engineRoot: string): string {
+  return path.join(
+    "/tmp-state",
+    `pipeline-candidate-process-${createHash("sha256").update(engineRoot).digest("hex").slice(0, 32)}.lock`,
+  );
+}
+
+test("detached pack loop retains the candidate-root lease until the child exits (#1454)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  let childAlive = true;
+  let parentAlive = true;
+  h.deps.processAlive = (pid) => {
+    if (pid === 111) return parentAlive;
+    if (pid === 4242) return childAlive;
+    return false;
+  };
+  const prepared = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const first = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: prepared.engine,
+    start: async () => ({ dispatch_state: "dispatched" as const, pid: 4242 }),
+    detachedSupervisor: (value) =>
+      value.dispatch_state === "dispatched" ? { pid: value.pid, starttime: null } : null,
+  });
+  assert.equal(first.ok, true);
+  const lockPath = candidateRootLockPath(repo);
+  assert.equal(h.files.has(lockPath), true, "lease must remain after detached handoff");
+  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 4242);
+
+  const resumePrepared = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.resume" },
+    h.deps,
+  );
+  assert.equal(resumePrepared.ok, true);
+  if (!resumePrepared.ok) return;
+
+  const concurrent = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: resumePrepared.engine,
+    start: async () => {
+      throw new Error("must not spawn while detached child holds the root");
+    },
+  });
+  assert.equal(concurrent.ok, false);
+  if (!concurrent.ok) assert.equal(concurrent.kind, "lock");
+
+  parentAlive = false;
+  const afterParentCrash = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: resumePrepared.engine,
+    start: async () => {
+      throw new Error("must not spawn after parent crash while child is live");
+    },
+  });
+  assert.equal(afterParentCrash.ok, false);
+  if (!afterParentCrash.ok) assert.equal(afterParentCrash.kind, "lock");
+
+  childAlive = false;
+  let reclaimed = 0;
+  const afterChildExit = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: resumePrepared.engine,
+    start: async () => ++reclaimed,
+  });
+  assert.equal(afterChildExit.ok, true);
+  assert.equal(reclaimed, 1);
+});
+
+test("candidate process lock serializes distinct SHAs on one canonical root (#1454)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const root = { head: SHA, porcelain: "" };
+  const h = prepareHarness({
+    roots: { [repo]: root },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  let childAlive = true;
+  h.deps.processAlive = (pid) => {
+    if (pid === 111) return true;
+    if (pid === 4242) return childAlive;
+    return false;
+  };
+  const first = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+  const started = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: first.engine,
+    start: async () => ({ dispatch_state: "dispatched" as const, pid: 4242 }),
+    detachedSupervisor: (value) => ({ pid: value.pid, starttime: null }),
+  });
+  assert.equal(started.ok, true);
+
+  root.head = OTHER;
+  const second = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: OTHER, consumer: "ship.stage-adapter" },
+    h.deps,
+  );
+  assert.equal(second.ok, true);
+  if (!second.ok) return;
+  const contended = await runCandidateEngineProcess({
+    consumer: "ship.stage-adapter",
+    engine: second.engine,
+    start: async () => {
+      throw new Error("must not spawn C2 while C1 child holds the canonical root");
+    },
+  });
+  assert.equal(contended.ok, false);
+  if (!contended.ok) assert.equal(contended.kind, "lock");
 });
 
 test("candidate process lock trusts its private parent before exclusively creating the lock (#1454)", async () => {

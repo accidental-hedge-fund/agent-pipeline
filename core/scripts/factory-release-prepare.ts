@@ -1226,6 +1226,17 @@ export interface PackLoopSpawnResult {
   spawn_attempt?: FactoryReleaseSpawnAttempt;
 }
 
+/** Live detached pack-loop supervisor that must keep the candidate-root lease. */
+export function packLoopDetachedSupervisor(
+  value: void | PackLoopSpawnResult,
+): { pid: number; starttime: string | null } | null {
+  if (!value || value.dispatch_state !== "dispatched") return null;
+  if (typeof value.pid !== "number" || !Number.isInteger(value.pid) || value.pid <= 0) {
+    return null;
+  }
+  return { pid: value.pid, starttime: null };
+}
+
 export interface DispatchPackLoopInput {
   repoDir: string;
   request: FactoryReleasePrepareRequest;
@@ -2433,6 +2444,7 @@ export async function productionResumeBoundPackLoop(
       { ...args, candidateInvocation: invocation, candidateEnv },
       deps.spawnDeps,
     ),
+    detachedSupervisor: packLoopDetachedSupervisor,
   });
   if (started.ok) return started.value;
   return {
@@ -2738,6 +2750,7 @@ export async function productionDispatchPackLoop(
         candidateInvocation: invocation,
         candidateEnv,
       }),
+      detachedSupervisor: packLoopDetachedSupervisor,
     });
     if (!started.ok) throw new Error(`pack-loop dispatch: ${started.error}`);
     spawnResult = started.value;

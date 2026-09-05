@@ -11,11 +11,11 @@ import {
   REQUIRED_LIFECYCLE_CLASSES_1333,
   REQUIRED_PUBLIC_ENTRYPOINTS,
   REQUIRED_ADMISSION_ROUTES,
+  GENERATED_HOST_ENV,
   admissionRouteExecutionGaps,
   admissionRouteInventoryGaps,
   assertAdmissionRouteInventoryComplete,
   captureRequiredAdmissionRouteCrossings,
-  delegateGeneratedHostNumericDrive,
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
   filterAttemptsBoundToCandidate,
@@ -69,7 +69,10 @@ async function executeGeneratedHostNumericDrive(
     fs.mkdirSync(path.join(temp, "tmp"), { recursive: true });
     const template = fs.readFileSync(path.join(REPO_ROOT, "hosts", "_shared", "entry.template.mjs"), "utf8");
     const launcher = path.join(scriptsDir, "pipeline.mjs");
-    fs.writeFileSync(launcher, template.replaceAll("__PROFILE__", manifest.profileDefault));
+    fs.writeFileSync(
+      launcher,
+      template.replaceAll("__PROFILE__", manifest.profileDefault).replaceAll("__HOST__", host),
+    );
     fs.copyFileSync(
       path.join(REPO_ROOT, "scripts", "ensure-engines-node.mjs"),
       path.join(scriptsDir, "ensure-engines-node.mjs"),
@@ -77,16 +80,20 @@ async function executeGeneratedHostNumericDrive(
     fs.writeFileSync(path.join(temp, "core", "package.json"), JSON.stringify({ version: "0.0.0-test" }));
     fs.writeFileSync(
       path.join(coreScripts, "pipeline.ts"),
-      "console.log(JSON.stringify(process.argv.slice(2)));\n",
+      "console.log(JSON.stringify({ argv: process.argv.slice(2), host: process.env.PIPELINE_GENERATED_HOST ?? null }));\n",
     );
     const result = spawnSync(process.execPath, [launcher, "1454"], {
       encoding: "utf8",
       env: { ...process.env, TMPDIR: path.join(temp, "tmp") },
     });
     assert.equal(result.status, 0, `${host} generated launcher failed: ${result.stderr}`);
-    const forwarded = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1) ?? "null") as string[];
-    assert.deepEqual(forwarded, ["1454", "--profile", manifest.profileDefault]);
-    return invokeCli([forwarded[0]!]);
+    const forwarded = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1) ?? "null") as {
+      argv: string[];
+      host: string | null;
+    };
+    assert.deepEqual(forwarded.argv, ["1454", "--profile", manifest.profileDefault]);
+    assert.equal(forwarded.host, host, `${host} generated launcher must forward ${GENERATED_HOST_ENV}`);
+    return invokeCli([forwarded.argv[0]!]);
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
@@ -529,16 +536,45 @@ test("hard gate executes inventoried production admission routes (#1454)", async
       await runShipCoordinator(shipIntent, null, shipAdmissionDeps(shipStore)).catch(() => {});
       events.push("protected:ship.resume");
 
+      const hostExecutors: Record<string, () => Promise<void>> = {};
       for (const host of SKILL_HOST_IDS) {
-        const delegated = await executeGeneratedHostNumericDrive(host, async (argv) => {
-          return delegateGeneratedHostNumericDrive(host, argv, async (forwarded) => {
-            assert.deepEqual(forwarded, ["1454"]);
-            events.push(`protected:host.${host}`);
+        hostExecutors[`host.${host === "claude" ? "claude-code" : host}`] = async () => {
+          const prev = process.env[GENERATED_HOST_ENV];
+          const delegated = await executeGeneratedHostNumericDrive(host, async (argv) => {
+            assert.deepEqual(argv, ["1454"]);
+            process.env[GENERATED_HOST_ENV] = host;
+            try {
+              const hostDrive: SingleIssueCommandDeps = {
+                resolveConfig: () => admissionCfg(),
+                resolveIssueNumber: async (_cfg, n) => n,
+                runLoopEngine: async () => {
+                  events.push(`protected:host.${host}`);
+                  return driveEngineResult(`loop-host-${host}`);
+                },
+                writeStdoutLine: () => {},
+              };
+              await runSingleIssueCommand("1454", { profile: "codex" } as CliOpts, hostDrive);
+            } finally {
+              if (prev === undefined) delete process.env[GENERATED_HOST_ENV];
+              else process.env[GENERATED_HOST_ENV] = prev;
+            }
             return true;
           });
-        });
-        assert.equal(delegated, true);
+          assert.equal(delegated, true);
+        };
       }
+      for (const [route, execute] of Object.entries(hostExecutors)) {
+        assert.equal(
+          REQUIRED_ADMISSION_ROUTES.some((row) => row.route === route),
+          true,
+          `host executor ${route} must be inventoried`,
+        );
+        await execute();
+      }
+      assert.deepEqual(
+        [...Object.keys(hostExecutors)].sort(),
+        REQUIRED_ADMISSION_ROUTES.filter((row) => row.class === "host").map((row) => row.route).sort(),
+      );
     });
   });
 

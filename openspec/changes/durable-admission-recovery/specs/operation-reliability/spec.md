@@ -59,6 +59,13 @@ The pipeline SHALL maintain one executable inventory that maps every required pu
 - **THEN** it SHALL delegate to the same CLI admission path
 - **AND** it SHALL NOT mint, rewrite, or bypass the CLI's Logical Operation identity or stamp
 
+#### Scenario: Generated host launcher stamps the host route through CLI drive
+
+- **WHEN** a generated Claude Code, Codex, Grok, or OpenCode launcher invokes numeric drive
+- **THEN** it SHALL forward its host identity into the CLI child environment
+- **AND** the CLI drive admission SHALL stamp the matching inventoried host route
+- **AND** SHALL NOT use a test-only delegation surrogate as that stamp
+
 #### Scenario: Duplicate or unknown inventory member fails validation
 
 - **WHEN** the inventory contains a duplicate route, an unknown entrypoint, or an entrypoint absent from the required set

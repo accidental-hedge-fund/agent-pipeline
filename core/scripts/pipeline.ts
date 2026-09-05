@@ -26,6 +26,7 @@ import { spawnDetached } from "./detach.ts";
 import { productionRestoreDeadDetached } from "./liveness-cli.ts";
 import { publishIssueBodyOrThrow } from "./issue-body-publisher.ts";
 import {
+  admitGeneratedHostLaunchFromEnv,
   assertRequiredAdmissionRoute,
   type RequiredAdmissionRouteName,
 } from "./operation-reliability.ts";
@@ -3352,6 +3353,7 @@ export function assertLoopAdmissionRoute(
   route: "drive.numeric" | "drive.detached-resume" | "loop.direct" | "loop.resume",
 ): void {
   const entrypoint = route.startsWith("drive.") ? "drive" : "loop";
+  if (entrypoint === "drive") admitGeneratedHostLaunchFromEnv();
   assertRequiredAdmissionRoute(route, entrypoint, "loop-admission");
 }
 
