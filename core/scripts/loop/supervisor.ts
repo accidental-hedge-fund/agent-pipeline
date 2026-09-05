@@ -758,14 +758,19 @@ function recoveryCandidateIdentity(
 }
 
 /** Logical recovery epoch. Production observations explicitly set
- * `logical_candidate_epoch`; null means commit lineage was unobservable and
- * therefore cannot prove a new epoch. Older injected/test observations omit
- * the field and retain the historical raw-HEAD behavior. */
+ * `logical_candidate_epoch`. A non-empty logical epoch is preferred when
+ * lineage is readable. Null/empty means the commit list was unobservable:
+ * Cooling invalidation then uses the readable raw HEAD as a conservative
+ * new epoch so a known S→H movement cannot keep S-era Cooling
+ * authoritative. Older injected/test observations omit the field and
+ * retain the historical raw-HEAD behavior. */
 function observedCandidateEpoch(item: LoopItemLedgerEntry | undefined): string {
   const identity = item?.last_verified_identity;
   if (!identity) return "";
   if (Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")) {
-    return identity.logical_candidate_epoch?.trim() ?? "";
+    const logical = identity.logical_candidate_epoch?.trim() ?? "";
+    if (logical) return logical;
+    return identity.head_sha.trim();
   }
   return identity.head_sha.trim();
 }

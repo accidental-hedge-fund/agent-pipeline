@@ -325,6 +325,24 @@ test("observeExternalIdentity: trailing pipeline commits preserve the logical ca
   assert.equal(identity.logical_candidate_epoch, productSha);
 });
 
+test("observeExternalIdentity: getPrCommits failure leaves raw HEAD with unobservable logical epoch (#1462)", async () => {
+  const shaS = "a".repeat(40);
+  const shaH = "b".repeat(40);
+  const { deps } = fakeObserveDeps({
+    async findPrForIssue() { return 12; },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: shaH, merge_commit_sha: null };
+    },
+    async getPrCommits() {
+      throw new Error("commit list unobservable");
+    },
+  });
+  const identity = await observeExternalIdentity(deps, "100");
+  assert.equal(identity.head_sha, shaH);
+  assert.equal(identity.logical_candidate_epoch, null);
+  assert.notEqual(identity.head_sha, shaS);
+});
+
 test("observeExternalIdentity: absent external objects are represented, not omitted", async () => {
   const { deps } = fakeObserveDeps();
   const identity = await observeExternalIdentity(deps, "100");

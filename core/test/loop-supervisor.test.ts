@@ -2978,6 +2978,99 @@ test("pipeline-internal tip resumes the existing recovery episode cursor (#1462)
   assert.equal(result.stop, null);
 });
 
+test("unobservable commit list after S→H does not keep S-era Cooling authoritative (#1462)", async () => {
+  const shaS = "a".repeat(40);
+  const shaH = "b".repeat(40);
+  const reviewFindings = DEFAULT_RECOVERY_POLICY["review-findings"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "review-findings": {
+        ...reviewFindings,
+        backoff: { initial_seconds: 3600, multiplier: 2, max_seconds: 7200 },
+      },
+    },
+  });
+  const seeded = blockedReviewRecoveryItem("100");
+  seeded.last_verified_identity = {
+    ...currentLocalIdentity(100),
+    pr_number: 12,
+    pr_state: "open",
+    head_sha: shaS,
+    logical_candidate_epoch: shaS,
+    pipeline_stage: "review-1",
+    checks_conclusion: "pending",
+  };
+  const ledger = testLedger({ "100": seeded });
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const time = deps.now().toISOString();
+  await persistOwnedCooling(deps, {
+    runId: "run-1",
+    token,
+    cooling: buildCoolingRecord({
+      reason: "strategy_cursor_exhausted",
+      time,
+      nextEligibleAt: coolingDeadline(time, { initial_seconds: 3600, multiplier: 2, max_seconds: 7200 }, 1),
+      itemId: "100",
+      theme: "review-findings",
+      candidateEpoch: shaS,
+      historicalEvidence: "recovery_exhausted",
+    }),
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:review-1"] };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: shaH, merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pending" }];
+    },
+    async getPrCommits() {
+      throw new Error("commit list unobservable");
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: shaH };
+    },
+  }).deps;
+  let recoveryCalls = 0;
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: false, evidence: "H recovery claimed", error: "fixture stops after H claim" };
+  };
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem: async () => {
+        throw new Error("blocked review item must recover before redispatch");
+      },
+      executeRecovery,
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+  assert.ok(
+    recoveryCalls >= 1,
+    "a readable S→H movement with unobservable lineage must not defer to S-era Cooling",
+  );
+  const auditAfter = await auditSupervisor(deps, "run-1");
+  const lastEntry = auditAfter.action_evidence.at(-1);
+  assert.notEqual(
+    lastEntry?.outcome,
+    "cooling_recovery",
+    "supervisor must not record cooling_recovery for stale S-era Cooling at H",
+  );
+  assert.equal(cycle.stop, null);
+});
+
 // ---------------------------------------------------------------------------
 // Needs-human blocker disposition (#570, capability
 // `loop-needs-human-blocker-disposition`) — regression for run
