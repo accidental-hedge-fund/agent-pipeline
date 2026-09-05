@@ -23,6 +23,7 @@ import type { PrDetail } from "../scripts/types.ts";
 const SHA_S = "1".repeat(40);
 const SHA_H = "2".repeat(40);
 const SHA_INTERNAL = "3".repeat(40);
+const SHA_J = "4".repeat(40);
 const ISSUE = 1462;
 const PR = 1459;
 
@@ -111,6 +112,8 @@ type DriveOpts = {
   worktreeHead?: string;
   worktreeDirty?: boolean;
   worktreeNotAncestor?: boolean;
+  /** After the first managed-worktree fetch, PR HEAD becomes this SHA (H→J race). */
+  prHeadAfterFetch?: string;
 };
 
 type DriveResult = {
@@ -147,6 +150,7 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
   const wtSlug = "x";
   const wtPath = path.join(repoDir, ".worktrees", `pipeline-${ISSUE}-${wtSlug}`);
   let worktreeHead = opts.worktreeHead ?? null;
+  let currentPrHead = opts.prHead;
   const origLog = console.log;
   const origWarn = console.warn;
   const origError = console.error;
@@ -245,8 +249,8 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
     },
     getPrDetail: async () => {
       if (opts.headError) throw new Error("cannot read PR HEAD");
-      if (!opts.prHead) throw new Error("getPrDetail must not run without a PR");
-      return prDetail(opts.prHead);
+      if (!currentPrHead) throw new Error("getPrDetail must not run without a PR");
+      return prDetail(currentPrHead);
     },
     getPrCommits: async () => opts.commits,
     ...(opts.currencySequence
@@ -254,7 +258,7 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
           resolveReviewedShaCurrency: async () => {
             const status = opts.currencySequence![Math.min(currencyCalls++, opts.currencySequence!.length - 1)];
             return status === "superseded"
-              ? { status: "superseded" as const, headSha: SHA_H }
+              ? { status: "superseded" as const, headSha: currentPrHead ?? SHA_H }
               : { status: "current" as const };
           },
         }
@@ -291,7 +295,11 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
         worktreeHead = args[args.length - 1] ?? worktreeHead;
         return { stdout: "", stderr: "", code: 0 };
       }
-      if (args[0] === "diff" || args[0] === "fetch" || args[0] === "show") {
+      if (args[0] === "fetch") {
+        if (opts.prHeadAfterFetch) currentPrHead = opts.prHeadAfterFetch;
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      if (args[0] === "diff" || args[0] === "show") {
         return { stdout: "", stderr: "", code: 0 };
       }
       return { stdout: "", stderr: "", code: 0 };
@@ -325,9 +333,9 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
         throw new Error("dispatch must not handle ready-to-deploy");
       }
       if (stage === "review-1" || stage === "review-2") {
-        reviewDispatchedAtSha = opts.prHead;
+        reviewDispatchedAtSha = currentPrHead;
         reviewDispatchedAtWorktreeHead = worktreeHead;
-        if (worktreeHead && worktreeHead !== opts.prHead) {
+        if (worktreeHead && currentPrHead && worktreeHead !== currentPrHead) {
           reviewAttemptedOnStaleHead = true;
         }
         if (opts.advanceReviewStages) {
@@ -399,6 +407,7 @@ test("visual-gate unblocked resume after developer HEAD movement returns to revi
     prHead: SHA_H,
     commits: developerCommits(),
     reviewSha: SHA_S,
+    worktreeHead: SHA_H,
   });
   assert.equal(r.dispatchStages.includes("visual-gate"), false, "must not run visual-gate");
   assert.equal(r.dispatchStages.includes("eval-gate"), false);
@@ -422,6 +431,7 @@ test("eval-gate, shipcheck-gate, and ready-to-deploy share the same guard", asyn
       prHead: SHA_H,
       commits: developerCommits(),
       reviewSha: SHA_S,
+      worktreeHead: SHA_H,
     });
     assert.equal(
       r.dispatchStages.includes(startStage),
@@ -487,6 +497,7 @@ test("unknown currency with readable H ≠ S returns to review-1 (rebase-absent 
     prHead: SHA_H,
     commits: [{ oid: SHA_H, messageHeadline: "fix: rebased findings" }],
     reviewSha: SHA_S,
+    worktreeHead: SHA_H,
   });
   assert.equal(r.dispatchStages.includes("visual-gate"), false);
   assert.ok(r.transitions.some((t) => t.to === "review-1"));
@@ -501,6 +512,7 @@ test("blocked leftover is not required: unblocked visual-gate still revalidates"
     commits: developerCommits(),
     reviewSha: SHA_S,
     blocked: false,
+    worktreeHead: SHA_H,
   });
   assert.equal(r.labels.includes("blocked"), false);
   assert.ok(r.transitions.some((t) => t.to === "review-1"));
@@ -514,6 +526,7 @@ test("blocked forged-comment resume clears the block and records one candidate-e
     reviewSha: SHA_S,
     attackerReviewSha: SHA_H,
     blocked: true,
+    worktreeHead: SHA_H,
   });
   assert.equal(r.clearBlockedCalls, 1);
   assert.equal(r.labels.includes("blocked"), false);
@@ -530,6 +543,7 @@ test("later-stage epoch restart selects the enabled exact-SHA review stage", asy
     reviewSha: SHA_S,
     standardReview: false,
     adversarialReview: true,
+    worktreeHead: SHA_H,
   });
   assert.ok(r.transitions.some((t) => t.from === "eval-gate" && t.to === "review-2"));
   assert.ok(r.dispatchStages.includes("review-2"));
@@ -559,6 +573,7 @@ test("deferred ready-to-deploy finalize rechecks currency and refuses a late HEA
     reviewSha: SHA_S,
     advanceReviewStages: true,
     currencySequence: ["current", "current", "current", "superseded"],
+    worktreeHead: SHA_H,
   });
   assert.equal(r.finalizeCalls, 0, "deferred terminal finalize must not run on stale review currency");
   assert.ok(
@@ -596,6 +611,40 @@ test("epoch restart fails closed when stale worktree S cannot bind to H", async 
   assert.equal(r.reviewAttemptedOnStaleHead, false);
   assert.equal(r.transitions.length, 0, "must not reroute to review while worktree remains at S");
   assert.ok(r.logs.some((line) => /refusing to dispatch review/.test(line)));
+});
+
+test("epoch restart with no managed worktree does not dispatch review from repo_dir", async () => {
+  const r = await driveLaterStage({
+    startStage: "visual-gate",
+    prHead: SHA_H,
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+  });
+  assert.equal(r.dispatchStages.includes("review-1"), false, "must not dispatch review without an H checkout");
+  assert.equal(r.dispatchStages.includes("visual-gate"), false);
+  assert.equal(r.reviewDispatchedAtSha, null);
+  assert.equal(r.reviewDispatchedAtWorktreeHead, null);
+  assert.equal(r.transitions.length, 0, "must not reroute to review when bind cannot prove an H checkout");
+  assert.ok(r.logs.some((line) => /no managed worktree on disk/.test(line)));
+});
+
+test("epoch restart does not review new HEAD J from stale checkout H when HEAD moves during bind", async () => {
+  const r = await driveLaterStage({
+    startStage: "visual-gate",
+    prHead: SHA_H,
+    prHeadAfterFetch: SHA_J,
+    commits: [
+      ...developerCommits(),
+      { oid: SHA_J, messageHeadline: "feat: follow-up on H" },
+    ],
+    reviewSha: SHA_S,
+    worktreeHead: SHA_S,
+  });
+  assert.equal(r.reviewAttemptedOnStaleHead, false, "review must not run in an H checkout while PR HEAD is J");
+  assert.equal(r.dispatchStages.includes("visual-gate"), false);
+  assert.ok(r.dispatchStages.includes("review-1"), "same advance must restart reconcile and dispatch review at J");
+  assert.equal(r.reviewDispatchedAtSha, SHA_J);
+  assert.equal(r.reviewDispatchedAtWorktreeHead, SHA_J);
 });
 
 test("nested whole-item, pipeline single, and loop item dispatch share runAdvance later-stage guard", () => {

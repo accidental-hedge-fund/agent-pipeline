@@ -797,9 +797,30 @@ test("advanceReview: post-diff getPrDetail throws → blocked (not silently cont
   assert.equal(rec.comments.length, 0, "no review comment may be posted when post-diff check throws");
 });
 
-// ---------------------------------------------------------------------------
-// advanceReview — verdict normalization gate
-// ---------------------------------------------------------------------------
+test("advanceReview: CWD HEAD differs from captured PR SHA → blocked without harness", async (t) => {
+  const cwdSha = "a".repeat(40);
+  const { deps, rec } = makeDeps([APPROVE]);
+  const mismatchDeps: AdvanceReviewDeps = {
+    ...deps,
+    getForIssue: async () => ({ path: "/wt", slug: "x" }),
+    gitInWorktree: async () => ({ stdout: `${cwdSha}\n`, stderr: "", code: 0 }),
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advanceReview(cfg, 1, 1, {}, 0, mismatchDeps);
+  });
+  assert.deepEqual(out, {
+    advanced: false,
+    status: "blocked",
+    reason: "review CWD HEAD differs from captured PR SHA",
+  });
+  assert.ok(
+    rec.blocked.some((b) => b.includes("wrong checkout") && b.includes(cwdSha.slice(0, 7))),
+    "must name the CWD/PR SHA mismatch",
+  );
+  assert.equal(rec.runReviewCalls, 0, "must not invoke the reviewer from a checkout that is not the captured PR SHA");
+  assert.equal(rec.comments.length, 0);
+});
 
 const cfg = {
   review_mode: "prompt-harness",

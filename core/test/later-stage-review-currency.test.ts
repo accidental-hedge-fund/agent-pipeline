@@ -14,6 +14,7 @@ const SHA_S = "a".repeat(40);
 const SHA_H = "b".repeat(40);
 const SHA_INTERNAL = "c".repeat(40);
 const SHA_REBASED = "d".repeat(40);
+const SHA_J = "e".repeat(40);
 const PIPELINE_ACTOR = "pipeline-bot";
 
 function cfg(): PipelineConfig {
@@ -450,15 +451,60 @@ function gitCallsRecorder() {
   };
 }
 
-test("bindEpochRestartWorktreeToHead: missing worktree is bound without git", async () => {
+test("bindEpochRestartWorktreeToHead: missing worktree fails closed without git", async () => {
   const rec = gitCallsRecorder();
   const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
     getOnDiskForIssue: async () => null,
     gitInWorktree: rec.git,
   });
-  assert.equal(result.kind, "bound");
-  if (result.kind === "bound") assert.equal(result.worktreeHead, null);
+  assert.equal(result.kind, "fail-closed");
+  assert.match(result.reason, /no managed worktree on disk/);
   assert.equal(rec.calls.length, 0);
+});
+
+test("bindEpochRestartWorktreeToHead: live PR HEAD J during bind does not move worktree to H", async () => {
+  const rec = gitCallsRecorder();
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => ({ path: managedWtPath(), slug: BIND_SLUG }),
+    gitInWorktree: rec.git,
+    resolveOpenPrHead: async () => SHA_J,
+  });
+  assert.equal(result.kind, "head-moved");
+  if (result.kind === "head-moved") assert.equal(result.observedHead, SHA_J);
+  assert.equal(rec.calls.some((a) => a[0] === "reset"), false);
+  assert.equal(rec.calls.some((a) => a[0] === "merge"), false);
+});
+
+test("bindEpochRestartWorktreeToHead: PR HEAD J after fetch does not reset worktree to H", async () => {
+  const rec = gitCallsRecorder();
+  let fetched = false;
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => ({ path: managedWtPath(), slug: BIND_SLUG }),
+    gitInWorktree: async (cwd, args, opts) => {
+      const out = await rec.git(cwd, args, opts);
+      if (args[0] === "fetch") fetched = true;
+      return out;
+    },
+    resolveOpenPrHead: async () => (fetched ? SHA_J : SHA_H),
+  });
+  assert.equal(result.kind, "head-moved");
+  if (result.kind === "head-moved") assert.equal(result.observedHead, SHA_J);
+  assert.equal(rec.calls.some((a) => a[0] === "reset"), false);
+  assert.equal(rec.calls.some((a) => a[0] === "merge"), false);
+});
+
+test("bindEpochRestartWorktreeToHead: worktree at H is head-moved when live PR is J", async () => {
+  const rec = gitCallsRecorder();
+  rec.setHead(SHA_H);
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => ({ path: managedWtPath(), slug: BIND_SLUG }),
+    gitInWorktree: rec.git,
+    resolveOpenPrHead: async () => SHA_J,
+  });
+  assert.equal(result.kind, "head-moved");
+  if (result.kind === "head-moved") assert.equal(result.observedHead, SHA_J);
+  assert.equal(rec.calls.some((a) => a[0] === "reset"), false);
+  assert.equal(rec.calls.some((a) => a[0] === "merge"), false);
 });
 
 test("bindEpochRestartWorktreeToHead: worktree already at H does not reset", async () => {

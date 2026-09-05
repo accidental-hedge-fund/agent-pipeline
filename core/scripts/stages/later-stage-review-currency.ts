@@ -4,8 +4,9 @@
 // reconcile PR HEAD against the latest review SHA using the shared currency
 // surface. A non-pipeline-internal HEAD starts a new candidate epoch and
 // returns the issue to review-1 after the managed worktree is bound to that
-// HEAD (or fail-closed if it cannot be). Pipeline-internal-only movement stays
-// current. Unreadable PR/HEAD fails closed. This is not a second SHA-gate product.
+// HEAD (or fail-closed if it cannot be, including when no managed worktree
+// exists). Pipeline-internal-only movement stays current. Unreadable PR/HEAD
+// fails closed. This is not a second SHA-gate product.
 
 import * as path from "node:path";
 import {
@@ -255,19 +256,24 @@ function normalizeFullSha(raw: string): string {
 }
 
 export type EpochRestartWorktreeBindResult =
-  | { kind: "bound"; worktreeHead: string | null; reason: string }
+  | { kind: "bound"; worktreeHead: string; reason: string }
+  | { kind: "head-moved"; observedHead: string; reason: string }
   | { kind: "fail-closed"; reason: string };
 
 export interface EpochRestartWorktreeBindDeps {
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   gitInWorktree?: typeof gitInWorktree;
+  /** Live open-PR HEAD reader. When omitted, bind verifies the supplied target only. */
+  resolveOpenPrHead?: () => Promise<string | null>;
 }
 
 /**
  * Bind a present managed worktree to the new candidate HEAD before epoch-restarted
- * review. Missing worktrees are not a stale-S reject. Present HEAD mismatch uses
- * the verified-head ancestor recipe (ff-only, then reset --hard) scoped to the
- * managed worktree path, or fails closed so review/test never run on S.
+ * review. Missing worktrees fail closed so review cannot fall back to `cfg.repo_dir`.
+ * Present HEAD mismatch uses the verified-head ancestor recipe (ff-only, then
+ * reset --hard) scoped to the managed worktree path, or fails closed so review/test
+ * never run on S. A live PR HEAD that moved past the bind target returns
+ * `head-moved` without mutating the worktree.
  */
 export async function bindEpochRestartWorktreeToHead(
   cfg: PipelineConfig,
@@ -298,9 +304,9 @@ export async function bindEpochRestartWorktreeToHead(
   }
   if (!wt) {
     return {
-      kind: "bound",
-      worktreeHead: null,
-      reason: "later-stage epoch restart: no managed worktree on disk",
+      kind: "fail-closed",
+      reason:
+        "later-stage epoch restart: no managed worktree on disk; refusing to dispatch review from the integration checkout",
     };
   }
 
@@ -334,6 +340,40 @@ export async function bindEpochRestartWorktreeToHead(
         "later-stage epoch restart: cannot read managed worktree HEAD; refusing to dispatch review",
     };
   }
+
+  const readLiveHead = async (): Promise<EpochRestartWorktreeBindResult | string> => {
+    if (!deps.resolveOpenPrHead) return target;
+    let raw: string | null;
+    try {
+      raw = await deps.resolveOpenPrHead();
+    } catch (err) {
+      return {
+        kind: "fail-closed",
+        reason: `later-stage epoch restart: cannot re-read PR HEAD during bind: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    const live = raw ? normalizeFullSha(raw) : "";
+    if (!live) {
+      return {
+        kind: "fail-closed",
+        reason:
+          "later-stage epoch restart: PR HEAD unreadable during bind; refusing to dispatch review",
+      };
+    }
+    if (live !== target) {
+      return {
+        kind: "head-moved",
+        observedHead: live,
+        reason:
+          `later-stage epoch restart: PR HEAD moved from ${target.slice(0, 7)} to ${live.slice(0, 7)} during bind; restarting review-currency reconcile`,
+      };
+    }
+    return live;
+  };
+
+  const liveBefore = await readLiveHead();
+  if (typeof liveBefore !== "string") return liveBefore;
+
   if (local === target) {
     return {
       kind: "bound",
@@ -360,15 +400,38 @@ export async function bindEpochRestartWorktreeToHead(
   const git = async (args: string[]) => gitWt(wt.path, args, { ignoreFailure: true });
   const verified = await resolveVerifiedRemoteHead(branch, {
     git,
-    resolveOpenPrHead: async () => target,
+    resolveOpenPrHead: async () => {
+      if (!deps.resolveOpenPrHead) return target;
+      const raw = await deps.resolveOpenPrHead();
+      return raw ? normalizeFullSha(raw) || null : null;
+    },
   });
-  if (!verified.ok || normalizeFullSha(verified.sha) !== target) {
+  if (!verified.ok) {
     return {
       kind: "fail-closed",
       reason:
         `later-stage epoch restart: cannot verify PR HEAD ${target.slice(0, 7)} in the managed worktree; refusing to dispatch review`,
     };
   }
+  const verifiedSha = normalizeFullSha(verified.sha);
+  if (verifiedSha !== target) {
+    if (verifiedSha) {
+      return {
+        kind: "head-moved",
+        observedHead: verifiedSha,
+        reason:
+          `later-stage epoch restart: PR HEAD moved from ${target.slice(0, 7)} to ${verifiedSha.slice(0, 7)} during bind; restarting review-currency reconcile`,
+      };
+    }
+    return {
+      kind: "fail-closed",
+      reason:
+        `later-stage epoch restart: cannot verify PR HEAD ${target.slice(0, 7)} in the managed worktree; refusing to dispatch review`,
+    };
+  }
+
+  const liveAfterVerify = await readLiveHead();
+  if (typeof liveAfterVerify !== "string") return liveAfterVerify;
 
   const ancestor = await isAncestorOfVerifiedHead(git, "HEAD", target);
   if (ancestor !== true) {
@@ -402,6 +465,9 @@ export async function bindEpochRestartWorktreeToHead(
         `later-stage epoch restart: managed worktree HEAD ${after.slice(0, 7) || "unresolved"} still does not match PR HEAD ${target.slice(0, 7)} after sync; refusing to dispatch review`,
     };
   }
+
+  const liveAfter = await readLiveHead();
+  if (typeof liveAfter !== "string") return liveAfter;
 
   return {
     kind: "bound",

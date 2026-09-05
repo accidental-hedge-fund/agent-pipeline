@@ -2540,6 +2540,13 @@ export async function runAdvance(
       if (laterCurrency.kind === "return-to-review") {
         tlog(`[pipeline] #${issueNumber}: ${laterCurrency.reason}`);
         if (!opts.dryRun) {
+          const getPr = deps.getPrForIssue ?? getPrForIssue;
+          const getDetailPr = deps.getPrDetail ?? getPrDetail;
+          const readLivePrHead = async (): Promise<string> => {
+            const prNumber = await getPr(cfg, issueNumber);
+            if (prNumber == null) return "";
+            return normalizeFullSha((await getDetailPr(cfg, prNumber)).head_sha ?? "") ?? "";
+          };
           const bind = await bindEpochRestartWorktreeToHead(
             cfg,
             issueNumber,
@@ -2547,6 +2554,10 @@ export async function runAdvance(
             {
               getOnDiskForIssue: deps.getOnDiskForIssue ?? getOnDiskForIssue,
               gitInWorktree: deps.gitInWorktree ?? gitInWorktree,
+              resolveOpenPrHead: async () => {
+                const live = await readLivePrHead();
+                return live || null;
+              },
             },
           );
           if (bind.kind === "fail-closed") {
@@ -2555,8 +2566,36 @@ export async function runAdvance(
             process.exitCode = 1;
             return { kind: "fail-closed", reason: bind.reason };
           }
-          if (bind.worktreeHead) {
+          if (bind.kind === "head-moved") {
             tlog(`[pipeline] #${issueNumber}: ${bind.reason}`);
+            return { kind: "rerouted", reason: bind.reason };
+          }
+          tlog(`[pipeline] #${issueNumber}: ${bind.reason}`);
+          let liveAfterBind = "";
+          try {
+            liveAfterBind = await readLivePrHead();
+          } catch (err) {
+            const reason =
+              `later-stage epoch restart: cannot re-read PR HEAD after bind: ${err instanceof Error ? err.message : String(err)}`;
+            tlog(`[pipeline] #${issueNumber}: ${reason}`);
+            laterStageCurrencyFailedClosed = true;
+            process.exitCode = 1;
+            return { kind: "fail-closed", reason };
+          }
+          const boundHead = normalizeFullSha(laterCurrency.headSha) ?? "";
+          if (!liveAfterBind) {
+            const reason =
+              "later-stage epoch restart: PR HEAD unreadable after bind; refusing to dispatch review";
+            tlog(`[pipeline] #${issueNumber}: ${reason}`);
+            laterStageCurrencyFailedClosed = true;
+            process.exitCode = 1;
+            return { kind: "fail-closed", reason };
+          }
+          if (liveAfterBind !== boundHead) {
+            const reason =
+              `later-stage epoch restart: PR HEAD moved from ${boundHead.slice(0, 7)} to ${liveAfterBind.slice(0, 7)} after bind; restarting review-currency reconcile`;
+            tlog(`[pipeline] #${issueNumber}: ${reason}`);
+            return { kind: "rerouted", reason };
           }
           if (isBlocked(detail.labels)) {
             await (deps.clearBlocked ?? clearBlocked)(cfg, issueNumber);

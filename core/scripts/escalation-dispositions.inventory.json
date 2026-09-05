@@ -1537,8 +1537,21 @@
     {
       "site_id": "stages.review-routing:harness-failure#7",
       "module": "scripts/stages/review-routing.ts",
-      "line": 667,
+      "line": 656,
       "occurrence": 7,
+      "match": "Review CWD HEAD ${cwdHead.slice(0, 7)} differs from captured PR SHA ${commitSha.",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "harness-failure",
+      "canonical_reason": "workflow-engine-defect",
+      "notes": "exact-SHA review invariant: CWD HEAD differs from captured PR SHA — fail closed, never record evidence from the wrong checkout (#1462)",
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
+    },
+    {
+      "site_id": "stages.review-routing:harness-failure#8",
+      "module": "scripts/stages/review-routing.ts",
+      "line": 744,
+      "occurrence": 8,
       "match": "harness-failure",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
@@ -1587,10 +1600,10 @@
       "migrated_outcome": "compatibility park projection"
     },
     {
-      "site_id": "stages.review-routing:harness-failure#8",
+      "site_id": "stages.review-routing:harness-failure#9",
       "module": "scripts/stages/review-routing.ts",
-      "line": 741,
-      "occurrence": 8,
+      "line": 818,
+      "occurrence": 9,
       "match": "Delegated executor \"${executorName}\"${providerNote} for stage \"${stage}\" format-",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
@@ -1600,10 +1613,10 @@
       "migrated_outcome": "Cooling"
     },
     {
-      "site_id": "stages.review-routing:harness-failure#9",
+      "site_id": "stages.review-routing:harness-failure#10",
       "module": "scripts/stages/review-routing.ts",
-      "line": 765,
-      "occurrence": 9,
+      "line": 842,
+      "occurrence": 10,
       "match": "harness-failure",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
@@ -1613,10 +1626,10 @@
       "migrated_outcome": "Cooling"
     },
     {
-      "site_id": "stages.review-routing:harness-failure#10",
+      "site_id": "stages.review-routing:harness-failure#11",
       "module": "scripts/stages/review-routing.ts",
-      "line": 889,
-      "occurrence": 10,
+      "line": 996,
+      "occurrence": 11,
       "match": "harness-failure",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "harness-failure",
@@ -1626,10 +1639,10 @@
       "migrated_outcome": "Cooling"
     },
     {
-      "site_id": "stages.review-routing:harness-failure#11",
+      "site_id": "stages.review-routing:harness-failure#12",
       "module": "scripts/stages/review-routing.ts",
-      "line": 1014,
-      "occurrence": 11,
+      "line": 1121,
+      "occurrence": 12,
       "match": "Review ${round} returned \\",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",

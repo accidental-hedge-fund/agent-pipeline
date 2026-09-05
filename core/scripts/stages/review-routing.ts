@@ -190,6 +190,7 @@ export interface AdvanceReviewDeps {
   getPrDetail?: typeof getPrDetail;
   getIssueDetail?: typeof getIssueDetail;
   getForIssue?: typeof getForIssue;
+  gitInWorktree?: typeof gitInWorktree;
   postComment?: typeof postComment;
   postPrComment?: typeof postPrComment;
   transition?: typeof transition;
@@ -641,6 +642,20 @@ export async function advanceReview(
 
   const wt = await getForIssueFn(cfg, issueNumber);
   const cwd = wt?.path ?? cfg.repo_dir;
+  const gitWt = deps.gitInWorktree ?? gitInWorktree;
+  let cwdHead = "";
+  try {
+    const headRes = await gitWt(cwd, ["rev-parse", "HEAD"], { ignoreFailure: true });
+    cwdHead = headRes.code === 0 ? headRes.stdout.trim().toLowerCase() : "";
+  } catch {
+    cwdHead = "";
+  }
+  if (/^[0-9a-f]{40}$/.test(cwdHead) && cwdHead !== commitSha.toLowerCase()) {
+    const reason =
+      `Review CWD HEAD ${cwdHead.slice(0, 7)} differs from captured PR SHA ${commitSha.slice(0, 7)}; refusing to record exact-SHA review evidence from the wrong checkout.`;
+    await setBlockedFn(cfg, issueNumber, reason, stage, "harness-failure");
+    return { advanced: false, status: "blocked", reason: "review CWD HEAD differs from captured PR SHA" };
+  }
 
   const invocation = await runReviewFn(
     cfg,
