@@ -19,6 +19,7 @@ import type { LoopContract, LoopLedger } from "./loop/types.ts";
 import { defaultLoopStoreDeps, runDir } from "./loop/store.ts";
 import {
   defaultResolveAndPrepareDeps,
+  hasCandidateProcessGuardEnv,
   runCandidateEngineProcess,
   resolveAndPrepareCandidateEngine,
   type CandidateEngineResult,
@@ -45,10 +46,10 @@ function canonicalJson(value: unknown): string {
 function runCommand(
   cmd: string,
   args: string[],
-  opts: { cwd: string; timeoutMs?: number },
+  opts: { cwd: string; timeoutMs?: number; env?: NodeJS.ProcessEnv },
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: opts.cwd });
+    const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
@@ -99,6 +100,8 @@ export type LayerAProbeRunInput = {
   candidateGitSha: string;
   /** Resolved candidate-engine checkout for TAP cwd. */
   candidateEngineDir: string;
+  /** Child-side exact candidate/readiness/lease proof. */
+  candidateEnv: NodeJS.ProcessEnv;
 };
 
 export interface HybridV2FromRunDeps {
@@ -236,8 +239,13 @@ export async function defaultRunLayerAProbe(
   probe: { id: string; test_file: string; test_name: string },
   input: LayerAProbeRunInput,
 ): Promise<VerifiedFrgPackRun["probes"][number]> {
+  if (!hasCandidateProcessGuardEnv(input.candidateEnv)) {
+    throw new Error(`pipeline factory-gate: Layer A probe ${probe.id} missing child-side candidate process proof`);
+  }
   const pattern = `^${probe.test_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
   const args = [
+    "--import",
+    path.join(input.candidateEngineDir, "scripts", "candidate-process-guard.mjs"),
     "--test",
     "--experimental-strip-types",
     "--test-reporter=tap",
@@ -246,7 +254,10 @@ export async function defaultRunLayerAProbe(
     probe.test_file,
   ];
   const startedAt = new Date().toISOString();
-  const result = await runCommand(process.execPath, args, { cwd: input.candidateEngineDir });
+  const result = await runCommand(process.execPath, args, {
+    cwd: input.candidateEngineDir,
+    env: input.candidateEnv,
+  });
   const finishedAt = new Date().toISOString();
   const tapEscaped = probe.test_name.replaceAll("#", "\\#");
   const names = [...new Set([probe.test_name, tapEscaped])];
@@ -502,10 +513,11 @@ export async function defaultCollectHybridV2FromRun(
     const started = await runCandidateEngineProcess({
       consumer: "factory-gate.hybrid-v2",
       engine: candidateEngine,
-      start: (checked) => runProbe(probe, {
+      start: (checked, candidateEnv) => runProbe(probe, {
         repoDir: args.repoDir,
         candidateGitSha,
         candidateEngineDir: checked.engineRoot,
+        candidateEnv: { ...process.env, ...candidateEnv },
       }),
     });
     if (!started.ok) {

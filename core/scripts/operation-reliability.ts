@@ -47,6 +47,12 @@ export interface RequiredAdmissionRoute {
   host?: "claude" | "codex" | "grok" | "opencode";
   /** Shared production boundary crossed by the exercised route. */
   boundary: "public-admission" | "loop-admission" | "train-admission" | "ship-admission" | "cli-delegate";
+  /** Executable binding shared by production assertion and the hard gate. */
+  bind(entrypoint: RequiredPublicEntrypoint, boundary: RequiredAdmissionRoute["boundary"]): void;
+  execute(
+    input: AdmissionRouteExerciseInput,
+    deps: AdmissionRouteExerciseDeps,
+  ): Promise<"admitted" | "refused">;
 }
 
 const EXPECTED_ADMISSION_ROUTES: Readonly<Record<string, RequiredPublicEntrypoint>> = {
@@ -69,8 +75,7 @@ const EXPECTED_ADMISSION_ROUTES: Readonly<Record<string, RequiredPublicEntrypoin
 } as const;
 export type RequiredAdmissionRouteName = keyof typeof EXPECTED_ADMISSION_ROUTES;
 
-/** Executable-route contract; tests exercise each boundary and validate this exact set. */
-export const REQUIRED_ADMISSION_ROUTES: readonly RequiredAdmissionRoute[] = [
+const REQUIRED_ADMISSION_ROUTE_ROWS = [
   { route: "drive.numeric", entrypoint: "drive", class: "direct", boundary: "loop-admission" },
   { route: "drive.detached-resume", entrypoint: "drive", class: "resume", boundary: "loop-admission" },
   { route: "single.direct", entrypoint: "single", class: "direct", boundary: "public-admission" },
@@ -89,6 +94,20 @@ export const REQUIRED_ADMISSION_ROUTES: readonly RequiredAdmissionRoute[] = [
   { route: "host.opencode", entrypoint: "drive", class: "host", boundary: "cli-delegate", host: "opencode" },
 ] as const;
 
+/** Executable-route contract; every row carries the same boundary used by production assertions. */
+export const REQUIRED_ADMISSION_ROUTES: readonly RequiredAdmissionRoute[] =
+  REQUIRED_ADMISSION_ROUTE_ROWS.map((row) => ({
+    ...row,
+    bind: (entrypoint, boundary) => {
+      if (row.entrypoint !== entrypoint || row.boundary !== boundary) {
+        throw new Error(
+          `required admission route binding mismatch for ${row.route}: expected ${entrypoint}/${boundary}`,
+        );
+      }
+    },
+    execute: (input, deps) => executeRequiredAdmissionRoute(row.route, input, deps),
+  }));
+
 export function admissionRouteInventoryGaps(
   routes: readonly RequiredAdmissionRoute[] = REQUIRED_ADMISSION_ROUTES,
 ): string[] {
@@ -104,6 +123,8 @@ export function admissionRouteInventoryGaps(
       gaps.push(`unknown entrypoint ${row.entrypoint}`);
     }
     if (!row.boundary) gaps.push(`route ${row.route} bypasses admission`);
+    if (typeof row.bind !== "function") gaps.push(`route ${row.route} missing production binding`);
+    if (typeof row.execute !== "function") gaps.push(`route ${row.route} missing executable binding`);
     if (row.class === "host" && !row.host) gaps.push(`host route ${row.route} missing generated host`);
     if (row.class !== "host" && row.host) gaps.push(`non-host route ${row.route} declares generated host ${row.host}`);
   }
@@ -133,11 +154,7 @@ export function assertRequiredAdmissionRoute(
   const matches = REQUIRED_ADMISSION_ROUTES.filter((row) => row.route === route);
   if (matches.length !== 1) throw new Error(`required admission route is not inventoried exactly once: ${route}`);
   const row = matches[0]!;
-  if (row.entrypoint !== entrypoint || row.boundary !== boundary) {
-    throw new Error(
-      `required admission route binding mismatch for ${route}: expected ${entrypoint}/${boundary}`,
-    );
-  }
+  row.bind(entrypoint, boundary);
 }
 
 export interface AdmissionRouteExerciseInput {
@@ -168,6 +185,52 @@ export interface AdmissionRouteExerciseDeps {
   ): Promise<boolean>;
 }
 
+async function executeRequiredAdmissionRoute(
+  route: RequiredAdmissionRouteName,
+  input: AdmissionRouteExerciseInput,
+  deps: AdmissionRouteExerciseDeps,
+): Promise<"admitted" | "refused"> {
+  if (input.row.route !== route) throw new Error(`admission exercise route mismatch for ${route}`);
+  assertRequiredAdmissionRoute(route, input.row.entrypoint, input.row.boundary);
+  const invokeCli = async (argv: readonly string[]): Promise<boolean> => {
+    if (argv.length !== 1 || argv[0] !== "1454") {
+      throw new Error(`generated host ${input.row.host ?? route} rewrote CLI argv`);
+    }
+    const admission = await deps.admit(input);
+    if (!admission.acknowledged) return false;
+    if (
+      admission.operationKey !== input.operationKey ||
+      admission.logicalOperationId !== input.logicalOperationId ||
+      admission.approvedRoot !== input.approvedRoot
+    ) {
+      throw new Error(`admission identity/root mismatch for ${route}`);
+    }
+    await deps.protectedOperation(input);
+    return true;
+  };
+
+  if (input.row.class !== "host") return await invokeCli(["1454"]) ? "admitted" : "refused";
+  if (!input.row.host || !deps.delegateHost) {
+    throw new Error(`generated host route ${route} has no executable delegate`);
+  }
+  let cliCalls = 0;
+  let cliResult = false;
+  const delegated = await deps.delegateHost(
+    { host: input.row.host, argv: ["1454"] },
+    async (argv) => {
+      cliCalls += 1;
+      if (cliCalls > 1) throw new Error(`generated host ${input.row.host} delegated more than once`);
+      cliResult = await invokeCli(argv);
+      return cliResult;
+    },
+  );
+  if (cliCalls !== 1) throw new Error(`generated host ${input.row.host} bypassed CLI admission`);
+  if (delegated !== cliResult) {
+    throw new Error(`generated host ${input.row.host} changed the CLI admission result`);
+  }
+  return delegated ? "admitted" : "refused";
+}
+
 /**
  * Behaviorally exercise every declared production admission route. The
  * caller injects admission and protected-operation seams, so CI can prove
@@ -193,47 +256,7 @@ export async function exerciseRequiredAdmissionRoutes(
       logicalOperationId: options.logicalOperationIdFor(row),
       approvedRoot: options.approvedRoot,
     };
-    const invokeCli = async (argv: readonly string[]): Promise<boolean> => {
-      if (argv.length !== 1 || argv[0] !== "1454") {
-        throw new Error(`generated host ${row.host ?? row.route} rewrote CLI argv`);
-      }
-      const admission = await deps.admit(input);
-      if (!admission.acknowledged) {
-        outcomes[row.route] = "refused";
-        return false;
-      }
-      if (
-        admission.operationKey !== input.operationKey ||
-        admission.logicalOperationId !== input.logicalOperationId ||
-        admission.approvedRoot !== input.approvedRoot
-      ) {
-        throw new Error(`admission identity/root mismatch for ${row.route}`);
-      }
-      await deps.protectedOperation(input);
-      outcomes[row.route] = "admitted";
-      return true;
-    };
-
-    if (row.class === "host") {
-      if (!row.host || !deps.delegateHost) {
-        throw new Error(`generated host route ${row.route} has no executable delegate`);
-      }
-      let cliCalls = 0;
-      const delegated = await deps.delegateHost(
-        { host: row.host, argv: ["1454"] },
-        async (argv) => {
-          cliCalls += 1;
-          if (cliCalls > 1) throw new Error(`generated host ${row.host} delegated more than once`);
-          return invokeCli(argv);
-        },
-      );
-      if (cliCalls !== 1) throw new Error(`generated host ${row.host} bypassed CLI admission`);
-      if (delegated !== (outcomes[row.route] === "admitted")) {
-        throw new Error(`generated host ${row.host} changed the CLI admission result`);
-      }
-    } else {
-      await invokeCli(["1454"]);
-    }
+    outcomes[row.route] = await row.execute(input, deps);
   }
   return outcomes;
 }

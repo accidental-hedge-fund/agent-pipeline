@@ -11,6 +11,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CANDIDATE_CORE_LOCKFILE_REL,
+  candidateReadyRecordPath,
   defaultPrepareCandidateEngineDeps,
   prepareCandidateEngine,
   revalidatePreparedCandidateEngineForSpawn,
@@ -22,6 +24,7 @@ import { parseExactGitSha } from "./ship-end-identity.ts";
 export const CANDIDATE_WORKTREE_PREFIX = "ship-candidate-";
 export const PIPELINE_TS_REL = path.join("core", "scripts", "pipeline.ts");
 export const LAUNCHER_REL = path.join("scripts", "pipeline-launcher.mjs");
+export const CANDIDATE_PROCESS_GUARD_REL = path.join("scripts", "candidate-process-guard.mjs");
 
 export interface CandidateEngine {
   engineRoot: string;
@@ -31,7 +34,60 @@ export interface CandidateEngine {
   /** Prepared proof is intentionally single-use at the spawn boundary. */
   revalidateBeforeSpawn?: () => CandidateEngineResult;
   /** Shared host-local lease held from final validation through process life. */
-  acquireProcessLock?: () => (() => void) | null;
+  acquireProcessLock?: () => CandidateProcessLease | null;
+}
+
+export const CANDIDATE_PROCESS_GUARD_ENV = {
+  required: "PIPELINE_CANDIDATE_PROCESS_GUARD",
+  root: "PIPELINE_CANDIDATE_PROCESS_ROOT",
+  sha: "PIPELINE_CANDIDATE_PROCESS_SHA",
+  readyRecord: "PIPELINE_CANDIDATE_PROCESS_READY_RECORD",
+  lockfileDigest: "PIPELINE_CANDIDATE_PROCESS_LOCKFILE_DIGEST",
+  processLock: "PIPELINE_CANDIDATE_PROCESS_LOCK",
+  processLockDigest: "PIPELINE_CANDIDATE_PROCESS_LOCK_DIGEST",
+} as const;
+
+export interface CandidateProcessGuardProof {
+  engineRoot: string;
+  commitSha: string;
+  readyRecordPath: string;
+  lockfileDigest: string;
+  processLockPath: string;
+  processLockDigest: string;
+}
+
+export interface CandidateProcessLease {
+  proof: CandidateProcessGuardProof;
+  release(): void;
+}
+
+/** Environment consumed by the candidate's child-side first-operation guard. */
+export function candidateProcessGuardEnv(
+  proof: CandidateProcessGuardProof,
+  source: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
+  return {
+    ...source,
+    [CANDIDATE_PROCESS_GUARD_ENV.required]: "1",
+    [CANDIDATE_PROCESS_GUARD_ENV.root]: proof.engineRoot,
+    [CANDIDATE_PROCESS_GUARD_ENV.sha]: proof.commitSha,
+    [CANDIDATE_PROCESS_GUARD_ENV.readyRecord]: proof.readyRecordPath,
+    [CANDIDATE_PROCESS_GUARD_ENV.lockfileDigest]: proof.lockfileDigest,
+    [CANDIDATE_PROCESS_GUARD_ENV.processLock]: proof.processLockPath,
+    [CANDIDATE_PROCESS_GUARD_ENV.processLockDigest]: proof.processLockDigest,
+  };
+}
+
+export function hasCandidateProcessGuardEnv(env: NodeJS.ProcessEnv | undefined): boolean {
+  return Boolean(
+    env?.[CANDIDATE_PROCESS_GUARD_ENV.required] === "1" &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.root] &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.sha] &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.readyRecord] &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.lockfileDigest] &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.processLock] &&
+    env[CANDIDATE_PROCESS_GUARD_ENV.processLockDigest]
+  );
 }
 
 export interface CandidateEngineConsumerRoute {
@@ -43,10 +99,14 @@ export interface CandidateEngineConsumerRoute {
   clean_before_bootstrap: true;
   clean_after_bootstrap: true;
   revalidate_before_spawn: true;
+  child_side_guard: true;
+  /** Executable production boundary used by this consumer. */
+  execute<T>(input: CandidateEngineStartInput<T>): Promise<CandidateEngineProcessResult<T>>;
 }
 
 const EXPECTED_CANDIDATE_ENGINE_CONSUMERS = [
-  "factory-release.pack-loop",
+  "factory-release.pack-loop.start",
+  "factory-release.pack-loop.resume",
   "factory-gate.hybrid-v2",
   "ship.stage-adapter",
 ] as const;
@@ -63,6 +123,9 @@ export const CANDIDATE_ENGINE_CONSUMERS: readonly CandidateEngineConsumerRoute[]
     clean_before_bootstrap: true as const,
     clean_after_bootstrap: true as const,
     revalidate_before_spawn: true as const,
+    child_side_guard: true as const,
+    execute: <T>(input: CandidateEngineStartInput<T>) =>
+      runBoundCandidateEngineProcess(consumer, input),
   }));
 
 export function candidateEngineConsumerInventoryGaps(
@@ -83,10 +146,12 @@ export function candidateEngineConsumerInventoryGaps(
       "clean_before_bootstrap",
       "clean_after_bootstrap",
       "revalidate_before_spawn",
+      "child_side_guard",
     ] as const) {
       if (route[proof] !== true) gaps.push(`${route.consumer} missing ${proof}`);
     }
     if (route.gate !== "resolve-and-prepare") gaps.push(`${route.consumer} bypasses resolve-and-prepare`);
+    if (typeof route.execute !== "function") gaps.push(`${route.consumer} missing executable boundary`);
   }
   for (const consumer of EXPECTED_CANDIDATE_ENGINE_CONSUMERS) {
     if (!seen.has(consumer)) gaps.push(`missing consumer ${consumer}`);
@@ -134,18 +199,14 @@ export function candidateEngineRuntimeBindingGaps(
     ) {
       gaps.push(`raw parent-only candidate revalidation in ${file}`);
     }
-    const canResolveCandidate = /\bresolveAndPrepareCandidateEngine\b/.test(source);
-    const refersToCandidateExecutable =
-      /\.launcherPath\b|\bshipEndCliPrefix\s*\(|\bcandidateEngineDir\b/.test(source);
-    const canStartProcess =
-      /\b(?:spawn|spawnSync|execFile|execFileSync|runCommand|runProbe)\s*\(/.test(source);
-    if (
-      file !== "ship-end-candidate.ts" &&
-      (canResolveCandidate || refersToCandidateExecutable) &&
-      canStartProcess &&
-      !/\brunCandidateEngineProcess\s*\(/.test(source)
-    ) {
-      gaps.push(`raw candidate process start in ${file}`);
+    if (file !== "ship-end-candidate.ts") {
+      const directStarts = [
+        /\b(?:spawn|spawnSync|execFile|execFileSync)\s*\(\s*[^,\n;]{0,160}\.launcherPath\b/g,
+        /\b(?:spawn|spawnSync|execFile|execFileSync)\s*\(\s*[^,\n;]{0,160}candidateInvocation\.executable\b/g,
+      ];
+      if (directStarts.some((pattern) => pattern.test(source))) {
+        gaps.push(`raw candidate process start in ${file}`);
+      }
     }
   }
   for (const consumer of EXPECTED_CANDIDATE_ENGINE_CONSUMERS) {
@@ -204,6 +265,7 @@ function engineRootOk(
   if (!deps.fileExists(path.join(root, PIPELINE_TS_REL))) return null;
   const launcherPath = path.join(root, LAUNCHER_REL);
   if (!deps.fileExists(launcherPath)) return null;
+  if (!deps.fileExists(path.join(root, CANDIDATE_PROCESS_GUARD_REL))) return null;
   const head = parseExactGitSha(deps.revParseHead(root));
   if (head !== wantSha) return null;
   const porcelain = deps.porcelain(root);
@@ -351,11 +413,27 @@ export async function resolveAndPrepareCandidateEngine(
         if (!d.writeText(lockPath, body, "wx")) return null;
       }
       if (!d.statePathTrusted(lockPath) || d.readText(lockPath) !== body) return null;
-      return () => {
-        if (d.statePathTrusted(lockPath) && d.readText(lockPath) === body) {
-          d.remove(lockPath);
-        }
-      };
+      try {
+        const lockfileDigest = d.digest(d.readFile(path.join(engine.engineRoot, CANDIDATE_CORE_LOCKFILE_REL)));
+        return {
+          proof: {
+            engineRoot: engine.engineRoot,
+            commitSha: engine.commitSha,
+            readyRecordPath: candidateReadyRecordPath(engine.engineRoot, engine.commitSha, stateDir),
+            lockfileDigest,
+            processLockPath: lockPath,
+            processLockDigest: createHash("sha256").update(body).digest("hex"),
+          },
+          release: () => {
+            if (d.statePathTrusted(lockPath) && d.readText(lockPath) === body) {
+              d.remove(lockPath);
+            }
+          },
+        };
+      } catch {
+        if (d.statePathTrusted(lockPath) && d.readText(lockPath) === body) d.remove(lockPath);
+        return null;
+      }
     },
   });
   return { ok: true, engine: bindRevalidation(prepared.engine) };
@@ -365,6 +443,11 @@ export type CandidateEngineProcessResult<T> =
   | { ok: true; value: T; engine: CandidateEngine }
   | { ok: false; error: string; kind?: CandidateEngineFailureKind };
 
+export interface CandidateEngineStartInput<T> {
+  engine: CandidateEngine;
+  start: (engine: CandidateEngine, childEnv: NodeJS.ProcessEnv) => Promise<T>;
+}
+
 /**
  * The sole candidate-process start boundary. Revalidation happens inside the
  * start operation, after all caller bookkeeping, and the prepared proof is
@@ -373,18 +456,30 @@ export type CandidateEngineProcessResult<T> =
 export async function runCandidateEngineProcess<T>(input: {
   consumer: CandidateEngineConsumer;
   engine: CandidateEngine;
-  start: (engine: CandidateEngine) => Promise<T>;
+  start: (engine: CandidateEngine, childEnv: NodeJS.ProcessEnv) => Promise<T>;
 }): Promise<CandidateEngineProcessResult<T>> {
-  assertCandidateEngineConsumerRoute(input.consumer);
-  if (input.engine.consumer !== input.consumer) {
+  const route = CANDIDATE_ENGINE_CONSUMERS.find((row) => row.consumer === input.consumer);
+  if (!route) {
+    assertCandidateEngineConsumerRoute(input.consumer);
+    throw new Error(`candidate-engine consumer has no executable boundary: ${input.consumer}`);
+  }
+  return route.execute({ engine: input.engine, start: input.start });
+}
+
+async function runBoundCandidateEngineProcess<T>(
+  consumer: CandidateEngineConsumer,
+  input: CandidateEngineStartInput<T>,
+): Promise<CandidateEngineProcessResult<T>> {
+  assertCandidateEngineConsumerRoute(consumer);
+  if (input.engine.consumer !== consumer) {
     return {
       ok: false,
       kind: "identity",
-      error: `candidate engine proof belongs to ${input.engine.consumer ?? "no consumer"}, not ${input.consumer}`,
+      error: `candidate engine proof belongs to ${input.engine.consumer ?? "no consumer"}, not ${consumer}`,
     };
   }
-  const release = input.engine.acquireProcessLock?.() ?? null;
-  if (!release) {
+  const lease = input.engine.acquireProcessLock?.() ?? null;
+  if (!lease) {
     return { ok: false, kind: "lock", error: "candidate process-start lock is unavailable" };
   }
   try {
@@ -392,14 +487,14 @@ export async function runCandidateEngineProcess<T>(input: {
     if (!checked.ok) return checked;
     // Invoke the process-start seam in the same turn as the synchronous final
     // check while retaining the shared lease through process completion.
-    const started = input.start(checked.engine);
+    const started = input.start(checked.engine, candidateProcessGuardEnv(lease.proof));
     return {
       ok: true,
       value: await started,
       engine: checked.engine,
     };
   } finally {
-    release();
+    lease.release();
   }
 }
 

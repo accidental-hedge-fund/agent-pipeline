@@ -243,6 +243,7 @@ export interface RealShipCoordinatorDepsOptions {
   spawnEnsureTag?: (
     engine: CandidateEngine,
     opts: { version: string; mergeCommitOid: string; packedCandidate: string },
+    childEnv: NodeJS.ProcessEnv,
   ) => Promise<void>;
   factoryReleaseRequestPath?: string;
   /** Persist or resume the ship-bound factory-release request JSON. */
@@ -1521,6 +1522,7 @@ export interface CandidateShipEndContext {
   spawnEnsureTag?(
     engine: CandidateEngine,
     opts: { version: string; mergeCommitOid: string; packedCandidate: string },
+    childEnv: NodeJS.ProcessEnv,
   ): Promise<void>;
   delay?(ms: number): Promise<void>;
   frgWaitAttempts?: number;
@@ -1557,10 +1559,10 @@ async function spawnLeaf(
   const started = await runCandidateEngineProcess({
     consumer: "ship.stage-adapter",
     engine,
-    start: async (checked) => {
+    start: async (checked, childEnv) => {
       const argv = [...shipEndCliPrefix(checked, ctx.nodeBin ?? "node"), ...leaf];
       assertShipEndLeafArgv(argv);
-      return ctx.spawn(argv, env);
+      return ctx.spawn(argv, { ...env, ...childEnv });
     },
   });
   if (!started.ok) {
@@ -2427,11 +2429,15 @@ export function bindCandidateShipEndOperations(
         const started = await runCandidateEngineProcess({
           consumer: "ship.stage-adapter",
           engine,
-          start: (checked) => ctx.spawnEnsureTag!(checked, {
-            version: intent.version,
-            mergeCommitOid: release.merge_commit_oid,
-            packedCandidate: release.candidate_head_oid,
-          }),
+          start: (checked, childEnv) => ctx.spawnEnsureTag!(
+            checked,
+            {
+              version: intent.version,
+              mergeCommitOid: release.merge_commit_oid,
+              packedCandidate: release.candidate_head_oid,
+            },
+            childEnv,
+          ),
         });
         if (!started.ok) {
           throw candidateReadinessError(started.kind === "lock" ? "lock" : "readiness", started.error);

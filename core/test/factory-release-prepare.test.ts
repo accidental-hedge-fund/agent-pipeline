@@ -83,6 +83,7 @@ import {
   uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
 } from "../scripts/operation-reliability.ts";
+import { candidateProcessGuardEnv } from "../scripts/ship-end-candidate.ts";
 
 const MANIFEST_SHA = "a".repeat(64);
 const CANDIDATE = "b".repeat(40);
@@ -2566,14 +2567,35 @@ function testInvocation(loopRunId: string, sha = CANDIDATE): CandidateInvocation
   });
 }
 
+function testCandidateEnv(): NodeJS.ProcessEnv {
+  return candidateProcessGuardEnv({
+    engineRoot: "/candidate-engine",
+    commitSha: CANDIDATE,
+    readyRecordPath: "/state/ready.json",
+    lockfileDigest: "d".repeat(64),
+    processLockPath: "/state/process.lock",
+    processLockDigest: "f".repeat(64),
+  });
+}
+
 function preparedCandidateResolver() {
-  return async () => {
+  return async (input: { consumer: "factory-release.pack-loop.start" | "factory-release.pack-loop.resume" }) => {
     const engine = {
       engineRoot: "/candidate-engine",
       launcherPath: CANDIDATE_LAUNCHER,
       commitSha: CANDIDATE,
-      consumer: "factory-release.pack-loop" as const,
-      acquireProcessLock: () => () => {},
+      consumer: input.consumer,
+      acquireProcessLock: () => ({
+        proof: {
+          engineRoot: "/candidate-engine",
+          commitSha: CANDIDATE,
+          readyRecordPath: "/state/ready.json",
+          lockfileDigest: "d".repeat(64),
+          processLockPath: "/state/process.lock",
+          processLockDigest: "f".repeat(64),
+        },
+        release() {},
+      }),
       revalidateBeforeSpawn: () => ({ ok: true as const, engine }),
     };
     return { ok: true as const, engine };
@@ -2733,6 +2755,7 @@ test("resume spawn strips FRG signing vars from the candidate loop environment",
       repoDir: "/repo",
       loop_run_id: "loop-env-resume",
       candidateInvocation: testInvocation("loop-env-resume"),
+      candidateEnv: testCandidateEnv(),
       requestCandidateSha: CANDIDATE,
     },
     {
@@ -2772,6 +2795,7 @@ test("pack-loop spawn execs the candidate launcher, not PATH pipeline, when PIPE
       repoDir: "/repo",
       loop_run_id: "loop-mixed-binary",
       candidateInvocation: invocation,
+      candidateEnv: testCandidateEnv(),
       requestCandidateSha: CANDIDATE,
     },
     {
@@ -2796,6 +2820,27 @@ test("missing candidate invocation fails closed and does not exec PATH pipeline"
       ),
     /missing typed candidate invocation/,
   );
+});
+
+test("raw pack-loop consumer cannot spawn without an executable process-boundary proof (#1454)", async () => {
+  let spawned = false;
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-unregistered-consumer",
+      candidateInvocation: testInvocation("loop-unregistered-consumer"),
+    },
+    {
+      fileExists: () => true,
+      spawn: (() => {
+        spawned = true;
+        throw new Error("must not spawn");
+      }) as never,
+    },
+  );
+  assert.equal(result.dispatch_state, "bound");
+  assert.match(result.last_error ?? "", /missing child-side candidate process proof/);
+  assert.equal(spawned, false);
 });
 
 test("pre-handoff child exit 1 persists failed and surfaces stderr", async () => {
@@ -2833,6 +2878,7 @@ test("pre-handoff child exit 1 persists failed and surfaces stderr", async () =>
       repoDir: "/repo",
       loop_run_id: "loop-pre-handoff",
       candidateInvocation: testInvocation("loop-pre-handoff"),
+      candidateEnv: testCandidateEnv(),
       requestCandidateSha: CANDIDATE,
     },
     {
@@ -2867,6 +2913,7 @@ test("OS spawn throw leaves dispatch_state bound", async () => {
       repoDir: "/repo",
       loop_run_id: "loop-enoent",
       candidateInvocation: testInvocation("loop-enoent"),
+      candidateEnv: testCandidateEnv(),
       requestCandidateSha: CANDIDATE,
     },
     {
@@ -2888,6 +2935,7 @@ test("handoff SHA mismatch fails closed", async () => {
       repoDir: "/repo",
       loop_run_id: "loop-sha-mismatch",
       candidateInvocation: testInvocation("loop-sha-mismatch"),
+      candidateEnv: testCandidateEnv(),
       requestCandidateSha: CANDIDATE,
     },
     {
@@ -2945,6 +2993,7 @@ test("malformed handoff stops a still-running child before return", async () => 
       repoDir: "/repo",
       loop_run_id: "loop-malformed-running",
       candidateInvocation: testInvocation("loop-malformed-running"),
+      candidateEnv: testCandidateEnv(),
       requestCandidateSha: CANDIDATE,
     },
     {
@@ -3067,6 +3116,7 @@ test("resume OS accept persists starting so a later invoke does not spawn a seco
       fileExists: fsOps.fileExists,
       reconcilePackLoop: async () => boundLoopArtifacts({ loop_run_id: loopRunId }),
       probePackLoopLiveness: async () => deadPid,
+      resolveCandidateEngine: preparedCandidateResolver() as never,
       createOrReusePackIssues: async () => {
         throw new Error("must not create pack issues during resume");
       },

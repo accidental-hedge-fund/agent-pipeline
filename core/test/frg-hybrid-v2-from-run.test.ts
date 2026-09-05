@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   defaultCollectHybridV2FromRun,
+  defaultRunLayerAProbe,
   githubItemObservationsFromLiveIssues,
   overlayLedgerStateFromGitHub,
   resolvePackedCandidateIdentity,
@@ -25,13 +26,37 @@ const CANDIDATE_C = "6670cee2b2659bc8350e98c1a2a34b53299b995b";
 const CONTROL_REPO = "/control-repo";
 const CANDIDATE_ENGINE = "/candidate-engine";
 
+test("raw Layer A consumer cannot spawn without an executable process-boundary proof (#1454)", async () => {
+  await assert.rejects(
+    () => defaultRunLayerAProbe(
+      { id: "unregistered", test_file: "test/noop.test.ts", test_name: "noop" },
+      {
+        repoDir: CONTROL_REPO,
+        candidateGitSha: CANDIDATE_C,
+        candidateEngineDir: CANDIDATE_ENGINE,
+      } as never,
+    ),
+    /missing child-side candidate process proof/,
+  );
+});
+
 function fakeEngine(engineRoot: string, commitSha: string) {
   const engine: import("../scripts/ship-end-candidate.ts").CandidateEngine = {
     engineRoot,
     launcherPath: path.join(engineRoot, LAUNCHER_REL),
     commitSha,
     consumer: "factory-gate.hybrid-v2",
-    acquireProcessLock: () => () => {},
+    acquireProcessLock: () => ({
+      proof: {
+        engineRoot,
+        commitSha,
+        readyRecordPath: "/state/ready.json",
+        lockfileDigest: "d".repeat(64),
+        processLockPath: "/state/process.lock",
+        processLockDigest: "f".repeat(64),
+      },
+      release() {},
+    }),
     revalidateBeforeSpawn: () => ({ ok: true, engine }),
   };
   return {

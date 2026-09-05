@@ -99,6 +99,7 @@ import {
 } from "./fault-recovery-matrix.ts";
 import {
   defaultResolveAndPrepareDeps,
+  hasCandidateProcessGuardEnv,
   resolveAndPrepareCandidateEngine,
   runCandidateEngineProcess,
   type ResolveAndPrepareCandidateEngineDeps,
@@ -1890,6 +1891,7 @@ export type SpawnCandidateLoop = (args: {
   engineTrack: "candidate";
   label: string;
   candidateInvocation?: CandidateInvocation;
+  candidateEnv?: NodeJS.ProcessEnv;
 }) => Promise<void | PackLoopSpawnResult>;
 
 /**
@@ -2194,6 +2196,7 @@ export async function defaultSpawnCandidateLoop(
     loop_run_id: string;
     candidateInvocation?: CandidateInvocation;
     requestCandidateSha?: string;
+    candidateEnv?: NodeJS.ProcessEnv;
   },
   deps: SpawnCandidateLoopDeps = {},
 ): Promise<PackLoopSpawnResult> {
@@ -2202,8 +2205,15 @@ export async function defaultSpawnCandidateLoop(
   const fileExists = deps.fileExists ?? defaultFileExistsSync;
   const requestSha = args.requestCandidateSha ?? args.candidateInvocation?.candidateSha ?? "";
   const invocation = assertCandidateInvocation(args.candidateInvocation, requestSha, fileExists);
+  if (!hasCandidateProcessGuardEnv(args.candidateEnv)) {
+    return {
+      dispatch_state: "bound",
+      last_error: "pack-loop spawn refused: missing child-side candidate process proof",
+      spawn_attempt: { error_code: "candidate_guard_missing", at: isoNow(now()) },
+    };
+  }
   const spawnImpl = deps.spawn ?? ((await import("node:child_process")).spawn as unknown as CandidateLoopSpawn);
-  const childEnv = sanitizeCandidateLoopEnv(sourceEnv);
+  const childEnv = sanitizeCandidateLoopEnv({ ...sourceEnv, ...args.candidateEnv });
   childEnv[PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV] = invocation.candidateSha;
   let child: CandidateLoopChild;
   try {
@@ -2363,10 +2373,73 @@ export async function defaultResumeBoundPackLoop(
     loop_run_id: string;
     candidateInvocation?: CandidateInvocation;
     requestCandidateSha?: string;
+    candidateEnv?: NodeJS.ProcessEnv;
   },
   deps: SpawnCandidateLoopDeps = {},
 ): Promise<PackLoopSpawnResult> {
   return defaultSpawnCandidateLoop(args, deps);
+}
+
+/** Resume uses a fresh exact-candidate proof; a stored launcher identity alone never authorizes spawn. */
+export async function productionResumeBoundPackLoop(
+  args: {
+    repoDir: string;
+    loop_run_id: string;
+    candidateInvocation?: CandidateInvocation;
+    requestCandidateSha: string;
+  },
+  deps: {
+    resolveCandidate?: typeof resolveAndPrepareCandidateEngine;
+    resolveCandidateDeps?: ResolveAndPrepareCandidateEngineDeps;
+    spawnDeps?: SpawnCandidateLoopDeps;
+  } = {},
+): Promise<PackLoopSpawnResult> {
+  const resolved = await (deps.resolveCandidate ?? resolveAndPrepareCandidateEngine)(
+    {
+      repoDir: args.repoDir,
+      candidateSha: args.requestCandidateSha,
+      candidateEngineRootEnv: (deps.spawnDeps?.env ?? process.env).PIPELINE_CANDIDATE_ENGINE_ROOT,
+      consumer: "factory-release.pack-loop.resume",
+    },
+    deps.resolveCandidateDeps ?? defaultResolveAndPrepareDeps(),
+  );
+  if (!resolved.ok) {
+    return {
+      dispatch_state: "bound",
+      last_error: `pack-loop resume: ${resolved.error}`,
+      spawn_attempt: { error_code: "candidate_not_ready", at: isoNow(deps.spawnDeps?.now?.() ?? new Date()) },
+    };
+  }
+  const invocation = freezeCandidateInvocation({
+    executable: resolved.engine.launcherPath,
+    loopRunId: args.loop_run_id,
+    candidateSha: resolved.engine.commitSha,
+  });
+  if (args.candidateInvocation && (
+    args.candidateInvocation.executable !== invocation.executable ||
+    JSON.stringify(args.candidateInvocation.argv) !== JSON.stringify(invocation.argv) ||
+    args.candidateInvocation.candidateSha !== invocation.candidateSha
+  )) {
+    return {
+      dispatch_state: "bound",
+      last_error: "pack-loop resume: stored invocation does not match the freshly prepared candidate",
+      spawn_attempt: { error_code: "candidate_identity_mismatch", at: isoNow(deps.spawnDeps?.now?.() ?? new Date()) },
+    };
+  }
+  const started = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: resolved.engine,
+    start: (_checked, candidateEnv) => defaultResumeBoundPackLoop(
+      { ...args, candidateInvocation: invocation, candidateEnv },
+      deps.spawnDeps,
+    ),
+  });
+  if (started.ok) return started.value;
+  return {
+    dispatch_state: "bound",
+    last_error: `pack-loop resume: ${started.error}`,
+    spawn_attempt: { error_code: started.kind ?? "candidate_not_ready", at: isoNow(deps.spawnDeps?.now?.() ?? new Date()) },
+  };
 }
 
 async function persistSpawnResult(
@@ -2585,7 +2658,7 @@ export async function productionDispatchPackLoop(
       repoDir: input.repoDir,
       candidateSha: input.request.integrated_candidate.git_sha,
       candidateEngineRootEnv: (deps.env ?? process.env).PIPELINE_CANDIDATE_ENGINE_ROOT,
-      consumer: "factory-release.pack-loop",
+      consumer: "factory-release.pack-loop.start",
     },
     deps.resolveCandidateDeps ?? defaultResolveAndPrepareDeps(),
   );
@@ -2636,6 +2709,7 @@ export async function productionDispatchPackLoop(
           repoDir: spawnArgs.repoDir,
           loop_run_id: spawnArgs.loop_run_id,
           candidateInvocation: spawnArgs.candidateInvocation ?? invocation,
+          candidateEnv: spawnArgs.candidateEnv,
           requestCandidateSha: input.request.integrated_candidate.git_sha,
         },
         {
@@ -2653,15 +2727,16 @@ export async function productionDispatchPackLoop(
   let spawnResult: void | PackLoopSpawnResult;
   try {
     const started = await runCandidateEngineProcess({
-      consumer: "factory-release.pack-loop",
+      consumer: "factory-release.pack-loop.start",
       engine: resolved.engine,
-      start: () => spawn({
+      start: (_checked, candidateEnv) => spawn({
         repoDir: input.repoDir,
         loop_run_id,
         issue_numbers: input.issue_numbers,
         engineTrack: "candidate",
         label: input.label,
         candidateInvocation: invocation,
+        candidateEnv,
       }),
     });
     if (!started.ok) throw new Error(`pack-loop dispatch: ${started.error}`);
@@ -3133,7 +3208,7 @@ export async function generateDurableUnsignedFrg(
       loop_run_id: string;
       candidateInvocation?: CandidateInvocation;
     }) =>
-      defaultResumeBoundPackLoop(
+      productionResumeBoundPackLoop(
         {
           repoDir: args.repoDir,
           loop_run_id: args.loop_run_id,
@@ -3141,17 +3216,20 @@ export async function generateDurableUnsignedFrg(
           requestCandidateSha: request.integrated_candidate.git_sha,
         },
         {
-          ...opts.spawnDeps,
-          now: opts.spawnDeps?.now ?? now,
-          writeFile: opts.spawnDeps?.writeFile ?? writeFile,
-          onAccepted: async (info) => {
-            await persistPackLoopOsAccepted(
-              reconcileCtx,
-              args.loop_run_id,
-              info,
-              args.candidateInvocation,
-            );
-            if (opts.spawnDeps?.onAccepted) await opts.spawnDeps.onAccepted(info);
+          resolveCandidate: opts.resolveCandidateEngine,
+          spawnDeps: {
+            ...opts.spawnDeps,
+            now: opts.spawnDeps?.now ?? now,
+            writeFile: opts.spawnDeps?.writeFile ?? writeFile,
+            onAccepted: async (info) => {
+              await persistPackLoopOsAccepted(
+                reconcileCtx,
+                args.loop_run_id,
+                info,
+                args.candidateInvocation,
+              );
+              if (opts.spawnDeps?.onAccepted) await opts.spawnDeps.onAccepted(info);
+            },
           },
         },
       ));

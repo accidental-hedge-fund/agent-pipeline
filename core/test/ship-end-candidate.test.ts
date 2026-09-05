@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import {
+  CANDIDATE_PROCESS_GUARD_REL,
   assertShipEndLeafArgv,
   attestorChildEnv,
   hmacVerifyChildEnv,
@@ -35,6 +36,7 @@ function deps(opts: {
         const files = st.files ?? [
           path.join(root, "core/scripts/pipeline.ts"),
           path.join(root, "scripts/pipeline-launcher.mjs"),
+          path.join(root, CANDIDATE_PROCESS_GUARD_REL),
         ];
         if (files.includes(p)) return true;
       }

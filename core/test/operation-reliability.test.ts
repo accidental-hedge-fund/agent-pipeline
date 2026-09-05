@@ -2,8 +2,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   REQUIRED_LIFECYCLE_CLASSES_1333,
@@ -25,6 +27,48 @@ import {
 import { SKILL_HOST_IDS } from "../scripts/host-skill.ts";
 
 const CORE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const REPO_ROOT = path.resolve(CORE_ROOT, "..");
+
+async function executeGeneratedHostNumericDrive(
+  host: (typeof SKILL_HOST_IDS)[number],
+  invokeCli: (argv: readonly string[]) => Promise<boolean>,
+): Promise<boolean> {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), `pipeline-admission-host-${host}-`));
+  try {
+    const manifest = JSON.parse(fs.readFileSync(
+      path.join(REPO_ROOT, "hosts", host, "outer-host.manifest.json"),
+      "utf8",
+    )) as { profileDefault: string };
+    const scriptsDir = path.join(temp, "scripts");
+    const coreScripts = path.join(temp, "core", "scripts");
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    fs.mkdirSync(coreScripts, { recursive: true });
+    fs.mkdirSync(path.join(temp, "core", "node_modules"), { recursive: true });
+    fs.mkdirSync(path.join(temp, "tmp"), { recursive: true });
+    const template = fs.readFileSync(path.join(REPO_ROOT, "hosts", "_shared", "entry.template.mjs"), "utf8");
+    const launcher = path.join(scriptsDir, "pipeline.mjs");
+    fs.writeFileSync(launcher, template.replaceAll("__PROFILE__", manifest.profileDefault));
+    fs.copyFileSync(
+      path.join(REPO_ROOT, "scripts", "ensure-engines-node.mjs"),
+      path.join(scriptsDir, "ensure-engines-node.mjs"),
+    );
+    fs.writeFileSync(path.join(temp, "core", "package.json"), JSON.stringify({ version: "0.0.0-test" }));
+    fs.writeFileSync(
+      path.join(coreScripts, "pipeline.ts"),
+      "console.log(JSON.stringify(process.argv.slice(2)));\n",
+    );
+    const result = spawnSync(process.execPath, [launcher, "1454"], {
+      encoding: "utf8",
+      env: { ...process.env, TMPDIR: path.join(temp, "tmp") },
+    });
+    assert.equal(result.status, 0, `${host} generated launcher failed: ${result.stderr}`);
+    const forwarded = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1) ?? "null") as string[];
+    assert.deepEqual(forwarded, ["1454", "--profile", manifest.profileDefault]);
+    return invokeCli([forwarded[0]!]);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+}
 
 import {
   computeFrgEvidence,
@@ -59,6 +103,14 @@ test("required admission route inventory is exact and hard-gated (#1454)", () =>
     row.route === "single.direct" ? { ...row, boundary: "" } : row,
   ) as never;
   assert.throws(() => assertAdmissionRouteInventoryComplete(nameOnly), /bypasses admission/);
+
+  const declarationOnly = REQUIRED_ADMISSION_ROUTES.map((row) =>
+    row.route === "loop.resume" ? { ...row, execute: undefined } : row,
+  ) as never;
+  assert.throws(
+    () => assertAdmissionRouteInventoryComplete(declarationOnly),
+    /route loop\.resume missing executable binding/,
+  );
 });
 
 test("production admission routes behaviorally cross admission before protected work (#1454)", async () => {
@@ -80,7 +132,7 @@ test("production admission routes behaviorally cross admission before protected 
       },
       delegateHost: async (input, invokeCli) => {
         events.push(`host:${input.host}`);
-        return invokeCli(input.argv);
+        return executeGeneratedHostNumericDrive(input.host, invokeCli);
       },
     },
     {
@@ -99,7 +151,7 @@ test("production admission routes behaviorally cross admission before protected 
     [...SKILL_HOST_IDS].sort(),
   );
   for (const host of SKILL_HOST_IDS) {
-    const generated = readFileSync(path.join(CORE_ROOT, "..", "hosts", host, "SKILL.md"), "utf8");
+    const generated = fs.readFileSync(path.join(CORE_ROOT, "..", "hosts", host, "SKILL.md"), "utf8");
     assert.match(generated, /Host SKILL for the `pipeline` CLI/);
     assert.match(generated, /`pipeline <N>` starts the durable\s+one-item drive/);
   }

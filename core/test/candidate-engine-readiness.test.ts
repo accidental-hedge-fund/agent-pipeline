@@ -3,6 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +18,7 @@ import {
   type PrepareCandidateEngineDeps,
 } from "../scripts/candidate-engine-readiness.ts";
 import {
+  CANDIDATE_PROCESS_GUARD_REL,
   CANDIDATE_ENGINE_CONSUMERS,
   assertCandidateEngineConsumerInventoryComplete,
   candidateEngineConsumerInventoryGaps,
@@ -29,6 +31,7 @@ import {
   type ResolveCandidateEngineDeps,
 } from "../scripts/ship-end-candidate.ts";
 import { BLOCKER_KINDS } from "../scripts/types.ts";
+import { verifyCandidateProcessGuard } from "../../scripts/candidate-process-guard.mjs";
 
 const SHA = "b".repeat(40);
 const OTHER = "d".repeat(40);
@@ -36,6 +39,20 @@ const LOCKFILE_V1 = Buffer.from('{"lockfileVersion":1,"v":"one"}');
 const LOCKFILE_V2 = Buffer.from('{"lockfileVersion":1,"v":"two"}');
 const DIGEST_V1 = "d1-lock";
 const DIGEST_V2 = "d2-lock";
+
+function fakeProcessLease() {
+  return {
+    proof: {
+      engineRoot: "/candidate",
+      commitSha: SHA,
+      readyRecordPath: "/state/ready.json",
+      lockfileDigest: DIGEST_V1,
+      processLockPath: "/state/process.lock",
+      processLockDigest: "f".repeat(64),
+    },
+    release() {},
+  };
+}
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
@@ -68,16 +85,16 @@ test("candidate-engine consumer inventory is exact and hard-gated (#1454)", () =
   assert.deepEqual(candidateEngineConsumerInventoryGaps(), []);
   assert.throws(
     () => assertCandidateEngineConsumerInventoryComplete(
-      CANDIDATE_ENGINE_CONSUMERS.filter((row) => row.consumer !== "factory-release.pack-loop"),
+      CANDIDATE_ENGINE_CONSUMERS.filter((row) => row.consumer !== "factory-release.pack-loop.start"),
     ),
-    /missing consumer factory-release\.pack-loop/,
+    /missing consumer factory-release\.pack-loop\.start/,
   );
   const bypass = CANDIDATE_ENGINE_CONSUMERS.map((row) =>
-    row.consumer === "ship.stage-adapter" ? { ...row, revalidate_before_spawn: false } : row,
+    row.consumer === "ship.stage-adapter" ? { ...row, child_side_guard: false } : row,
   ) as never;
   assert.throws(
     () => assertCandidateEngineConsumerInventoryComplete(bypass),
-    /ship\.stage-adapter missing revalidate_before_spawn/,
+    /ship\.stage-adapter missing child_side_guard/,
   );
 });
 
@@ -101,6 +118,16 @@ test("candidate-engine hard gate discovers and exercises every production proces
     ],
   );
 
+  const hiddenAlongsideAValidConsumer = {
+    ...sources,
+    "stages/ship-adapter.ts": `${sources["stages/ship-adapter.ts"]}\nspawn(candidate.engine.launcherPath);`,
+  };
+  assert.ok(
+    candidateEngineRuntimeBindingGaps(hiddenAlongsideAValidConsumer)
+      .includes("raw candidate process start in stages/ship-adapter.ts"),
+    "a raw new spawn in a file that already has a valid consumer must still fail the hard gate",
+  );
+
   for (const row of CANDIDATE_ENGINE_CONSUMERS) {
     let starts = 0;
     const engine = {
@@ -108,18 +135,17 @@ test("candidate-engine hard gate discovers and exercises every production proces
       launcherPath: "/candidate/scripts/pipeline-launcher.mjs",
       commitSha: SHA,
       consumer: row.consumer,
-      acquireProcessLock: () => () => {},
+      acquireProcessLock: fakeProcessLease,
       revalidateBeforeSpawn: () => ({ ok: true as const, engine: {
         engineRoot: "/candidate",
         launcherPath: "/candidate/scripts/pipeline-launcher.mjs",
         commitSha: SHA,
         consumer: row.consumer,
-        acquireProcessLock: () => () => {},
+        acquireProcessLock: fakeProcessLease,
         revalidateBeforeSpawn: () => { throw new Error("single boundary validation only"); },
       } }),
     };
-    const result = await runCandidateEngineProcess({
-      consumer: row.consumer,
+    const result = await row.execute({
       engine,
       start: async () => ++starts,
     });
@@ -162,6 +188,7 @@ function defaultFiles(root: string): string[] {
   return [
     path.join(root, "core/scripts/pipeline.ts"),
     path.join(root, "scripts/pipeline-launcher.mjs"),
+    path.join(root, CANDIDATE_PROCESS_GUARD_REL),
     path.join(root, CANDIDATE_CORE_LOCKFILE_REL),
   ];
 }
@@ -469,6 +496,64 @@ test("candidate movement after an earlier parent check is refused inside the pro
   assert.equal(h.spawned.length, 0);
 });
 
+test("candidate movement after final parent validation is refused by the child-side guard (#1454)", async () => {
+  const engineRoot = "/candidate";
+  const lockfile = Buffer.from("candidate lockfile");
+  const lockfileDigest = createHash("sha256").update(lockfile).digest("hex");
+  const processLock = Buffer.from("held candidate process lease");
+  const proof = {
+    engineRoot,
+    commitSha: SHA,
+    readyRecordPath: "/state/ready.json",
+    lockfileDigest,
+    processLockPath: "/state/process.lock",
+    processLockDigest: createHash("sha256").update(processLock).digest("hex"),
+  };
+  let head = SHA;
+  let candidateStarts = 0;
+  const engine = {
+    engineRoot,
+    launcherPath: path.join(engineRoot, "scripts", "pipeline-launcher.mjs"),
+    commitSha: SHA,
+    consumer: "ship.stage-adapter" as const,
+    acquireProcessLock: () => ({ proof, release() {} }),
+    revalidateBeforeSpawn: () => ({ ok: true as const, engine }),
+  };
+
+  const started = await runCandidateEngineProcess({
+    consumer: "ship.stage-adapter",
+    engine,
+    start: async (_checked, childEnv) => {
+      head = OTHER; // The reviewed race: movement after the parent's final check.
+      const guarded = verifyCandidateProcessGuard(childEnv, {
+        realpath: (p: string) => p === engineRoot
+          ? engineRoot
+          : p.endsWith("candidate-process-guard.mjs")
+            ? path.join(engineRoot, CANDIDATE_PROCESS_GUARD_REL)
+            : p,
+        readFile: (p: string) => {
+          if (p === proof.processLockPath) return processLock;
+          if (p === proof.readyRecordPath) return Buffer.from(JSON.stringify({
+            schema: READY_RECORD_SCHEMA,
+            engineRoot,
+            commitSha: SHA,
+            lockfileDigest,
+          }));
+          if (p === path.join(engineRoot, CANDIDATE_CORE_LOCKFILE_REL)) return lockfile;
+          throw new Error(`unexpected guard read ${p}`);
+        },
+        git: (_root: string, args: string[]) => args[0] === "status" ? "" : `${head}\n`,
+      });
+      if (guarded.ok) candidateStarts += 1;
+      return guarded.ok ? 0 : 78;
+    },
+  });
+
+  assert.equal(started.ok, true);
+  if (started.ok) assert.equal(started.value, 78);
+  assert.equal(candidateStarts, 0);
+});
+
 test("candidate process lock trusts its private parent before exclusively creating the lock (#1454)", async () => {
   const repo = "/repo";
   const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
@@ -684,6 +769,7 @@ test("missing nested lockfile fails closed with no spawn", async () => {
         files: [
           path.join(repo, "core/scripts/pipeline.ts"),
           path.join(repo, "scripts/pipeline-launcher.mjs"),
+          path.join(repo, CANDIDATE_PROCESS_GUARD_REL),
         ],
       },
     },
