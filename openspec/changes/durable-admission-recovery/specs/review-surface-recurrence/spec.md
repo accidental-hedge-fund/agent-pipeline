@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: A settled-surface evidence rule SHALL distinguish recurrence from a newly discovered defect
 
