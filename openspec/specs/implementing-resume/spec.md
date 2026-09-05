@@ -7,57 +7,43 @@ TBD - created by archiving change implementing-resume. Update Purpose after arch
 
 ### Requirement: implementing stage is resumable when commits exist in the worktree
 
-When the orchestrator dispatches stage `implementing` at the start of a run, it SHALL first consult the repo-stable live-planning marker for the issue. If a live process owns the marker, the dispatcher SHALL return a `waiting` outcome naming that owner without inspecting or mutating the worktree. Otherwise it SHALL reconcile durable harness mutation ownership and the current candidate epoch before deciding whether implementation is complete.
+When the orchestrator dispatches stage `implementing` at the start of a run (re-entry, not mid-flight), it SHALL first consult the repo-stable live-planning marker for the issue. If a live process owns the marker, the dispatcher SHALL return a `waiting` outcome whose reason names the live concurrent owner. Otherwise it SHALL check durable harness mutation ownership for an interrupted incomplete implement attempt (see `harness-mutation-ownership`). When ownership shows owned leftovers or an in-flight implement attempt whose holder is dead, the dispatcher SHALL NOT treat commits ahead of base as sufficient to skip the implementer. It SHALL checkpoint owned leftovers when present. After checkpoint, if unknown product dirt remains, the dispatcher SHALL set the established unknown-dirt block and SHALL NOT re-invoke the implementer or resume post-implementation steps. Otherwise it SHALL either re-invoke the implementer when the deliverable is unsatisfied, or, only when the shared implement-deliverable contract reports satisfied and the worktree is clean of unknown product dirt, resume post-implementation steps.
 
-Commits ahead of base SHALL be provenance only. The dispatcher SHALL resume the post-implementation sequence only when the shared implement-deliverable observer proves the exact current candidate contains the required product implementation and identifies that evidence as implementation rather than planning. A planning artifact, planning-only salvage or checkpoint commit, merged planning/specification PR, process exit, local ledger state, label, or comment SHALL NOT satisfy that proof. When product implementation is not proved and the worktree can be safely reused, RecoverySupervisor SHALL retain ownership and schedule or invoke the implementation harness for the current epoch. Unknown product dirt and failed ownership checkpointing SHALL retain their existing fail-closed behavior. When no reusable candidate exists, RecoverySupervisor MAY reconstruct the stage through the established restart-from-ready treatment.
+If no live process owns the marker, no interrupted incomplete implement attempt is current, and an existing worktree for the issue has commits ahead of the base branch, it SHALL resume the post-implementation steps — test gate → push → open-or-find PR → transition `implementing → review-1` — without re-planning or re-implementing. If no live process owns the marker AND no worktree with commits exists AND no interrupted owned leftovers remain to checkpoint, the issue is crash-stranded and the dispatcher SHALL restart the planning arc from `ready` (see the crash-stranded recovery requirement) rather than returning `waiting`.
+
+The liveness check SHALL run before the commits-ahead check so that a live cross-domain implementer is never resume-raced.
 
 #### Scenario: re-entry with commits — advances to review-1
 
-- **WHEN** a pipeline run re-enters `implementing` with no live owner
-- **AND** the exact current candidate is ahead of base and authoritatively satisfies the product implementation postcondition
-- **AND** ownership reconciliation and cleanliness checks pass
-- **THEN** the pipeline SHALL run the required post-implementation gates and publication sequence
-- **AND** SHALL NOT re-run planning or implementation solely to manufacture another commit
-
-#### Scenario: reused implementation PR is bound to the admitted operation
-
-- **WHEN** the publication sequence reuses an existing or concurrently created implementation PR
-- **THEN** it SHALL verify the PR body is bound to the admitted Logical Operation
-- **AND** when the binding is absent it SHALL append the marker and confirm it by re-reading the PR
-- **AND** a conflicting or unconfirmed binding SHALL remain RecoverySupervisor-owned and SHALL NOT transition toward review
-
-#### Scenario: Planning-only commit invokes implementation
-
-- **WHEN** a salvaged or ordinary commit ahead of base contains only the accepted OpenSpec or other planning artifact
-- **AND** no exact-candidate product implementation postcondition is proved
-- **THEN** the pipeline SHALL NOT resume post-implementation, open an implementation PR, or transition to design or review
-- **AND** RecoverySupervisor SHALL retain ownership and invoke or schedule the implementation harness
+- **WHEN** a pipeline run starts with the current stage resolved as `implementing`
+- **AND** no live process owns the repo-stable live-planning marker for the issue
+- **AND** a worktree exists for the issue with at least one commit ahead of `cfg.base_branch`
+- **AND** durable ownership does not show an interrupted incomplete implement attempt with owned leftovers
+- **AND** the issue does not carry the `blocked` label
+- **THEN** the pipeline SHALL run the test gate, push the branch, create or find the PR, and transition the issue to `review-1`
+- **AND** SHALL NOT re-invoke the planning or implementing harness
 
 #### Scenario: re-entry with a live owner — returns waiting (no resume race)
 
-- **WHEN** the repo-stable live-planning marker records a live owner for the issue
-- **THEN** the dispatcher SHALL return an owned `waiting` outcome
-- **AND** SHALL NOT inspect the worktree, resume post-implementation, roll back the label, or restart planning
-
-#### Scenario: Unknown product dirt stays fail closed
-
-- **WHEN** ownership reconciliation leaves unknown product dirt on the candidate
-- **THEN** the dispatcher SHALL NOT invoke a product-mutating harness or enter post-implementation publication
-- **AND** RecoverySupervisor SHALL retain the existing typed recovery ownership
+- **WHEN** a pipeline run starts with the current stage resolved as `implementing`
+- **AND** the repo-stable live-planning marker is present and its recorded PID is alive
+- **THEN** the dispatcher SHALL return `{ advanced: false, status: "waiting" }`
+- **AND** the `waiting` reason SHALL name the live concurrent owner rather than "nothing to do at this point"
+- **AND** SHALL NOT inspect the worktree, resume post-implementation steps, roll back the label, or restart planning
 
 #### Scenario: resume after unblock — test gate re-runs
 
-- **WHEN** a prior implementing attempt was blocked by the test gate
-- **AND** the exact current candidate now has authoritative implementation-role proof and the operator clears the compatibility block
-- **THEN** re-entry SHALL run the test gate again before publication
-- **AND** SHALL advance only when the current Candidate epoch passes
+- **WHEN** a prior run blocked at `implementing` due to a test-gate failure
+- **AND** the operator has fixed the failing tests and committed to the worktree branch
+- **AND** the operator runs `--unblock` followed by `/pipeline N`
+- **THEN** the pipeline SHALL re-enter the resume path, re-run the test gate, and advance to `review-1` if the gate passes
 
 #### Scenario: resume when gate still fails — re-blocks
 
-- **WHEN** implementing re-entry has authoritative current implementation proof
-- **AND** the test gate still fails
-- **THEN** the pipeline SHALL report the established test-gate failure under RecoverySupervisor ownership
-- **AND** SHALL NOT open a PR or transition toward review
+- **WHEN** the pipeline resumes at `implementing` with commits in the worktree
+- **AND** durable ownership does not show an interrupted incomplete implement attempt with owned leftovers
+- **AND** the test gate fails again on the resume attempt
+- **THEN** the pipeline SHALL call `setBlocked` with kind `test-gate-exhausted` and SHALL NOT open a PR or transition the stage
 
 ### Requirement: PR is created exactly once across the initial run and any resume runs
 
@@ -155,6 +141,25 @@ The post-implementation path SHALL, after creating or reusing the PR for issue N
 - **THEN** the path SHALL NOT transition out of `implementing` as advanced
 - **AND** SHALL NOT close or supersede-comment S
 
+### Requirement: Implementing re-entry SHALL adopt an existing planning deliverable when the implement goal is already satisfied
+
+When the pipeline re-enters the implementing stage or the implement phase of planning (including a **fresh process** re-entry, not only an in-memory helper call) and the accepted planning deliverable is already present at HEAD — for example a spec-only issue whose OpenSpec change under `openspec/changes/<id>/` landed in the planning commit — the path SHALL evaluate implement goal satisfaction via the shared `noop-advance-contract` (implement-deliverable-present). When the check reports satisfied, the worktree is clean relative to the implement headBefore, and relevant gates for the path are green, the pipeline SHALL advance through post-implement steps (test gate → push → open-or-find PR → transition toward review as already specified) **without** requiring an empty implementer commit and **without** blocking with `blockerKind: "no-commits"` solely for an empty implementer commit range. When the deliverable is missing or gates fail, the path SHALL fail closed (restart, block, or re-invoke implement per existing rules) and SHALL NOT skip implement solely because a prior harness “succeeded” with no commits.
+
+#### Scenario: Spec-only planning commit deliverable advances without empty implement commit
+
+- **WHEN** a fresh re-entry reaches implementing / implement with the accepted OpenSpec deliverable already present from the planning commit
+- **AND** the implement harness produces no new commit (or is skipped because goal is already satisfied)
+- **AND** the worktree is clean and relevant gates pass
+- **THEN** the pipeline SHALL advance without inventing an empty commit
+- **AND** SHALL NOT set `blockerKind: "no-commits"` solely for the empty implementer range
+- **AND** SHALL record attested goal-satisfaction evidence at the evaluated HEAD SHA
+
+#### Scenario: Missing deliverable still fails closed
+
+- **WHEN** implementing / implement ends with no new commit and the declared OpenSpec or freeform deliverable is absent at HEAD
+- **THEN** the shared evaluation SHALL not report implement-deliverable-present satisfaction
+- **AND** the path SHALL block or recover under existing no-commits / crash-stranded rules rather than advancing as complete
+
 ### Requirement: Interrupted incomplete implement SHALL NOT skip the implementer because commits exist
 
 When implementing re-entry finds a dead holder and durable ownership shows an interrupted implement attempt with pipeline-owned leftovers, the dispatcher SHALL checkpoint those leftovers (or run the `checkpoint_owned_harness_dirt` recipe) and SHALL NOT skip the implementer solely because the worktree has commits ahead of `cfg.base_branch`. After checkpoint, if unknown product dirt remains, the pipeline SHALL set the established unknown-dirt block and SHALL NOT re-invoke the implementer or take the post-implementation path. After checkpoint, if the shared implement-deliverable contract reports unsatisfied and unknown product dirt is empty, the pipeline SHALL re-invoke the implementer. If the contract reports satisfied, the worktree is clean of unknown product dirt, and relevant gates are green, the pipeline MAY take the post-implementation path without a second empty implementer commit. If checkpoint fails and owned leftovers remain, the dispatcher SHALL NOT re-invoke a product-mutating harness and SHALL NOT take the post-implementation path; it SHALL block with kind `harness-failure` and SHALL preserve the existing ownership record. Format-gate unknown-dirt pre-flight SHALL NOT run against those owned leftovers before checkpoint. Terminal evidence SHALL use disposition `rejected` when unknown product dirt remains after checkpoint, `resumed` when the implementer is re-invoked, or `checkpointed` / `recovered` when checkpoint plus deliverable satisfaction continues post-implement.
@@ -225,20 +230,3 @@ When the implementing harness returns timeout (or equivalent failure) in the sam
 - **AND** the classifier still matches
 - **THEN** the engine SHALL take the same post-implementation path
 - **AND** SHALL NOT roll back to `ready` as crash-stranded solely because no PR exists yet
-
-### Requirement: Planning and implementation deliverables SHALL have distinct identities
-
-The pipeline SHALL record or derive a verifiable role and identity for the accepted planning artifact and a separate identity for the implementation candidate. Implementing-stage goal checks SHALL accept only implementation-role evidence bound to the current Candidate epoch. A content match, commit authorship marker, or OpenSpec change path SHALL NOT change a planning artifact into implementation evidence.
-
-#### Scenario: Salvage preserves planning role
-
-- **WHEN** recovery salvages a commit whose material product delta is only the planning artifact
-- **THEN** the salvaged commit SHALL remain classified as planning provenance
-- **AND** SHALL NOT satisfy the implementing-stage goal
-
-#### Scenario: Candidate replacement requires new implementation proof
-
-- **WHEN** implementation was proved for candidate epoch `E1`
-- **AND** the candidate moves to epoch `E2`
-- **THEN** the prior implementation proof SHALL be invalid for `E2`
-- **AND** post-implementation work SHALL wait until the implementation postcondition is re-proved for `E2`
