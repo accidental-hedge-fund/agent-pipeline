@@ -6,6 +6,7 @@
 // node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs". No eval of train JSON.
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,8 +27,11 @@ export interface CandidateEngine {
   engineRoot: string;
   launcherPath: string;
   commitSha: string;
+  consumer?: CandidateEngineRoute;
   /** Prepared proof is intentionally single-use at the spawn boundary. */
-  revalidateBeforeSpawn?: () => Promise<CandidateEngineResult>;
+  revalidateBeforeSpawn?: () => CandidateEngineResult;
+  /** Shared host-local lease held from final validation through process life. */
+  acquireProcessLock?: () => (() => void) | null;
 }
 
 export interface CandidateEngineConsumerRoute {
@@ -45,9 +49,9 @@ const EXPECTED_CANDIDATE_ENGINE_CONSUMERS = [
   "factory-release.pack-loop",
   "factory-gate.hybrid-v2",
   "ship.stage-adapter",
-  "pipeline.candidate-leaf",
 ] as const;
 export type CandidateEngineConsumer = (typeof EXPECTED_CANDIDATE_ENGINE_CONSUMERS)[number];
+export type CandidateEngineRoute = CandidateEngineConsumer | "pipeline.candidate-leaf";
 
 export const CANDIDATE_ENGINE_CONSUMERS: readonly CandidateEngineConsumerRoute[] =
   EXPECTED_CANDIDATE_ENGINE_CONSUMERS.map((consumer) => ({
@@ -103,6 +107,65 @@ export function assertCandidateEngineConsumerRoute(consumer: CandidateEngineCons
   if (matches.length !== 1 || matches[0]!.gate !== "resolve-and-prepare") {
     throw new Error(`candidate-engine consumer is not bound exactly once to resolve-and-prepare: ${consumer}`);
   }
+}
+
+export function assertCandidateEnginePreparationRoute(route: CandidateEngineRoute): void {
+  if (route === "pipeline.candidate-leaf") return;
+  assertCandidateEngineConsumerRoute(route);
+}
+
+/** Discover actual production resolve/start bindings; declarations alone do not satisfy CI. */
+export function candidateEngineRuntimeBindingGaps(
+  sources: Readonly<Record<string, string>>,
+): string[] {
+  const resolved = new Set<string>();
+  const started = new Set<string>();
+  const gaps: string[] = [];
+  for (const [file, source] of Object.entries(sources)) {
+    for (const match of source.matchAll(/resolveAndPrepareCandidateEngine\)?\s*\(\s*\{[\s\S]{0,500}?consumer:\s*["']([^"']+)["']/g)) {
+      resolved.add(match[1]!);
+    }
+    for (const match of source.matchAll(/runCandidateEngineProcess\(\s*\{[\s\S]{0,240}?consumer:\s*["']([^"']+)["']/g)) {
+      started.add(match[1]!);
+    }
+    if (
+      file !== "ship-end-candidate.ts" &&
+      /\brevalidateCandidateEngineBeforeSpawn\s*\(/.test(source)
+    ) {
+      gaps.push(`raw parent-only candidate revalidation in ${file}`);
+    }
+    const canResolveCandidate = /\bresolveAndPrepareCandidateEngine\b/.test(source);
+    const refersToCandidateExecutable =
+      /\.launcherPath\b|\bshipEndCliPrefix\s*\(|\bcandidateEngineDir\b/.test(source);
+    const canStartProcess =
+      /\b(?:spawn|spawnSync|execFile|execFileSync|runCommand|runProbe)\s*\(/.test(source);
+    if (
+      file !== "ship-end-candidate.ts" &&
+      (canResolveCandidate || refersToCandidateExecutable) &&
+      canStartProcess &&
+      !/\brunCandidateEngineProcess\s*\(/.test(source)
+    ) {
+      gaps.push(`raw candidate process start in ${file}`);
+    }
+  }
+  for (const consumer of EXPECTED_CANDIDATE_ENGINE_CONSUMERS) {
+    if (!resolved.has(consumer)) gaps.push(`missing production resolve ${consumer}`);
+    if (!started.has(consumer)) gaps.push(`missing production start ${consumer}`);
+  }
+  for (const consumer of started) {
+    if (!(EXPECTED_CANDIDATE_ENGINE_CONSUMERS as readonly string[]).includes(consumer)) {
+      gaps.push(`unknown production start ${consumer}`);
+    }
+  }
+  for (const consumer of resolved) {
+    if (
+      consumer !== "pipeline.candidate-leaf" &&
+      !(EXPECTED_CANDIDATE_ENGINE_CONSUMERS as readonly string[]).includes(consumer)
+    ) {
+      gaps.push(`unknown production resolve ${consumer}`);
+    }
+  }
+  return gaps;
 }
 
 export type CandidateEngineFailureKind = "identity" | "readiness" | "lock";
@@ -162,7 +225,7 @@ export function resolveCandidateEngine(
     repoDir: string;
     candidateSha: string;
     candidateEngineRootEnv?: string | null;
-    consumer: CandidateEngineConsumer;
+    consumer: CandidateEngineRoute;
   },
   deps: ResolveCandidateEngineDeps,
 ): CandidateEngineResult {
@@ -229,14 +292,15 @@ export async function resolveAndPrepareCandidateEngine(
   },
   deps: ResolveAndPrepareCandidateEngineDeps,
 ): Promise<CandidateEngineResult> {
-  assertCandidateEngineConsumerRoute(opts.consumer);
+  assertCandidateEnginePreparationRoute(opts.consumer);
   const resolved = resolveCandidateEngine(opts, deps);
   if (!resolved.ok) return resolved;
   const prepared = await prepareCandidateEngine(resolved.engine, deps as ResolveAndPrepareDeps);
   if (!prepared.ok) return prepared;
   const bindRevalidation = (engine: CandidateEngine): CandidateEngine => ({
     ...engine,
-    revalidateBeforeSpawn: async () => {
+    consumer: opts.consumer,
+    revalidateBeforeSpawn: () => {
       const checked = revalidatePreparedCandidateEngineForSpawn(
         engine,
         deps as ResolveAndPrepareDeps,
@@ -244,14 +308,97 @@ export async function resolveAndPrepareCandidateEngine(
       if (!checked.ok) return checked;
       return { ok: true, engine: bindRevalidation(checked.engine) };
     },
+    acquireProcessLock: () => {
+      const stateDir = (deps as ResolveAndPrepareDeps).tmpDir();
+      const lockPath = path.join(
+        stateDir,
+        `pipeline-candidate-process-${createHash("sha256")
+          .update(`${engine.engineRoot}\n${engine.commitSha}`)
+          .digest("hex")
+          .slice(0, 32)}.lock`,
+      );
+      const d = deps as ResolveAndPrepareDeps;
+      if (!d.statePathTrusted(lockPath)) return null;
+      const owner = d.parentIdentity();
+      const body = `${JSON.stringify({
+        schema: "pipeline-candidate-process-lock/v1",
+        engineRoot: engine.engineRoot,
+        commitSha: engine.commitSha,
+        pid: owner.pid,
+        starttime: owner.starttime,
+      })}\n`;
+      if (!d.writeText(lockPath, body, "wx")) {
+        try {
+          const existing = JSON.parse(d.readText(lockPath) ?? "null") as {
+            pid?: unknown;
+            starttime?: unknown;
+          } | null;
+          if (
+            !existing ||
+            typeof existing.pid !== "number" ||
+            d.processAlive(
+              existing.pid,
+              typeof existing.starttime === "string" ? existing.starttime : null,
+            )
+          ) return null;
+          d.remove(lockPath);
+        } catch {
+          return null;
+        }
+        if (!d.writeText(lockPath, body, "wx")) return null;
+      }
+      return () => d.remove(lockPath);
+    },
   });
   return { ok: true, engine: bindRevalidation(prepared.engine) };
 }
 
+export type CandidateEngineProcessResult<T> =
+  | { ok: true; value: T; engine: CandidateEngine }
+  | { ok: false; error: string; kind?: CandidateEngineFailureKind };
+
+/**
+ * The sole candidate-process start boundary. Revalidation happens inside the
+ * start operation, after all caller bookkeeping, and the prepared proof is
+ * bound to the inventoried consumer before the injected spawn seam is called.
+ */
+export async function runCandidateEngineProcess<T>(input: {
+  consumer: CandidateEngineConsumer;
+  engine: CandidateEngine;
+  start: (engine: CandidateEngine) => Promise<T>;
+}): Promise<CandidateEngineProcessResult<T>> {
+  assertCandidateEngineConsumerRoute(input.consumer);
+  if (input.engine.consumer !== input.consumer) {
+    return {
+      ok: false,
+      kind: "identity",
+      error: `candidate engine proof belongs to ${input.engine.consumer ?? "no consumer"}, not ${input.consumer}`,
+    };
+  }
+  const release = input.engine.acquireProcessLock?.() ?? null;
+  if (!release) {
+    return { ok: false, kind: "lock", error: "candidate process-start lock is unavailable" };
+  }
+  try {
+    const checked = revalidateCandidateEngineBeforeSpawn(input.engine);
+    if (!checked.ok) return checked;
+    // Invoke the process-start seam in the same turn as the synchronous final
+    // check while retaining the shared lease through process completion.
+    const started = input.start(checked.engine);
+    return {
+      ok: true,
+      value: await started,
+      engine: checked.engine,
+    };
+  } finally {
+    release();
+  }
+}
+
 /** Consume the prepared proof immediately before an inventoried spawn. */
-export async function revalidateCandidateEngineBeforeSpawn(
+export function revalidateCandidateEngineBeforeSpawn(
   engine: CandidateEngine,
-): Promise<CandidateEngineResult> {
+): CandidateEngineResult {
   if (!engine.revalidateBeforeSpawn) {
     return {
       ok: false,
@@ -259,7 +406,7 @@ export async function revalidateCandidateEngineBeforeSpawn(
       error: "candidate engine has no final pre-spawn revalidation proof",
     };
   }
-  const checked = await engine.revalidateBeforeSpawn();
+  const checked = engine.revalidateBeforeSpawn();
   if (!checked.ok) return checked;
   if (
     checked.engine.commitSha !== engine.commitSha ||

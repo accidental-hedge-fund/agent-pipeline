@@ -727,6 +727,8 @@ export interface RunDeliveryStageAdapterInput {
   evidenceRole?: ArtifactEvidenceRole | string | null;
   artifactIdentity?: string | null;
   postconditionProven?: boolean;
+  /** This stage authors its required artifact; consumers must already prove it. */
+  evidenceProducerBeforeAttempt?: boolean;
   observeEvidence?: (
     phase: "before" | "after",
     outcome?: Outcome,
@@ -792,7 +794,7 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
         stage: input.stage,
         ...evidence,
       });
-      if (bindingFailure) {
+      if (bindingFailure && !input.evidenceProducerBeforeAttempt) {
         const outcome: Outcome = {
           advanced: false,
           status: "waiting",
@@ -807,11 +809,29 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
         consumeReportedOwned(obs);
         return outcome;
       }
+      if (!input.evidenceProducerBeforeAttempt && evidence.postconditionProven !== true) {
+        const outcome: Outcome = {
+          advanced: false,
+          status: "waiting",
+          reason: "delivery-stage evidence refused before execution: required artifact postcondition is unproved",
+        };
+        const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+          ...baseIdentity,
+          ...evidence,
+          outcome,
+          postconditionProven: false,
+        }));
+        consumeReportedOwned(obs);
+        return outcome;
+      }
     }
     const outcome = await input.attempt();
     if (input.observeEvidence) {
       evidence = await input.observeEvidence("after", outcome);
-      if (preAttemptEvidence && !sameEvidenceBinding(preAttemptEvidence, evidence)) {
+      const producerEstablishedEvidence = input.evidenceProducerBeforeAttempt &&
+        preAttemptEvidence?.postconditionProven !== true &&
+        evidence.postconditionProven === true;
+      if (preAttemptEvidence && !sameEvidenceBinding(preAttemptEvidence, evidence) && !producerEstablishedEvidence) {
         const waiting: Outcome = {
           advanced: false,
           status: "waiting",

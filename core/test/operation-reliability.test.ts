@@ -10,8 +10,8 @@ import {
   REQUIRED_PUBLIC_ENTRYPOINTS,
   REQUIRED_ADMISSION_ROUTES,
   admissionRouteInventoryGaps,
-  admissionRouteRuntimeBindingGaps,
   assertAdmissionRouteInventoryComplete,
+  exerciseRequiredAdmissionRoutes,
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
   filterAttemptsBoundToCandidate,
@@ -22,6 +22,7 @@ import {
   uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
 } from "../scripts/operation-reliability.ts";
+import { SKILL_HOST_IDS } from "../scripts/host-skill.ts";
 
 const CORE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -60,23 +61,106 @@ test("required admission route inventory is exact and hard-gated (#1454)", () =>
   assert.throws(() => assertAdmissionRouteInventoryComplete(nameOnly), /bypasses admission/);
 });
 
-test("production admission routes are runtime-bound to the executable inventory (#1454)", () => {
-  const sources = Object.fromEntries(
-    ["scripts/pipeline.ts", "scripts/stages/train.ts", "scripts/stages/ship.ts"].map((relative) => [
-      relative,
-      readFileSync(path.join(CORE_ROOT, relative), "utf8"),
-    ]),
+test("production admission routes behaviorally cross admission before protected work (#1454)", async () => {
+  const events: string[] = [];
+  const outcomes = await exerciseRequiredAdmissionRoutes(
+    {
+      admit: async (input) => {
+        events.push(`admit:${input.row.route}`);
+        return {
+          acknowledged: true,
+          operationKey: input.operationKey,
+          logicalOperationId: input.logicalOperationId,
+          approvedRoot: input.approvedRoot,
+        };
+      },
+      protectedOperation: async (input) => {
+        assert.equal(events.at(-1), `admit:${input.row.route}`);
+        events.push(`protected:${input.row.route}`);
+      },
+      delegateHost: async (input, invokeCli) => {
+        events.push(`host:${input.host}`);
+        return invokeCli(input.argv);
+      },
+    },
+    {
+      approvedRoot: "/factory-control",
+      logicalOperationIdFor: (row) => `lop-${row.route}`,
+    },
   );
-  assert.deepEqual(admissionRouteRuntimeBindingGaps(sources), []);
-  assert.match(sources["scripts/pipeline.ts"]!, /assertRequiredAdmissionRoute/);
 
-  const missing = {
-    ...sources,
-    "scripts/stages/ship.ts": sources["scripts/stages/ship.ts"]!.replace('"ship.resume"', '"ship.missing"'),
-  };
+  assert.equal(Object.keys(outcomes).length, REQUIRED_ADMISSION_ROUTES.length);
+  for (const row of REQUIRED_ADMISSION_ROUTES) {
+    assert.equal(outcomes[row.route], "admitted");
+    assert.ok(events.includes(`protected:${row.route}`), row.route);
+  }
   assert.deepEqual(
-    admissionRouteRuntimeBindingGaps(missing).filter((gap) => gap.includes("ship.resume")),
-    ["missing runtime route binding ship.resume"],
+    REQUIRED_ADMISSION_ROUTES.filter((row) => row.class === "host").map((row) => row.host).sort(),
+    [...SKILL_HOST_IDS].sort(),
+  );
+  for (const host of SKILL_HOST_IDS) {
+    const generated = readFileSync(path.join(CORE_ROOT, "..", "hosts", host, "SKILL.md"), "utf8");
+    assert.match(generated, /Host SKILL for the `pipeline` CLI/);
+    assert.match(generated, /`pipeline <N>` starts the durable\s+one-item drive/);
+  }
+});
+
+test("executable admission inventory refuses every route without protected work (#1454)", async () => {
+  const protectedRoutes: string[] = [];
+  const outcomes = await exerciseRequiredAdmissionRoutes(
+    {
+      admit: async () => ({ acknowledged: false }),
+      protectedOperation: async (input) => { protectedRoutes.push(input.row.route); },
+      delegateHost: async (input, invokeCli) => invokeCli(input.argv),
+    },
+    {
+      approvedRoot: "/factory-control",
+      logicalOperationIdFor: (row) => `lop-${row.route}`,
+    },
+  );
+  assert.deepEqual(protectedRoutes, []);
+  assert.ok(Object.values(outcomes).every((outcome) => outcome === "refused"));
+});
+
+test("executable admission inventory rejects wrong root/identity and host bypass (#1454)", async () => {
+  let protectedCalls = 0;
+  await assert.rejects(
+    () => exerciseRequiredAdmissionRoutes(
+      {
+        admit: async (input) => ({
+          acknowledged: true,
+          operationKey: input.operationKey,
+          logicalOperationId: `${input.logicalOperationId}-replacement`,
+          approvedRoot: input.approvedRoot,
+        }),
+        protectedOperation: async () => { protectedCalls += 1; },
+        delegateHost: async (input, invokeCli) => invokeCli(input.argv),
+      },
+      { approvedRoot: "/factory-control", logicalOperationIdFor: (row) => `lop-${row.route}` },
+    ),
+    /admission identity\/root mismatch/,
+  );
+  assert.equal(protectedCalls, 0);
+
+  await assert.rejects(
+    () => exerciseRequiredAdmissionRoutes(
+      {
+        admit: async (input) => ({
+          acknowledged: true,
+          operationKey: input.operationKey,
+          logicalOperationId: input.logicalOperationId,
+          approvedRoot: input.approvedRoot,
+        }),
+        protectedOperation: async () => {},
+        delegateHost: async () => false,
+      },
+      {
+        routes: REQUIRED_ADMISSION_ROUTES,
+        approvedRoot: "/factory-control",
+        logicalOperationIdFor: (row) => `lop-${row.route}`,
+      },
+    ),
+    /generated host claude bypassed CLI admission/,
   );
 });
 

@@ -19,7 +19,7 @@ import type { LoopContract, LoopLedger } from "./loop/types.ts";
 import { defaultLoopStoreDeps, runDir } from "./loop/store.ts";
 import {
   defaultResolveAndPrepareDeps,
-  revalidateCandidateEngineBeforeSpawn,
+  runCandidateEngineProcess,
   resolveAndPrepareCandidateEngine,
   type CandidateEngineResult,
 } from "./ship-end-candidate.ts";
@@ -499,18 +499,20 @@ export async function defaultCollectHybridV2FromRun(
 
   const probes: VerifiedFrgPackRun["probes"] = [];
   for (const probe of pack.manifest.pilot_policy.layer_a_probes) {
-    const checked = await revalidateCandidateEngineBeforeSpawn(candidateEngine);
-    if (!checked.ok) {
-      throw new Error(`pipeline factory-gate: hybrid-v2 collect ${checked.error}`);
-    }
-    candidateEngine = checked.engine;
-    probes.push(
-      await runProbe(probe, {
+    const started = await runCandidateEngineProcess({
+      consumer: "factory-gate.hybrid-v2",
+      engine: candidateEngine,
+      start: (checked) => runProbe(probe, {
         repoDir: args.repoDir,
         candidateGitSha,
-        candidateEngineDir: candidateEngine.engineRoot,
+        candidateEngineDir: checked.engineRoot,
       }),
-    );
+    });
+    if (!started.ok) {
+      throw new Error(`pipeline factory-gate: hybrid-v2 collect ${started.error}`);
+    }
+    candidateEngine = started.engine;
+    probes.push(started.value);
   }
 
   const events: Array<{ seq?: number; kind?: string; item_id?: string; data?: { item_id?: string } }> = [];

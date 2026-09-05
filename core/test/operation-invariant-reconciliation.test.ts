@@ -23,6 +23,7 @@ import {
   reconstructedLocalState,
   recoveryRecipeCompletesOriginalMutation,
   repairShaMismatchIsHumanStop,
+  verifiedForwardTarget,
   type ReconcileObserveDeps,
 } from "../scripts/loop/reconcile.ts";
 import { isLoopNextAction, type LoopExternalIdentity } from "../scripts/loop/types.ts";
@@ -257,6 +258,48 @@ test("4.1 merged completion must match the active operation and candidate (#1454
     }),
     "uncertain",
   );
+});
+
+test("4.1 unrelated open implementation PR cannot advance the active operation (#1454)", async () => {
+  const sha = "a".repeat(40);
+  const deps = fakeObserve({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:ready-to-deploy"] };
+    },
+    async findPrForIssue() {
+      return 99;
+    },
+    async listLinkedPrs() {
+      return [99];
+    },
+    async getPrDetail() {
+      return {
+        number: 99,
+        state: "open",
+        head_ref: "pipeline/unrelated",
+        head_sha: sha,
+        merge_commit_sha: null,
+      };
+    },
+    async getPrArtifactBinding() {
+      return {
+        role: "implementation",
+        artifactIdentity: `pr:99:${sha}`,
+        candidateSha: sha,
+        candidateEpoch: sha,
+        logicalOperationId: "lop-unrelated",
+      };
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/unrelated", sha, rebase_in_progress: false, product_dirt: false };
+    },
+  });
+  const observed = await observeExternalIdentity(deps, "1369", {
+    logicalOperationId: "lop-current",
+  });
+  assert.equal(observed.logical_operation_id, "lop-unrelated");
+  assert.equal(observed.expected_logical_operation_id, "lop-current");
+  assert.equal(verifiedForwardTarget(observed), null);
 });
 
 test("4.1 truncated linked-PR scan is uncertain, never known_absent", () => {

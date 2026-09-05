@@ -23,7 +23,7 @@ import {
   shipEndLeafArgv,
   uncredentialedPrepareEnv,
   resolveAndPrepareCandidateEngine,
-  revalidateCandidateEngineBeforeSpawn,
+  runCandidateEngineProcess,
   type CandidateEngine,
   type CandidateEngineResult,
   type PresentFrgAttestorCredentialDeps,
@@ -1554,11 +1554,19 @@ async function spawnLeaf(
   leaf: string[],
   env: NodeJS.ProcessEnv,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  const checked = await revalidateCandidateEngineBeforeSpawn(engine);
-  if (!checked.ok) throw candidateReadinessError(checked.kind === "lock" ? "lock" : "readiness", checked.error);
-  const argv = [...shipEndCliPrefix(checked.engine, ctx.nodeBin ?? "node"), ...leaf];
-  assertShipEndLeafArgv(argv);
-  return ctx.spawn(argv, env);
+  const started = await runCandidateEngineProcess({
+    consumer: "ship.stage-adapter",
+    engine,
+    start: async (checked) => {
+      const argv = [...shipEndCliPrefix(checked, ctx.nodeBin ?? "node"), ...leaf];
+      assertShipEndLeafArgv(argv);
+      return ctx.spawn(argv, env);
+    },
+  });
+  if (!started.ok) {
+    throw candidateReadinessError(started.kind === "lock" ? "lock" : "readiness", started.error);
+  }
+  return started.value;
 }
 
 async function delayMs(ctx: CandidateShipEndContext, ms: number): Promise<void> {
@@ -2416,15 +2424,18 @@ export function bindCandidateShipEndOperations(
       const existing = await pinOps.observeTag(intent, release);
       if (existing) return existing;
       if (typeof ctx.spawnEnsureTag === "function") {
-        const checked = await revalidateCandidateEngineBeforeSpawn(engine);
-        if (!checked.ok) {
-          throw candidateReadinessError(checked.kind === "lock" ? "lock" : "readiness", checked.error);
-        }
-        await ctx.spawnEnsureTag(checked.engine, {
-          version: intent.version,
-          mergeCommitOid: release.merge_commit_oid,
-          packedCandidate: release.candidate_head_oid,
+        const started = await runCandidateEngineProcess({
+          consumer: "ship.stage-adapter",
+          engine,
+          start: (checked) => ctx.spawnEnsureTag!(checked, {
+            version: intent.version,
+            mergeCommitOid: release.merge_commit_oid,
+            packedCandidate: release.candidate_head_oid,
+          }),
         });
+        if (!started.ok) {
+          throw candidateReadinessError(started.kind === "lock" ? "lock" : "readiness", started.error);
+        }
       } else {
         const spawned = await spawnLeaf(
           ctx,

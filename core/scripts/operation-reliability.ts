@@ -44,6 +44,7 @@ export interface RequiredAdmissionRoute {
   route: string;
   entrypoint: RequiredPublicEntrypoint;
   class: AdmissionRouteClass;
+  host?: "claude" | "codex" | "grok" | "opencode";
   /** Shared production boundary crossed by the exercised route. */
   boundary: "public-admission" | "loop-admission" | "train-admission" | "ship-admission" | "cli-delegate";
 }
@@ -63,6 +64,8 @@ const EXPECTED_ADMISSION_ROUTES: Readonly<Record<string, RequiredPublicEntrypoin
   "ship.resume": "ship",
   "host.claude-code": "drive",
   "host.codex": "drive",
+  "host.grok": "drive",
+  "host.opencode": "drive",
 } as const;
 export type RequiredAdmissionRouteName = keyof typeof EXPECTED_ADMISSION_ROUTES;
 
@@ -80,8 +83,10 @@ export const REQUIRED_ADMISSION_ROUTES: readonly RequiredAdmissionRoute[] = [
   { route: "merge-queue.apply", entrypoint: "merge-queue", class: "direct", boundary: "public-admission" },
   { route: "ship.direct", entrypoint: "ship", class: "direct", boundary: "ship-admission" },
   { route: "ship.resume", entrypoint: "ship", class: "resume", boundary: "ship-admission" },
-  { route: "host.claude-code", entrypoint: "drive", class: "host", boundary: "cli-delegate" },
-  { route: "host.codex", entrypoint: "drive", class: "host", boundary: "cli-delegate" },
+  { route: "host.claude-code", entrypoint: "drive", class: "host", boundary: "cli-delegate", host: "claude" },
+  { route: "host.codex", entrypoint: "drive", class: "host", boundary: "cli-delegate", host: "codex" },
+  { route: "host.grok", entrypoint: "drive", class: "host", boundary: "cli-delegate", host: "grok" },
+  { route: "host.opencode", entrypoint: "drive", class: "host", boundary: "cli-delegate", host: "opencode" },
 ] as const;
 
 export function admissionRouteInventoryGaps(
@@ -99,6 +104,8 @@ export function admissionRouteInventoryGaps(
       gaps.push(`unknown entrypoint ${row.entrypoint}`);
     }
     if (!row.boundary) gaps.push(`route ${row.route} bypasses admission`);
+    if (row.class === "host" && !row.host) gaps.push(`host route ${row.route} missing generated host`);
+    if (row.class !== "host" && row.host) gaps.push(`non-host route ${row.route} declares generated host ${row.host}`);
   }
   for (const route of Object.keys(EXPECTED_ADMISSION_ROUTES)) {
     if (!seen.has(route)) gaps.push(`missing route ${route}`);
@@ -133,37 +140,102 @@ export function assertRequiredAdmissionRoute(
   }
 }
 
+export interface AdmissionRouteExerciseInput {
+  row: RequiredAdmissionRoute;
+  operationKey: string;
+  logicalOperationId: string;
+  approvedRoot: string;
+}
+
+export type AdmissionRouteExerciseAcknowledgement =
+  | {
+      acknowledged: true;
+      operationKey: string;
+      logicalOperationId: string;
+      approvedRoot: string;
+    }
+  | { acknowledged: false };
+
+export interface AdmissionRouteExerciseDeps {
+  /** Exercise the same injectable admission seam used before protected work. */
+  admit(input: AdmissionRouteExerciseInput): Promise<AdmissionRouteExerciseAcknowledgement>;
+  /** Canary for the protected drive/merge/repair path. */
+  protectedOperation(input: AdmissionRouteExerciseInput): Promise<void>;
+  /** Execute an installed generated-host delegation into the CLI route. */
+  delegateHost?(
+    input: { host: NonNullable<RequiredAdmissionRoute["host"]>; argv: readonly string[] },
+    invokeCli: (argv: readonly string[]) => Promise<boolean>,
+  ): Promise<boolean>;
+}
+
 /**
- * CI correspondence half of the executable inventory. Production route
- * handlers call {@link assertRequiredAdmissionRoute}; this check makes those
- * runtime bindings set-equal to the non-host inventory instead of trusting
- * the declaration alone.
+ * Behaviorally exercise every declared production admission route. The
+ * caller injects admission and protected-operation seams, so CI can prove
+ * ordering, approved-root and pre-bound identity propagation, refusal, and
+ * generated-host delegation without network, git, or ambient auth.
  */
-export function admissionRouteRuntimeBindingGaps(
-  sources: Readonly<Record<string, string>>,
-): string[] {
-  const combined = Object.entries(sources)
-    .map(([file, source]) => `\n/* ${file} */\n${source}`)
-    .join("\n");
-  const gaps: string[] = [];
-  for (const row of REQUIRED_ADMISSION_ROUTES) {
-    if (row.class === "host") continue;
-    const escaped = row.route.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const occurrences = combined.match(new RegExp(`["']${escaped}["']`, "g"))?.length ?? 0;
-    if (occurrences === 0) gaps.push(`missing runtime route binding ${row.route}`);
-    if (occurrences > 1) gaps.push(`duplicate runtime route binding ${row.route}`);
-  }
-  const asserted = combined.matchAll(
-    /assertRequiredAdmissionRoute\(\s*([\s\S]{0,160}?),\s*["'](?:drive|single|loop|train|merge|merge-queue|ship)["']\s*,/g,
-  );
-  for (const match of asserted) {
-    for (const literal of match[1]!.matchAll(/["']([^"']+)["']/g)) {
-      if (!(literal[1]! in EXPECTED_ADMISSION_ROUTES)) {
-        gaps.push(`unknown runtime route binding ${literal[1]}`);
+export async function exerciseRequiredAdmissionRoutes(
+  deps: AdmissionRouteExerciseDeps,
+  options: {
+    routes?: readonly RequiredAdmissionRoute[];
+    approvedRoot: string;
+    logicalOperationIdFor(route: RequiredAdmissionRoute): string;
+  },
+): Promise<Readonly<Record<string, "admitted" | "refused">>> {
+  const routes = options.routes ?? REQUIRED_ADMISSION_ROUTES;
+  assertAdmissionRouteInventoryComplete(routes);
+  const outcomes: Record<string, "admitted" | "refused"> = {};
+
+  for (const row of routes) {
+    const input: AdmissionRouteExerciseInput = {
+      row,
+      operationKey: `inventory:${row.route}`,
+      logicalOperationId: options.logicalOperationIdFor(row),
+      approvedRoot: options.approvedRoot,
+    };
+    const invokeCli = async (argv: readonly string[]): Promise<boolean> => {
+      if (argv.length !== 1 || argv[0] !== "1454") {
+        throw new Error(`generated host ${row.host ?? row.route} rewrote CLI argv`);
       }
+      const admission = await deps.admit(input);
+      if (!admission.acknowledged) {
+        outcomes[row.route] = "refused";
+        return false;
+      }
+      if (
+        admission.operationKey !== input.operationKey ||
+        admission.logicalOperationId !== input.logicalOperationId ||
+        admission.approvedRoot !== input.approvedRoot
+      ) {
+        throw new Error(`admission identity/root mismatch for ${row.route}`);
+      }
+      await deps.protectedOperation(input);
+      outcomes[row.route] = "admitted";
+      return true;
+    };
+
+    if (row.class === "host") {
+      if (!row.host || !deps.delegateHost) {
+        throw new Error(`generated host route ${row.route} has no executable delegate`);
+      }
+      let cliCalls = 0;
+      const delegated = await deps.delegateHost(
+        { host: row.host, argv: ["1454"] },
+        async (argv) => {
+          cliCalls += 1;
+          if (cliCalls > 1) throw new Error(`generated host ${row.host} delegated more than once`);
+          return invokeCli(argv);
+        },
+      );
+      if (cliCalls !== 1) throw new Error(`generated host ${row.host} bypassed CLI admission`);
+      if (delegated !== (outcomes[row.route] === "admitted")) {
+        throw new Error(`generated host ${row.host} changed the CLI admission result`);
+      }
+    } else {
+      await invokeCli(["1454"]);
     }
   }
-  return gaps;
+  return outcomes;
 }
 
 /** #1333 mechanical fault-matrix lifecycle classes required for FRG promotion. */

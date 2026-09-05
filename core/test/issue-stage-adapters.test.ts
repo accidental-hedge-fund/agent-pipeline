@@ -239,7 +239,7 @@ test("1.4 protected dispatch binds before mutation and re-observes completion (#
         candidateEpoch: sha,
         evidenceRole: "implementation",
         artifactIdentity: `implementation:${sha}`,
-        postconditionProven: phase === "after",
+        postconditionProven: true,
       };
     },
     attempt: async () => {
@@ -256,6 +256,71 @@ test("1.4 protected dispatch binds before mutation and re-observes completion (#
   assert.deepEqual(order, ["observe:before", "attempt", "observe:after"]);
 });
 
+test("1.4 evidence-consuming stage cannot mutate before artifact proof (#1454)", async () => {
+  let attempts = 0;
+  const sha = "a".repeat(40);
+  const out = await runDeliveryStageAdapter({
+    stage: "ready-to-deploy",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-no-implementation-proof",
+    requireEvidenceBeforeAttempt: true,
+    observeEvidence: async () => ({
+      candidateSha: sha,
+      candidateEpoch: sha,
+      evidenceRole: null,
+      artifactIdentity: null,
+      postconditionProven: false,
+    }),
+    attempt: async () => {
+      attempts++;
+      return { advanced: false, status: "finalized", reason: "must not publish" };
+    },
+  });
+  assert.equal(attempts, 0);
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /evidence (binding )?refused before execution/);
+});
+
+test("1.4 evidence producer may establish the exact artifact during its attempt (#1454)", async () => {
+  let attempts = 0;
+  const sha = "a".repeat(40);
+  const out = await runDeliveryStageAdapter({
+    stage: "implementing",
+    cfg: cfg(),
+    issueNumber: 1454,
+    logicalOperationId: "lop-produce-implementation",
+    requireEvidenceBeforeAttempt: true,
+    evidenceProducerBeforeAttempt: true,
+    observeEvidence: async (phase) => phase === "before"
+      ? {
+          candidateSha: sha,
+          candidateEpoch: sha,
+          evidenceRole: null,
+          artifactIdentity: null,
+          postconditionProven: false,
+        }
+      : {
+          candidateSha: sha,
+          candidateEpoch: sha,
+          evidenceRole: "implementation",
+          artifactIdentity: `implementation:${sha}`,
+          postconditionProven: true,
+        },
+    attempt: async () => {
+      attempts++;
+      return {
+        advanced: true,
+        from: "implementing",
+        to: "design-gate",
+        summary: "implementation proof established",
+      };
+    },
+  });
+  assert.equal(attempts, 1);
+  assert.equal(out.advanced, true);
+});
+
 test("1.4 protected dispatch rejects completion when the Candidate binding changes during execution (#1454)", async () => {
   const beforeSha = "a".repeat(40);
   const afterSha = "b".repeat(40);
@@ -264,7 +329,7 @@ test("1.4 protected dispatch rejects completion when the Candidate binding chang
     candidateEpoch: beforeSha,
     evidenceRole: "implementation" as const,
     artifactIdentity: `implementation:${beforeSha}`,
-    postconditionProven: false,
+    postconditionProven: true,
   };
   const changedBindings = [
     { name: "candidate SHA", after: { ...before, candidateSha: afterSha } },

@@ -19,6 +19,7 @@
 
 import * as fsp from "node:fs/promises";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -1296,7 +1297,6 @@ interface PublicAdmissionClaim {
   repository: string;
   domain: string;
   issue: number | null;
-  approved_root: string;
   claimed_at: string;
 }
 
@@ -1443,9 +1443,24 @@ function admissionClaimDigest(operationKey: string): string {
   return createHash("sha256").update(operationKey).digest("hex");
 }
 
-function admissionClaimPath(approvedRoot: string, operationKey: string): string {
+export function resolvePublicAdmissionClaimRoot(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (env.AGENT_PIPELINE_STATE_HOME) {
+    return path.join(path.resolve(env.AGENT_PIPELINE_STATE_HOME), "public-admission-claims");
+  }
+  if (env.PIPELINE_STATE_HOME) {
+    return path.join(path.resolve(env.PIPELINE_STATE_HOME), "public-admission-claims");
+  }
+  if (env.XDG_STATE_HOME) {
+    return path.join(path.resolve(env.XDG_STATE_HOME), "agent-pipeline", "public-admission-claims");
+  }
+  return path.join(os.homedir(), ".local", "state", "agent-pipeline", "public-admission-claims");
+}
+
+function admissionClaimPath(claimsRoot: string, operationKey: string): string {
   const digest = createHash("sha256").update(operationKey).digest("hex");
-  return path.join(approvedRoot, ".agent-pipeline", "admissions", `${digest}.json`);
+  return path.join(claimsRoot, `${digest}.json`);
 }
 
 function verifyAdmissionClaim(
@@ -1462,7 +1477,7 @@ function verifyAdmissionClaim(
 }
 
 async function claimPublicLogicalOperation(input: {
-  approvedRoot: string;
+  claimsRoot: string;
   operationKey: string;
   proposedLogicalOperationId: string | null;
   mintLogicalOperationId: () => string;
@@ -1475,9 +1490,9 @@ async function claimPublicLogicalOperation(input: {
   claimedAt: string;
   deps: PublicAdmissionStoreDeps;
 }): Promise<{ logicalOperationId: string; claimPath: string }> {
-  const claimsRoot = path.join(input.approvedRoot, ".agent-pipeline", "admissions");
+  const claimsRoot = input.claimsRoot;
   const digest = admissionClaimDigest(input.operationKey);
-  const claimPath = admissionClaimPath(input.approvedRoot, input.operationKey);
+  const claimPath = admissionClaimPath(claimsRoot, input.operationKey);
   await input.deps.mkdir(claimsRoot, { recursive: true });
   const expected = {
     operation_key: input.operationKey,
@@ -1485,7 +1500,6 @@ async function claimPublicLogicalOperation(input: {
     repository: input.repository,
     domain: input.domain,
     issue: input.issue,
-    approved_root: input.approvedRoot,
   };
   const readClaim = async (filePath: string): Promise<PublicAdmissionClaim | null> => {
     try {
@@ -1624,58 +1638,13 @@ export async function persistPublicEntrypointAdmission(
         : `${mode} admission requires an existing Logical Operation identity`,
     );
   }
-  const persistRoot = await resolvePublicAdmissionPersistRoot({
-    repoDir: opts.repoDir,
-    env: opts.env,
-    factoryControlDir: opts.factoryControlDir,
-    factoryControlRoot: opts.factoryControlRoot,
-  });
-  if (!persistRoot) {
-    if (!identity.logicalOperationId && mode === "direct") {
-      identity = { ...identity, logicalOperationId: mintLogical() };
-    }
-    return publicAdmissionFailure(
-      identity,
-      null,
-      null,
-      "approved_root_unavailable",
-      "resolve_approved_root",
-      "approved factory-control root is unavailable",
-    );
-  }
-  const requestedRoot = path.resolve(persistRoot);
-  let approvedRoot: string;
-  try {
-    approvedRoot = await deps.realpath(requestedRoot);
-  } catch (err) {
-    if (!identity.logicalOperationId && mode === "direct") {
-      identity = { ...identity, logicalOperationId: mintLogical() };
-    }
-    return publicAdmissionFailure(
-      identity,
-      requestedRoot,
-      null,
-      "approved_root_unavailable",
-      "canonicalize_approved_root",
-      err,
-    );
-  }
-  if (approvedRoot !== requestedRoot) {
-    if (!identity.logicalOperationId && mode === "direct") {
-      identity = { ...identity, logicalOperationId: mintLogical() };
-    }
-    return publicAdmissionFailure(
-      identity,
-      approvedRoot,
-      null,
-      "approved_root_mismatch",
-      "verify_approved_root",
-      `approved root resolved to ${approvedRoot}, expected ${requestedRoot}`,
-    );
-  }
+  const claimNamespace = createHash("sha256")
+    .update(`${identity.domain}\u0000${identity.repository}`)
+    .digest("hex");
+  const claimsRoot = path.join(resolvePublicAdmissionClaimRoot(opts.env), claimNamespace);
   try {
     const claimed = await claimPublicLogicalOperation({
-      approvedRoot,
+      claimsRoot,
       operationKey,
       proposedLogicalOperationId,
       mintLogicalOperationId: mintLogical,
@@ -1698,11 +1667,51 @@ export async function persistPublicEntrypointAdmission(
     const message = boundedAdmissionDiagnostic(err);
     return publicAdmissionFailure(
       identity,
-      approvedRoot,
+      null,
       null,
       /conflict|mismatch/i.test(message) ? "identity_conflict" : "persistence_failure",
       "claim_operation",
       err,
+    );
+  }
+  const persistRoot = await resolvePublicAdmissionPersistRoot({
+    repoDir: opts.repoDir,
+    env: opts.env,
+    factoryControlDir: opts.factoryControlDir,
+    factoryControlRoot: opts.factoryControlRoot,
+  });
+  if (!persistRoot) {
+    return publicAdmissionFailure(
+      identity,
+      null,
+      null,
+      "approved_root_unavailable",
+      "resolve_approved_root",
+      "approved factory-control root is unavailable",
+    );
+  }
+  const requestedRoot = path.resolve(persistRoot);
+  let approvedRoot: string;
+  try {
+    approvedRoot = await deps.realpath(requestedRoot);
+  } catch (err) {
+    return publicAdmissionFailure(
+      identity,
+      requestedRoot,
+      null,
+      "approved_root_unavailable",
+      "canonicalize_approved_root",
+      err,
+    );
+  }
+  if (approvedRoot !== requestedRoot) {
+    return publicAdmissionFailure(
+      identity,
+      approvedRoot,
+      null,
+      "approved_root_mismatch",
+      "verify_approved_root",
+      `approved root resolved to ${approvedRoot}, expected ${requestedRoot}`,
     );
   }
   const logicalOperationId = identity.logicalOperationId;

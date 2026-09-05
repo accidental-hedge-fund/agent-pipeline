@@ -1066,7 +1066,7 @@ export function createDeliveryStageEvidenceObserver(
         candidateEpoch: identity,
         evidenceRole: "planning",
         artifactIdentity: plan ? `planning:${identity}` : `planning-target:${identity}`,
-        postconditionProven: phase === "after" && progressed && Boolean(plan),
+        postconditionProven: Boolean(plan) && (phase === "before" || progressed),
       };
     }
 
@@ -1092,17 +1092,14 @@ export function createDeliveryStageEvidenceObserver(
         paths = diffFilePaths(diff);
       }
     }
-    if (!candidateSha) candidateSha = evidenceDigest(`${cfg.repo}#${issueNumber}:implementation-target`);
     const implementation = observeImplementDeliverablePaths({ paths, candidateSha });
     const exactImplementation = implementation.role === "implementation" && Boolean(implementation.artifact_id);
     return {
       candidateSha,
       candidateEpoch: candidateSha,
-      evidenceRole: "implementation",
-      artifactIdentity: exactImplementation
-        ? implementation.artifact_id
-        : `implementation-target:${cfg.repo}#${issueNumber}:${candidateSha}`,
-      postconditionProven: phase === "after" && progressed && exactImplementation,
+      evidenceRole: exactImplementation ? "implementation" : null,
+      artifactIdentity: exactImplementation ? implementation.artifact_id : null,
+      postconditionProven: exactImplementation && (phase === "before" || progressed),
     };
   };
 }
@@ -1139,6 +1136,7 @@ export async function dispatch(
       logicalOperationId: opts.logicalOperationId,
       reportObservation: opts.reportObservation,
       requireEvidenceBeforeAttempt: true,
+      evidenceProducerBeforeAttempt: stage === "planning" || stage === "implementing",
       observeEvidence: opts.observeDeliveryStageEvidence,
       attempt,
     });

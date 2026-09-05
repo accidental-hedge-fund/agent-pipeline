@@ -891,6 +891,9 @@ export interface LoopExternalIdentity {
   artifact_role?: "planning" | "implementation" | "unknown";
   artifact_identity?: string | null;
   candidate_epoch?: string | null;
+  /** Operation marker on the selected artifact and the ledger operation it must match. */
+  logical_operation_id?: string | null;
+  expected_logical_operation_id?: string | null;
   /** Every linked PR number consulted for integration completeness. */
   linked_pr_numbers?: number[];
 }

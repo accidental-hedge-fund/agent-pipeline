@@ -418,7 +418,9 @@ test("candidate-worktree-only persist is not unique-operation coverage (#1446)",
       assert.equal(admission.runDir, null);
     }
   }
-  assert.equal(files.size, 0);
+  assert.equal(files.size, 3, "root refusal retains only the three durable pre-admission claims");
+  assert.ok([...files.keys()].every((p) => p.includes("/public-admission-claims/") && p.endsWith(".json")));
+  assert.equal([...files.keys()].some((p) => p.endsWith("/run.json") || p.endsWith("/events.jsonl")), false);
   writeUnboundPrefixRun(files, GENERIC, "train-host");
   writeUnboundPrefixRun(files, GENERIC, "1446-2026-09-04T23-26-39-000Z");
   const result = await runFactoryGate(

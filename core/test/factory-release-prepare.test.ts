@@ -2572,7 +2572,9 @@ function preparedCandidateResolver() {
       engineRoot: "/candidate-engine",
       launcherPath: CANDIDATE_LAUNCHER,
       commitSha: CANDIDATE,
-      revalidateBeforeSpawn: async () => ({ ok: true as const, engine }),
+      consumer: "factory-release.pack-loop" as const,
+      acquireProcessLock: () => () => {},
+      revalidateBeforeSpawn: () => ({ ok: true as const, engine }),
     };
     return { ok: true as const, engine };
   };

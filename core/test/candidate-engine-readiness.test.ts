@@ -20,6 +20,8 @@ import {
   CANDIDATE_ENGINE_CONSUMERS,
   assertCandidateEngineConsumerInventoryComplete,
   candidateEngineConsumerInventoryGaps,
+  candidateEngineRuntimeBindingGaps,
+  runCandidateEngineProcess,
   revalidateCandidateEngineBeforeSpawn,
   resolveAndPrepareCandidateEngine as sharedResolveAndPrepareCandidateEngine,
   resolveCandidateEngine,
@@ -43,9 +45,22 @@ function resolveAndPrepareCandidateEngine(
   deps: ResolveAndPrepareCandidateEngineDeps,
 ) {
   return sharedResolveAndPrepareCandidateEngine(
-    { ...opts, consumer: "pipeline.candidate-leaf" },
+    { ...opts, consumer: "ship.stage-adapter" },
     deps,
   );
+}
+
+function readTypeScriptSources(root: string, relative = ""): Record<string, string> {
+  const sources: Record<string, string> = {};
+  for (const entry of fs.readdirSync(path.join(root, relative), { withFileTypes: true })) {
+    const child = path.join(relative, entry.name);
+    if (entry.isDirectory()) {
+      Object.assign(sources, readTypeScriptSources(root, child));
+    } else if (entry.isFile() && entry.name.endsWith(".ts")) {
+      sources[child] = fs.readFileSync(path.join(root, child), "utf8");
+    }
+  }
+  return sources;
 }
 
 test("candidate-engine consumer inventory is exact and hard-gated (#1454)", () => {
@@ -64,6 +79,53 @@ test("candidate-engine consumer inventory is exact and hard-gated (#1454)", () =
     () => assertCandidateEngineConsumerInventoryComplete(bypass),
     /ship\.stage-adapter missing revalidate_before_spawn/,
   );
+});
+
+test("candidate-engine hard gate discovers and exercises every production process start (#1454)", async () => {
+  const sources = readTypeScriptSources(path.join(repoRoot, "core", "scripts"));
+  assert.deepEqual(candidateEngineRuntimeBindingGaps(sources), []);
+
+  const bypass = {
+    ...sources,
+    "new-consumer.ts": `async function bypass(engine) {
+      await resolveAndPrepareCandidateEngine(engine);
+      await revalidateCandidateEngineBeforeSpawn(engine);
+      spawn(engine.launcherPath);
+    }`,
+  };
+  assert.deepEqual(
+    candidateEngineRuntimeBindingGaps(bypass).filter((gap) => gap.includes("new-consumer.ts")),
+    [
+      "raw parent-only candidate revalidation in new-consumer.ts",
+      "raw candidate process start in new-consumer.ts",
+    ],
+  );
+
+  for (const row of CANDIDATE_ENGINE_CONSUMERS) {
+    let starts = 0;
+    const engine = {
+      engineRoot: "/candidate",
+      launcherPath: "/candidate/scripts/pipeline-launcher.mjs",
+      commitSha: SHA,
+      consumer: row.consumer,
+      acquireProcessLock: () => () => {},
+      revalidateBeforeSpawn: () => ({ ok: true as const, engine: {
+        engineRoot: "/candidate",
+        launcherPath: "/candidate/scripts/pipeline-launcher.mjs",
+        commitSha: SHA,
+        consumer: row.consumer,
+        acquireProcessLock: () => () => {},
+        revalidateBeforeSpawn: () => { throw new Error("single boundary validation only"); },
+      } }),
+    };
+    const result = await runCandidateEngineProcess({
+      consumer: row.consumer,
+      engine,
+      start: async () => ++starts,
+    });
+    assert.equal(result.ok, true, row.consumer);
+    assert.equal(starts, 1, row.consumer);
+  }
 });
 
 test("resolve-and-prepare rejects an uninventoried consumer before resolution I/O (#1454)", async () => {
@@ -378,7 +440,7 @@ async function resolveThenSpawn(
   return result;
 }
 
-test("candidate movement after preparation refuses the final spawn (#1454)", async () => {
+test("candidate movement after an earlier parent check is refused inside the process-start boundary (#1454)", async () => {
   const repo = "/repo";
   const root = { head: SHA, porcelain: "" };
   const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
@@ -391,10 +453,18 @@ test("candidate movement after preparation refuses the final spawn (#1454)", asy
     h.deps,
   );
   assert.equal(prepared.ok, true);
-  root.head = OTHER;
   if (prepared.ok) {
-    const checked = await revalidateCandidateEngineBeforeSpawn(prepared.engine);
-    assert.equal(checked.ok, false);
+    const priorParentCheck = revalidateCandidateEngineBeforeSpawn(prepared.engine);
+    assert.equal(priorParentCheck.ok, true);
+    root.head = OTHER;
+    const started = await runCandidateEngineProcess({
+      consumer: "ship.stage-adapter",
+      engine: prepared.engine,
+      start: async () => {
+        recordSpawn(h.events, h.spawned, ["node", prepared.engine.launcherPath]);
+      },
+    });
+    assert.equal(started.ok, false);
   }
   assert.equal(h.spawned.length, 0);
 });

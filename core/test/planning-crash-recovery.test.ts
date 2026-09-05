@@ -42,7 +42,15 @@ const PLANNING_EVIDENCE = async () => ({
   artifactIdentity: "planning:test-owner/test-repo#271",
   postconditionProven: false,
 });
+const PLAN_REVIEW_EVIDENCE = async (phase: "before" | "after") => ({
+  candidateSha: "a".repeat(40),
+  candidateEpoch: "a".repeat(40),
+  evidenceRole: "planning" as const,
+  artifactIdentity: "planning:test-owner/test-repo#271",
+  postconditionProven: phase === "before",
+});
 const OPTS = { dryRun: false, observeDeliveryStageEvidence: PLANNING_EVIDENCE };
+const PLAN_REVIEW_OPTS = { dryRun: false, observeDeliveryStageEvidence: PLAN_REVIEW_EVIDENCE };
 const RUN_ID = "271-2026-01-01T00:00:00Z";
 
 function makeDeps(planningResult: Outcome): {
@@ -117,7 +125,7 @@ test("planning crash recovery: stranded plan-review rolls back to ready and rest
     },
   };
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, trackingDeps);
+  const out = await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, trackingDeps);
 
   assert.equal(out.advanced, false, "unbound recovery output must not certify advancement");
   assert.equal((out as { status?: string }).status, "waiting");
@@ -154,7 +162,7 @@ test("planning crash recovery: unbound plan-review recovery remains waiting", as
   const cfg = makeCfg();
   const { deps } = makeDeps(ADVANCING_OUTCOME);
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
+  const out = await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
   assert.equal(
     (out as { status?: string }).status,
@@ -181,7 +189,7 @@ test("planning crash recovery: transition called with correct from-stage for pla
   const cfg = makeCfg();
   const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);
 
-  await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
+  await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
   assert.equal(transitionCalls[0]?.from, "plan-review");
   assert.equal(transitionCalls[0]?.to, "ready");
@@ -236,7 +244,7 @@ test("planning crash recovery: dry-run does not call transition for plan-review"
     cfg,
     ISSUE,
     "plan-review",
-    { dryRun: true, observeDeliveryStageEvidence: PLANNING_EVIDENCE },
+    { dryRun: true, observeDeliveryStageEvidence: PLAN_REVIEW_EVIDENCE },
     RUN_ID,
     undefined,
     undefined,
@@ -296,7 +304,7 @@ test("planning crash recovery: live marker from another domain prevents rollback
     },
   };
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, crossDomainDeps);
+  const out = await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, crossDomainDeps);
 
   assert.equal(
     (out as { status?: string }).status,
@@ -404,7 +412,7 @@ test("plan-review recovery with completed plan resumes without rolling back to r
     hasCompletedPlan: async () => true,
   };
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
+  const out = await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
   assert.equal(out.advanced, false);
   assert.equal((out as { status?: string }).status, "waiting");
@@ -433,7 +441,7 @@ test("plan-review recovery without completed plan still restarts from ready", as
     hasCompletedPlan: async () => false,
   };
 
-  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
+  const out = await dispatch(cfg, ISSUE, "plan-review", PLAN_REVIEW_OPTS, RUN_ID, undefined, undefined, undefined, deps);
 
   assert.equal(out.advanced, false);
   assert.equal((out as { status?: string }).status, "waiting");

@@ -428,7 +428,10 @@ export async function observeExternalIdentity(
   const authoritative = consultAllLinked
     ? selectAuthoritativeLinkedPr(linkedFacts, exactBinding)
     : linkedFacts[0] ?? null;
-  const chosen = authoritative?.number ?? foundPrNumber;
+  const chosen = integration_certainty === "known_complete"
+    ? authoritative?.number ?? foundPrNumber
+    : foundPrNumber ?? authoritative?.number ?? null;
+  const projectedArtifact = linkedFacts.find((fact) => fact.number === chosen) ?? authoritative;
   if (chosen !== null) {
     const detail = detailByNumber.get(chosen) ?? await deps.getPrDetail(chosen);
     if (detail) {
@@ -465,9 +468,11 @@ export async function observeExternalIdentity(
     product_dirt: local?.product_dirt === true,
     integration_certainty,
     linked_pr_numbers,
-    artifact_role: authoritative?.artifact_role ?? "unknown",
-    artifact_identity: authoritative?.artifact_identity ?? null,
-    candidate_epoch: authoritative?.candidate_epoch ?? null,
+    artifact_role: projectedArtifact?.artifact_role ?? "unknown",
+    artifact_identity: projectedArtifact?.artifact_identity ?? null,
+    candidate_epoch: projectedArtifact?.candidate_epoch ?? null,
+    logical_operation_id: projectedArtifact?.logical_operation_id ?? null,
+    expected_logical_operation_id: expected.logicalOperationId ?? null,
   };
 }
 
@@ -550,11 +555,14 @@ export function repairShaMismatchIsHumanStop(input: {
  *
  *  Checks conclusion never influences this target. */
 export function verifiedForwardTarget(identity: LoopExternalIdentity): LoopItemState | null {
+  const expectedOperation = identity.expected_logical_operation_id?.trim() ?? "";
+  const artifactOperation = identity.logical_operation_id?.trim() ?? "";
   const exactImplementation =
     identity.artifact_role === "implementation" &&
     Boolean(identity.artifact_identity?.trim()) &&
     Boolean(identity.head_sha.trim()) &&
-    identity.candidate_epoch?.trim().toLowerCase() === identity.head_sha.trim().toLowerCase();
+    identity.candidate_epoch?.trim().toLowerCase() === identity.head_sha.trim().toLowerCase() &&
+    (!expectedOperation || artifactOperation === expectedOperation);
   if (
     identity.pr_state === "merged" &&
     identity.integration_certainty === "known_complete" &&

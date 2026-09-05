@@ -30,7 +30,9 @@ function fakeEngine(engineRoot: string, commitSha: string) {
     engineRoot,
     launcherPath: path.join(engineRoot, LAUNCHER_REL),
     commitSha,
-    revalidateBeforeSpawn: async () => ({ ok: true, engine }),
+    consumer: "factory-gate.hybrid-v2",
+    acquireProcessLock: () => () => {},
+    revalidateBeforeSpawn: () => ({ ok: true, engine }),
   };
   return {
     ok: true as const,

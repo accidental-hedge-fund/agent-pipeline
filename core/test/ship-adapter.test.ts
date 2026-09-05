@@ -2155,7 +2155,9 @@ const candidateEngine: import("../scripts/ship-end-candidate.ts").CandidateEngin
   engineRoot: "/cand",
   launcherPath: "/cand/scripts/pipeline-launcher.mjs",
   commitSha: head,
-  revalidateBeforeSpawn: async () => ({ ok: true, engine: candidateEngine }),
+  consumer: "ship.stage-adapter",
+  acquireProcessLock: () => () => {},
+  revalidateBeforeSpawn: () => ({ ok: true, engine: candidateEngine }),
 };
 
 function memoryShipStore(): ShipStateStore & { status: ShipStatus | null; events: ShipPhaseEvent[] } {

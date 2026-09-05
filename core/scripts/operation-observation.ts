@@ -116,7 +116,9 @@ export function selectAuthoritativeLinkedPr(
     pr.state === "merged" && pr.contained === true && isExactLinkedImplementation(pr, expected)
   );
   if (containedMerged) return containedMerged;
-  const open = linked.find((pr) => pr.state === "open" && pr.artifact_role === "implementation");
+  const open = linked.find((pr) =>
+    pr.state === "open" && isExactLinkedImplementation(pr, expected)
+  );
   if (open) return open;
   const ambiguousMerged = linked.find((pr) => pr.state === "merged");
   if (ambiguousMerged) return ambiguousMerged;

@@ -27,6 +27,7 @@ import {
   persistPublicEntrypointAdmission,
   publicEntrypointRunIdFor,
   resolvePublicAdmissionPersistRoot,
+  resolvePublicAdmissionClaimRoot,
   readEvents,
   readWriteHealth,
   recordWriteHealthFailure,
@@ -532,6 +533,13 @@ test("resolvePublicAdmissionPersistRoot: unknown factory-control root fails clos
   );
 });
 
+test("resolvePublicAdmissionClaimRoot: uses the RecoverySupervisor state home (#1454)", () => {
+  assert.equal(
+    resolvePublicAdmissionClaimRoot({ AGENT_PIPELINE_STATE_HOME: "/state" }),
+    path.join("/state", "public-admission-claims"),
+  );
+});
+
 test("persistPublicEntrypointAdmission: nested and resumed attempts reuse one immutable logical identity", async () => {
   const logicalOperationId = "lop-root-operation";
   const firstStore = memRunStore();
@@ -739,29 +747,46 @@ test("persistPublicEntrypointAdmission: concurrent shared run id cannot overwrit
   assert.equal(meta.logical_operation_id, acknowledged.logicalOperationId);
 });
 
-test("persistPublicEntrypointAdmission: unavailable and non-canonical roots fail before writes", async () => {
+test("persistPublicEntrypointAdmission: approved-root refusals reuse a durable pre-admission identity after restart", async () => {
   for (const fixture of [
-    { root: null, realpath: async (p: string) => p, kind: "approved_root_unavailable" },
-    { root: "/control-link", realpath: async () => "/control-real", kind: "approved_root_mismatch" },
+    { name: "unavailable", root: null, realpath: async (p: string) => p, kind: "approved_root_unavailable" },
+    { name: "uncanonicalizable", root: "/control", realpath: async () => { throw new Error("realpath failed"); }, kind: "approved_root_unavailable" },
+    { name: "noncanonical", root: "/control-link", realpath: async () => "/control-real", kind: "approved_root_mismatch" },
   ] as const) {
     const store = memRunStore();
-    const result = await persistPublicEntrypointAdmission(
-      {
+    let mintCalls = 0;
+    const input = {
         repoDir: "/candidate",
         factoryControlRoot: fixture.root,
         kind: "single",
         route: "single.direct",
         repo: "owner/repo",
         issue: 1454,
-        mintLogicalOperationId: () => "lop-prebound",
-      },
+        operationKey: `single:owner/repo:${fixture.name}:1454`,
+        env: { AGENT_PIPELINE_STATE_HOME: "/state" },
+        mintLogicalOperationId: () => `lop-prebound-${fixture.name}-${++mintCalls}`,
+      } as const;
+    const result = await persistPublicEntrypointAdmission(
+      input,
+      { ...store.deps, realpath: fixture.realpath },
+    );
+    const retry = await persistPublicEntrypointAdmission(
+      input,
       { ...store.deps, realpath: fixture.realpath },
     );
     assert.equal(result.acknowledged, false);
+    assert.equal(retry.acknowledged, false);
     if (!result.acknowledged) assert.equal(result.failure.kind, fixture.kind);
-    assert.equal(store.files.size, 0);
-    assert.equal(store.mkdirs.length, 0);
-    assert.equal(result.logicalOperationId, "lop-prebound");
+    assert.equal(retry.logicalOperationId, result.logicalOperationId);
+    assert.equal(mintCalls, 1);
+    assert.ok(
+      [...store.files.keys()].some((p) => p.startsWith("/state/public-admission-claims/")),
+      `${fixture.name} must retain RecoverySupervisor-readable pre-admission evidence`,
+    );
+    assert.ok(
+      ![...store.files.keys()].some((p) => p.includes(`${path.sep}runs${path.sep}`)),
+      `${fixture.name} must not publish a qualifying run stamp`,
+    );
   }
 });
 

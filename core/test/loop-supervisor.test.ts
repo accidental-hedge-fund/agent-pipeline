@@ -231,6 +231,7 @@ function fakeObserveDeps(overrides: Partial<ReconcileObserveDeps> = {}): { deps:
         artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
         candidateSha: detail.head_sha,
         candidateEpoch: detail.head_sha,
+        logicalOperationId: "lop-loop-supervisor-test",
       };
     },
     async getLocalHead(issueNumber) {
@@ -280,6 +281,7 @@ function coordinatedFakes(outcomeFor: (itemId: string) => LoopExecutionResponse[
         artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
         candidateSha: detail.head_sha,
         candidateEpoch: detail.head_sha,
+        logicalOperationId: "lop-loop-supervisor-test",
       };
     },
     async getLocalHead() {
@@ -323,6 +325,7 @@ function testContract(overrides: Partial<LoopContract> = {}): LoopContract {
     consecutive_blocked_limit: 3,
     verification: null,
     report_format: "markdown",
+    logical_operation_id: "lop-loop-supervisor-test",
     ordering: "dependency_sequential",
     max_active_items: 1,
     concurrency_model: "exclusive_lock_single_engine",

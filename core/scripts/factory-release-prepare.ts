@@ -100,7 +100,7 @@ import {
 import {
   defaultResolveAndPrepareDeps,
   resolveAndPrepareCandidateEngine,
-  revalidateCandidateEngineBeforeSpawn,
+  runCandidateEngineProcess,
   type ResolveAndPrepareCandidateEngineDeps,
 } from "./ship-end-candidate.ts";
 import {
@@ -2652,18 +2652,20 @@ export async function productionDispatchPackLoop(
       ));
   let spawnResult: void | PackLoopSpawnResult;
   try {
-    const finalCandidate = await revalidateCandidateEngineBeforeSpawn(resolved.engine);
-    if (!finalCandidate.ok) {
-      throw new Error(`pack-loop dispatch: ${finalCandidate.error}`);
-    }
-    spawnResult = await spawn({
-      repoDir: input.repoDir,
-      loop_run_id,
-      issue_numbers: input.issue_numbers,
-      engineTrack: "candidate",
-      label: input.label,
-      candidateInvocation: invocation,
+    const started = await runCandidateEngineProcess({
+      consumer: "factory-release.pack-loop",
+      engine: resolved.engine,
+      start: () => spawn({
+        repoDir: input.repoDir,
+        loop_run_id,
+        issue_numbers: input.issue_numbers,
+        engineTrack: "candidate",
+        label: input.label,
+        candidateInvocation: invocation,
+      }),
     });
+    if (!started.ok) throw new Error(`pack-loop dispatch: ${started.error}`);
+    spawnResult = started.value;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code ?? "spawn_throw";
     const last_error = formatPackLoopLastError({
