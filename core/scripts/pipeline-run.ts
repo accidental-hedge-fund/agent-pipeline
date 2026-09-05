@@ -183,6 +183,7 @@ import {
   isDeliveryStage,
   requiredEvidenceRoleForStage,
   runDeliveryStageAdapter,
+  readProducerCompletionEvidence,
   type DeliveryStage,
   type DeliveryStageEvidenceObserver,
 } from "./issue-stage-adapters.ts";
@@ -875,6 +876,8 @@ export interface PlanningRecoveryDeps {
   hasCompletedPlan?: (cfg: PipelineConfig, issueNumber: number) => Promise<boolean>;
   /** Shared issue-implementation-readiness gate (#1238). Injected in tests. */
   evaluateIssueReadiness?: typeof evaluateIssueReadiness;
+  /** Implementing-stage producer. Tests inject a fake that emits its Candidate binding. */
+  dispatchResume?: typeof planningStage.dispatchResume;
 }
 
 /** True when issue comments already include a completed plan artifact (#870). */
@@ -901,6 +904,7 @@ export function realPlanningRecoveryDeps(): PlanningRecoveryDeps {
     tryAcquireLivePlanningMarker,
     hasCompletedPlan: hasCompletedPlanComment,
     evaluateIssueReadiness,
+    dispatchResume: planningStage.dispatchResume,
   };
 }
 
@@ -1129,15 +1133,10 @@ export async function dispatch(
       runStoreDeps,
       recoveryDeps,
     );
-    if (
-      evidenceProducer &&
-      outcome.advanced &&
-      opts.observeDeliveryStageEvidence
-    ) {
-      // Capture the candidate/artifact at the producer's completion boundary.
-      // runDeliveryStageAdapter re-observes it before accepting the epoch
-      // transition, so a later replacement cannot inherit producer authority.
-      producerCompletionEvidence = await opts.observeDeliveryStageEvidence("after", outcome);
+    if (evidenceProducer && outcome.advanced) {
+      // The producing handler emits this binding at its completion. Do not
+      // manufacture it from a later observer read of a possibly replaced HEAD.
+      producerCompletionEvidence = readProducerCompletionEvidence(outcome);
     }
     return outcome;
   };
@@ -1387,7 +1386,8 @@ async function dispatchStageHandler(
       // live owner + no commits → crash-stranded, roll back to `ready` and
       // restart planning.
       const implDeps = recoveryDeps ?? realPlanningRecoveryDeps();
-      return planningStage.dispatchResume(cfg, issueNumber, {
+      const resume = implDeps.dispatchResume ?? planningStage.dispatchResume;
+      return resume(cfg, issueNumber, {
         dryRun,
         model,
         pipelineRunId,

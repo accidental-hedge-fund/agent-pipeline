@@ -176,6 +176,16 @@ export function assertGeneratedHostAdmissionRoute(
   assertRequiredAdmissionRoute(route, "drive", "cli-delegate");
 }
 
+/** Production generated-host adapter: stamp the host route, then delegate to CLI. */
+export async function delegateGeneratedHostNumericDrive(
+  host: keyof typeof GENERATED_HOST_ADMISSION_ROUTES,
+  argv: readonly string[],
+  invokeCli: (argv: readonly string[]) => Promise<boolean>,
+): Promise<boolean> {
+  assertGeneratedHostAdmissionRoute(host);
+  return invokeCli(argv);
+}
+
 /** #1333 mechanical fault-matrix lifecycle classes required for FRG promotion. */
 export const REQUIRED_LIFECYCLE_CLASSES_1333 = [
   "mechanical",

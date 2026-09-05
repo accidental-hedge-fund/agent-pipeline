@@ -21,6 +21,7 @@ import {
   type IssueReadinessTreatment,
 } from "../scripts/issue-readiness.ts";
 import { dispatch, type PlanningRecoveryDeps } from "../scripts/pipeline-run.ts";
+import { attachProducerCompletionEvidence } from "../scripts/issue-stage-adapters.ts";
 
 function makeCfg(overrides: Partial<PipelineConfig> = {}): PipelineConfig {
   return {
@@ -625,19 +626,28 @@ test("commit-producing implementation dispatch accepts its captured exact Candid
   const cfg = makeCfg({ issue_readiness: { enabled: true, timeout: 600 } });
   const before = "a".repeat(40);
   const produced = "b".repeat(40);
+  const producedEvidence = {
+    candidateSha: produced,
+    candidateEpoch: produced,
+    evidenceRole: "implementation" as const,
+    artifactIdentity: `implementation:${produced}`,
+    postconditionProven: true,
+  };
+  let liveSha = before;
   let observations = 0;
   const out = await dispatch(cfg, 5, "implementing", {
     dryRun: true,
     logicalOperationId: "lop-implementation-producer",
     observeDeliveryStageEvidence: async () => {
       observations += 1;
-      const sha = observations === 1 ? before : produced;
+      const sha = liveSha;
+      const proved = sha === produced;
       return {
         candidateSha: sha,
         candidateEpoch: sha,
-        evidenceRole: observations === 1 ? null : "implementation",
-        artifactIdentity: observations === 1 ? null : `implementation:${sha}`,
-        postconditionProven: observations > 1,
+        evidenceRole: proved ? "implementation" : null,
+        artifactIdentity: proved ? `implementation:${sha}` : null,
+        postconditionProven: proved,
       };
     },
   }, "run", undefined, undefined, undefined, {
@@ -647,9 +657,72 @@ test("commit-producing implementation dispatch accepts its captured exact Candid
     evaluateIssueReadiness: async () => {
       throw new Error("implementing must not evaluate readiness");
     },
+    dispatchResume: async () => {
+      liveSha = produced;
+      return attachProducerCompletionEvidence(
+        {
+          advanced: true,
+          from: "implementing",
+          to: "design-gate",
+          summary: "implementation proof established",
+        },
+        producedEvidence,
+      );
+    },
   });
   assert.equal(out.advanced, true);
-  assert.equal(observations, 3);
+  assert.equal(observations, 2);
+});
+
+test("commit-producing implementation dispatch cannot certify a post-handler replacement Candidate", async () => {
+  const cfg = makeCfg({ issue_readiness: { enabled: true, timeout: 600 } });
+  const produced = "b".repeat(40);
+  const replacement = "c".repeat(40);
+  const producedEvidence = {
+    candidateSha: produced,
+    candidateEpoch: produced,
+    evidenceRole: "implementation" as const,
+    artifactIdentity: `implementation:${produced}`,
+    postconditionProven: true,
+  };
+  let liveSha = "a".repeat(40);
+  const out = await dispatch(cfg, 5, "implementing", {
+    dryRun: true,
+    logicalOperationId: "lop-implementation-producer-replaced",
+    observeDeliveryStageEvidence: async () => {
+      const sha = liveSha;
+      const proved = sha === produced || sha === replacement;
+      return {
+        candidateSha: sha,
+        candidateEpoch: sha,
+        evidenceRole: proved ? "implementation" : null,
+        artifactIdentity: proved ? `implementation:${sha}` : null,
+        postconditionProven: proved,
+      };
+    },
+  }, "run", undefined, undefined, undefined, {
+    transition: async () => {},
+    planningAdvance: async () => ({ advanced: false, status: "waiting", reason: "unused" }),
+    isLivePlanningActive: () => false,
+    evaluateIssueReadiness: async () => {
+      throw new Error("implementing must not evaluate readiness");
+    },
+    dispatchResume: async () => {
+      const outcome = attachProducerCompletionEvidence(
+        {
+          advanced: true,
+          from: "implementing",
+          to: "design-gate",
+          summary: "implementation proof established for produced Candidate",
+        },
+        producedEvidence,
+      );
+      liveSha = replacement;
+      return outcome;
+    },
+  });
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /Candidate binding changed during execution/);
 });
 
 test("pickup coordinators share ready-dispatch gate and have no private copy", async () => {

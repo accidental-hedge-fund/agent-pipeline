@@ -15,6 +15,7 @@ import {
   admissionRouteInventoryGaps,
   assertAdmissionRouteInventoryComplete,
   captureRequiredAdmissionRouteCrossings,
+  delegateGeneratedHostNumericDrive,
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
   filterAttemptsBoundToCandidate,
@@ -27,11 +28,25 @@ import {
 } from "../scripts/operation-reliability.ts";
 import {
   SKILL_HOST_IDS,
-  renderHostSkill,
 } from "../scripts/host-skill.ts";
-import { executeAfterPublicAdmission, assertLoopAdmissionRoute } from "../scripts/pipeline.ts";
-import { assertTrainAdmissionRoute } from "../scripts/stages/train.ts";
-import { assertShipAdmissionRoute } from "../scripts/stages/ship.ts";
+import {
+  executeAfterPublicAdmission,
+  handleRunSubcommand,
+  runLoopCommand,
+  runSingleIssueCommand,
+  type CliOpts,
+  type LoopCliDeps,
+  type RunSubcommandDeps,
+  type SingleIssueCommandDeps,
+} from "../scripts/pipeline.ts";
+import { runTrain, type TrainDeps, type TrainIssueSnapshot } from "../scripts/stages/train.ts";
+import {
+  operatorShipIntent,
+  runShipCoordinator,
+  type ShipCoordinatorDeps,
+  type ShipStatus,
+} from "../scripts/stages/ship.ts";
+import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 
 const CORE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPO_ROOT = path.resolve(CORE_ROOT, "..");
@@ -113,59 +128,422 @@ test("required admission route inventory is exact and hard-gated (#1454)", () =>
 
 });
 
-test("hard gate executes production-owned admission route adapters (#1454)", async () => {
-  const events: string[] = [];
-  const captured = await captureRequiredAdmissionRouteCrossings(async () => {
-    for (const [route, kind] of [
-      ["single.direct", "single"],
-      ["merge.direct", "merge"],
-      ["merge-queue.apply", "merge-queue"],
-    ] as const) {
-      const executed = await executeAfterPublicAdmission(
-        {
-          repoDir: "/factory-control",
-          repo: "acme/repo",
-          domain: "acme+repo",
-          kind,
-          operationKey: `inventory:${route}`,
-          route,
-        },
-        async () => { events.push(`protected:${route}`); },
-        {
-          persistPublicAdmission: (async (input: { operationKey?: string }) => {
-            events.push(`admit:${route}`);
-            return {
-              acknowledged: true,
-              operationKey: input.operationKey ?? "",
-              logicalOperationId: `lop-${route}`,
-              approvedRoot: "/factory-control",
-            };
-          }) as never,
-        },
-      );
-      assert.equal(executed.ok, true);
-      assert.deepEqual(events.slice(-2), [`admit:${route}`, `protected:${route}`]);
-    }
+function admissionCfg(): PipelineConfig {
+  return {
+    ...DEFAULT_CONFIG,
+    repo: "acme/repo",
+    repo_dir: "/factory-control",
+    domain: "acme+repo",
+    base_branch: "main",
+  };
+}
 
-    for (const route of ["drive.numeric", "drive.detached-resume", "loop.direct", "loop.resume"] as const) {
-      assertLoopAdmissionRoute(route);
-    }
-    for (const route of ["train.direct", "train.recovery", "merge.train-nested"] as const) {
-      assertTrainAdmissionRoute(route);
-    }
-    for (const route of ["ship.direct", "ship.resume"] as const) {
-      assertShipAdmissionRoute(route);
-    }
-    renderHostSkill();
-    for (const host of SKILL_HOST_IDS) {
-      const delegated = await executeGeneratedHostNumericDrive(host, async () => {
-        return true;
+function acknowledgedAdmission(input: {
+  operationKey?: string;
+  logicalOperationId?: string;
+  approvedRoot?: string | null;
+}) {
+  return {
+    acknowledged: true as const,
+    operationKey: input.operationKey ?? "",
+    logicalOperationId: input.logicalOperationId ?? "lop-admitted",
+    approvedRoot: input.approvedRoot ?? "/factory-control",
+  };
+}
+
+async function withCapturedConsole<T>(fn: () => Promise<T>): Promise<T> {
+  const origLog = console.log;
+  const origErr = console.error;
+  console.log = () => {};
+  console.error = () => {};
+  try {
+    return await fn();
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+  }
+}
+
+function driveEngineResult(runId: string) {
+  return {
+    kind: "drive" as const,
+    result: {
+      runId,
+      cycles: 1,
+      stop: null,
+      holdOutstanding: false,
+      allDone: true,
+      resumed: false,
+      heldItemIds: [],
+      dispatched: 1,
+      excludedItemIds: [],
+      exclusionReason: null,
+      completion: "all_items_done" as const,
+    },
+  };
+}
+
+function fakeGitRepo(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-admission-loop-"));
+  fs.mkdirSync(path.join(dir, ".git"));
+  return dir;
+}
+
+function memAdmissionStore() {
+  const files = new Map<string, string>();
+  const enoent = (p: string): NodeJS.ErrnoException => {
+    const e = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+    e.code = "ENOENT";
+    return e;
+  };
+  return {
+    readFile: async (p: string) => {
+      if (!files.has(p)) throw enoent(p);
+      return files.get(p)!;
+    },
+    writeFile: async (p: string, data: string) => {
+      files.set(p, data);
+    },
+    appendFile: async (p: string, data: string) => {
+      files.set(p, (files.get(p) ?? "") + data);
+    },
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async (p: string) => {
+      if (!files.has(p)) throw enoent(p);
+      return { mtime: new Date(0) };
+    },
+    rename: async (from: string, to: string) => {
+      const contents = files.get(from);
+      if (contents === undefined) throw enoent(from);
+      files.set(to, contents);
+      files.delete(from);
+    },
+    fsyncFile: async () => {},
+    fsyncDirectory: async () => {},
+    realpath: async (p: string) => path.resolve(p),
+    link: async (existingPath: string, newPath: string) => {
+      if (files.has(newPath)) {
+        const error = new Error(`EEXIST: ${newPath}`) as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+      const contents = files.get(existingPath);
+      if (contents === undefined) throw enoent(existingPath);
+      files.set(newPath, contents);
+    },
+    unlink: async (p: string) => {
+      if (!files.delete(p)) throw enoent(p);
+    },
+  };
+}
+
+function trainAdmissionDeps(
+  events: string[],
+  persist: TrainDeps["persistPublicAdmission"],
+): TrainDeps & {
+  seedIssue(s: TrainIssueSnapshot): void;
+  seedPr(issue: number, pr: number): void;
+} {
+  const issues = new Map<number, TrainIssueSnapshot>();
+  const openPr = new Map<number, number>();
+  const prState = new Map<number, { state: "open" | "merged"; oid: string | null; head: string }>();
+  const store = memAdmissionStore();
+  const deps: TrainDeps & {
+    seedIssue(s: TrainIssueSnapshot): void;
+    seedPr(issue: number, pr: number): void;
+  } = {
+    log() {},
+    now: () => new Date("2026-08-28T17:28:03.000Z"),
+    runStore: store,
+    publicAdmissionStore: store,
+    resolveApprovedControlRoot: async () => "/factory-control",
+    persistPublicAdmission: persist,
+    async getIssue(n) {
+      const s = issues.get(n);
+      if (!s) throw new Error(`missing issue ${n}`);
+      return s;
+    },
+    async listMilestoneIssues() {
+      return [...issues.values()];
+    },
+    discoverDeps: {
+      async getIssueTitleBody(n) {
+        const s = issues.get(n);
+        return s ? { title: s.title, body: s.body } : null;
+      },
+      async getBlockedByIssueNumbers() {
+        return [];
+      },
+      async getIssueOpenState(n) {
+        return issues.get(n)?.state === "closed" ? "closed" : "open";
+      },
+    },
+    async advanceWave(list) {
+      const out = new Map();
+      for (const n of list) {
+        const s = issues.get(n)!;
+        s.labels = ["pipeline:ready-to-deploy"];
+        out.set(n, { ok: true as const, terminal: "ready-to-deploy" as const, labels: s.labels });
+      }
+      return out;
+    },
+    async getPrForIssue(n) {
+      return openPr.get(n) ?? null;
+    },
+    async getPrForIssueAnyState(n) {
+      return openPr.get(n) ?? null;
+    },
+    async mergeIssuePr(pr) {
+      events.push(`protected:merge.train-nested:${pr}`);
+      const cur = prState.get(pr) ?? { state: "open" as const, oid: null, head: "h" };
+      prState.set(pr, {
+        state: "merged",
+        oid: `aa${pr}${"c".repeat(40)}`.slice(0, 40),
+        head: cur.head,
       });
-      assert.equal(delegated, true);
-    }
+      for (const [issue, p] of openPr) if (p === pr) openPr.delete(issue);
+    },
+    async observePr(pr) {
+      const cur = prState.get(pr) ?? { state: "open" as const, oid: null, head: "h" };
+      return {
+        state: cur.state === "merged" ? "merged" : "open",
+        mergeCommitOid: cur.oid,
+        headRefOid: cur.head,
+      };
+    },
+    async fetchBase() {},
+    async baseTip() {
+      return "b".repeat(40);
+    },
+    async isAncestor(ancestor, descendant) {
+      return descendant === "b".repeat(40) && ancestor.startsWith("aa");
+    },
+    seedIssue(s) {
+      issues.set(s.number, s);
+    },
+    seedPr(issue, pr) {
+      openPr.set(issue, pr);
+      prState.set(pr, { state: "open", oid: null, head: "a".repeat(40) });
+    },
+  };
+  return deps;
+}
+
+function shipAdmissionDeps(store: { status: ShipStatus | null }): ShipCoordinatorDeps {
+  const boom = async (): Promise<never> => {
+    throw new Error("stop after admission");
+  };
+  return {
+    now: () => new Date("2026-08-10T12:00:00.000Z"),
+    state: {
+      statusFile: (key) => `/state/ships/${key}/status.json`,
+      eventsFile: (key) => `/state/ships/${key}/events.jsonl`,
+      async read() {
+        return store.status ? structuredClone(store.status) : null;
+      },
+      async writeAtomic(_key, value) {
+        store.status = structuredClone(value);
+      },
+      async appendEvent() {},
+    },
+    authorizationPublicKey: "unused",
+    async withRunLock(_key, fn) {
+      return fn();
+    },
+    reconcile: boom,
+    planTrain: boom,
+    convergeTrain: boom,
+    convergeFrgPack: boom,
+    convergeFrgScore: boom,
+    convergeReleasePrepare: boom,
+    convergeReleaseFinish: boom,
+    convergeTag: boom,
+    waitForRelease: boom,
+    convergeEnginePromote: boom,
+    convergeDeployment: boom,
+    async observeRemainingOpenMilestoneIssues() {
+      return [];
+    },
+  };
+}
+
+test("hard gate executes inventoried production admission routes (#1454)", async () => {
+  const events: string[] = [];
+  const persist = (async (input: {
+    operationKey?: string;
+    logicalOperationId?: string;
+    route?: string;
+  }) => {
+    events.push(`admit:${input.route ?? input.operationKey}`);
+    return {
+      ...acknowledgedAdmission({
+        operationKey: input.operationKey,
+        logicalOperationId: `lop-${input.route ?? "admitted"}`,
+        approvedRoot: "/factory-control",
+      }),
+      runDir: "/factory-control/.agent-pipeline/runs/admission-test",
+      runId: "admission-test",
+    };
+  }) as never;
+
+  const captured = await captureRequiredAdmissionRouteCrossings(async () => {
+    await withCapturedConsole(async () => {
+      for (const [route, kind] of [
+        ["merge.direct", "merge"],
+        ["merge-queue.apply", "merge-queue"],
+      ] as const) {
+        const executed = await executeAfterPublicAdmission(
+          {
+            repoDir: "/factory-control",
+            repo: "acme/repo",
+            domain: "acme+repo",
+            kind,
+            operationKey: `inventory:${route}`,
+            route,
+          },
+          async (admission) => {
+            assert.equal(admission.logicalOperationId, `lop-${route}`);
+            assert.equal(admission.approvedRoot, "/factory-control");
+            events.push(`protected:${route}`);
+          },
+          { persistPublicAdmission: persist },
+        );
+        assert.equal(executed.ok, true);
+        assert.deepEqual(events.slice(-2), [`admit:${route}`, `protected:${route}`]);
+      }
+
+      const singleDeps: SingleIssueCommandDeps = {
+        resolveConfig: () => admissionCfg(),
+        resolveIssueNumber: async (_cfg, n) => n,
+        runLoopEngine: async (input) => {
+          assert.equal(input.logicalOperationId, "lop-single.direct");
+          events.push("protected:single.direct");
+          return driveEngineResult("loop-single");
+        },
+        writeStdoutLine: () => {},
+        persistPublicAdmission: persist,
+      };
+      await runSingleIssueCommand("1454", { profile: "codex" } as CliOpts, singleDeps, {
+        persistPublicAdmission: true,
+      });
+      assert.deepEqual(events.slice(-2), ["admit:single.direct", "protected:single.direct"]);
+
+      const numericDeps: SingleIssueCommandDeps = {
+        resolveConfig: () => admissionCfg(),
+        resolveIssueNumber: async (_cfg, n) => n,
+        runLoopEngine: async () => {
+          events.push("protected:drive.numeric");
+          return driveEngineResult("loop-numeric");
+        },
+        writeStdoutLine: () => {},
+      };
+      await runSingleIssueCommand("1454", { profile: "codex" } as CliOpts, numericDeps);
+
+      const detachDeps: RunSubcommandDeps = {
+        spawnDetached: async () => {
+          events.push("protected:drive.detached-resume");
+          return { runDir: "/tmp/wrapper", pid: 1 };
+        },
+        findGitRoot: () => "/factory-control",
+        cwd: () => "/factory-control",
+        restoreDeadDetached: async () => null,
+      };
+      const priorExit = process.exitCode;
+      process.exitCode = undefined;
+      await handleRunSubcommand("1454", { detach: true, profile: "codex" } as CliOpts, detachDeps);
+      process.exitCode = priorExit;
+      assert.ok(events.includes("protected:drive.detached-resume"));
+
+      const repoDir = fakeGitRepo();
+      try {
+        const loopDirect: LoopCliDeps = {
+          runLoopPreflight: async () => ({
+            ok: true,
+            args: { selector: { type: "work-list", value: ["1454"] }, resumeRunId: undefined, audit: false },
+          }),
+          runLoopEngine: async () => {
+            events.push("protected:loop.direct");
+            return driveEngineResult("loop-direct");
+          },
+          writeStdoutLine: () => {},
+        };
+        await runLoopCommand({ profile: "codex", repoPath: repoDir } as CliOpts, ["1454"], loopDirect);
+
+        const loopResume: LoopCliDeps = {
+          runLoopPreflight: async () => ({
+            ok: true,
+            args: { selector: { type: "work-list", value: ["1454"] }, resumeRunId: "loop-resume-1", audit: false },
+          }),
+          runLoopEngine: async (input) => {
+            assert.equal(input.resumeRunId, "loop-resume-1");
+            events.push("protected:loop.resume");
+            return { ...driveEngineResult("loop-resume-1"), result: { ...driveEngineResult("loop-resume-1").result, resumed: true } };
+          },
+          writeStdoutLine: () => {},
+        };
+        await runLoopCommand({ profile: "codex", repoPath: repoDir, resume: "loop-resume-1" } as CliOpts, [], loopResume);
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      }
+
+      const recovery = trainAdmissionDeps(events, persist);
+      recovery.seedIssue({
+        number: 11,
+        title: "recovery",
+        body: "independent",
+        labels: ["pipeline:ready"],
+        state: "open",
+      });
+      await runTrain(
+        { issues: [11], merge: false, baseBranch: "main", repoDir: "/tmp/repo", repo: "acme/repo" },
+        recovery,
+      );
+      events.push("protected:train.recovery");
+
+      const nested = trainAdmissionDeps(events, persist);
+      nested.seedIssue({
+        number: 12,
+        title: "merge",
+        body: "independent",
+        labels: ["pipeline:ready-to-deploy"],
+        state: "open",
+      });
+      nested.seedPr(12, 112);
+      await runTrain(
+        { issues: [12], merge: true, baseBranch: "main", repoDir: "/tmp/repo", repo: "acme/repo" },
+        nested,
+      );
+      events.push("protected:train.direct");
+
+      const shipStore: { status: ShipStatus | null } = { status: null };
+      const shipIntent = operatorShipIntent({
+        repository: "acme/repo",
+        base_branch: "main",
+        milestone: "v1.40.1",
+        version: "1.40.1",
+      });
+      await runShipCoordinator(shipIntent, null, shipAdmissionDeps(shipStore)).catch(() => {});
+      events.push("protected:ship.direct");
+      assert.ok(shipStore.status, "ship.direct must persist coordinator status");
+      await runShipCoordinator(shipIntent, null, shipAdmissionDeps(shipStore)).catch(() => {});
+      events.push("protected:ship.resume");
+
+      for (const host of SKILL_HOST_IDS) {
+        const delegated = await executeGeneratedHostNumericDrive(host, async (argv) => {
+          return delegateGeneratedHostNumericDrive(host, argv, async (forwarded) => {
+            assert.deepEqual(forwarded, ["1454"]);
+            events.push(`protected:host.${host}`);
+            return true;
+          });
+        });
+        assert.equal(delegated, true);
+      }
+    });
   });
 
   assert.deepEqual(admissionRouteExecutionGaps(captured.routes), []);
+  assert.ok(events.includes("protected:merge.train-nested:112"));
   assert.deepEqual(
     REQUIRED_ADMISSION_ROUTES.filter((row) => row.class === "host").map((row) => row.host).sort(),
     [...SKILL_HOST_IDS].sort(),

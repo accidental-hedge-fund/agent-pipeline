@@ -737,9 +737,9 @@ export interface RunDeliveryStageAdapterInput {
     "candidateSha" | "candidateEpoch" | "evidenceRole" | "artifactIdentity" | "postconditionProven"
   >>;
   /**
-   * Exact evidence captured by the producer immediately after its successful
-   * handler returned. The adapter re-observes after that boundary and accepts
-   * a producer-created Candidate epoch only while both observations agree.
+   * Immutable Candidate/artifact binding emitted by the producing handler at
+   * its successful completion. The adapter re-observes after that boundary and
+   * accepts a producer-created Candidate epoch only while both observations agree.
    */
   producerCompletionEvidence?: () => DeliveryStageEvidence | null;
   attempt: () => Promise<Outcome>;
@@ -749,7 +749,32 @@ export type DeliveryStageEvidenceObserver = NonNullable<
   RunDeliveryStageAdapterInput["observeEvidence"]
 >;
 
-type DeliveryStageEvidence = Awaited<ReturnType<DeliveryStageEvidenceObserver>>;
+export type DeliveryStageEvidence = Awaited<ReturnType<DeliveryStageEvidenceObserver>>;
+
+const producerCompletionEvidenceByOutcome = new WeakMap<object, DeliveryStageEvidence>();
+
+export function freezeDeliveryStageEvidence(evidence: DeliveryStageEvidence): DeliveryStageEvidence {
+  return Object.freeze({
+    candidateSha: evidence.candidateSha,
+    candidateEpoch: evidence.candidateEpoch,
+    evidenceRole: evidence.evidenceRole,
+    artifactIdentity: evidence.artifactIdentity,
+    postconditionProven: evidence.postconditionProven,
+  });
+}
+
+/** Bind the exact Candidate/artifact the producing handler established. */
+export function attachProducerCompletionEvidence(
+  outcome: Outcome,
+  evidence: DeliveryStageEvidence,
+): Outcome {
+  producerCompletionEvidenceByOutcome.set(outcome, freezeDeliveryStageEvidence(evidence));
+  return outcome;
+}
+
+export function readProducerCompletionEvidence(outcome: Outcome): DeliveryStageEvidence | null {
+  return producerCompletionEvidenceByOutcome.get(outcome) ?? null;
+}
 
 function sameEvidenceBinding(before: DeliveryStageEvidence, after: DeliveryStageEvidence): boolean {
   return (

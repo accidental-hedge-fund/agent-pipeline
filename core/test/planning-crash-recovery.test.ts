@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import { _internals, type PlanningRecoveryDeps } from "../scripts/pipeline.ts";
 import type { Outcome, PipelineConfig, Stage } from "../scripts/types.ts";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
+import { attachProducerCompletionEvidence } from "../scripts/issue-stage-adapters.ts";
 
 const { dispatch } = _internals;
 
@@ -230,9 +231,16 @@ test("planning crash recovery: dry-run does not call transition for planning", a
 
 test("planning producer dispatch accepts only its captured epoch transition", async () => {
   const cfg = makeCfg();
-  const { deps } = makeDeps(ADVANCING_OUTCOME);
   const before = "a".repeat(40);
   const produced = "b".repeat(40);
+  const producedEvidence = {
+    candidateSha: produced,
+    candidateEpoch: produced,
+    evidenceRole: "planning" as const,
+    artifactIdentity: `planning:${produced}`,
+    postconditionProven: true,
+  };
+  let liveSha = before;
   let observations = 0;
   const out = await dispatch(
     cfg,
@@ -243,13 +251,14 @@ test("planning producer dispatch accepts only its captured epoch transition", as
       logicalOperationId: "lop-planning-producer",
       observeDeliveryStageEvidence: async () => {
         observations += 1;
-        const sha = observations === 1 ? before : produced;
+        const sha = liveSha;
+        const proved = sha === produced;
         return {
           candidateSha: sha,
           candidateEpoch: sha,
           evidenceRole: "planning",
-          artifactIdentity: observations === 1 ? `planning-target:${sha}` : `planning:${sha}`,
-          postconditionProven: observations > 1,
+          artifactIdentity: proved ? `planning:${sha}` : `planning-target:${sha}`,
+          postconditionProven: proved,
         };
       },
     },
@@ -257,17 +266,34 @@ test("planning producer dispatch accepts only its captured epoch transition", as
     undefined,
     undefined,
     undefined,
-    deps,
+    {
+      transition: async () => {},
+      isLivePlanningActive: () => false,
+      planningAdvance: async () => {
+        liveSha = produced;
+        return attachProducerCompletionEvidence(
+          { advanced: true, from: "planning", to: "plan-review", summary: "plan produced" },
+          producedEvidence,
+        );
+      },
+    },
   );
   assert.equal(out.advanced, true);
-  assert.equal(observations, 3, "before, producer-completion, and final verification are required");
+  assert.equal(observations, 2, "handler emission replaces a later observer capture");
 });
 
 test("planning producer dispatch refuses movement after its captured epoch", async () => {
   const cfg = makeCfg();
-  const { deps } = makeDeps(ADVANCING_OUTCOME);
-  const shas = ["a".repeat(40), "b".repeat(40), "c".repeat(40)];
-  let observations = 0;
+  const produced = "b".repeat(40);
+  const replacement = "c".repeat(40);
+  const producedEvidence = {
+    candidateSha: produced,
+    candidateEpoch: produced,
+    evidenceRole: "planning" as const,
+    artifactIdentity: `planning:${produced}`,
+    postconditionProven: true,
+  };
+  let liveSha = "a".repeat(40);
   const out = await dispatch(
     cfg,
     ISSUE,
@@ -276,14 +302,14 @@ test("planning producer dispatch refuses movement after its captured epoch", asy
       dryRun: true,
       logicalOperationId: "lop-planning-replaced",
       observeDeliveryStageEvidence: async () => {
-        const sha = shas[Math.min(observations, shas.length - 1)]!;
-        observations += 1;
+        const sha = liveSha;
+        const proved = sha === produced || sha === replacement;
         return {
           candidateSha: sha,
           candidateEpoch: sha,
           evidenceRole: "planning",
-          artifactIdentity: observations === 1 ? `planning-target:${sha}` : `planning:${sha}`,
-          postconditionProven: observations > 1,
+          artifactIdentity: proved ? `planning:${sha}` : `planning-target:${sha}`,
+          postconditionProven: proved,
         };
       },
     },
@@ -291,7 +317,18 @@ test("planning producer dispatch refuses movement after its captured epoch", asy
     undefined,
     undefined,
     undefined,
-    deps,
+    {
+      transition: async () => {},
+      isLivePlanningActive: () => false,
+      planningAdvance: async () => {
+        const outcome = attachProducerCompletionEvidence(
+          { advanced: true, from: "planning", to: "plan-review", summary: "plan produced" },
+          producedEvidence,
+        );
+        liveSha = replacement;
+        return outcome;
+      },
+    },
   );
   assert.equal(out.advanced, false);
   if (!out.advanced) assert.match(out.reason, /Candidate binding changed/);

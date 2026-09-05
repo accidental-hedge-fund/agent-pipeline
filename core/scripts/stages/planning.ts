@@ -116,6 +116,7 @@ import {
   type ImplementDeliverableObservation,
   type InspectUnpublishedDeps,
 } from "../unpublished-stage-commit.ts";
+import { attachProducerCompletionEvidence } from "../issue-stage-adapters.ts";
 import {
   evaluatePostHarnessNoNewCommit,
   formatNoopAdvanceEvidenceNote,
@@ -3095,7 +3096,7 @@ export async function dispatchResume(
 
   const resumeWt = { path: wt.path, branch: branchName(issueNumber, wt.slug) };
 
-  return doResume(cfg, issueNumber, resumeWt, {
+  const outcome = await doResume(cfg, issueNumber, resumeWt, {
     prTitle: `[Pipeline] ${title} (#${issueNumber})`,
     prBody,
     transitionMessage: (prNumber) =>
@@ -3106,6 +3107,20 @@ export async function dispatchResume(
     runStoreDeps: opts.runStoreDeps,
     logicalOperationId: opts.logicalOperationId,
   });
+  if (
+    outcome.advanced &&
+    currentDeliverable &&
+    isExactImplementationDeliverable(currentDeliverable)
+  ) {
+    return attachProducerCompletionEvidence(outcome, {
+      candidateSha: currentDeliverable.candidate_sha,
+      candidateEpoch: currentDeliverable.candidate_epoch,
+      evidenceRole: "implementation",
+      artifactIdentity: currentDeliverable.artifact_id,
+      postconditionProven: true,
+    });
+  }
+  return outcome;
 }
 
 // ---------------------------------------------------------------------------
