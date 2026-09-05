@@ -25,7 +25,8 @@ See `proposal.md` for motivation and the #1459 / v1.40.1 dogfood path.
 
 - One dispatch-time later-stage guard that all advance entry points share.
 - Reuse the existing currency helper and internal-commit classifier. Do not invent a second SHA-gate product.
-- Atomic return to `review-1` on superseded HEAD before any later stage handler runs.
+- Same-advance return to the first enabled exact-SHA review stage on superseded HEAD before any later-stage handler or terminal finalizer runs.
+- Clear stale blocked state and durably audit each candidate-epoch restart.
 - Recovery next-action after epoch change cannot treat review-stage work as noop from pending checks or a stale prior episode.
 
 **Non-Goals:**
@@ -41,7 +42,7 @@ See `proposal.md` for motivation and the #1459 / v1.40.1 dogfood path.
 
 ### D1: Guard lives on `runAdvance` dispatch, not inside visual-gate
 
-**Choice:** Before `runAdvance` dispatches `visual-gate`, `eval-gate`, `shipcheck-gate`, or `ready-to-deploy`, reconcile review currency against the linked PR HEAD. On superseded or unclassifiable-with-moved-head, transition to `review-1` and `continue` the same advance loop (same pattern as stale-block resume). Do not call the later-stage handler.
+**Choice:** Before `runAdvance` dispatches `visual-gate`, `eval-gate`, `shipcheck-gate`, or `ready-to-deploy`, reconcile review currency against the linked PR HEAD. Repeat the guard immediately inside terminal finalization, including its deferred path. On superseded or unclassifiable-with-moved-head, clear a leftover block, transition to the first enabled exact-SHA review stage (`review-1`, otherwise `review-2`), record a durable candidate-epoch restart event, and `continue` the same advance loop (same pattern as stale-block resume). Do not call the later-stage handler or finalizer. Fail closed if neither review stage is enabled.
 
 **Why this is the first holding rung:** nested, single, and loop already enter `runAdvance`. The currency helper and `transition()` already exist. A visual-gate-only check would miss eval/shipcheck/ready-to-deploy and would be a site mole.
 
@@ -66,9 +67,9 @@ See `proposal.md` for motivation and the #1459 / v1.40.1 dogfood path.
 | Currency | Later-stage action |
 |---|---|
 | `current` (exact SHA or pipeline-internal-only) | Dispatch the later stage as today |
-| `superseded` (non-pipeline-internal in S..H) | Invalidate prior-SHA review/test/readiness authority. Atomic `transition` to `review-1`. Do not run the later stage. Continue the same advance so review-1 can run. |
+| `superseded` (non-pipeline-internal in S..H) | Invalidate prior-SHA review/test/readiness authority. Clear a leftover block, transition to the first enabled exact-SHA review stage, and record the epoch restart. Do not run the later stage. Continue the same advance so review can run. |
 | `unknown` and H is readable and H ≠ S | Same as superseded (conservative re-review at H). Cannot prove internal-only reuse. |
-| PR missing / HEAD unreadable | Fail closed: do not dispatch the later stage; do not reach ready-to-deploy; do not invent a pass. |
+| PR missing / HEAD unreadable, or no review stage enabled | Fail closed: do not dispatch the later stage; do not reach ready-to-deploy; do not invent a pass. |
 
 **Why:** Matches SHA-gate / stale-block supersession plus fail-closed observation. Returning to `review-1` is the issue's required epoch restart, not delta-at-visual-gate.
 
@@ -76,7 +77,7 @@ See `proposal.md` for motivation and the #1459 / v1.40.1 dogfood path.
 
 ### D4: Invalidation is routing plus evidence authority, not a new store
 
-**Choice:** Do not add a durable "epoch invalidated" table. Authority invalidation is: (1) later stage does not run, (2) stage label becomes `review-1`, (3) ready-to-deploy and later-gate evidence bound to S cannot authorize H. Existing candidate-integrity / review-SHA rules already refuse stale review for readiness; this change makes later-stage dispatch obey them.
+**Choice:** Do not add a durable "epoch invalidated" table. Authority invalidation is: (1) later stage does not run, (2) leftover blocked state is cleared, (3) the stage label becomes the enabled exact-SHA review stage, (4) a `candidate_epoch_restarted` run event binds S, H, and both stages, and (5) ready-to-deploy and later-gate evidence bound to S cannot authorize H. Existing candidate-integrity / review-SHA rules already refuse stale review for readiness; this change makes later-stage dispatch obey them.
 
 **Why:** First holding rung. A new epoch ledger would be a custom layer the implementer then has to build.
 

@@ -102,6 +102,11 @@ type DriveOpts = {
   commits: { oid: string; messageHeadline: string }[];
   blocked?: boolean;
   reviewSha?: string | null;
+  attackerReviewSha?: string | null;
+  standardReview?: boolean;
+  adversarialReview?: boolean;
+  advanceReviewStages?: boolean;
+  currencySequence?: Array<"current" | "superseded">;
 };
 
 type DriveResult = {
@@ -110,6 +115,9 @@ type DriveResult = {
   labels: string[];
   logs: string[];
   reviewDispatchedAtSha: string | null;
+  clearBlockedCalls: number;
+  finalizeCalls: number;
+  candidateEpochEvents: number;
 };
 
 async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
@@ -125,6 +133,9 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
   const transitions: DriveResult["transitions"] = [];
   const logs: string[] = [];
   let reviewDispatchedAtSha: string | null = null;
+  let clearBlockedCalls = 0;
+  let finalizeCalls = 0;
+  let currencyCalls = 0;
   const origLog = console.log;
   const origWarn = console.warn;
   const origError = console.error;
@@ -143,18 +154,19 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
     ...(opts.reviewSha
       ? [{ author: "pipeline-bot", body: reviewComment(opts.reviewSha) }]
       : []),
-    ...[
-      "review-1",
-      "review-2",
-      "pre-merge",
-      "visual-gate",
-      "eval-gate",
-      "shipcheck-gate",
-      "ready-to-deploy",
-    ].map((s) => ({
+    ...(opts.attackerReviewSha
+      ? [{ author: "attacker", body: reviewComment(opts.attackerReviewSha) }]
+      : []),
+    ...STAGES.filter((s) => s !== "backlog" && s !== "ready").map((s) => ({
       author: "pipeline-bot",
-      body: `## Pipeline: ${s}\n<!-- pipeline-audit: run=test state=${s} -->`,
+      body: `## Pipeline: ${s}\n<!-- pipeline-audit: run=${runId} state=${s} -->`,
     })),
+    ...(opts.blocked
+      ? [{
+          author: "pipeline-bot",
+          body: `## Pipeline: Blocked\n<!-- pipeline-audit: run=${runId} state=blocked -->`,
+        }]
+      : []),
   ];
 
   const detail = {
@@ -181,7 +193,10 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
       reviewer: "codex",
       reviewerSource: "default",
     },
-    steps: { standard_review: true, adversarial_review: true },
+    steps: {
+      standard_review: opts.standardReview ?? true,
+      adversarial_review: opts.adversarialReview ?? true,
+    },
     auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
     papercuts: { enabled: false, auto_file: false },
     corrections: { auto_file: false },
@@ -222,6 +237,16 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
       return prDetail(opts.prHead);
     },
     getPrCommits: async () => opts.commits,
+    ...(opts.currencySequence
+      ? {
+          resolveReviewedShaCurrency: async () => {
+            const status = opts.currencySequence![Math.min(currencyCalls++, opts.currencySequence!.length - 1)];
+            return status === "superseded"
+              ? { status: "superseded" as const, headSha: SHA_H }
+              : { status: "current" as const };
+          },
+        }
+      : {}),
     getOnDiskForIssue: async () => null,
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     postComment: async () => {},
@@ -238,6 +263,15 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
       if (idx >= 0) labels[idx] = `pipeline:${to}`;
       else labels.push(`pipeline:${to}`);
     },
+    clearBlocked: async () => {
+      clearBlockedCalls++;
+      const idx = labels.indexOf("blocked");
+      if (idx >= 0) labels.splice(idx, 1);
+    },
+    finalizeReadyToDeploy: async () => {
+      finalizeCalls++;
+      return { advanced: false, status: "finalized", reason: "finalized" };
+    },
     dispatch: async (_cfg, _n, stage) => {
       dispatchStages.push(stage);
       if (stage === "ready-to-deploy") {
@@ -245,6 +279,13 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
       }
       if (stage === "review-1" || stage === "review-2") {
         reviewDispatchedAtSha = opts.prHead;
+        if (opts.advanceReviewStages) {
+          const to = nextStage(stage);
+          const idx = labels.findIndex((l) => l.startsWith("pipeline:"));
+          if (idx >= 0) labels[idx] = `pipeline:${to}`;
+          else labels.push(`pipeline:${to}`);
+          return { advanced: true, from: stage, to, summary: `${stage} → ${to}` };
+        }
         return {
           advanced: false,
           status: "waiting",
@@ -261,12 +302,19 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
 
   try {
     await withoutHostPinAuthorityEnv(() => runAdvance(cfg, ISSUE, { runId }, deps));
+    const eventsPath = path.join(repoDir, ".agent-pipeline", "runs", runId, "events.jsonl");
+    const events = fs.existsSync(eventsPath)
+      ? fs.readFileSync(eventsPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      : [];
     return {
       dispatchStages,
       transitions,
       labels: [...labels],
       logs,
       reviewDispatchedAtSha,
+      clearBlockedCalls,
+      finalizeCalls,
+      candidateEpochEvents: events.filter((event) => event.type === "candidate_epoch_restarted").length,
     };
   } finally {
     console.log = origLog;
@@ -403,6 +451,68 @@ test("blocked leftover is not required: unblocked visual-gate still revalidates"
   });
   assert.equal(r.labels.includes("blocked"), false);
   assert.ok(r.transitions.some((t) => t.to === "review-1"));
+});
+
+test("blocked forged-comment resume clears the block and records one candidate-epoch audit", async () => {
+  const r = await driveLaterStage({
+    startStage: "visual-gate",
+    prHead: SHA_H,
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+    attackerReviewSha: SHA_H,
+    blocked: true,
+  });
+  assert.equal(r.clearBlockedCalls, 1);
+  assert.equal(r.labels.includes("blocked"), false);
+  assert.ok(r.transitions.some((t) => t.from === "visual-gate" && t.to === "review-1"));
+  assert.ok(r.dispatchStages.includes("review-1"));
+  assert.equal(r.candidateEpochEvents, 1);
+});
+
+test("later-stage epoch restart selects the enabled exact-SHA review stage", async () => {
+  const r = await driveLaterStage({
+    startStage: "eval-gate",
+    prHead: SHA_H,
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+    standardReview: false,
+    adversarialReview: true,
+  });
+  assert.ok(r.transitions.some((t) => t.from === "eval-gate" && t.to === "review-2"));
+  assert.ok(r.dispatchStages.includes("review-2"));
+  assert.equal(r.dispatchStages.includes("eval-gate"), false);
+});
+
+test("later-stage epoch restart fails closed when both review stages are disabled", async () => {
+  const r = await driveLaterStage({
+    startStage: "ready-to-deploy",
+    prHead: SHA_H,
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+    standardReview: false,
+    adversarialReview: false,
+  });
+  assert.equal(r.transitions.length, 0);
+  assert.equal(r.dispatchStages.length, 0);
+  assert.equal(r.finalizeCalls, 0);
+  assert.ok(r.logs.some((line) => /no exact-SHA review stage is enabled/.test(line)));
+});
+
+test("deferred ready-to-deploy finalize rechecks currency and refuses a late HEAD move", async () => {
+  const r = await driveLaterStage({
+    startStage: "plan-review",
+    prHead: SHA_H,
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+    advanceReviewStages: true,
+    currencySequence: ["current", "current", "current", "superseded"],
+  });
+  assert.equal(r.finalizeCalls, 0, "deferred terminal finalize must not run on stale review currency");
+  assert.ok(
+    r.transitions.some((t) => t.from === "ready-to-deploy" && t.to === "review-1"),
+    `deferred terminal path must restart review after the late HEAD move: ${JSON.stringify(r)}`,
+  );
+  assert.equal(r.candidateEpochEvents, 1);
 });
 
 test("nested whole-item, pipeline single, and loop item dispatch share runAdvance later-stage guard", () => {

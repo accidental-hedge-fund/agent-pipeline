@@ -47,7 +47,13 @@ export function isLaterStageForReviewCurrency(
 export type LaterStageReviewCurrencyResult =
   | { kind: "not-applicable"; reason: string }
   | { kind: "current"; reviewedSha: string; headSha: string; reason: string }
-  | { kind: "return-to-review"; reviewedSha: string; headSha: string; reason: string }
+  | {
+      kind: "return-to-review";
+      reviewedSha: string;
+      headSha: string;
+      reviewStage: "review-1" | "review-2";
+      reason: string;
+    }
   | { kind: "fail-closed"; reason: string };
 
 export interface LaterStageReviewCurrencyDeps {
@@ -60,11 +66,12 @@ export interface LaterStageReviewCurrencyDeps {
 }
 
 function mapReconcileToLaterStageAction(input: {
+  cfg: PipelineConfig;
   reviewedSha: string;
   headSha: string;
   currency: ReviewedShaCurrency;
 }): LaterStageReviewCurrencyResult {
-  const { reviewedSha, headSha, currency } = input;
+  const { cfg, reviewedSha, headSha, currency } = input;
   const observed: ReviewCurrencyObservedState = {
     reviewedSha,
     headSha,
@@ -90,13 +97,26 @@ function mapReconcileToLaterStageAction(input: {
 
   // Design D3: superseded, or unknown with readable H ≠ S, starts a new epoch.
   if (headSha !== reviewedSha) {
+    const reviewStage = cfg.steps.standard_review
+      ? "review-1"
+      : cfg.steps.adversarial_review
+        ? "review-2"
+        : null;
+    if (!reviewStage) {
+      return {
+        kind: "fail-closed",
+        reason:
+          `later-stage review currency changed from ${reviewedSha.slice(0, 7)} ` +
+          `to ${headSha.slice(0, 7)}, but no exact-SHA review stage is enabled; refusing to dispatch`,
+      };
+    }
     const reason =
       currency.status === "superseded"
         ? `later-stage review currency superseded: HEAD ${headSha.slice(0, 7)} ` +
-          `has non-pipeline-internal commit(s) since reviewed-sha ${reviewedSha.slice(0, 7)}; returning to review-1`
+          `has non-pipeline-internal commit(s) since reviewed-sha ${reviewedSha.slice(0, 7)}; returning to ${reviewStage}`
         : `later-stage review currency unknown between reviewed-sha ${reviewedSha.slice(0, 7)} ` +
-          `and HEAD ${headSha.slice(0, 7)} (rebase/squash or unclassifiable history); returning to review-1`;
-    return { kind: "return-to-review", reviewedSha, headSha, reason };
+          `and HEAD ${headSha.slice(0, 7)} (rebase/squash or unclassifiable history); returning to ${reviewStage}`;
+    return { kind: "return-to-review", reviewedSha, headSha, reviewStage, reason };
   }
 
   return {
@@ -130,7 +150,15 @@ export async function reconcileLaterStageReviewCurrency(
   // Review-headed body with `reviewed-sha` equal to HEAD. Fail closed when the
   // authenticated pipeline actor cannot be determined.
   const getActor = deps.getGhActor ?? getGhActor;
-  const actor = await getActor();
+  let actor: string | null;
+  try {
+    actor = await getActor();
+  } catch (err) {
+    return {
+      kind: "fail-closed",
+      reason: `later-stage review-currency: cannot resolve authenticated gh actor: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
   if (actor === null) {
     return {
       kind: "fail-closed",
@@ -200,6 +228,7 @@ export async function reconcileLaterStageReviewCurrency(
     currency.status === "superseded" ? currency.headSha : headSha;
 
   return mapReconcileToLaterStageAction({
+    cfg,
     reviewedSha,
     headSha: observedHead,
     currency,

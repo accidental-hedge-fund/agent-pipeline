@@ -723,12 +723,16 @@ export interface AdvanceDeps {
   getPrDiff?: typeof getPrDiff;
   /** Label transition seam. Tests inject a fake so later-stage epoch restart does not call GitHub. */
   transition?: typeof transition;
+  /** Block-clear seam used when a later-stage candidate epoch restarts review. */
+  clearBlocked?: typeof clearBlocked;
   resolveReviewedShaCurrency?: LaterStageReviewCurrencyDeps["resolveCurrency"];
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   gitInWorktree?: typeof gitInWorktree;
   postComment?: typeof postComment;
   postPrComment?: typeof postPrComment;
   addLabelToPr?: typeof addLabelToPr;
+  /** Terminal-finalize seam for later-stage currency regression tests. */
+  finalizeReadyToDeploy?: typeof deployReady.finalize;
   dispatch?: typeof dispatch;
   /**
    * Last-advanced product candidate pin (#1243). Tests inject a SHA; omit to
@@ -2508,8 +2512,82 @@ export async function runAdvance(
     let exhaustionStage: Stage | undefined;
     let runCompleteStopReason: RunCompleteStopReason | undefined;
 
+    type LaterCurrencyGuardResult =
+      | { kind: "current" }
+      | { kind: "rerouted"; reason: string }
+      | { kind: "fail-closed"; reason: string };
+
+    async function guardLaterStageReviewCurrency(
+      stage: Stage,
+      detail: { labels: string[]; comments: { body: string; author?: string | null }[] },
+    ): Promise<LaterCurrencyGuardResult> {
+      if (!isLaterStageForReviewCurrency(stage)) return { kind: "current" };
+      const laterCurrency = await reconcileLaterStageReviewCurrency(
+        cfg,
+        issueNumber,
+        stage,
+        detail,
+        {
+          getPrForIssue: deps.getPrForIssue ?? getPrForIssue,
+          getPrDetail: deps.getPrDetail ?? getPrDetail,
+          getPrCommits: deps.getPrCommits ?? getPrCommits,
+          getGhActor: deps.getGhActor ?? getGhActor,
+          resolveCurrency: deps.resolveReviewedShaCurrency,
+        },
+      );
+      if (laterCurrency.kind === "current") return { kind: "current" };
+      if (laterCurrency.kind === "return-to-review") {
+        tlog(`[pipeline] #${issueNumber}: ${laterCurrency.reason}`);
+        if (!opts.dryRun) {
+          if (isBlocked(detail.labels)) {
+            await (deps.clearBlocked ?? clearBlocked)(cfg, issueNumber);
+          }
+          await (deps.transition ?? transition)(
+            cfg,
+            issueNumber,
+            stage,
+            laterCurrency.reviewStage,
+            laterCurrency.reason,
+          );
+          if (runDir) {
+            await appendEvent(
+              runDir,
+              {
+                schema_version: RUN_SCHEMA_VERSION,
+                type: "candidate_epoch_restarted",
+                at: evidenceTimestamp(),
+                from_sha: laterCurrency.reviewedSha,
+                to_sha: laterCurrency.headSha,
+                from_stage: stage,
+                review_stage: laterCurrency.reviewStage,
+                disposition: "new_epoch",
+              },
+              runStoreDeps,
+            );
+          }
+          transitions++;
+          lastStage = laterCurrency.reviewStage;
+          finalStage = laterCurrency.reviewStage;
+        }
+        return { kind: "rerouted", reason: laterCurrency.reason };
+      }
+      tlog(`[pipeline] #${issueNumber}: ${laterCurrency.reason}`);
+      laterStageCurrencyFailedClosed = true;
+      process.exitCode = 1;
+      return { kind: "fail-closed", reason: laterCurrency.reason };
+    }
+
     /** Run terminal finalize + lifecycle events. Shared by in-loop R2D branch and post-loop guarantee. */
     async function runTerminalFinalize(reason: "in-loop" | "deferred"): Promise<Outcome> {
+      const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
+      const currencyGuard = await guardLaterStageReviewCurrency("ready-to-deploy", detail);
+      if (currencyGuard.kind !== "current") {
+        return {
+          advanced: false,
+          status: currencyGuard.kind === "fail-closed" ? "error" : "waiting",
+          reason: currencyGuard.reason,
+        };
+      }
       const rtdStage = evidenceStageName("ready-to-deploy");
       const rtdEnteredAt = evidenceTimestamp();
       if (reason === "deferred") {
@@ -2523,7 +2601,7 @@ export async function runAdvance(
       }
       let out: Outcome;
       try {
-        out = await deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps, {
+        out = await (deps.finalizeReadyToDeploy ?? deployReady.finalize)(cfg, issueNumber, runDir, runStoreDeps, {
           getOnDiskForIssue: deps.getOnDiskForIssue,
           getIssueDetail: deps.getIssueDetail,
           getPrForIssue: deps.getPrForIssue,
@@ -2586,39 +2664,13 @@ export async function runAdvance(
       // `pipeline:blocked` label is not required. Nested/single/loop share
       // this path because they all enter runAdvance.
       if (isLaterStageForReviewCurrency(stage)) {
-        const laterCurrency = await reconcileLaterStageReviewCurrency(
-          cfg,
-          issueNumber,
-          stage,
-          detail,
-          {
-            getPrForIssue: deps.getPrForIssue ?? getPrForIssue,
-            getPrDetail: deps.getPrDetail ?? getPrDetail,
-            getPrCommits: deps.getPrCommits ?? getPrCommits,
-            getGhActor: deps.getGhActor ?? getGhActor,
-            resolveCurrency: deps.resolveReviewedShaCurrency,
-          },
-        );
-        if (laterCurrency.kind === "return-to-review") {
-          tlog(`[pipeline] #${issueNumber}: ${laterCurrency.reason}`);
+        const laterCurrency = await guardLaterStageReviewCurrency(stage, detail);
+        if (laterCurrency.kind === "rerouted") {
           if (opts.dryRun) break;
-          await (deps.transition ?? transition)(
-            cfg,
-            issueNumber,
-            stage,
-            "review-1",
-            laterCurrency.reason,
-          );
-          transitions++;
-          lastStage = "review-1";
-          finalStage = "review-1";
           if (opts.once) break;
           continue;
         }
         if (laterCurrency.kind === "fail-closed") {
-          tlog(`[pipeline] #${issueNumber}: ${laterCurrency.reason}`);
-          laterStageCurrencyFailedClosed = true;
-          process.exitCode = 1;
           break;
         }
       }

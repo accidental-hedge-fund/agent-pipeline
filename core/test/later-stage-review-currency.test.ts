@@ -329,3 +329,43 @@ test("reconcileLaterStageReviewCurrency: sequential getPrDetail S then H returns
   }
   assert.ok(prDetailCalls >= 2, "currency resolver must re-read PR HEAD after the first exact-SHA observation");
 });
+
+test("reconcileLaterStageReviewCurrency: uses review-2 when standard review is disabled", async () => {
+  const config = cfg();
+  config.steps.standard_review = false;
+  config.steps.adversarial_review = true;
+  const result = await reconcileLaterStageReviewCurrency(
+    config,
+    1462,
+    "visual-gate",
+    detailWithReview(SHA_S),
+    {
+      ...actorDeps(),
+      getPrForIssue: async () => 99,
+      getPrDetail: async () => ({ number: 99, head_sha: SHA_H } as never),
+      resolveCurrency: async () => ({ status: "superseded", headSha: SHA_H }),
+    },
+  );
+  assert.equal(result.kind, "return-to-review");
+  if (result.kind === "return-to-review") assert.equal(result.reviewStage, "review-2");
+});
+
+test("reconcileLaterStageReviewCurrency: fails closed when no exact-SHA review is enabled", async () => {
+  const config = cfg();
+  config.steps.standard_review = false;
+  config.steps.adversarial_review = false;
+  const result = await reconcileLaterStageReviewCurrency(
+    config,
+    1462,
+    "ready-to-deploy",
+    detailWithReview(SHA_S),
+    {
+      ...actorDeps(),
+      getPrForIssue: async () => 99,
+      getPrDetail: async () => ({ number: 99, head_sha: SHA_H } as never),
+      resolveCurrency: async () => ({ status: "superseded", headSha: SHA_H }),
+    },
+  );
+  assert.equal(result.kind, "fail-closed");
+  assert.match(result.reason, /no exact-SHA review stage is enabled/);
+});

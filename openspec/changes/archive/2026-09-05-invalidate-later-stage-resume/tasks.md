@@ -11,6 +11,8 @@
 - [x] 2.3 On pipeline-internal-only `current`, dispatch the later stage unchanged, and verify the internal-only fixture does not force re-review
 - [x] 2.4 On unreadable PR/HEAD, fail closed without dispatching the later stage or reaching ready-to-deploy, and verify the observation-failure fixture holds
 - [x] 2.5 On `unknown` with readable H ≠ S, treat as new epoch and return to `review-1` (same as superseded), and verify the rebase-absent-S fixture does not stay at visual-gate
+- [x] 2.6 Select the first enabled exact-SHA review stage, fail closed when none is enabled, clear a leftover block, and record the candidate-epoch restart durably
+- [x] 2.7 Re-run the guard inside both in-loop and deferred ready-to-deploy finalization so a late HEAD move cannot race an earlier observation
 
 ## 3. Exact-SHA review after epoch change
 
@@ -28,6 +30,7 @@
 - [x] 5.2 Add sibling fixtures for `eval-gate`, `shipcheck-gate`, and `ready-to-deploy` that return to `review-1` before the later work runs
 - [x] 5.3 Add pipeline-internal-only and unreadable-HEAD fixtures matching the spec scenarios
 - [x] 5.4 Inject deps only (no real network, git, or subprocess) in all new tests
+- [x] 5.5 Cover forged review comments, stale blocked state, disabled review-stage routing, durable epoch audit, and deferred-finalizer HEAD movement
 
 ## 6. Mirror, validate, CI
 
