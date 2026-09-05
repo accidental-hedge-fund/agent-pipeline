@@ -30,10 +30,10 @@ Issue #1449 is a synthetic Factory Reliability Gate (FRG) pack item. It exercise
 
 ## Acceptance Criteria
 
-- [ ] The only active OpenSpec change is `frg-pack-1401-clean-openspec`.
-- [ ] File `core/test/fixtures/frg/pack-1401-pipeline-ship-1.40.1/clean-openspec.json` exists.
-- [ ] That fixture JSON has `release_version` equal to `"1.40.1"`.
-- [ ] A unit test under `core/test/` reads only that run-scoped path and fails if `release_version` is not `"1.40.1"`.
-- [ ] Production files under `core/scripts/` are unchanged.
+- [x] The only active OpenSpec change is `frg-pack-1401-clean-openspec`.
+- [x] File `core/test/fixtures/frg/pack-1401-pipeline-ship-1.40.1/clean-openspec.json` exists.
+- [x] That fixture JSON has `release_version` equal to `"1.40.1"`.
+- [x] A unit test under `core/test/` reads only that run-scoped path and fails if `release_version` is not `"1.40.1"`.
+- [x] Production files under `core/scripts/` are unchanged.
 - [ ] Pre-merge archives this change. No active change path remains under `openspec/changes/` except `archive/`.
 - [ ] The Pipeline reaches `pipeline:ready-to-deploy` for issue #1449.
