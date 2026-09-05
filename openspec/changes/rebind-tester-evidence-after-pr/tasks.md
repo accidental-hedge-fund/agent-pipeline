@@ -29,3 +29,11 @@
 
 - [x] 5.1 After any `core/` edit, run `node scripts/build.mjs` and include regenerated host SKILL / `plugin/` in the same change. Verify `node scripts/build.mjs --check` is clean
 - [x] 5.2 Run `openspec validate rebind-tester-evidence-after-pr` and `npm run ci` from the repo root. Verify both are green. Do not weaken delivery-stage binding, trusted-surface, review, merge, or FRG. Do not add an `auto_merge` key or merge stage
+
+## 6. Review 2 regressions
+
+- [x] 6.1 Disabled `test_gate` does not fail-closed when no SHA-matched passed Tester record exists and exact product-path implementation proof remains sufficient
+- [x] 6.2 Recovery executor passes pinned `engineFingerprint` into the shared helper and binds a subject-less SHA-matched passed record
+- [x] 6.3 Successor run adopts a prior-run SHA-matched passed Tester record without a second suite command
+- [x] 6.4 Idempotent pre-observer bind/reproduce and ordering-diagnostic conversion use `isConsumerImplementationStage` (resume at review-1)
+- [x] 6.5 PR head movement between bind and observer fail-closes with `tester_rebind_pr_head_mismatch`

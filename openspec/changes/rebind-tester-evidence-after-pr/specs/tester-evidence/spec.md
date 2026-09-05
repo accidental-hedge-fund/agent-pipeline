@@ -53,6 +53,29 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 - **THEN** that invocation SHALL use the same bind-or-reproduce path
 - **AND** SHALL NOT skip the bind because the caller is FRG or nested
 
+#### Scenario: disabled test gate does not strand exact product-path implementation proof
+
+- **WHEN** `test_gate.enabled` is false
+- **AND** no SHA-matched passed Tester record exists for the final PR head
+- **AND** exact product-path implementation proof exists for the observed candidate
+- **THEN** the pipeline SHALL NOT fail closed solely because Tester rebind cannot record a suite pass
+- **AND** the consumer observer SHALL still accept that exact product-path implementation proof
+
+#### Scenario: successor dispatch reuses SHA-matched rebound Tester evidence from a prior run
+
+- **WHEN** recovery or a prior advance bound SHA-matched passed Tester evidence for PR head S in a prior run directory
+- **AND** the next loop dispatch mints a new run directory
+- **THEN** the pipeline SHALL bind or adopt that SHA-matched record into the successor run by exact candidate identity
+- **AND** SHALL NOT require a second suite command solely to recreate the already-passed record
+
+#### Scenario: PR head movement after bind is not authorized as the observed candidate
+
+- **WHEN** the pipeline binds or reproduces Tester evidence for observed PR head S1
+- **AND** a subsequent read of the linked PR head observes S2 where S1 ≠ S2 before the consumer observer runs
+- **THEN** the pipeline SHALL fail closed with typed blocker `tester_rebind_pr_head_mismatch`
+- **OR** SHALL rebind or reproduce for S2 before the observer runs
+- **AND** SHALL NOT present S1 Tester evidence as current implementation-role proof for S2
+
 ### Requirement: Pipeline SHALL fail closed when PR head or trusted-surface identity cannot be observed after push
 
 If, after the implementation commit is pushed, the linked PR head is missing, is not a full 40-character hex SHA, or disagrees with the pushed head, or trusted-surface identity cannot be resolved, the pipeline SHALL fail closed with a typed actionable blocker. The pipeline SHALL NOT run a consumer delivery-stage observer against missing implementation-role evidence as if the post-PR bind had succeeded. The blocker code SHALL be machine-readable on the observation or run evidence and SHALL NOT be only the generic `required implementation evidence role, observed missing` string.

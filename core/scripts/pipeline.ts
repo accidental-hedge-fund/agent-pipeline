@@ -122,6 +122,8 @@ import {
   type PublishUnpublishedExecutorDeps,
 } from "./unpublished-stage-commit.ts";
 import { resolveEngineCommitSha } from "./engine-attribution.ts";
+import { resolvePinnedEngineIdentity, type EngineIdentity } from "./engine-identity.ts";
+import { buildEngineFingerprint } from "./evidence-subject.ts";
 import { formatPipelineVersionJson } from "./ship-end-identity.ts";
 import {
   bundlePath,
@@ -2043,6 +2045,8 @@ export interface RealExecuteRecoveryDeps {
   getPrForIssue?: typeof getPrForIssue;
   getPrDetail?: typeof getPrDetail;
   readTrustedSurfaceDecision?: typeof import("./run-store.ts").readTrustedSurfaceDecision;
+  /** Pinned engine identity for subject construction on subject-less Tester records. */
+  resolvePinnedEngineIdentity?: () => EngineIdentity | null;
 }
 
 /** Production provider-neutral recovery registry. Substantive repair delegates
@@ -2765,6 +2769,14 @@ export function realExecuteRecovery(
         } catch {
           pushedHeadSha = null;
         }
+        const pinned = (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)();
+        const engineFingerprint = pinned
+          ? buildEngineFingerprint({
+              version: pinned.version,
+              templates_fingerprint: pinned.templates_fingerprint,
+              ...(pinned.commit_sha ? { commit_sha: pinned.commit_sha } : {}),
+            })
+          : undefined;
         const rebind = await rebindFn({
           cfg,
           issueNumber,
@@ -2774,6 +2786,8 @@ export function realExecuteRecovery(
           prHeadSha: prDetail?.head_sha ?? null,
           pushedHeadSha,
           trustedSurface,
+          domain: (cfg.domain || cfg.repo || "").trim() || undefined,
+          engineFingerprint,
           reproduce: async ({ runDir: dest }) => {
             const wt = await getWorktree(cfg, issueNumber);
             if (!wt) return { ok: false };

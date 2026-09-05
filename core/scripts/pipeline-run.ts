@@ -200,8 +200,10 @@ import {
 import { diffFilePaths } from "./stages/review-parsing.ts";
 import { observeImplementDeliverablePaths } from "./unpublished-stage-commit.ts";
 import {
+  isConsumerImplementationStage,
   observeTesterImplementationRole,
   rebindTesterEvidenceAfterPr,
+  shaMatchedPassedTesterEvidence,
   testerEvidenceOrderingDiagnosticForRefuse,
   testerSubjectOmittedBecauseUnobservable,
   type RebindTesterEvidenceAfterPrInput,
@@ -2971,7 +2973,7 @@ export async function runAdvance(
       // reproduce, and a missing/unobservable PR fails closed.
       let handoffPrHeadSha: string | null = null;
       let testerSubjectOmitted = false;
-      if (stage === "design-gate" && runDir && !opts.dryRun) {
+      if (isConsumerImplementationStage(stage) && runDir && !opts.dryRun) {
         const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
           () => null,
         );
@@ -2996,9 +2998,6 @@ export async function runAdvance(
             );
           }
         }
-        if (!pushedHeadSha) {
-          pushedHeadSha = normalizeCandidateSha(lastTrustedSurfaceCandidateSha);
-        }
         const engineFp = pinnedEngine
           ? buildEngineFingerprint({
               version: pinnedEngine.version,
@@ -3007,7 +3006,7 @@ export async function runAdvance(
             })
           : null;
         const rebindFn = deps.rebindTesterEvidenceAfterPr ?? rebindTesterEvidenceAfterPr;
-        const rebind = await rebindFn({
+        const rebindInput = (): RebindTesterEvidenceAfterPrInput => ({
           cfg,
           issueNumber,
           stage,
@@ -3019,11 +3018,30 @@ export async function runAdvance(
           domain: (cfg.domain || cfg.repo || "").trim() || undefined,
           engineFingerprint: engineFp,
           io: deps.testerIo,
+          allowSkipIfUnreproducible: stage !== "design-gate",
+          resolvePriorShaMatchedTester: async (candidateSha) => {
+            const sha = normalizeCandidateSha(candidateSha);
+            if (!sha) return null;
+            const currentId = path.basename(runDir);
+            const ids = await listRunIds(cfg.repo_dir, runStoreDeps).catch(() => [] as string[]);
+            const prefix = `${issueNumber}-`;
+            for (const id of ids) {
+              if (!id.startsWith(prefix) || id === currentId) continue;
+              const priorDir = runDirPath(cfg.repo_dir, id);
+              const priorRead = await readTesterEvidence(priorDir, deps.testerIo);
+              const matched = shaMatchedPassedTesterEvidence(
+                priorRead.status === "ok" ? priorRead.evidence : null,
+                sha,
+              );
+              if (matched) return matched;
+            }
+            return null;
+          },
           reproduce: async ({ runDir: dest }) => {
             const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
               () => null,
             );
-            if (!wt || !cfg.test_gate) return { ok: false };
+            if (!wt || !cfg.test_gate) return { ok: false, unavailable: true };
             try {
               const { runTestGate } = await import("./testgate.ts");
               const gate = await runTestGate(
@@ -3043,7 +3061,7 @@ export async function runAdvance(
             }
           },
         });
-        if (!rebind.ok) {
+        const failClosedRebind = async (rebind: Extract<RebindTesterEvidenceResult, { ok: false }>): Promise<Outcome> => {
           tlog(`[pipeline] #${issueNumber}: ${rebind.summary}`);
           const blockedOut: Outcome = {
             advanced: false,
@@ -3068,6 +3086,41 @@ export async function runAdvance(
           ).catch(() => {});
           printOutcome(issueNumber, stage, blockedOut, tlog);
           return blockedOut;
+        };
+        const rebind = await rebindFn(rebindInput());
+        if (!rebind.ok) {
+          // Design-gate is the first consumer after push: fail closed.
+          // Later consumer stages still attempt bind/reproduce, but a blocked
+          // trusted-surface or unreproducible record must not prevent
+          // later-stage currency reroute or exact product-path proof.
+          if (stage === "design-gate") {
+            return await failClosedRebind(rebind);
+          }
+        } else if (rebind.action !== "not-applicable") {
+          // Reread the live PR head immediately before dispatch. A concurrent
+          // push after the bind-time read must not authorize an obsolete SHA.
+          const confirmPrNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
+            () => null,
+          );
+          const confirmDetail = confirmPrNumber
+            ? await (deps.getPrDetail ?? getPrDetail)(cfg, confirmPrNumber).catch(() => null)
+            : null;
+          const confirmSha = normalizeCandidateSha(confirmDetail?.head_sha);
+          if (!confirmSha || confirmSha !== rebind.candidateSha) {
+            const mismatch = await rebindFn({
+              ...rebindInput(),
+              prNumber: confirmPrNumber,
+              prHeadSha: confirmSha,
+              pushedHeadSha: rebind.candidateSha,
+              reproduce: undefined,
+            });
+            if (!mismatch.ok) {
+              return await failClosedRebind(mismatch);
+            }
+            handoffPrHeadSha = mismatch.candidateSha;
+          } else {
+            handoffPrHeadSha = confirmSha;
+          }
         }
       }
 
@@ -3229,7 +3282,7 @@ export async function runAdvance(
       if (
         !out.advanced &&
         out.status === "waiting" &&
-        stage === "design-gate"
+        isConsumerImplementationStage(stage)
       ) {
         const orderingDiagnostic = testerEvidenceOrderingDiagnosticForRefuse({
           stage,

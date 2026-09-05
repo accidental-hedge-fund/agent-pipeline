@@ -55,7 +55,7 @@ import {
   type TesterEvidence,
   type TesterEvidenceIoDeps,
 } from "../scripts/tester-evidence.ts";
-import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
+import { DEFAULT_CONFIG, type PipelineConfig, type Stage } from "../scripts/types.ts";
 
 const SHA_S = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -239,6 +239,8 @@ test("recipe id rebind_tester_evidence_after_pr is locked across catalogue and p
 test("consumer implementation stages exclude producers and planning-role stages", () => {
   assert.equal(isConsumerImplementationStage("design-gate"), true);
   assert.equal(isConsumerImplementationStage("review-1"), true);
+  assert.equal(isConsumerImplementationStage("fix-1"), true);
+  assert.equal(isConsumerImplementationStage("pre-merge"), true);
   assert.equal(isConsumerImplementationStage("implementing"), false);
   assert.equal(isConsumerImplementationStage("planning"), false);
   assert.equal(isConsumerImplementationStage("plan-review"), false);
@@ -540,9 +542,10 @@ test("3.2 planning-role artifacts still cannot complete design-gate", async () =
 test("3.3 nested advance, single, loop, and FRG share runAdvance rebind", async () => {
   const runAdvanceSrc = await readFile(join(__dirname, "../scripts/pipeline-run.ts"), "utf8");
   assert.match(runAdvanceSrc, /rebindTesterEvidenceAfterPr/);
-  assert.match(runAdvanceSrc, /stage === "design-gate"/);
+  assert.match(runAdvanceSrc, /isConsumerImplementationStage\(stage\)/);
   assert.match(runAdvanceSrc, /pushedHeadSha/);
   assert.match(runAdvanceSrc, /testerEvidenceOrderingDiagnosticForRefuse/);
+  assert.match(runAdvanceSrc, /resolvePriorShaMatchedTester/);
   assert.doesNotMatch(runAdvanceSrc, /existingTester\.status === "missing"/);
   const nestedSrc = await readFile(join(__dirname, "../scripts/nested-advance.ts"), "utf8");
   assert.match(nestedSrc, /runAdvance/);
@@ -550,6 +553,7 @@ test("3.3 nested advance, single, loop, and FRG share runAdvance rebind", async 
   const pipelineSrc = await readFile(join(__dirname, "../scripts/pipeline.ts"), "utf8");
   assert.match(pipelineSrc, /runAdvance/);
   assert.match(pipelineSrc, /pushedHeadSha/);
+  assert.match(pipelineSrc, /engineFingerprint/);
 });
 
 test("1.4 / 4.2 evidence-ordering diagnostic does not charge scratch or publish", () => {
@@ -708,14 +712,19 @@ const ENGINE = {
 async function driveDesignGateAdvance(opts: {
   prNumber: number | null;
   prHeadSha?: string | null;
+  prHeadSequence?: string[];
   worktreeHead?: string | null;
   tester?: TesterEvidence | null;
+  priorTester?: TesterEvidence | null;
+  startStage?: Stage;
+  testGateEnabled?: boolean;
   rebind?: AdvanceDeps["rebindTesterEvidenceAfterPr"];
   dispatch?: AdvanceDeps["dispatch"];
 }): Promise<{
   rebindCalls: RebindTesterEvidenceAfterPrInput[];
   setBlocked: Array<{ reason: string; kind: string | undefined }>;
   blockerEvents: Array<Record<string, unknown>>;
+  dispatchCalls: number;
 }> {
   const repoDir = fs.mkdtempSync(join(os.tmpdir(), "rebind-run-advance-"));
   const domain = `rebind-adv-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -725,9 +734,18 @@ async function driveDesignGateAdvance(opts: {
   const runDir = runDirPath(repoDir, runId);
   const io = memoryIo();
   if (opts.tester) plant(io, runDir, opts.tester);
+  if (opts.priorTester) {
+    const priorRunId = `${issue}-2026-09-05T20-00-00-000Z`;
+    const priorDir = runDirPath(repoDir, priorRunId);
+    fs.mkdirSync(priorDir, { recursive: true });
+    plant(io, priorDir, opts.priorTester);
+  }
   const rebindCalls: RebindTesterEvidenceAfterPrInput[] = [];
   const setBlocked: Array<{ reason: string; kind: string | undefined }> = [];
-  const labels = ["pipeline:design-gate"];
+  const startStage = opts.startStage ?? "design-gate";
+  const labels = [`pipeline:${startStage}`];
+  let prHeadReads = 0;
+  let dispatchCalls = 0;
   const pipelineCfg = {
     repo: "acme/widget",
     domain,
@@ -746,6 +764,10 @@ async function driveDesignGateAdvance(opts: {
     auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
     papercuts: { enabled: false, auto_file: false },
     corrections: { auto_file: false },
+    test_gate: {
+      ...DEFAULT_CONFIG.test_gate,
+      enabled: opts.testGateEnabled ?? DEFAULT_CONFIG.test_gate.enabled,
+    },
   } as unknown as PipelineConfig;
   const deps: AdvanceDeps = {
     resolvePinnedEngineIdentity: () => ENGINE,
@@ -769,7 +791,7 @@ async function driveDesignGateAdvance(opts: {
       comments: [
         {
           author: "pipeline-bot",
-          body: `## Pipeline: design-gate\n<!-- pipeline-audit: run=${runId} state=design-gate -->`,
+          body: `## Pipeline: ${startStage}\n<!-- pipeline-audit: run=${runId} state=${startStage} -->`,
         },
         {
           author: "pipeline-bot",
@@ -779,10 +801,14 @@ async function driveDesignGateAdvance(opts: {
     })) as AdvanceDeps["getIssueDetail"],
     getGhActor: async () => "pipeline-bot",
     getPrForIssue: async () => opts.prNumber,
-    getPrDetail: async () =>
-      opts.prNumber
-        ? ({ number: opts.prNumber, head_sha: opts.prHeadSha ?? SHA_S } as never)
-        : null,
+    getPrDetail: async () => {
+      if (!opts.prNumber) return null;
+      const sequenced = opts.prHeadSequence?.[prHeadReads++];
+      return {
+        number: opts.prNumber,
+        head_sha: sequenced ?? opts.prHeadSha ?? SHA_S,
+      } as never;
+    },
     getOnDiskForIssue: async () =>
       opts.worktreeHead ? ({ path: "/wt/1468", slug: "1468-x" } as never) : null,
     gitInWorktree: async (_cwd, args) => {
@@ -812,6 +838,7 @@ async function driveDesignGateAdvance(opts: {
     postComment: async () => {},
     postPrComment: async () => {},
     dispatch: async (_c, _n, stage, ...rest) => {
+      dispatchCalls++;
       const result = opts.dispatch
         ? await opts.dispatch(_c, _n, stage, ...rest)
         : {
@@ -840,7 +867,7 @@ async function driveDesignGateAdvance(opts: {
           .map((line) => JSON.parse(line) as Record<string, unknown>)
           .filter((event) => event.type === "blocker_set")
       : [];
-    return { rebindCalls, setBlocked, blockerEvents };
+    return { rebindCalls, setBlocked, blockerEvents, dispatchCalls };
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
@@ -930,4 +957,194 @@ test("runAdvance attaches evidence-ordering diagnostic to a missing-role refuse"
   );
   const diagnostic = driven.blockerEvents[0]?.diagnostic;
   assert.equal(isTesterEvidenceOrderingDiagnostic(diagnostic), true);
+});
+
+function boundPassed(over: Partial<TesterEvidence> = {}): TesterEvidence {
+  return subjectlessPassed({
+    evidence_subject: {
+      schema_version: 1,
+      domain: "acme",
+      issue: 1468,
+      pr: 99,
+      run_id: "1468/test-run",
+      candidate_sha: SHA_S,
+      diff_hash: null,
+      policy_hash: "e".repeat(64),
+      engine_fingerprint: ENGINE_FP,
+      verifier_fingerprint: VERIFIER_H,
+      required_evidence_set_revision: "f".repeat(64),
+    },
+    ...over,
+  });
+}
+
+test("disabled test gate does not fail-closed when no passed Tester record exists", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1468";
+  let reproduced = false;
+  const result = await rebindTesterEvidenceAfterPr(
+    baseInput(io, {
+      runDir,
+      cfg: { ...cfg(), test_gate: { ...cfg().test_gate, enabled: false } },
+      reproduce: async () => {
+        reproduced = true;
+        plant(io, runDir, subjectlessPassed({ overall_status: "disabled", commands: [] }));
+        return { ok: true };
+      },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.action, "not-applicable");
+    assert.equal(result.suiteCommandInvoked, false);
+  }
+  assert.equal(reproduced, false);
+});
+
+test("disabled test gate skip lets observer use exact product-path proof", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1468";
+  const result = await rebindTesterEvidenceAfterPr(
+    baseInput(io, {
+      runDir,
+      cfg: { ...cfg(), test_gate: { ...cfg().test_gate, enabled: false } },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.action, "not-applicable");
+  const observer = createDeliveryStageEvidenceObserver(cfg(), 1468, "design-gate", false, {
+    getIssueDetail: async () => ({
+      number: 1468,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: "https://example.test/1468",
+      labels: ["pipeline:design-gate"],
+      comments: [],
+    }),
+    getOnDiskForIssue: async () => ({ path: "/wt/1468", slug: "1468-x" }) as never,
+    gitInWorktree: async (_cwd, args) => {
+      if (args[0] === "rev-parse") {
+        return { stdout: `${SHA_S}\n`, stderr: "", code: 0 };
+      }
+      if (args[0] === "diff") {
+        return { stdout: "core/scripts/pipeline-run.ts\n", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    runDir,
+    testerIo: io,
+  });
+  const evidence = await observer("before");
+  const binding = completingEvidenceBindingFailure({
+    stage: "design-gate",
+    ...evidence,
+  });
+  assert.equal(evidence.evidenceRole, "implementation");
+  assert.equal(binding, null);
+});
+
+test("helper adopts prior-run SHA-matched Tester evidence without a second suite", async () => {
+  const io = memoryIo();
+  const current = "/runs/1468-successor";
+  const prior = boundPassed();
+  let reproduced = false;
+  const result = await rebindTesterEvidenceAfterPr(
+    baseInput(io, {
+      runDir: current,
+      resolvePriorShaMatchedTester: async () => prior,
+      reproduce: async () => {
+        reproduced = true;
+        return { ok: false };
+      },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.action, "already-bound");
+    assert.equal(result.suiteCommandInvoked, false);
+    assert.equal(result.candidateSha, SHA_S);
+  }
+  assert.equal(reproduced, false);
+  const stored = JSON.parse(io.files.get(testerEvidencePath(current)) ?? "{}") as TesterEvidence;
+  assert.equal(stored.candidate_sha, SHA_S);
+  assert.equal(stored.evidence_subject?.candidate_sha, SHA_S);
+});
+
+test("runAdvance successor adopts prior-run Tester evidence without reproducing", async () => {
+  let reproduced = 0;
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    priorTester: boundPassed(),
+    rebind: async (input) =>
+      rebindTesterEvidenceAfterPr({
+        ...input,
+        reproduce: async () => {
+          reproduced++;
+          return { ok: false };
+        },
+      }),
+    dispatch: async (_c, _n, stage) =>
+      stage === "design-gate"
+        ? {
+            advanced: true,
+            from: "design-gate",
+            to: "review-1",
+            summary: "design-gate passed",
+          }
+        : { advanced: false, status: "waiting", reason: "stop after adopt" },
+  });
+  assert.ok(driven.rebindCalls.length >= 1);
+  assert.equal(reproduced, 0);
+  assert.equal(driven.dispatchCalls, 1);
+  assert.equal(driven.setBlocked.length, 0);
+});
+
+test("runAdvance invokes rebind at review-1 resume with subject-less Tester", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "review-1",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    tester: subjectlessPassed(),
+    rebind: async () => ({
+      ok: true,
+      action: "bind",
+      candidateSha: SHA_S,
+      evidence: boundPassed(),
+      suiteCommandInvoked: false,
+    }),
+  });
+  assert.ok(driven.rebindCalls.length >= 1);
+  assert.equal(driven.rebindCalls[0]?.stage, "review-1");
+  assert.ok(
+    driven.setBlocked.some((row) =>
+      /required implementation evidence role, observed missing/.test(row.reason),
+    ),
+  );
+  const diagnostic = driven.blockerEvents[0]?.diagnostic;
+  assert.equal(isTesterEvidenceOrderingDiagnostic(diagnostic), true);
+});
+
+test("runAdvance fail-closes when PR head moves between bind and observer", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    tester: subjectlessPassed(),
+  });
+  assert.ok(driven.rebindCalls.length >= 2);
+  assert.equal(driven.rebindCalls[0]?.prHeadSha, SHA_S);
+  assert.equal(driven.rebindCalls[1]?.prHeadSha, SHA_B);
+  assert.equal(driven.rebindCalls[1]?.pushedHeadSha, SHA_S);
+  assert.equal(driven.dispatchCalls, 0);
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_mismatch",
+  );
 });

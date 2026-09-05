@@ -91,9 +91,9 @@ export type TrustedSurfaceRebindDecision = {
 export type RebindTesterEvidenceResult =
   | {
       ok: true;
-      action: "bind" | "reproduce" | "already-bound";
+      action: "bind" | "reproduce" | "already-bound" | "not-applicable";
       candidateSha: string;
-      evidence: TesterEvidence;
+      evidence: TesterEvidence | null;
       suiteCommandInvoked: boolean;
     }
   | {
@@ -133,7 +133,21 @@ export interface RebindTesterEvidenceAfterPrInput {
   reproduce?: (input: ReproduceTesterEvidenceInput) => Promise<{
     ok: boolean;
     candidate_sha?: string | null;
+    /** True when the producer could not run (no worktree / gate). */
+    unavailable?: boolean;
   }>;
+  /**
+   * Later consumer stages: if no SHA-matched passed record exists and the
+   * producer cannot run, skip fail-closed so the observer can still use
+   * exact product-path proof.
+   */
+  allowSkipIfUnreproducible?: boolean;
+  /**
+   * Successor-run lookup (#1468 review 2): a SHA-matched passed Tester record
+   * from a prior run of the same issue, identified by exact candidate SHA.
+   * Adopted into the current runDir so the consumer observer can read it.
+   */
+  resolvePriorShaMatchedTester?: (candidateSha: string) => Promise<TesterEvidence | null>;
   persistBlocker?: (record: TesterRebindBlockerRecord) => Promise<void>;
 }
 
@@ -380,11 +394,20 @@ function shaMatchedPassedRecord(
   sha: string,
 ): TesterEvidence | null {
   if (read.status !== "ok") return null;
-  if (!candidateShaMatches(read.evidence.candidate_sha, sha)) return null;
-  if (read.evidence.overall_status !== "passed") return null;
-  if (read.evidence.commands.length === 0) return null;
-  if (read.evidence.commands.some((c) => c.status !== "passed")) return null;
-  return read.evidence;
+  return shaMatchedPassedTesterEvidence(read.evidence, sha);
+}
+
+/** SHA-matched Tester record that recorded a suite pass (not disabled/failed). */
+export function shaMatchedPassedTesterEvidence(
+  evidence: TesterEvidence | null | undefined,
+  sha: string,
+): TesterEvidence | null {
+  if (!evidence) return null;
+  if (!candidateShaMatches(evidence.candidate_sha, sha)) return null;
+  if (evidence.overall_status !== "passed") return null;
+  if (evidence.commands.length === 0) return null;
+  if (evidence.commands.some((c) => c.status !== "passed")) return null;
+  return evidence;
 }
 
 function alreadyBound(
@@ -443,8 +466,28 @@ export async function rebindTesterEvidenceAfterPr(
 
   const io = input.io ?? defaultIo;
   const read = await readTesterEvidence(input.runDir, io);
-  const matched = shaMatchedPassedRecord(read, prHead);
+  let matched = shaMatchedPassedRecord(read, prHead);
   const writeFn = input.writeTesterEvidence ?? writeTesterEvidence;
+
+  if (!matched && input.resolvePriorShaMatchedTester) {
+    const prior = await input.resolvePriorShaMatchedTester(prHead);
+    const priorMatched = shaMatchedPassedTesterEvidence(prior, prHead);
+    if (priorMatched) {
+      const adopted = await writeFn(input.runDir, priorMatched, { io, appendEvent: false });
+      if (!adopted.ok) {
+        const result = failClosed(
+          input,
+          "tester_rebind_trusted_surface_unobservable",
+          `tester rebind: persist of prior-run Tester evidence failed: ${adopted.error ?? "write failed"}`,
+          prHead,
+          priorMatched,
+        );
+        await persistBlockerRecord(input, result.blocker);
+        return result;
+      }
+      matched = priorMatched;
+    }
+  }
 
   if (matched) {
     if (alreadyBound(matched, prHead, pin.hash)) {
@@ -539,7 +582,26 @@ export async function rebindTesterEvidenceAfterPr(
     };
   }
 
+  if (input.cfg.test_gate?.enabled === false) {
+    return {
+      ok: true,
+      action: "not-applicable",
+      candidateSha: prHead,
+      evidence: read.status === "ok" ? read.evidence : null,
+      suiteCommandInvoked: false,
+    };
+  }
+
+  const skipUnreproducible = (): Extract<RebindTesterEvidenceResult, { ok: true }> => ({
+    ok: true,
+    action: "not-applicable",
+    candidateSha: prHead,
+    evidence: read.status === "ok" ? read.evidence : null,
+    suiteCommandInvoked: false,
+  });
+
   if (!input.reproduce) {
+    if (input.allowSkipIfUnreproducible) return skipUnreproducible();
     const result = failClosed(
       input,
       "tester_rebind_trusted_surface_unobservable",
@@ -561,6 +623,9 @@ export async function rebindTesterEvidenceAfterPr(
     ? observeTesterImplementationRole(afterMatched, prHead)
     : null;
   if (!reproduced.ok || !afterMatched || !afterRole) {
+    if (input.allowSkipIfUnreproducible && reproduced.unavailable) {
+      return skipUnreproducible();
+    }
     const result = failClosed(
       input,
       "tester_rebind_trusted_surface_unobservable",

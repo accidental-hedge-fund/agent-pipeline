@@ -1,8 +1,21 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { realExecuteRecovery } from "../scripts/pipeline.ts";
+import { buildEngineFingerprint } from "../scripts/evidence-subject.ts";
+import { rebindTesterEvidenceAfterPr } from "../scripts/rebind-tester-evidence-after-pr.ts";
+import { runDirPath } from "../scripts/run-store.ts";
 import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 import { encodeReviewArtifact, type ReviewArtifact } from "../scripts/stages/review-parsing.ts";
+import {
+  computeConfigDigest,
+  TESTER_EVIDENCE_KIND,
+  TESTER_EVIDENCE_SCHEMA_VERSION,
+  testerEvidencePath,
+  type TesterEvidence,
+} from "../scripts/tester-evidence.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 
 function cfg(): PipelineConfig {
@@ -653,6 +666,143 @@ test("rebind_tester_evidence_after_pr passes pushed worktree HEAD for the mismat
   assert.equal(receivedPushed, pushed);
   assert.equal(result.succeeded, false);
   assert.match(result.error ?? "", /tester_rebind_pr_head_mismatch/);
+});
+
+test("rebind_tester_evidence_after_pr binds a subject-less passed record with pinned engine identity", async () => {
+  const repoDir = fs.mkdtempSync(join(os.tmpdir(), "rebind-recovery-"));
+  const runId = "1468-2026-09-05T21-00-00-000Z";
+  const runDir = runDirPath(repoDir, runId);
+  const sha = "a".repeat(40);
+  const engine = {
+    version: "1.40.1",
+    root: "/skill/core",
+    templates_fingerprint: "e".repeat(64),
+    commit_sha: "f".repeat(40),
+  };
+  const engineFp = buildEngineFingerprint({
+    version: engine.version,
+    templates_fingerprint: engine.templates_fingerprint,
+    commit_sha: engine.commit_sha,
+  });
+  const subjectless: TesterEvidence = {
+    schema_version: TESTER_EVIDENCE_SCHEMA_VERSION,
+    kind: TESTER_EVIDENCE_KIND,
+    candidate_sha: sha,
+    run_id: runId,
+    issue: 42,
+    pr: null,
+    worktree_id: "pipeline-42-wt",
+    config_digest: computeConfigDigest({
+      command_identity: "npm test",
+      enabled: true,
+      timeout: 300,
+      max_output_chars: 4000,
+    }),
+    toolchain_fingerprint: { node: "v24.0.0", platform: "linux", arch: "x64" },
+    started_at: "2026-09-05T20:00:00Z",
+    ended_at: "2026-09-05T20:00:05Z",
+    duration_ms: 5000,
+    overall_status: "passed",
+    commands: [
+      {
+        identity: "npm test",
+        exit_code: 0,
+        duration_ms: 4800,
+        status: "passed",
+        output_excerpt: "ok",
+      },
+    ],
+    output_excerpt: "ok",
+    producer: { component: "test-build-gate" },
+  };
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(testerEvidencePath(runDir), `${JSON.stringify(subjectless, null, 2)}\n`);
+  let receivedFingerprint: string | null | undefined;
+  const execute = realExecuteRecovery(
+    { ...cfg(), domain: "acme", repo_dir: repoDir },
+    {
+      getOnDiskForIssue: async () => null,
+      getPrForIssue: async () => 99,
+      getPrDetail: async () => ({ number: 99, head_sha: sha }) as never,
+      readTrustedSurfaceDecision: async () => ({
+        outcome: "passthrough",
+        candidate_sha: sha,
+        effective_verifier_hash: "c".repeat(64),
+      }) as never,
+      resolvePinnedEngineIdentity: () => engine,
+      clearBlocked: async () => {},
+      rebindTesterEvidenceAfterPr: async (input) => {
+        receivedFingerprint = input.engineFingerprint;
+        return rebindTesterEvidenceAfterPr(input);
+      },
+    },
+  );
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "required implementation evidence role, observed missing",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      trusted_surface_outcome: "passthrough",
+      pr_head: sha,
+      subject_omitted_because_unobservable: true,
+    },
+  });
+  try {
+    const result = await execute({
+      ...mechanicalInput(),
+      action: "rebind_tester_evidence_after_pr",
+      blockerClass: "workflow-engine-defect",
+      diagnostic,
+      evidence: {
+        pr_number: 99,
+        pipeline_run_id: runId,
+        candidate_identity: `pr:99:run:${runId}`,
+      },
+    });
+    assert.equal(result.succeeded, true, result.error ?? result.evidence);
+    assert.equal(receivedFingerprint, engineFp);
+    const stored = JSON.parse(fs.readFileSync(testerEvidencePath(runDir), "utf8")) as TesterEvidence;
+    assert.equal(stored.evidence_subject?.schema_version, 1);
+    assert.equal(stored.evidence_subject?.candidate_sha, sha);
+    assert.equal(stored.evidence_subject?.engine_fingerprint, engineFp);
+    assert.equal(stored.pr, 99);
+
+    const successorDir = runDirPath(repoDir, "1468-2026-09-05T22-00-00-000Z");
+    fs.mkdirSync(successorDir, { recursive: true });
+    let reproduced = false;
+    const successor = await rebindTesterEvidenceAfterPr({
+      cfg: { ...cfg(), domain: "acme", repo_dir: repoDir },
+      issueNumber: 42,
+      stage: "design-gate",
+      runDir: successorDir,
+      prNumber: 99,
+      prHeadSha: sha,
+      trustedSurface: {
+        outcome: "passthrough",
+        candidate_sha: sha,
+        effective_verifier_hash: "c".repeat(64),
+      },
+      domain: "acme",
+      engineFingerprint: engineFp,
+      resolvePriorShaMatchedTester: async () => stored,
+      reproduce: async () => {
+        reproduced = true;
+        return { ok: false };
+      },
+    });
+    assert.equal(successor.ok, true);
+    if (successor.ok) {
+      assert.equal(successor.action, "already-bound");
+      assert.equal(successor.suiteCommandInvoked, false);
+    }
+    assert.equal(reproduced, false);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
 });
 
 test("rebind_tester_evidence_after_pr fail-closed does not report recovered", async () => {
