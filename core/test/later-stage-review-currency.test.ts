@@ -3,10 +3,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  bindEpochRestartWorktreeToHead,
   isLaterStageForReviewCurrency,
   reconcileLaterStageReviewCurrency,
 } from "../scripts/stages/later-stage-review-currency.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
+import { worktreePath } from "../scripts/worktree.ts";
 
 const SHA_S = "a".repeat(40);
 const SHA_H = "b".repeat(40);
@@ -368,4 +370,180 @@ test("reconcileLaterStageReviewCurrency: fails closed when no exact-SHA review i
   );
   assert.equal(result.kind, "fail-closed");
   assert.match(result.reason, /no exact-SHA review stage is enabled/);
+});
+
+const BIND_ISSUE = 1462;
+const BIND_SLUG = "x";
+
+function bindCfg(): PipelineConfig {
+  return {
+    ...DEFAULT_CONFIG,
+    repo: "o/r",
+    repo_dir: "/repo",
+    worktree_root: ".worktrees",
+    base_branch: "main",
+  };
+}
+
+function managedWtPath(c: PipelineConfig = bindCfg()): string {
+  return worktreePath(c, BIND_ISSUE, BIND_SLUG);
+}
+
+function gitCallsRecorder() {
+  const calls: string[][] = [];
+  let head = SHA_S;
+  let dirty = "";
+  let ancestorCode = 0;
+  let ffCode = 0;
+  let resetCode = 0;
+  let verifyOk = true;
+  return {
+    calls,
+    setHead: (sha: string) => {
+      head = sha;
+    },
+    setDirty: (porcelain: string) => {
+      dirty = porcelain;
+    },
+    setAncestorCode: (code: number) => {
+      ancestorCode = code;
+    },
+    setFfCode: (code: number) => {
+      ffCode = code;
+    },
+    setResetCode: (code: number) => {
+      resetCode = code;
+    },
+    setVerifyOk: (ok: boolean) => {
+      verifyOk = ok;
+    },
+    git: async (_cwd: string, args: string[]) => {
+      calls.push(args);
+      if (args[0] === "rev-parse" && args.includes("HEAD") && !args.includes("--verify")) {
+        return { stdout: `${head}\n`, stderr: "", code: 0 };
+      }
+      if (args[0] === "rev-parse" && args.includes("--verify")) {
+        const ref = args[args.length - 1] ?? "";
+        return verifyOk
+          ? { stdout: `${ref}\n`, stderr: "", code: 0 }
+          : { stdout: "", stderr: "missing", code: 1 };
+      }
+      if (args[0] === "status") {
+        return { stdout: dirty, stderr: "", code: 0 };
+      }
+      if (args[0] === "merge-base") {
+        return { stdout: "", stderr: "", code: ancestorCode };
+      }
+      if (args[0] === "fetch") {
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      if (args[0] === "merge" && args.includes("--ff-only")) {
+        if (ffCode === 0) head = args[args.length - 1] ?? head;
+        return { stdout: "", stderr: "", code: ffCode };
+      }
+      if (args[0] === "reset" && args.includes("--hard")) {
+        if (resetCode === 0) head = args[args.length - 1] ?? head;
+        return { stdout: "", stderr: "", code: resetCode };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+  };
+}
+
+test("bindEpochRestartWorktreeToHead: missing worktree is bound without git", async () => {
+  const rec = gitCallsRecorder();
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => null,
+    gitInWorktree: rec.git,
+  });
+  assert.equal(result.kind, "bound");
+  if (result.kind === "bound") assert.equal(result.worktreeHead, null);
+  assert.equal(rec.calls.length, 0);
+});
+
+test("bindEpochRestartWorktreeToHead: worktree already at H does not reset", async () => {
+  const rec = gitCallsRecorder();
+  rec.setHead(SHA_H);
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => ({ path: managedWtPath(), slug: BIND_SLUG }),
+    gitInWorktree: rec.git,
+  });
+  assert.equal(result.kind, "bound");
+  if (result.kind === "bound") assert.equal(result.worktreeHead, SHA_H);
+  assert.equal(rec.calls.some((a) => a[0] === "reset"), false);
+  assert.equal(rec.calls.some((a) => a[0] === "merge"), false);
+});
+
+test("bindEpochRestartWorktreeToHead: dirty S worktree fails closed without reset", async () => {
+  const rec = gitCallsRecorder();
+  rec.setDirty(" M core/scripts/pipeline-run.ts\n");
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => ({ path: managedWtPath(), slug: BIND_SLUG }),
+    gitInWorktree: rec.git,
+  });
+  assert.equal(result.kind, "fail-closed");
+  assert.match(result.reason, /dirty/);
+  assert.equal(rec.calls.some((a) => a[0] === "reset"), false);
+});
+
+test("bindEpochRestartWorktreeToHead: S not ancestor of H fails closed without reset", async () => {
+  const rec = gitCallsRecorder();
+  rec.setAncestorCode(1);
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => ({ path: managedWtPath(), slug: BIND_SLUG }),
+    gitInWorktree: rec.git,
+  });
+  assert.equal(result.kind, "fail-closed");
+  assert.match(result.reason, /not an ancestor/);
+  assert.equal(rec.calls.some((a) => a[0] === "reset"), false);
+});
+
+test("bindEpochRestartWorktreeToHead: fast-forward S to H binds before review", async () => {
+  const rec = gitCallsRecorder();
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => ({ path: managedWtPath(), slug: BIND_SLUG }),
+    gitInWorktree: rec.git,
+  });
+  assert.equal(result.kind, "bound");
+  if (result.kind === "bound") assert.equal(result.worktreeHead, SHA_H);
+  assert.equal(rec.calls.some((a) => a[0] === "merge" && a.includes("--ff-only")), true);
+  assert.equal(rec.calls.some((a) => a[0] === "reset"), false);
+});
+
+test("bindEpochRestartWorktreeToHead: reset --hard S to H when ff-only fails", async () => {
+  const rec = gitCallsRecorder();
+  rec.setFfCode(1);
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => ({ path: managedWtPath(), slug: BIND_SLUG }),
+    gitInWorktree: rec.git,
+  });
+  assert.equal(result.kind, "bound");
+  if (result.kind === "bound") assert.equal(result.worktreeHead, SHA_H);
+  assert.equal(
+    rec.calls.some((a) => a[0] === "reset" && a.includes("--hard") && a.includes(SHA_H)),
+    true,
+  );
+});
+
+test("bindEpochRestartWorktreeToHead: path outside managed root fails closed", async () => {
+  const rec = gitCallsRecorder();
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => ({ path: "/tmp/other-checkout", slug: BIND_SLUG }),
+    gitInWorktree: rec.git,
+  });
+  assert.equal(result.kind, "fail-closed");
+  assert.match(result.reason, /not the managed root/);
+  assert.equal(rec.calls.length, 0);
+});
+
+test("bindEpochRestartWorktreeToHead: unverified H fails closed", async () => {
+  const rec = gitCallsRecorder();
+  rec.setVerifyOk(false);
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => ({ path: managedWtPath(), slug: BIND_SLUG }),
+    gitInWorktree: rec.git,
+  });
+  assert.equal(result.kind, "fail-closed");
+  assert.match(result.reason, /cannot verify PR HEAD/);
+  assert.equal(rec.calls.some((a) => a[0] === "reset"), false);
 });

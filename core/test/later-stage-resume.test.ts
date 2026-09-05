@@ -107,6 +107,10 @@ type DriveOpts = {
   adversarialReview?: boolean;
   advanceReviewStages?: boolean;
   currencySequence?: Array<"current" | "superseded">;
+  /** Managed-worktree HEAD at start. Omit for no on-disk worktree. */
+  worktreeHead?: string;
+  worktreeDirty?: boolean;
+  worktreeNotAncestor?: boolean;
 };
 
 type DriveResult = {
@@ -115,6 +119,8 @@ type DriveResult = {
   labels: string[];
   logs: string[];
   reviewDispatchedAtSha: string | null;
+  reviewDispatchedAtWorktreeHead: string | null;
+  reviewAttemptedOnStaleHead: boolean;
   clearBlockedCalls: number;
   finalizeCalls: number;
   candidateEpochEvents: number;
@@ -133,9 +139,14 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
   const transitions: DriveResult["transitions"] = [];
   const logs: string[] = [];
   let reviewDispatchedAtSha: string | null = null;
+  let reviewDispatchedAtWorktreeHead: string | null = null;
+  let reviewAttemptedOnStaleHead = false;
   let clearBlockedCalls = 0;
   let finalizeCalls = 0;
   let currencyCalls = 0;
+  const wtSlug = "x";
+  const wtPath = path.join(repoDir, ".worktrees", `pipeline-${ISSUE}-${wtSlug}`);
+  let worktreeHead = opts.worktreeHead ?? null;
   const origLog = console.log;
   const origWarn = console.warn;
   const origError = console.error;
@@ -184,6 +195,7 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
     repo: "owner/repo",
     domain,
     repo_dir: repoDir,
+    worktree_root: ".worktrees",
     base_branch: "main",
     invocation: "pipeline",
     marker_footer: "*Automated by Claude Code Pipeline Skill*",
@@ -247,8 +259,43 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
           },
         }
       : {}),
-    getOnDiskForIssue: async () => null,
-    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    getOnDiskForIssue: async () =>
+      opts.worktreeHead ? { path: wtPath, slug: wtSlug } : null,
+    gitInWorktree: async (_cwd, args) => {
+      if (!opts.worktreeHead) return { stdout: "", stderr: "", code: 0 };
+      if (args[0] === "rev-parse" && args.includes("HEAD") && !args.includes("--verify")) {
+        return { stdout: `${worktreeHead}\n`, stderr: "", code: 0 };
+      }
+      if (args[0] === "rev-parse" && args.includes("--verify")) {
+        const ref = args[args.length - 1] ?? "";
+        return { stdout: `${ref}\n`, stderr: "", code: 0 };
+      }
+      if (args[0] === "rev-parse") {
+        return { stdout: `${SHA_S}\n`, stderr: "", code: 0 };
+      }
+      if (args[0] === "status") {
+        return {
+          stdout: opts.worktreeDirty ? " M core/scripts/pipeline-run.ts\n" : "",
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (args[0] === "merge-base") {
+        return { stdout: "", stderr: "", code: opts.worktreeNotAncestor ? 1 : 0 };
+      }
+      if (args[0] === "merge" && args.includes("--ff-only")) {
+        worktreeHead = args[args.length - 1] ?? worktreeHead;
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      if (args[0] === "reset" && args.includes("--hard")) {
+        worktreeHead = args[args.length - 1] ?? worktreeHead;
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      if (args[0] === "diff" || args[0] === "fetch" || args[0] === "show") {
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
     postComment: async () => {},
     postPrComment: async () => {},
     addLabelToPr: async () => {},
@@ -279,6 +326,10 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
       }
       if (stage === "review-1" || stage === "review-2") {
         reviewDispatchedAtSha = opts.prHead;
+        reviewDispatchedAtWorktreeHead = worktreeHead;
+        if (worktreeHead && worktreeHead !== opts.prHead) {
+          reviewAttemptedOnStaleHead = true;
+        }
         if (opts.advanceReviewStages) {
           const to = nextStage(stage);
           const idx = labels.findIndex((l) => l.startsWith("pipeline:"));
@@ -312,6 +363,8 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
       labels: [...labels],
       logs,
       reviewDispatchedAtSha,
+      reviewDispatchedAtWorktreeHead,
+      reviewAttemptedOnStaleHead,
       clearBlockedCalls,
       finalizeCalls,
       candidateEpochEvents: events.filter((event) => event.type === "candidate_epoch_restarted").length,
@@ -515,10 +568,41 @@ test("deferred ready-to-deploy finalize rechecks currency and refuses a late HEA
   assert.equal(r.candidateEpochEvents, 1);
 });
 
+test("epoch restart does not review on managed worktree HEAD S when PR HEAD is H", async () => {
+  const r = await driveLaterStage({
+    startStage: "visual-gate",
+    prHead: SHA_H,
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+    worktreeHead: SHA_S,
+  });
+  assert.equal(r.reviewAttemptedOnStaleHead, false, "review must not run while worktree HEAD is still S");
+  assert.equal(r.reviewDispatchedAtWorktreeHead, SHA_H, "review/test cwd HEAD must be H after bind");
+  assert.ok(r.dispatchStages.includes("review-1"));
+  assert.equal(r.dispatchStages.includes("visual-gate"), false);
+});
+
+test("epoch restart fails closed when stale worktree S cannot bind to H", async () => {
+  const r = await driveLaterStage({
+    startStage: "eval-gate",
+    prHead: SHA_H,
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+    worktreeHead: SHA_S,
+    worktreeDirty: true,
+  });
+  assert.equal(r.dispatchStages.includes("review-1"), false);
+  assert.equal(r.dispatchStages.includes("eval-gate"), false);
+  assert.equal(r.reviewAttemptedOnStaleHead, false);
+  assert.equal(r.transitions.length, 0, "must not reroute to review while worktree remains at S");
+  assert.ok(r.logs.some((line) => /refusing to dispatch review/.test(line)));
+});
+
 test("nested whole-item, pipeline single, and loop item dispatch share runAdvance later-stage guard", () => {
   assert.match(NESTED_ADVANCE_SRC, /runAdvance\(/);
   assert.match(PIPELINE_SRC, /await deps\.runAdvance\(/);
   assert.match(PIPELINE_RUN_SRC, /reconcileLaterStageReviewCurrency/);
+  assert.match(PIPELINE_RUN_SRC, /bindEpochRestartWorktreeToHead/);
   assert.match(
     PIPELINE_RUN_SRC,
     /isLaterStageForReviewCurrency\(stage\)/,

@@ -53,6 +53,7 @@ import {
   tryResumeStaleBlocked,
 } from "./stages/stale-blocked-rereview.ts";
 import {
+  bindEpochRestartWorktreeToHead,
   isLaterStageForReviewCurrency,
   reconcileLaterStageReviewCurrency,
   type LaterStageReviewCurrencyDeps,
@@ -2539,6 +2540,24 @@ export async function runAdvance(
       if (laterCurrency.kind === "return-to-review") {
         tlog(`[pipeline] #${issueNumber}: ${laterCurrency.reason}`);
         if (!opts.dryRun) {
+          const bind = await bindEpochRestartWorktreeToHead(
+            cfg,
+            issueNumber,
+            laterCurrency.headSha,
+            {
+              getOnDiskForIssue: deps.getOnDiskForIssue ?? getOnDiskForIssue,
+              gitInWorktree: deps.gitInWorktree ?? gitInWorktree,
+            },
+          );
+          if (bind.kind === "fail-closed") {
+            tlog(`[pipeline] #${issueNumber}: ${bind.reason}`);
+            laterStageCurrencyFailedClosed = true;
+            process.exitCode = 1;
+            return { kind: "fail-closed", reason: bind.reason };
+          }
+          if (bind.worktreeHead) {
+            tlog(`[pipeline] #${issueNumber}: ${bind.reason}`);
+          }
           if (isBlocked(detail.labels)) {
             await (deps.clearBlocked ?? clearBlocked)(cfg, issueNumber);
           }

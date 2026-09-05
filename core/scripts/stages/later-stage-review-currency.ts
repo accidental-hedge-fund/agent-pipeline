@@ -3,9 +3,11 @@
 // Before dispatch of visual-gate / eval-gate / shipcheck-gate / ready-to-deploy,
 // reconcile PR HEAD against the latest review SHA using the shared currency
 // surface. A non-pipeline-internal HEAD starts a new candidate epoch and
-// returns the issue to review-1. Pipeline-internal-only movement stays current.
-// Unreadable PR/HEAD fails closed. This is not a second SHA-gate product.
+// returns the issue to review-1 after the managed worktree is bound to that
+// HEAD (or fail-closed if it cannot be). Pipeline-internal-only movement stays
+// current. Unreadable PR/HEAD fails closed. This is not a second SHA-gate product.
 
+import * as path from "node:path";
 import {
   getGhActor,
   getPrCommits,
@@ -16,7 +18,17 @@ import {
   reconcileReviewCurrency,
   type ReviewCurrencyObservedState,
 } from "../reconcile-and-converge.ts";
+import {
+  isAncestorOfVerifiedHead,
+  resolveVerifiedRemoteHead,
+} from "../transient-wrappers.ts";
 import type { PipelineConfig } from "../types.ts";
+import {
+  branchName,
+  getOnDiskForIssue,
+  gitInWorktree,
+  worktreePath,
+} from "../worktree.ts";
 import { extractReviewedSha } from "./review-parsing.ts";
 import {
   resolveReviewedShaCurrency,
@@ -233,4 +245,167 @@ export async function reconcileLaterStageReviewCurrency(
     headSha: observedHead,
     currency,
   });
+}
+
+const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
+
+function normalizeFullSha(raw: string): string {
+  const sha = raw.trim().toLowerCase();
+  return FULL_SHA_RE.test(sha) ? sha : "";
+}
+
+export type EpochRestartWorktreeBindResult =
+  | { kind: "bound"; worktreeHead: string | null; reason: string }
+  | { kind: "fail-closed"; reason: string };
+
+export interface EpochRestartWorktreeBindDeps {
+  getOnDiskForIssue?: typeof getOnDiskForIssue;
+  gitInWorktree?: typeof gitInWorktree;
+}
+
+/**
+ * Bind a present managed worktree to the new candidate HEAD before epoch-restarted
+ * review. Missing worktrees are not a stale-S reject. Present HEAD mismatch uses
+ * the verified-head ancestor recipe (ff-only, then reset --hard) scoped to the
+ * managed worktree path, or fails closed so review/test never run on S.
+ */
+export async function bindEpochRestartWorktreeToHead(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  headSha: string,
+  deps: EpochRestartWorktreeBindDeps = {},
+): Promise<EpochRestartWorktreeBindResult> {
+  const target = normalizeFullSha(headSha);
+  if (!target) {
+    return {
+      kind: "fail-closed",
+      reason:
+        "later-stage epoch restart: PR HEAD is not a full SHA; refusing to dispatch review",
+    };
+  }
+
+  const getWt = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const gitWt = deps.gitInWorktree ?? gitInWorktree;
+
+  let wt: { path: string; slug: string } | null;
+  try {
+    wt = await getWt(cfg, issueNumber);
+  } catch (err) {
+    return {
+      kind: "fail-closed",
+      reason: `later-stage epoch restart: cannot resolve managed worktree: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (!wt) {
+    return {
+      kind: "bound",
+      worktreeHead: null,
+      reason: "later-stage epoch restart: no managed worktree on disk",
+    };
+  }
+
+  const expectedPath = worktreePath(
+    { ...cfg, worktree_root: cfg.worktree_root || ".worktrees" },
+    issueNumber,
+    wt.slug,
+  );
+  if (path.resolve(wt.path) !== path.resolve(expectedPath)) {
+    return {
+      kind: "fail-closed",
+      reason:
+        `later-stage epoch restart: worktree path ${wt.path} is not the managed root; refusing to dispatch review`,
+    };
+  }
+
+  const readHead = async (): Promise<string> => {
+    try {
+      const res = await gitWt(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+      return res.code === 0 ? normalizeFullSha(res.stdout) : "";
+    } catch {
+      return "";
+    }
+  };
+
+  const local = await readHead();
+  if (!local) {
+    return {
+      kind: "fail-closed",
+      reason:
+        "later-stage epoch restart: cannot read managed worktree HEAD; refusing to dispatch review",
+    };
+  }
+  if (local === target) {
+    return {
+      kind: "bound",
+      worktreeHead: local,
+      reason: `later-stage epoch restart: managed worktree already at PR HEAD ${target.slice(0, 7)}`,
+    };
+  }
+
+  const status = await gitWt(
+    wt.path,
+    ["status", "--porcelain", "--untracked-files=all"],
+    { ignoreFailure: true },
+  );
+  if (status.code !== 0 || status.stdout.trim() !== "") {
+    return {
+      kind: "fail-closed",
+      reason:
+        `later-stage epoch restart: managed worktree HEAD ${local.slice(0, 7)} does not match PR HEAD ${target.slice(0, 7)} ` +
+        "and the worktree is dirty; refusing to dispatch review",
+    };
+  }
+
+  const branch = branchName(issueNumber, wt.slug);
+  const git = async (args: string[]) => gitWt(wt.path, args, { ignoreFailure: true });
+  const verified = await resolveVerifiedRemoteHead(branch, {
+    git,
+    resolveOpenPrHead: async () => target,
+  });
+  if (!verified.ok || normalizeFullSha(verified.sha) !== target) {
+    return {
+      kind: "fail-closed",
+      reason:
+        `later-stage epoch restart: cannot verify PR HEAD ${target.slice(0, 7)} in the managed worktree; refusing to dispatch review`,
+    };
+  }
+
+  const ancestor = await isAncestorOfVerifiedHead(git, "HEAD", target);
+  if (ancestor !== true) {
+    return {
+      kind: "fail-closed",
+      reason:
+        `later-stage epoch restart: managed worktree HEAD ${local.slice(0, 7)} is not an ancestor of PR HEAD ${target.slice(0, 7)}; ` +
+        "refusing reset and review dispatch",
+    };
+  }
+
+  const ff = await git(["merge", "--ff-only", target]);
+  if (ff.code !== 0) {
+    // Safety scope: `git reset --hard` targets only this managed worktree path,
+    // and only after HEAD is a proven ancestor of the verified PR head H.
+    const reset = await git(["reset", "--hard", target]);
+    if (reset.code !== 0) {
+      return {
+        kind: "fail-closed",
+        reason:
+          `later-stage epoch restart: could not move managed worktree from ${local.slice(0, 7)} to PR HEAD ${target.slice(0, 7)}; refusing to dispatch review`,
+      };
+    }
+  }
+
+  const after = await readHead();
+  if (after !== target) {
+    return {
+      kind: "fail-closed",
+      reason:
+        `later-stage epoch restart: managed worktree HEAD ${after.slice(0, 7) || "unresolved"} still does not match PR HEAD ${target.slice(0, 7)} after sync; refusing to dispatch review`,
+    };
+  }
+
+  return {
+    kind: "bound",
+    worktreeHead: after,
+    reason: `later-stage epoch restart: synchronized managed worktree to PR HEAD ${target.slice(0, 7)}`,
+  };
 }
