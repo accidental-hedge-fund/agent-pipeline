@@ -674,6 +674,10 @@ function describeObservedState(identity: LoopExternalIdentity): string {
 /** Computes exactly one {@link LoopNextAction} from the reconciled item state
  *  and its verified identity alone. No clock read, randomness, or I/O — the
  *  same inputs always yield the same action (#511 acceptance criterion). */
+function isReviewPipelineStage(stage: string | null | undefined): boolean {
+  return stage === "review-1" || stage === "review-2";
+}
+
 export function computeNextAction(
   state: LoopItemState,
   identity: LoopExternalIdentity,
@@ -686,14 +690,24 @@ export function computeNextAction(
   if (drift === "ledger-ahead" || drift === "external-absent" || drift === "identity-mismatch") {
     return "reconstruct";
   }
-  if (drift === "checks-regressed") return identity.checks_conclusion === "pending" ? "await-checks" : "noop";
+  const reviewStage = isReviewPipelineStage(identity.pipeline_stage);
+  // #1462: pending checks must not noop exact-SHA review after a new candidate epoch.
+  if (drift === "checks-regressed") {
+    if (reviewStage) return "advance";
+    return identity.checks_conclusion === "pending" ? "await-checks" : "noop";
+  }
   // Labels carry workflow state, never authority.
   if (identity.blocked_label_present) return "noop";
 
   switch (state) {
     case "pr_opened":
+      if (reviewStage) return "advance";
       if (identity.checks_conclusion === "pending") return "await-checks";
       if (identity.checks_conclusion === "success") return "advance";
+      return "noop";
+    case "in_progress":
+    case "pending":
+      if (reviewStage) return "advance";
       return "noop";
     case "merged":
       return mergeBarrierSetForThisItem ? "clear-merge-barrier" : "noop";

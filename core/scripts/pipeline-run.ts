@@ -15,6 +15,7 @@ import {
   ensurePipelineLabels,
   getGhActor,
   getIssueDetail,
+  getPrCommits,
   getPrDetail,
   getPrDiff,
   getPrForIssue,
@@ -51,6 +52,11 @@ import {
   stageEligibleForStaleBlockedResume,
   tryResumeStaleBlocked,
 } from "./stages/stale-blocked-rereview.ts";
+import {
+  isLaterStageForReviewCurrency,
+  reconcileLaterStageReviewCurrency,
+  type LaterStageReviewCurrencyDeps,
+} from "./stages/later-stage-review-currency.ts";
 import { withLock, runStateDir, isLivePlanningActive, tryAcquireLivePlanningMarker } from "./lock.ts";
 import {
   bundlePath,
@@ -713,7 +719,11 @@ export interface AdvanceDeps {
   getGhActor?: typeof getGhActor;
   getPrForIssue?: typeof getPrForIssue;
   getPrDetail?: typeof getPrDetail;
+  getPrCommits?: typeof getPrCommits;
   getPrDiff?: typeof getPrDiff;
+  /** Label transition seam. Tests inject a fake so later-stage epoch restart does not call GitHub. */
+  transition?: typeof transition;
+  resolveReviewedShaCurrency?: LaterStageReviewCurrencyDeps["resolveCurrency"];
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   gitInWorktree?: typeof gitInWorktree;
   postComment?: typeof postComment;
@@ -2489,6 +2499,9 @@ export async function runAdvance(
     // can exhaust MAX_ITERATIONS on the advance that labels the issue R2D, leaving
     // PR tagging / Pipeline Complete unrun unless we defer-finalize after the loop.
     let deployReadyFinalized = false;
+    // #1462: later-stage review-currency fail-closed must not fall through to
+    // deferred ready-to-deploy finalize when resume started at that label.
+    let laterStageCurrencyFailedClosed = false;
     // Non-terminal MAX_ITERATIONS fall-through (#1245). Snapshot the stage
     // before any park so run_complete.final_state stays the pre-park stage.
     let iterationIncomplete = false;
@@ -2566,6 +2579,47 @@ export async function runAdvance(
         await reconcileAuditComment(
           cfg, issueNumber, "blocked", pipelineRunId, blockedRepairBody, detail.comments, auditTrustedActor,
         );
+      }
+
+      // #1462: before any later-stage handler or ready-to-deploy finalize,
+      // reconcile PR HEAD against the latest review SHA. A leftover
+      // `pipeline:blocked` label is not required. Nested/single/loop share
+      // this path because they all enter runAdvance.
+      if (isLaterStageForReviewCurrency(stage)) {
+        const laterCurrency = await reconcileLaterStageReviewCurrency(
+          cfg,
+          issueNumber,
+          stage,
+          detail,
+          {
+            getPrForIssue: deps.getPrForIssue ?? getPrForIssue,
+            getPrDetail: deps.getPrDetail ?? getPrDetail,
+            getPrCommits: deps.getPrCommits ?? getPrCommits,
+            resolveCurrency: deps.resolveReviewedShaCurrency,
+          },
+        );
+        if (laterCurrency.kind === "return-to-review") {
+          tlog(`[pipeline] #${issueNumber}: ${laterCurrency.reason}`);
+          if (opts.dryRun) break;
+          await (deps.transition ?? transition)(
+            cfg,
+            issueNumber,
+            stage,
+            "review-1",
+            laterCurrency.reason,
+          );
+          transitions++;
+          lastStage = "review-1";
+          finalStage = "review-1";
+          if (opts.once) break;
+          continue;
+        }
+        if (laterCurrency.kind === "fail-closed") {
+          tlog(`[pipeline] #${issueNumber}: ${laterCurrency.reason}`);
+          laterStageCurrencyFailedClosed = true;
+          process.exitCode = 1;
+          break;
+        }
       }
 
       if (stage === "ready-to-deploy") {
@@ -3003,6 +3057,7 @@ export async function runAdvance(
     // removal); run it here so PR tagging never depends on spare budget.
     const iterationBudgetExhausted = i === MAX_ITERATIONS;
     if (
+      !laterStageCurrencyFailedClosed &&
       shouldRunDeferredTerminalFinalize({
         dryRun: !!opts.dryRun,
         alreadyFinalized: deployReadyFinalized,

@@ -80,6 +80,42 @@ export type SelectStrategyResult =
   | { kind: "claim"; action: RecoveryRecipe; cursor: number; skipped: RecoveryRecipe[] }
   | { kind: "exhausted"; skipped: RecoveryRecipe[] };
 
+/** True when a recovery attempt is keyed to `candidateEpoch` (HEAD SHA or `head=` identity). */
+export function attemptBelongsToCandidateEpoch(
+  attempt: { candidate_epoch?: string | null; candidate_identity?: string | null },
+  candidateEpoch: string,
+): boolean {
+  const wanted = candidateEpoch.trim().toLowerCase();
+  if (!wanted) return false;
+  const epoch = (attempt.candidate_epoch ?? "").trim().toLowerCase();
+  if (epoch === wanted) return true;
+  if (epoch.includes(`head=${wanted}`)) return true;
+  const identity = (attempt.candidate_identity ?? "").toLowerCase();
+  return identity.includes(`head=${wanted}`);
+}
+
+/**
+ * True when Cooling was recorded under a previous candidate epoch. A new HEAD
+ * must not inherit S-episode exhaustion or Cooling as authority to skip review.
+ */
+export function coolingIsStaleForNewCandidateEpoch(
+  cooling: LoopCoolingRecord | null | undefined,
+  attempts: readonly Pick<
+    LoopRecoveryAttempt,
+    "item_id" | "candidate_epoch" | "candidate_identity"
+  >[],
+  itemId: string | undefined,
+  candidateEpoch: string,
+): boolean {
+  if (!cooling || !itemId) return false;
+  if (cooling.item_id && cooling.item_id !== itemId) return false;
+  const wanted = candidateEpoch.trim();
+  if (!wanted) return false;
+  const latest = [...attempts].reverse().find((attempt) => attempt.item_id === itemId);
+  if (!latest) return false;
+  return !attemptBelongsToCandidateEpoch(latest, wanted);
+}
+
 export function recoveryEpisodeId(key: RecoveryEpisodeKey): string {
   const canonical = [
     "pipeline-recovery-episode@1",

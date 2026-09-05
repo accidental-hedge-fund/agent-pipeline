@@ -542,6 +542,32 @@ test("computeNextAction: pending checks on an aligned pr_opened item yields awai
   assert.equal(computeNextAction("pr_opened", identity, null, false), "await-checks");
 });
 
+test("computeNextAction: pending checks do not noop review-1 after epoch change (#1462)", () => {
+  const identity = openPrIdentity({
+    pipeline_stage: "review-1",
+    checks_conclusion: "pending",
+    head_sha: "b".repeat(40),
+    candidate_epoch: "b".repeat(40),
+  });
+  assert.equal(computeNextAction("in_progress", identity, null, false), "advance");
+  assert.equal(computeNextAction("pending", identity, null, false), "advance");
+  assert.equal(computeNextAction("pr_opened", identity, null, false), "advance");
+  assert.equal(
+    computeNextAction("in_progress", identity, "checks-regressed", false),
+    "advance",
+  );
+  assert.notEqual(computeNextAction("in_progress", identity, null, false), "noop");
+  assert.notEqual(computeNextAction("in_progress", identity, "checks-regressed", false), "await-checks");
+});
+
+test("computeNextAction: review-2 stays actionable with pending checks (#1462)", () => {
+  const identity = openPrIdentity({
+    pipeline_stage: "review-2",
+    checks_conclusion: "pending",
+  });
+  assert.equal(computeNextAction("in_progress", identity, null, false), "advance");
+});
+
 test("computeNextAction: contradictions never invent human authority", () => {
   for (const cls of ["ledger-ahead", "external-absent", "identity-mismatch"] as const) {
     assert.equal(computeNextAction("pr_opened", openPrIdentity(), cls, false), "reconstruct");

@@ -69,6 +69,7 @@ import {
   buildCoolingRecord,
   coolingDeadline,
   coolingIsActive,
+  coolingIsStaleForNewCandidateEpoch,
   coolingRecordForItem,
   emptyEpisode,
   perStrategyBound,
@@ -998,6 +999,7 @@ async function executeBlockedRecovery(
     }
   }
 
+  const currentEpoch = item.last_verified_identity?.head_sha.trim() ?? "";
   const matchingAttempts = ledger.recovery_attempts.filter(
     (attempt) =>
       attempt.item_id === itemId &&
@@ -1009,7 +1011,15 @@ async function executeBlockedRecovery(
   if (!attempt) {
     const policy = contract.recovery_policy[item.blocked_theme];
     const ownedCooling = coolingRecordForItem(ledger, itemId);
-    if (coolingIsActive(ownedCooling, deps.store.now().toISOString())) {
+    if (
+      coolingIsActive(ownedCooling, deps.store.now().toISOString()) &&
+      !coolingIsStaleForNewCandidateEpoch(
+        ownedCooling,
+        ledger.recovery_attempts,
+        itemId,
+        currentEpoch,
+      )
+    ) {
       await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
         item_id: itemId,
         reason: "cooling_next_eligible_at",
@@ -2273,21 +2283,32 @@ export async function runSupervisorCycle(
     }
 
     if (ledger.cooling) {
-      await appendActionEvidence(deps.store, runId, token, {
-        item_id: ledger.cooling.item_id ?? null,
-        action: "noop",
-        outcome: "cooling_recovery",
-        next_action: null,
-        progress: recoveryProgress ? "progress" : "no_progress",
-      });
-      return {
-        progress: recoveryProgress,
-        stop: null,
-        cooling: ledger.cooling,
-        holdOutstanding: false,
-        allDone: false,
-        heldItemIds: heldItemIdsFromLedger(ledger),
-      };
+      const cooledId = ledger.cooling.item_id;
+      const cooledItem = cooledId ? ledger.items[cooledId] : undefined;
+      const cooledEpoch = cooledItem?.last_verified_identity?.head_sha.trim() ?? "";
+      const staleCooling = coolingIsStaleForNewCandidateEpoch(
+        ledger.cooling,
+        ledger.recovery_attempts,
+        cooledId,
+        cooledEpoch,
+      );
+      if (!staleCooling) {
+        await appendActionEvidence(deps.store, runId, token, {
+          item_id: ledger.cooling.item_id ?? null,
+          action: "noop",
+          outcome: "cooling_recovery",
+          next_action: null,
+          progress: recoveryProgress ? "progress" : "no_progress",
+        });
+        return {
+          progress: recoveryProgress,
+          stop: null,
+          cooling: ledger.cooling,
+          holdOutstanding: false,
+          allDone: false,
+          heldItemIds: heldItemIdsFromLedger(ledger),
+        };
+      }
     }
 
     // Engine-owned strategy-cursor exhaustion stays item-local Cooling (or an
