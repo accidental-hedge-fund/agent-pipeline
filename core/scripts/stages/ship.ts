@@ -64,6 +64,11 @@ export {
 
 const execFileAsync = promisify(execFile);
 
+/** Production-owned admission adapter used at the locked ship coordinator boundary. */
+export function assertShipAdmissionRoute(route: "ship.direct" | "ship.resume"): void {
+  assertRequiredAdmissionRoute(route, "ship", "ship-admission");
+}
+
 export const SHIP_SCHEMA_VERSION = 1;
 export const SHIP_AUTHORIZATION_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 /** Stable identity for operator `pipeline ship --milestone` (no grant document). */
@@ -1035,11 +1040,7 @@ export async function runShipCoordinator(
   if (!path.isAbsolute(eventsFile)) throw new Error("ship state: events_file must be an absolute path");
 
   const loaded = await deps.state.read(coordinateKey);
-  assertRequiredAdmissionRoute(
-    loaded ? "ship.resume" : "ship.direct",
-    "ship",
-    "ship-admission",
-  );
+  assertShipAdmissionRoute(loaded ? "ship.resume" : "ship.direct");
   let status: ShipStatus;
   if (loaded) {
     status = parseStatus(loaded);

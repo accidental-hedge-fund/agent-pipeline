@@ -3347,6 +3347,14 @@ export interface LoopCliDeps {
 
 const defaultLoopCliDeps: LoopCliDeps = { runLoopPreflight, runLoopEngine: defaultRunLoopEngine };
 
+/** Production-owned adapter shared by direct, numeric, detached, and resumed loop routes. */
+export function assertLoopAdmissionRoute(
+  route: "drive.numeric" | "drive.detached-resume" | "loop.direct" | "loop.resume",
+): void {
+  const entrypoint = route.startsWith("drive.") ? "drive" : "loop";
+  assertRequiredAdmissionRoute(route, entrypoint, "loop-admission");
+}
+
 /** `pipeline loop ...` (#512): normalize arguments, run the deterministic
  *  loop:store-schema-compatibility + native-/goal preflight checks, and — on
  *  success — drive (or resume) the in-repo durable loop supervisor, or render
@@ -3395,11 +3403,7 @@ export async function runLoopCommand(
   }
 
   if (!outcome.args.audit) {
-    assertRequiredAdmissionRoute(
-      outcome.args.resumeRunId ? "loop.resume" : "loop.direct",
-      "loop",
-      "loop-admission",
-    );
+    assertLoopAdmissionRoute(outcome.args.resumeRunId ? "loop.resume" : "loop.direct");
   }
 
   const writeLine = deps.writeStdoutLine ?? writeFlushedStdoutLine;
@@ -3668,7 +3672,7 @@ export async function runSingleIssueCommand(
     }
     admittedLogicalOperationId = admission.logicalOperationId;
   } else {
-    assertRequiredAdmissionRoute("drive.numeric", "drive", "loop-admission");
+    assertLoopAdmissionRoute("drive.numeric");
   }
 
   const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
@@ -8592,7 +8596,7 @@ export async function handleRunSubcommand(
   }
 
   if (opts.detach) {
-    assertRequiredAdmissionRoute("drive.detached-resume", "drive", "loop-admission");
+    assertLoopAdmissionRoute("drive.detached-resume");
     // Resolve the repo BEFORE creating any artifact (#485). A detached launch used to
     // compute `findGitRoot(start) ?? start` — silently falling back to an unvalidated
     // cwd — then create the wrapper dir, log, and run-store pointer, only to have the

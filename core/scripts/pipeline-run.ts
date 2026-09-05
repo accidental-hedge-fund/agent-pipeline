@@ -1115,8 +1115,10 @@ export async function dispatch(
   runStoreDeps?: RunStoreDeps,
   recoveryDeps?: PlanningRecoveryDeps,
 ): Promise<Outcome> {
-  const attempt = () =>
-    dispatchStageHandler(
+  const evidenceProducer = stage === "planning" || stage === "implementing";
+  let producerCompletionEvidence: Awaited<ReturnType<DeliveryStageEvidenceObserver>> | null = null;
+  const attempt = async () => {
+    const outcome = await dispatchStageHandler(
       cfg,
       issueNumber,
       stage,
@@ -1127,6 +1129,18 @@ export async function dispatch(
       runStoreDeps,
       recoveryDeps,
     );
+    if (
+      evidenceProducer &&
+      outcome.advanced &&
+      opts.observeDeliveryStageEvidence
+    ) {
+      // Capture the candidate/artifact at the producer's completion boundary.
+      // runDeliveryStageAdapter re-observes it before accepting the epoch
+      // transition, so a later replacement cannot inherit producer authority.
+      producerCompletionEvidence = await opts.observeDeliveryStageEvidence("after", outcome);
+    }
+    return outcome;
+  };
   if (isDeliveryStage(stage)) {
     return runDeliveryStageAdapter({
       stage,
@@ -1136,8 +1150,9 @@ export async function dispatch(
       logicalOperationId: opts.logicalOperationId,
       reportObservation: opts.reportObservation,
       requireEvidenceBeforeAttempt: true,
-      evidenceProducerBeforeAttempt: stage === "planning" || stage === "implementing",
+      evidenceProducerBeforeAttempt: evidenceProducer,
       observeEvidence: opts.observeDeliveryStageEvidence,
+      producerCompletionEvidence: evidenceProducer ? () => producerCompletionEvidence : undefined,
       attempt,
     });
   }

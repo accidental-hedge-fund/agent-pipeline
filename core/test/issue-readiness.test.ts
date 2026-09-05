@@ -621,6 +621,37 @@ test("dispatch implementing: does not fetch for issue-readiness", async () => {
   assert.equal(gate, 0);
 });
 
+test("commit-producing implementation dispatch accepts its captured exact Candidate", async () => {
+  const cfg = makeCfg({ issue_readiness: { enabled: true, timeout: 600 } });
+  const before = "a".repeat(40);
+  const produced = "b".repeat(40);
+  let observations = 0;
+  const out = await dispatch(cfg, 5, "implementing", {
+    dryRun: true,
+    logicalOperationId: "lop-implementation-producer",
+    observeDeliveryStageEvidence: async () => {
+      observations += 1;
+      const sha = observations === 1 ? before : produced;
+      return {
+        candidateSha: sha,
+        candidateEpoch: sha,
+        evidenceRole: observations === 1 ? null : "implementation",
+        artifactIdentity: observations === 1 ? null : `implementation:${sha}`,
+        postconditionProven: observations > 1,
+      };
+    },
+  }, "run", undefined, undefined, undefined, {
+    transition: async () => {},
+    planningAdvance: async () => ({ advanced: false, status: "waiting", reason: "unused" }),
+    isLivePlanningActive: () => false,
+    evaluateIssueReadiness: async () => {
+      throw new Error("implementing must not evaluate readiness");
+    },
+  });
+  assert.equal(out.advanced, true);
+  assert.equal(observations, 3);
+});
+
 test("pickup coordinators share ready-dispatch gate and have no private copy", async () => {
   const { readFileSync } = await import("node:fs");
   const { dirname, join } = await import("node:path");

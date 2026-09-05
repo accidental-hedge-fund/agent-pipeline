@@ -15,6 +15,7 @@ import {
   OPERATION_SURFACE,
   type OperationSurfaceEntry,
 } from "./operation-surface.ts";
+import { assertGeneratedHostAdmissionRoute } from "./operation-reliability.ts";
 
 /** Issue-locked generated-host membership. Contains no notify values. */
 export const SKILL_HOST_IDS = ["claude", "codex", "grok", "opencode"] as const;
@@ -166,6 +167,7 @@ export function renderHostSkill(options: RenderHostSkillOptions = {}): string {
   const operationSurface = options.operationSurface ?? OPERATION_SURFACE;
   const manifests = options.manifests ?? loadOuterHostManifestsPreferHosts();
   const rows = projectSkillNotifyRows(manifests);
+  for (const row of rows) assertGeneratedHostAdmissionRoute(row.id);
 
   return [
     "---",

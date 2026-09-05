@@ -12,29 +12,30 @@ The archived `stamp-required-unique-op-admissions` contract is normative but its
 - Keep incomplete work durably owned by RecoverySupervisor and invalidate candidate-bound implementation, review, test, decision, and authority evidence on every candidate epoch change.
 - Bound Decisions authority evidence with content-addressed references so repeated requests do not duplicate the issue context, dependency closure, or specification corpus.
 - Publish generated grill Markdown through a non-argv body channel and preserve typed, actionable diagnostics for transport and operating-system spawn failures, including null process status.
+- Keep distinct newly discovered blockers blocking even when they share a file/category surface with an older settled finding, and refuse OpenSpec archive while explicit tasks remain unchecked.
 - Preserve the existing authority boundary: admission stamps do not authorize or prove merge, release, deployment, rollback, destructive work, or success; `advance`, `loop`, and `single` still never merge.
 
 ## Acceptance Criteria
 
-- [ ] Every task and acceptance criterion from archived change `2026-09-05-stamp-required-unique-op-admissions` has implementation and hermetic test evidence without weakening durability, approved-root enforcement, identity, inventory, recovery ownership, collection, or the release hard gate.
-- [ ] Every covered public admission creates or resumes exactly one immutable Logical Operation identity, and retries, restarts, reattachment, and nested work preserve that identity while physical attempts remain distinct.
-- [ ] A covered operation does not begin protected work until its stamp is atomically published, durability-flushed, read back, and verified against the bound operation, physical attempt, entrypoint, and approved execution root.
-- [ ] Missing, malformed, conflicting, or unapproved-root stamps fail closed and emit typed mechanical evidence under the same pre-bound identity; no protected downstream adapter runs.
-- [ ] Direct `single`, `merge`, and `merge-queue --apply`, plus each train-nested merge, satisfy the archived admission ordering and identity contract; numeric drive remains distinct from `single`.
-- [ ] Candidate-engine commands spawn only from the exact canonical root returned by shared resolve-and-prepare after candidate identity, readiness, and pre/post-bootstrap cleanliness are proved.
-- [ ] An executable inventory covers required public entrypoints, nested operations, recovery/resume paths, and applicable host adapters, and the repository validation gate fails for a missing, duplicate, unknown, or bypassing admission site.
-- [ ] Unique-operation collection accepts only qualifying artifacts from approved roots, never synthesizes absent coverage, never treats admission as completion, and leaves `uniqueOperationSloFailure` as a release-prepare hard failure.
-- [ ] A salvaged planning-only commit cannot satisfy the implementing-stage deliverable, enter post-implementation publication, transition to design/review, or avoid implementation-harness execution.
-- [ ] A merged planning/specification PR cannot prove implementation, merge completion, or Logical Operation completion for an issue whose current stage still requires implementation.
-- [ ] Reconciliation of an open issue at any actionable stage, including `pipeline:ready`, resumes or schedules the missing implementation work despite an older merged planning PR.
-- [ ] Planning-artifact and implementation-candidate identities remain distinct and are checked at implementation, recovery, reconciliation, review, and completion boundaries.
-- [ ] When exact implementation completion is not proved, RecoverySupervisor records an owned active, cooling, waiting, reconstruction, or typed-request outcome; it does not produce an ownerless terminal or false-human projection.
-- [ ] Candidate movement starts a new Candidate epoch and invalidates all candidate-bound implementation, test, review, decision, and authority evidence until each fact is re-proved for that epoch.
-- [ ] Decisions authority requests retain bounded, content-addressed evidence and binding metadata without repeating the full context, dependency, or specification corpus, and rendered issue bodies stay within GitHub's body-size limit.
-- [ ] Grill issue-body publication successfully delivers a generated Markdown body above the prior argv failure threshold through stdin, a body file, or an equivalent non-argv channel.
-- [ ] Grill publication failures retain typed actionable diagnostics, and an operating-system spawn failure with null status is not reported as success, an unclassified lifecycle outcome, or a misleading numeric exit.
-- [ ] Network-free regressions prove planning-only salvage invokes implementation, a reopened actionable issue with an older merged planning PR is not reconciled complete, and oversized grill Markdown is delivered without an argv body.
-- [ ] Generated host artifacts and any generator-owned documentation are refreshed after core changes, and `openspec validate --all`, generated-artifact checks, and the complete `npm run ci` gate pass.
+- [x] Every task and acceptance criterion from archived change `2026-09-05-stamp-required-unique-op-admissions` has implementation and hermetic test evidence without weakening durability, approved-root enforcement, identity, inventory, recovery ownership, collection, or the release hard gate.
+- [x] Every covered public admission creates or resumes exactly one immutable Logical Operation identity, and retries, restarts, reattachment, and nested work preserve that identity while physical attempts remain distinct.
+- [x] A covered operation does not begin protected work until its stamp is atomically published, durability-flushed, read back, and verified against the bound operation, physical attempt, entrypoint, and approved execution root.
+- [x] Missing, malformed, conflicting, or unapproved-root stamps fail closed and emit typed mechanical evidence under the same pre-bound identity; no protected downstream adapter runs.
+- [x] Direct `single`, `merge`, and `merge-queue --apply`, plus each train-nested merge, satisfy the archived admission ordering and identity contract; numeric drive remains distinct from `single`.
+- [x] Candidate-engine commands spawn only from the exact canonical root returned by shared resolve-and-prepare after candidate identity, readiness, and pre/post-bootstrap cleanliness are proved.
+- [x] An executable inventory covers required public entrypoints, nested operations, recovery/resume paths, and applicable host adapters, and the repository validation gate fails for a missing, duplicate, unknown, or bypassing admission site.
+- [x] Unique-operation collection accepts only qualifying artifacts from approved roots, never synthesizes absent coverage, never treats admission as completion, and leaves `uniqueOperationSloFailure` as a release-prepare hard failure.
+- [x] A salvaged planning-only commit cannot satisfy the implementing-stage deliverable, enter post-implementation publication, transition to design/review, or avoid implementation-harness execution.
+- [x] A merged planning/specification PR cannot prove implementation, merge completion, or Logical Operation completion for an issue whose current stage still requires implementation.
+- [x] Reconciliation of an open issue at any actionable stage, including `pipeline:ready`, resumes or schedules the missing implementation work despite an older merged planning PR.
+- [x] Planning-artifact and implementation-candidate identities remain distinct and are checked at implementation, recovery, reconciliation, review, and completion boundaries.
+- [x] When exact implementation completion is not proved, RecoverySupervisor records an owned active, cooling, waiting, reconstruction, or typed-request outcome; it does not produce an ownerless terminal or false-human projection.
+- [x] Candidate movement starts a new Candidate epoch and invalidates all candidate-bound implementation, test, review, decision, and authority evidence until each fact is re-proved for that epoch.
+- [x] Decisions authority requests retain bounded, content-addressed evidence and binding metadata without repeating the full context, dependency, or specification corpus, and rendered issue bodies stay within GitHub's body-size limit.
+- [x] Grill issue-body publication successfully delivers a generated Markdown body above the prior argv failure threshold through stdin, a body file, or an equivalent non-argv channel.
+- [x] Grill publication failures retain typed actionable diagnostics, and an operating-system spawn failure with null status is not reported as success, an unclassified lifecycle outcome, or a misleading numeric exit.
+- [x] Network-free regressions prove planning-only salvage invokes implementation, a reopened actionable issue with an older merged planning PR is not reconciled complete, and oversized grill Markdown is delivered without an argv body.
+- [x] Generated host artifacts and any generator-owned documentation are refreshed after core changes, and `openspec validate --all`, generated-artifact checks, and the complete `npm run ci` gate pass.
 
 ## Capabilities
 
@@ -51,6 +52,8 @@ The archived `stamp-required-unique-op-admissions` contract is normative but its
 - `operation-invariant-reconciliation`: distinguish planning PR integration from exact implementation completion and honor a reopened issue's current actionable stage.
 - `issue-stage-adapters`: bind stage completion and candidate evidence to explicit artifact roles and Candidate epochs while retaining RecoverySupervisor ownership.
 - `grill-with-docs-admission`: bound authority evidence and publish evidence-bearing issue bodies through a typed non-argv transport.
+- `review-surface-recurrence`: require specific-finding identity before settled-surface evidence demotion.
+- `openspec-integration`: make explicit task completion a precondition of automated archive.
 
 ## Impact
 

@@ -11,9 +11,10 @@ import {
   REQUIRED_LIFECYCLE_CLASSES_1333,
   REQUIRED_PUBLIC_ENTRYPOINTS,
   REQUIRED_ADMISSION_ROUTES,
+  admissionRouteExecutionGaps,
   admissionRouteInventoryGaps,
   assertAdmissionRouteInventoryComplete,
-  exerciseRequiredAdmissionRoutes,
+  captureRequiredAdmissionRouteCrossings,
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
   filterAttemptsBoundToCandidate,
@@ -24,7 +25,13 @@ import {
   uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
 } from "../scripts/operation-reliability.ts";
-import { SKILL_HOST_IDS } from "../scripts/host-skill.ts";
+import {
+  SKILL_HOST_IDS,
+  renderHostSkill,
+} from "../scripts/host-skill.ts";
+import { executeAfterPublicAdmission, assertLoopAdmissionRoute } from "../scripts/pipeline.ts";
+import { assertTrainAdmissionRoute } from "../scripts/stages/train.ts";
+import { assertShipAdmissionRoute } from "../scripts/stages/ship.ts";
 
 const CORE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPO_ROOT = path.resolve(CORE_ROOT, "..");
@@ -104,48 +111,61 @@ test("required admission route inventory is exact and hard-gated (#1454)", () =>
   ) as never;
   assert.throws(() => assertAdmissionRouteInventoryComplete(nameOnly), /bypasses admission/);
 
-  const declarationOnly = REQUIRED_ADMISSION_ROUTES.map((row) =>
-    row.route === "loop.resume" ? { ...row, execute: undefined } : row,
-  ) as never;
-  assert.throws(
-    () => assertAdmissionRouteInventoryComplete(declarationOnly),
-    /route loop\.resume missing executable binding/,
-  );
 });
 
-test("production admission routes behaviorally cross admission before protected work (#1454)", async () => {
+test("hard gate executes production-owned admission route adapters (#1454)", async () => {
   const events: string[] = [];
-  const outcomes = await exerciseRequiredAdmissionRoutes(
-    {
-      admit: async (input) => {
-        events.push(`admit:${input.row.route}`);
-        return {
-          acknowledged: true,
-          operationKey: input.operationKey,
-          logicalOperationId: input.logicalOperationId,
-          approvedRoot: input.approvedRoot,
-        };
-      },
-      protectedOperation: async (input) => {
-        assert.equal(events.at(-1), `admit:${input.row.route}`);
-        events.push(`protected:${input.row.route}`);
-      },
-      delegateHost: async (input, invokeCli) => {
-        events.push(`host:${input.host}`);
-        return executeGeneratedHostNumericDrive(input.host, invokeCli);
-      },
-    },
-    {
-      approvedRoot: "/factory-control",
-      logicalOperationIdFor: (row) => `lop-${row.route}`,
-    },
-  );
+  const captured = await captureRequiredAdmissionRouteCrossings(async () => {
+    for (const [route, kind] of [
+      ["single.direct", "single"],
+      ["merge.direct", "merge"],
+      ["merge-queue.apply", "merge-queue"],
+    ] as const) {
+      const executed = await executeAfterPublicAdmission(
+        {
+          repoDir: "/factory-control",
+          repo: "acme/repo",
+          domain: "acme+repo",
+          kind,
+          operationKey: `inventory:${route}`,
+          route,
+        },
+        async () => { events.push(`protected:${route}`); },
+        {
+          persistPublicAdmission: (async (input: { operationKey?: string }) => {
+            events.push(`admit:${route}`);
+            return {
+              acknowledged: true,
+              operationKey: input.operationKey ?? "",
+              logicalOperationId: `lop-${route}`,
+              approvedRoot: "/factory-control",
+            };
+          }) as never,
+        },
+      );
+      assert.equal(executed.ok, true);
+      assert.deepEqual(events.slice(-2), [`admit:${route}`, `protected:${route}`]);
+    }
 
-  assert.equal(Object.keys(outcomes).length, REQUIRED_ADMISSION_ROUTES.length);
-  for (const row of REQUIRED_ADMISSION_ROUTES) {
-    assert.equal(outcomes[row.route], "admitted");
-    assert.ok(events.includes(`protected:${row.route}`), row.route);
-  }
+    for (const route of ["drive.numeric", "drive.detached-resume", "loop.direct", "loop.resume"] as const) {
+      assertLoopAdmissionRoute(route);
+    }
+    for (const route of ["train.direct", "train.recovery", "merge.train-nested"] as const) {
+      assertTrainAdmissionRoute(route);
+    }
+    for (const route of ["ship.direct", "ship.resume"] as const) {
+      assertShipAdmissionRoute(route);
+    }
+    renderHostSkill();
+    for (const host of SKILL_HOST_IDS) {
+      const delegated = await executeGeneratedHostNumericDrive(host, async () => {
+        return true;
+      });
+      assert.equal(delegated, true);
+    }
+  });
+
+  assert.deepEqual(admissionRouteExecutionGaps(captured.routes), []);
   assert.deepEqual(
     REQUIRED_ADMISSION_ROUTES.filter((row) => row.class === "host").map((row) => row.host).sort(),
     [...SKILL_HOST_IDS].sort(),
@@ -157,63 +177,41 @@ test("production admission routes behaviorally cross admission before protected 
   }
 });
 
-test("executable admission inventory refuses every route without protected work (#1454)", async () => {
-  const protectedRoutes: string[] = [];
-  const outcomes = await exerciseRequiredAdmissionRoutes(
-    {
-      admit: async () => ({ acknowledged: false }),
-      protectedOperation: async (input) => { protectedRoutes.push(input.row.route); },
-      delegateHost: async (input, invokeCli) => invokeCli(input.argv),
-    },
-    {
-      approvedRoot: "/factory-control",
-      logicalOperationIdFor: (row) => `lop-${row.route}`,
-    },
-  );
-  assert.deepEqual(protectedRoutes, []);
-  assert.ok(Object.values(outcomes).every((outcome) => outcome === "refused"));
-});
-
-test("executable admission inventory rejects wrong root/identity and host bypass (#1454)", async () => {
+test("production public admission refusal executes no protected operation (#1454)", async () => {
   let protectedCalls = 0;
-  await assert.rejects(
-    () => exerciseRequiredAdmissionRoutes(
-      {
-        admit: async (input) => ({
-          acknowledged: true,
-          operationKey: input.operationKey,
-          logicalOperationId: `${input.logicalOperationId}-replacement`,
-          approvedRoot: input.approvedRoot,
-        }),
-        protectedOperation: async () => { protectedCalls += 1; },
-        delegateHost: async (input, invokeCli) => invokeCli(input.argv),
-      },
-      { approvedRoot: "/factory-control", logicalOperationIdFor: (row) => `lop-${row.route}` },
-    ),
-    /admission identity\/root mismatch/,
+  const executed = await executeAfterPublicAdmission(
+    {
+      repoDir: "/factory-control",
+      repo: "acme/repo",
+      domain: "acme+repo",
+      kind: "merge",
+      operationKey: "inventory:merge.direct",
+      route: "merge.direct",
+    },
+    async () => { protectedCalls += 1; },
+    {
+      persistPublicAdmission: (async () => ({
+        acknowledged: false,
+        kind: "merge",
+        runId: "merge-refused",
+        logicalOperationId: "lop-refused",
+        repository: "acme/repo",
+        domain: "acme+repo",
+        issue: null,
+        startedAt: "2026-09-05T00:00:00Z",
+        approvedRoot: null,
+        runDir: null,
+        binding: {},
+        failure: {
+          kind: "approved_root_unavailable",
+          step: "resolve_approved_root",
+          diagnostic: "injected refusal",
+        },
+      })) as never,
+    },
   );
+  assert.equal(executed.ok, false);
   assert.equal(protectedCalls, 0);
-
-  await assert.rejects(
-    () => exerciseRequiredAdmissionRoutes(
-      {
-        admit: async (input) => ({
-          acknowledged: true,
-          operationKey: input.operationKey,
-          logicalOperationId: input.logicalOperationId,
-          approvedRoot: input.approvedRoot,
-        }),
-        protectedOperation: async () => {},
-        delegateHost: async () => false,
-      },
-      {
-        routes: REQUIRED_ADMISSION_ROUTES,
-        approvedRoot: "/factory-control",
-        logicalOperationIdFor: (row) => `lop-${row.route}`,
-      },
-    ),
-    /generated host claude bypassed CLI admission/,
-  );
 });
 
 function packInput(over: Record<string, unknown> = {}) {

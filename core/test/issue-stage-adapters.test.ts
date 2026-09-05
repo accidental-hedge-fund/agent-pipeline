@@ -292,6 +292,13 @@ test("1.4 evidence producer may establish the exact artifact during its attempt 
     logicalOperationId: "lop-produce-implementation",
     requireEvidenceBeforeAttempt: true,
     evidenceProducerBeforeAttempt: true,
+    producerCompletionEvidence: () => ({
+      candidateSha: sha,
+      candidateEpoch: sha,
+      evidenceRole: "implementation",
+      artifactIdentity: `implementation:${sha}`,
+      postconditionProven: true,
+    }),
     observeEvidence: async (phase) => phase === "before"
       ? {
           candidateSha: sha,
@@ -331,6 +338,13 @@ test("1.4 evidence producer cannot establish an artifact for a replacement Candi
     logicalOperationId: "lop-producer-candidate-moved",
     requireEvidenceBeforeAttempt: true,
     evidenceProducerBeforeAttempt: true,
+    producerCompletionEvidence: () => ({
+      candidateSha: beforeSha,
+      candidateEpoch: beforeSha,
+      evidenceRole: "implementation",
+      artifactIdentity: `implementation:${beforeSha}`,
+      postconditionProven: true,
+    }),
     observeEvidence: async (phase) => phase === "before"
       ? {
           candidateSha: beforeSha,

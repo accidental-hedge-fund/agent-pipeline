@@ -61,6 +61,7 @@ import {
   type ReportOperationObservation,
   type LinkedPrIntegrationFact,
 } from "../operation-observation.ts";
+
 import {
   proveMergeResultInBase,
   releaseWorktreeForParkedIssue,
@@ -77,6 +78,17 @@ import {
 } from "./merge-supervision.ts";
 
 const execFileAsync = promisify(execFile);
+
+/** Production-owned admission adapter for train and its nested merge route. */
+export function assertTrainAdmissionRoute(
+  route: "train.direct" | "train.recovery" | "merge.train-nested",
+): void {
+  if (route === "merge.train-nested") {
+    assertRequiredAdmissionRoute(route, "merge", "public-admission");
+    return;
+  }
+  assertRequiredAdmissionRoute(route, "train", "train-admission");
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1150,7 +1162,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
   deps.log(formatTrainOrderedIssuesLine(ordered, mergeMode, mergeFirst));
 
   if (!mergeMode) {
-    assertRequiredAdmissionRoute("train.recovery", "train", "train-admission");
+    assertTrainAdmissionRoute("train.recovery");
   }
 
   const startedAt = deps.now?.() ?? new Date();
@@ -1203,6 +1215,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     const selectorKey = opts.milestone?.trim()
       ? `milestone:${opts.milestone.trim()}`
       : `issues:${ordered.join(",")}`;
+    assertTrainAdmissionRoute("train.direct");
     const admission = await (deps.persistPublicAdmission ?? persistPublicEntrypointAdmission)(
       {
         repoDir: opts.repoDir,
@@ -1356,6 +1369,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     });
   };
   const admitNestedMergeSubmission = async (issue: number, pr: number): Promise<string | null> => {
+    assertTrainAdmissionRoute("merge.train-nested");
     const admission = await (deps.persistPublicAdmission ?? persistPublicEntrypointAdmission)(
       {
         repoDir: opts.repoDir,

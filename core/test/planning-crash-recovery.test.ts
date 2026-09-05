@@ -228,6 +228,75 @@ test("planning crash recovery: dry-run does not call transition for planning", a
   assert.ok(out !== undefined, "dry-run must return an outcome");
 });
 
+test("planning producer dispatch accepts only its captured epoch transition", async () => {
+  const cfg = makeCfg();
+  const { deps } = makeDeps(ADVANCING_OUTCOME);
+  const before = "a".repeat(40);
+  const produced = "b".repeat(40);
+  let observations = 0;
+  const out = await dispatch(
+    cfg,
+    ISSUE,
+    "planning",
+    {
+      dryRun: true,
+      logicalOperationId: "lop-planning-producer",
+      observeDeliveryStageEvidence: async () => {
+        observations += 1;
+        const sha = observations === 1 ? before : produced;
+        return {
+          candidateSha: sha,
+          candidateEpoch: sha,
+          evidenceRole: "planning",
+          artifactIdentity: observations === 1 ? `planning-target:${sha}` : `planning:${sha}`,
+          postconditionProven: observations > 1,
+        };
+      },
+    },
+    RUN_ID,
+    undefined,
+    undefined,
+    undefined,
+    deps,
+  );
+  assert.equal(out.advanced, true);
+  assert.equal(observations, 3, "before, producer-completion, and final verification are required");
+});
+
+test("planning producer dispatch refuses movement after its captured epoch", async () => {
+  const cfg = makeCfg();
+  const { deps } = makeDeps(ADVANCING_OUTCOME);
+  const shas = ["a".repeat(40), "b".repeat(40), "c".repeat(40)];
+  let observations = 0;
+  const out = await dispatch(
+    cfg,
+    ISSUE,
+    "planning",
+    {
+      dryRun: true,
+      logicalOperationId: "lop-planning-replaced",
+      observeDeliveryStageEvidence: async () => {
+        const sha = shas[Math.min(observations, shas.length - 1)]!;
+        observations += 1;
+        return {
+          candidateSha: sha,
+          candidateEpoch: sha,
+          evidenceRole: "planning",
+          artifactIdentity: observations === 1 ? `planning-target:${sha}` : `planning:${sha}`,
+          postconditionProven: observations > 1,
+        };
+      },
+    },
+    RUN_ID,
+    undefined,
+    undefined,
+    undefined,
+    deps,
+  );
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /Candidate binding changed/);
+});
+
 test("planning crash recovery: dry-run does not call transition for plan-review", async () => {
   const cfg = makeCfg();
   const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);

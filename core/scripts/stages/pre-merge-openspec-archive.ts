@@ -174,6 +174,34 @@ export async function archiveAlreadyDone(
   });
 }
 
+export interface OpenSpecTaskReadiness {
+  complete: boolean;
+  incompleteCount: number;
+  reason: string | null;
+}
+
+/** Archive is a completion transition, so every declared task must be checked. */
+export function openSpecTaskReadiness(tasksMarkdown: string | null): OpenSpecTaskReadiness {
+  if (tasksMarkdown === null) {
+    // OpenSpec permits changes without a task checklist. Structural validation
+    // remains responsible for distinguishing an optional checklist from an
+    // unreadable change; this gate's narrower job is to forbid archiving a
+    // checklist that explicitly says work remains.
+    return { complete: true, incompleteCount: 0, reason: null };
+  }
+  const incompleteCount = tasksMarkdown
+    .split("\n")
+    .filter((line) => /^\s*-\s*\[\s\]\s+/.test(line)).length;
+  if (incompleteCount > 0) {
+    return {
+      complete: false,
+      incompleteCount,
+      reason: `${incompleteCount} unchecked task(s) remain in tasks.md`,
+    };
+  }
+  return { complete: true, incompleteCount: 0, reason: null };
+}
+
 /**
  * Head-side postcondition (#467 / #714): before pre-merge advances, block while
  * any OpenSpec change remains active on the reviewed PR tip.
@@ -268,6 +296,7 @@ export async function maybeArchiveOpenspec(
   const isActiveFn = deps.openspecIsActive ?? openspec.isActive;
   const changeDirExistsFn = deps.changeDirExists ?? openspec.changeDirExists;
   const listChangeDirsFn = deps.listChangeDirs ?? openspec.listChangeDirs;
+  const readChangeFileFn = deps.readChangeFile ?? openspec.readChangeFile;
   const listPrHeadChangeDirsFn = deps.listPrHeadChangeDirs ?? listPrHeadChangeDirs;
   const archiveFn = deps.openspecArchive ?? openspec.archive;
   const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
@@ -296,9 +325,9 @@ export async function maybeArchiveOpenspec(
   };
 
   /** Residual still-active block — same remedy text as enforceOpenspecActiveChangeGuard. */
-  const blockResidualActive = async (remaining: string[]): Promise<Outcome> => {
+  const blockResidualActive = async (remaining: string[], explicitReason?: string): Promise<Outcome> => {
     const stableRemaining = [...remaining].sort();
-    const reason =
+    const reason = explicitReason ??
       `Pre-merge cannot advance: OpenSpec change(s) still active on this PR: ${stableRemaining.join(", ")}. ` +
       `Run \`openspec archive <id>\` for each and push before pre-merge can continue.`;
     const diagnostic = buildStageDiagnostic({
@@ -633,6 +662,20 @@ export async function maybeArchiveOpenspec(
   const candidates = sharedActive.filter((id) => changeDirExistsFn(wt.path, id));
   if (candidates.length === 0) {
     return blockResidualActive(sharedActive);
+  }
+
+  // Archive folds the delta into the living contract and removes its active
+  // checklist. Refuse that irreversible lifecycle transition while any task is
+  // still unchecked, even if OpenSpec's
+  // structural validator would otherwise allow the archive.
+  for (const id of candidates) {
+    const readiness = openSpecTaskReadiness(readChangeFileFn(wt.path, id, "tasks.md"));
+    if (!readiness.complete) {
+      const reason =
+        `Pre-merge cannot archive OpenSpec change \`${id}\`: ${readiness.reason}. ` +
+        `Reconcile every task with implementation and verification evidence before archiving.`;
+      return blockResidualActive([id], reason);
+    }
   }
 
   // ---- Consistency guard (#106): never archive a delta the code outgrew ----

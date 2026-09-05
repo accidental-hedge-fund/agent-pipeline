@@ -736,6 +736,12 @@ export interface RunDeliveryStageAdapterInput {
     AdapterAttemptInput,
     "candidateSha" | "candidateEpoch" | "evidenceRole" | "artifactIdentity" | "postconditionProven"
   >>;
+  /**
+   * Exact evidence captured by the producer immediately after its successful
+   * handler returned. The adapter re-observes after that boundary and accepts
+   * a producer-created Candidate epoch only while both observations agree.
+   */
+  producerCompletionEvidence?: () => DeliveryStageEvidence | null;
   attempt: () => Promise<Outcome>;
 }
 
@@ -752,14 +758,6 @@ function sameEvidenceBinding(before: DeliveryStageEvidence, after: DeliveryStage
     before.evidenceRole === after.evidenceRole &&
     before.artifactIdentity === after.artifactIdentity
   );
-}
-
-function sameCandidateBinding(before: DeliveryStageEvidence, after: DeliveryStageEvidence): boolean {
-  const candidate = before.candidateSha?.trim().toLowerCase() ?? "";
-  const epoch = before.candidateEpoch?.trim().toLowerCase() ?? "";
-  return Boolean(candidate) && candidate === epoch &&
-    candidate === (after.candidateSha?.trim().toLowerCase() ?? "") &&
-    epoch === (after.candidateEpoch?.trim().toLowerCase() ?? "");
 }
 
 export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInput): Promise<Outcome> {
@@ -836,10 +834,15 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
     const outcome = await input.attempt();
     if (input.observeEvidence) {
       evidence = await input.observeEvidence("after", outcome);
+      const producerCompletionEvidence = input.producerCompletionEvidence?.() ?? null;
       const producerEstablishedEvidence = input.evidenceProducerBeforeAttempt &&
+        outcome.advanced &&
+        Boolean(input.logicalOperationId?.trim()) &&
         preAttemptEvidence?.postconditionProven !== true &&
         evidence.postconditionProven === true &&
-        sameCandidateBinding(preAttemptEvidence, evidence);
+        completingEvidenceBindingFailure({ stage: input.stage, ...evidence }) === null &&
+        producerCompletionEvidence !== null &&
+        sameEvidenceBinding(producerCompletionEvidence, evidence);
       if (preAttemptEvidence && !sameEvidenceBinding(preAttemptEvidence, evidence) && !producerEstablishedEvidence) {
         const waiting: Outcome = {
           advanced: false,

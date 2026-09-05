@@ -427,6 +427,7 @@ test("applySettledSurfaceEvidenceRule: a citation confined to recommendation/pri
     recommendation: "See `function scanEnginesOnly(engines) {` above.",
     prior_round_acknowledgment: "`function scanEnginesOnly(engines) {` — this delta's commits do not touch it.",
   };
+  settled[0]!.key = findingKey(f);
   const result = applySettledSurfaceEvidenceRule([f], settled, headFiles);
   assert.deepEqual(result.blocking, [], "quotes confined to recommendation/acknowledgment must not count as body evidence");
   assert.equal(result.demoted.length, 1);
@@ -436,6 +437,35 @@ test("applySettledSurfaceEvidenceRule: no-op when there is no settled history", 
   const f: ReviewFinding = { severity: "high", title: "t", body: "b", file: "a.ts", category: "x", confidence: 0.9, recommendation: "r" };
   const result = applySettledSurfaceEvidenceRule([f], [], []);
   assert.deepEqual(result.blocking, [f]);
+  assert.deepEqual(result.demoted, []);
+});
+
+test("applySettledSurfaceEvidenceRule: a new defect on a settled surface remains blocking without HEAD evidence (#1454)", () => {
+  const settled: SettledFindingVerification[] = [{
+    key: "old-finding-key",
+    surface: "src/a.ts|correctness",
+    title: "Producer rejects the epoch it created",
+    round: 2,
+    disposition: "resolved-by-fix",
+  }];
+  const newlyDiscovered: ReviewFinding = {
+    severity: "high",
+    title: "Admission inventory executes synthetic callbacks instead of production routes",
+    body: "The inventory does not prove that public entrypoints cross their real admission boundary.",
+    file: "src/a.ts",
+    category: "correctness",
+    confidence: 0.99,
+    recommendation: "Exercise the production-owned route adapters.",
+    prior_round_acknowledgment: "A different finding on this file was settled in round 2.",
+  };
+
+  const result = applySettledSurfaceEvidenceRule([newlyDiscovered], settled, [{
+    path: "src/a.ts",
+    content: "export function productionRoute() { return true; }",
+    truncated: false,
+    present: true,
+  }]);
+  assert.deepEqual(result.blocking, [newlyDiscovered]);
   assert.deepEqual(result.demoted, []);
 });
 
@@ -487,6 +517,7 @@ test("applySettledSurfaceEvidenceRule: a re-raised finding whose surface file fa
     file: "src/a.ts", category: "correctness", confidence: 0.9, recommendation: "re-apply the fix",
     prior_round_acknowledgment: "This delta does not touch src/a.ts.",
   };
+  settled[0]!.key = findingKey(f);
   const unreadable: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false, absenceReason: "unreadable" }];
   const rejected: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false, absenceReason: "rejected" }];
   for (const headFiles of [unreadable, rejected]) {
@@ -535,6 +566,9 @@ test("#451 regression: narrow-delta re-assertions of settled findings are demote
       prior_round_acknowledgment: "These commits do not address --range handling.",
     },
   ];
+  for (let i = 0; i < settled.length; i += 1) {
+    settled[i]!.key = findingKey(reassertions[i]!);
+  }
 
   // Pre-#496 behavior: partitionFindings alone (the existing reversal guard)
   // does NOT catch this — each finding carries a non-empty acknowledgment, so
@@ -552,7 +586,7 @@ test("#451 regression: narrow-delta re-assertions of settled findings are demote
   const originalKeys = reassertions.map(findingKey).sort();
   assert.deepEqual(demotedKeys, originalKeys);
   for (const { match } of evidenceResult.demoted) {
-    assert.ok(["ac3bdbd2", "4040cada", "edfd3cf1"].includes(match.settledKey));
+    assert.ok(originalKeys.includes(match.settledKey));
     assert.equal(match.settledRound, 1);
   }
 });
@@ -623,7 +657,7 @@ test("enforceReviewShaGate: a settled finding re-asserted with narrow-delta rati
     const result: DeltaReviewResult = {
       verdict: "needs-attention",
       findings: [{
-        severity: "high", title: "Old bug still present on foo.ts", file: "foo.ts", category: "correctness",
+        severity: "high", title: "Old bug on foo.ts", file: "foo.ts", category: "correctness",
         body: "It still looks broken.", confidence: 0.9, recommendation: "fix it",
         prior_round_acknowledgment: "This narrow delta does not touch foo.ts.",
       }],
