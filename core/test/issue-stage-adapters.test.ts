@@ -256,6 +256,54 @@ test("1.4 protected dispatch binds before mutation and re-observes completion (#
   assert.deepEqual(order, ["observe:before", "attempt", "observe:after"]);
 });
 
+test("1.4 protected dispatch rejects completion when the Candidate binding changes during execution (#1454)", async () => {
+  const beforeSha = "a".repeat(40);
+  const afterSha = "b".repeat(40);
+  const before = {
+    candidateSha: beforeSha,
+    candidateEpoch: beforeSha,
+    evidenceRole: "implementation" as const,
+    artifactIdentity: `implementation:${beforeSha}`,
+    postconditionProven: false,
+  };
+  const changedBindings = [
+    { name: "candidate SHA", after: { ...before, candidateSha: afterSha } },
+    { name: "candidate epoch", after: { ...before, candidateEpoch: afterSha } },
+    { name: "evidence role", after: { ...before, evidenceRole: "planning" as const } },
+    { name: "artifact identity", after: { ...before, artifactIdentity: `implementation:${afterSha}` } },
+  ];
+
+  for (const changed of changedBindings) {
+    const sink = memoryObservationSink();
+    const out = await runDeliveryStageAdapter({
+      stage: "implementing",
+      cfg: cfg(),
+      issueNumber: 1454,
+      logicalOperationId: `lop-candidate-moved-${changed.name.replaceAll(" ", "-")}`,
+      requireEvidenceBeforeAttempt: true,
+      reportObservation: sink.reportObservation,
+      observeEvidence: async (phase) => phase === "before"
+        ? before
+        : { ...changed.after, postconditionProven: true },
+      attempt: async () => ({
+        advanced: true,
+        from: "implementing",
+        to: "design-gate",
+        summary: "must not certify the replacement Candidate",
+      }),
+    });
+
+    assert.equal(out.advanced, false, changed.name);
+    if (!out.advanced) {
+      assert.equal(out.status, "waiting", changed.name);
+      assert.match(out.reason, /Candidate binding changed during execution/, changed.name);
+    }
+    assert.equal(sink.observations.length, 1, changed.name);
+    assert.equal(sink.observations[0]?.complete, false, changed.name);
+    assert.equal(sink.observations[0]?.owned, true, changed.name);
+  }
+});
+
 test("2.1 fixture that retries after uncertain side effects or candidate movement fails", () => {
   const uncertain = collectForbiddenLifecycleRetries(
     `

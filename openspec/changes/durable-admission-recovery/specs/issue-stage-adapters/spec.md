@@ -10,6 +10,13 @@ Candidate movement SHALL start a new Candidate epoch. Implementation proofs, rev
 - **THEN** implementation proof, tests, and review verdicts bound to `A` SHALL NOT authorize advancement at `B`
 - **AND** RecoverySupervisor SHALL require the applicable facts to be re-proved at `B`
 
+#### Scenario: Candidate moves during a delivery-stage attempt
+
+- **WHEN** a delivery-stage adapter binds candidate, epoch, evidence role, and artifact identity before an attempt
+- **AND** its post-attempt observation does not exactly match that binding
+- **THEN** the adapter SHALL NOT accept the attempt as completion
+- **AND** RecoverySupervisor SHALL retain ownership and rerun the stage against the replacement candidate
+
 #### Scenario: Authority hold does not survive candidate replacement
 
 - **WHEN** an authority request or grant was bound to candidate epoch `E1`

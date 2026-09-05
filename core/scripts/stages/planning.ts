@@ -12,6 +12,7 @@
 
 import {
   bindArtifactBodyToLogicalOperation,
+  logicalOperationIdFromArtifactBody,
   successorMutationsAllowed,
 } from "../operation-observation.ts";
 import {
@@ -21,11 +22,13 @@ import {
   extractHumanPlanComments,
   getIssueDetail,
   getOpenIssues,
+  getPrDetail,
   getPrForBranch,
   getPrForIssue,
   postComment,
   setBlocked,
   transition,
+  updatePrBody,
   type DisposeSupersededIssuePrsDeps,
 } from "../gh.ts";
 import {
@@ -2523,6 +2526,8 @@ export interface ResumeFromImplementingDeps {
   runTestGate?: typeof runTestGate;
   /** Exact-branch PR lookup — scoped to wt.branch so stale same-issue PRs are never reused. */
   getPrForBranch?: typeof getPrForBranch;
+  getPrDetail?: typeof getPrDetail;
+  updatePrBody?: typeof updatePrBody;
   createPr?: typeof createPr;
   /**
    * Integration side-effect certainty from every linked PR. When
@@ -2608,6 +2613,8 @@ export async function resumeFromImplementing(
 ): Promise<Outcome> {
   const gateRunner = deps.runTestGate ?? runTestGate;
   const prLookup = deps.getPrForBranch ?? getPrForBranch;
+  const prDetail = deps.getPrDetail ?? getPrDetail;
+  const prBodyUpdater = deps.updatePrBody ?? updatePrBody;
   const prCreator = deps.createPr ?? createPr;
   const gitOp = deps.gitInWorktree ?? gitInWorktree;
   const blocker = deps.setBlocked ?? setBlocked;
@@ -2797,6 +2804,42 @@ export async function resumeFromImplementing(
         await blocker(cfg, issueNumber, `PR creation failed: ${e.message}`, "implementing", "pr-creation-failed");
         return blockedOutcome(e.message, "pr-creation-failed");
       }
+    }
+  }
+
+  if (!prIsNew && opts.logicalOperationId?.trim()) {
+    const expectedLogicalOperationId = opts.logicalOperationId.trim();
+    try {
+      let detail = await prDetail(cfg, prNumber);
+      const existingLogicalOperationId = logicalOperationIdFromArtifactBody(detail.body);
+      if (existingLogicalOperationId && existingLogicalOperationId !== expectedLogicalOperationId) {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: `Reused PR #${prNumber} is bound to conflicting logical operation ${existingLogicalOperationId}; RecoverySupervisor retains ownership`,
+        };
+      }
+      if (!existingLogicalOperationId) {
+        await prBodyUpdater(
+          cfg,
+          prNumber,
+          bindArtifactBodyToLogicalOperation(detail.body, expectedLogicalOperationId),
+        );
+        detail = await prDetail(cfg, prNumber);
+        if (logicalOperationIdFromArtifactBody(detail.body) !== expectedLogicalOperationId) {
+          return {
+            advanced: false,
+            status: "waiting",
+            reason: `Reused PR #${prNumber} logical-operation binding was not confirmed; RecoverySupervisor retains ownership`,
+          };
+        }
+      }
+    } catch (err) {
+      return {
+        advanced: false,
+        status: "waiting",
+        reason: `Could not bind reused PR #${prNumber} to logical operation ${expectedLogicalOperationId}: ${(err as Error).message}; RecoverySupervisor retains ownership`,
+      };
     }
   }
 

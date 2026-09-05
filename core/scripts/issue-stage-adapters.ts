@@ -741,6 +741,17 @@ export type DeliveryStageEvidenceObserver = NonNullable<
   RunDeliveryStageAdapterInput["observeEvidence"]
 >;
 
+type DeliveryStageEvidence = Awaited<ReturnType<DeliveryStageEvidenceObserver>>;
+
+function sameEvidenceBinding(before: DeliveryStageEvidence, after: DeliveryStageEvidence): boolean {
+  return (
+    before.candidateSha === after.candidateSha &&
+    before.candidateEpoch === after.candidateEpoch &&
+    before.evidenceRole === after.evidenceRole &&
+    before.artifactIdentity === after.artifactIdentity
+  );
+}
+
 export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInput): Promise<Outcome> {
   let evidence = {
     candidateSha: input.candidateSha,
@@ -749,6 +760,7 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
     artifactIdentity: input.artifactIdentity,
     postconditionProven: input.postconditionProven,
   };
+  let preAttemptEvidence: DeliveryStageEvidence | null = null;
   const baseIdentity = {
     stage: input.stage,
     domain: input.cfg.domain ?? "unknown",
@@ -775,6 +787,7 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
     }
     if (input.observeEvidence) {
       evidence = await input.observeEvidence("before");
+      preAttemptEvidence = evidence;
       const bindingFailure = completingEvidenceBindingFailure({
         stage: input.stage,
         ...evidence,
@@ -798,6 +811,21 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
     const outcome = await input.attempt();
     if (input.observeEvidence) {
       evidence = await input.observeEvidence("after", outcome);
+      if (preAttemptEvidence && !sameEvidenceBinding(preAttemptEvidence, evidence)) {
+        const waiting: Outcome = {
+          advanced: false,
+          status: "waiting",
+          reason: "delivery-stage Candidate binding changed during execution; RecoverySupervisor retains ownership and must rerun the stage against the replacement candidate",
+        };
+        const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+          ...baseIdentity,
+          ...evidence,
+          outcome: waiting,
+          postconditionProven: false,
+        }));
+        consumeReportedOwned(obs);
+        return waiting;
+      }
     }
     const obs = observationFromAdapterAttempt({
       ...baseIdentity,
@@ -820,9 +848,47 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
       outcome.blockerKind === "head-drift" &&
       mayReplaySideEffect(reported.certainty)
     ) {
+      if (input.observeEvidence) {
+        evidence = await input.observeEvidence("before");
+        const bindingFailure = completingEvidenceBindingFailure({
+          stage: input.stage,
+          ...evidence,
+        });
+        if (bindingFailure) {
+          const waiting: Outcome = {
+            advanced: false,
+            status: "waiting",
+            reason: `delivery-stage evidence binding refused before replay: ${bindingFailure}`,
+          };
+          const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+            ...baseIdentity,
+            ...evidence,
+            outcome: waiting,
+            postconditionProven: false,
+          }));
+          consumeReportedOwned(obs);
+          return waiting;
+        }
+        preAttemptEvidence = evidence;
+      }
       const retry = await input.attempt();
       if (input.observeEvidence) {
         evidence = await input.observeEvidence("after", retry);
+        if (preAttemptEvidence && !sameEvidenceBinding(preAttemptEvidence, evidence)) {
+          const waiting: Outcome = {
+            advanced: false,
+            status: "waiting",
+            reason: "delivery-stage Candidate binding changed during replay; RecoverySupervisor retains ownership and must rerun the stage against the replacement candidate",
+          };
+          const obs = reportOwnedOperation(input.reportObservation, observationFromAdapterAttempt({
+            ...baseIdentity,
+            ...evidence,
+            outcome: waiting,
+            postconditionProven: false,
+          }));
+          consumeReportedOwned(obs);
+          return waiting;
+        }
       }
       const retryObs = observationFromAdapterAttempt({
         ...baseIdentity,

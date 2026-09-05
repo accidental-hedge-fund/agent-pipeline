@@ -14,6 +14,13 @@ Commits ahead of base SHALL be provenance only. The dispatcher SHALL resume the 
 - **THEN** the pipeline SHALL run the required post-implementation gates and publication sequence
 - **AND** SHALL NOT re-run planning or implementation solely to manufacture another commit
 
+#### Scenario: reused implementation PR is bound to the admitted operation
+
+- **WHEN** the publication sequence reuses an existing or concurrently created implementation PR
+- **THEN** it SHALL verify the PR body is bound to the admitted Logical Operation
+- **AND** when the binding is absent it SHALL append the marker and confirm it by re-reading the PR
+- **AND** a conflicting or unconfirmed binding SHALL remain RecoverySupervisor-owned and SHALL NOT transition toward review
+
 #### Scenario: Planning-only commit invokes implementation
 
 - **WHEN** a salvaged or ordinary commit ahead of base contains only the accepted OpenSpec or other planning artifact
