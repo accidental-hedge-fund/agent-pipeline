@@ -197,6 +197,11 @@ engine-promote use the production-pin CLI** (`$PIPELINE`). **After
 train-complete, FRG pack, `pipeline release`, `release finish`, and
 `release ensure-tag` use the candidate engine** at the FRG-bound SHA
 (`SHIP_END_CLI` = `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"`).
+That stable launcher uses same-process exec both to enter Node >=24 when a
+runtime bootstrap is needed and then to enter the candidate core CLI. It does
+not spawn a wrapper child:
+the candidate CLI therefore remains the ship coordinator's direct child and
+can verify the coordinator-owned process lease without weakening ancestry.
 Every accepted candidate root is made runnable before spawn: resolve-and-prepare
 proves candidate readiness as SHA plus nested `core/package-lock.json` digest.
 When candidate `factory-release prepare` launches its request-bound detached

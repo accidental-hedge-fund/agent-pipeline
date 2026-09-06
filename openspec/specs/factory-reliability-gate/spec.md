@@ -1217,7 +1217,11 @@ git SHA, target version, pack/manifest identity) together with a non-null
 Spawn SHALL exec the verified candidate launcher that wrote the contract
 from a typed candidate invocation (absolute executable, immutable argv, and
 candidate SHA). PATH `pipeline` and `PIPELINE_BIN` SHALL NOT be production
-fallbacks. `--engine-track candidate` SHALL remain intent metadata and SHALL
+fallbacks. The verified stable launcher SHALL use same-process exec for any
+Node >=24 runtime bootstrap and again to replace itself with the candidate
+core CLI; it SHALL NOT spawn either as a wrapper child. The core CLI SHALL therefore preserve
+the launcher's PID and direct-parent relationship to the process-lease owner.
+`--engine-track candidate` SHALL remain intent metadata and SHALL
 NOT select the binary. The generator SHALL persist a durable dispatch state
 machine on the binding: `bound` (never started or retryable OS spawn
 failure), `starting` (OS accepted, observation deadline set), `dispatched`
@@ -1254,6 +1258,17 @@ release-eligible evidence.
 - **AND** it SHALL then dispatch one durable loop on the candidate engine
   launcher for that SHA with the pack work-list or the `factory-gate` label
 - **AND** it SHALL return in-progress status without inventing `pass: true`
+
+#### Scenario: Candidate launcher preserves lease-owner ancestry
+
+- **WHEN** a ship coordinator starts the verified candidate launcher while
+  holding the candidate process lease
+- **THEN** the launcher SHALL same-process exec both a required Node >=24
+  runtime bootstrap and the candidate core CLI
+- **AND** the core CLI SHALL retain the launcher PID and the coordinator as its
+  direct parent
+- **AND** it SHALL NOT insert a wrapper process that makes the core CLI a
+  grandchild of the lease owner
 
 #### Scenario: Second prepare resumes the same bound loop
 

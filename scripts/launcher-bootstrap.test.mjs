@@ -116,6 +116,21 @@ exit 0
   return bin;
 }
 
+function writeExecProxyNode24(dir) {
+  mkdirSync(dir, { recursive: true });
+  const bin = join(dir, "node");
+  writeFileSync(
+    bin,
+      `#!${process.execPath}\n` +
+      `if (process.argv[2] === "-p") { process.stdout.write("24.0.0\\n"); process.exit(0); }\n` +
+      `process.env.AGENT_PIPELINE_TEST_NODE_VERSION = "24.0.0";\n` +
+      `process.execve(process.execPath, [process.execPath, "--import", ` +
+      `process.env.AGENT_PIPELINE_TEST_PATCH_FILE, ...process.argv.slice(2)], process.env);\n`,
+  );
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
 function stripFinalNewline(text) {
   return text.endsWith("\n") ? text.slice(0, -1) : text;
 }
@@ -225,6 +240,81 @@ test("source: both launchers have version-first wiring and no duplicated walker"
       `${label} must not embed a PATH-split node walker`,
     );
   }
+});
+
+test("pipeline launcher execs the core CLI without changing process ancestry (#1507)", {
+  skip: PATCH_SKIP,
+}, () => {
+  const root = mkdtempSync(join(tmpdir(), "pipeline-launcher-exec-"));
+  try {
+    const launcher = copyLauncher(root, LAUNCHER, { sibling: "real" });
+    mkdirSync(join(root, "core", "node_modules"), { recursive: true });
+    const observation = join(root, "process.json");
+    writeFileSync(
+      join(root, "core", "scripts", "pipeline.ts"),
+      `import { writeFileSync } from "node:fs";\n` +
+        `writeFileSync(process.env.AGENT_PIPELINE_EXEC_OBSERVATION, ` +
+        `JSON.stringify({ pid: process.pid, ppid: process.ppid, argv: process.argv }));\n`,
+    );
+    const result = runPatched(launcher, ["doctor", "--json"], {
+      AGENT_PIPELINE_TEST_NODE_VERSION: "24.0.0",
+      AGENT_PIPELINE_EXEC_OBSERVATION: observation,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const observed = JSON.parse(readFileSync(observation, "utf8"));
+    assert.equal(
+      observed.ppid,
+      process.pid,
+      "core CLI must remain the test process's direct child; a spawned wrapper changes ppid",
+    );
+    assert.equal(observed.argv[1], join(root, "core", "scripts", "pipeline.ts"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pipeline launcher preserves ancestry through Node 22 to Node 24 bootstrap (#1507)", {
+  skip: PATCH_SKIP || typeof process.execve !== "function",
+}, () => {
+  const root = mkdtempSync(join(tmpdir(), "pipeline-launcher-bootstrap-exec-"));
+  try {
+    const launcher = copyLauncher(root, LAUNCHER, { sibling: "real" });
+    mkdirSync(join(root, "core", "node_modules"), { recursive: true });
+    const observation = join(root, "process.json");
+    const node24 = writeExecProxyNode24(join(root, "node24"));
+    writeFileSync(
+      join(root, "core", "scripts", "pipeline.ts"),
+      `import { writeFileSync } from "node:fs";\n` +
+        `writeFileSync(process.env.AGENT_PIPELINE_EXEC_OBSERVATION, ` +
+        `JSON.stringify({ pid: process.pid, ppid: process.ppid, argv: process.argv }));\n`,
+    );
+    const result = runPatched(launcher, ["doctor", "--json"], {
+      AGENT_PIPELINE_TEST_NODE_VERSION: PATCHED_VERSION,
+      AGENT_PIPELINE_NODE: node24,
+      AGENT_PIPELINE_TEST_PATCH_FILE: pathToFileURL(PATCH_FILE).href,
+      AGENT_PIPELINE_EXEC_OBSERVATION: observation,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const observed = JSON.parse(readFileSync(observation, "utf8"));
+    assert.equal(
+      observed.ppid,
+      process.pid,
+      "runtime bootstrap and core entry must both retain the original launcher PID",
+    );
+    assert.equal(observed.argv[1], join(root, "core", "scripts", "pipeline.ts"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("source: guarded candidate launch cannot fall back to a wrapper child (#1507)", () => {
+  const src = readFileSync(LAUNCHER, "utf8");
+  const execAt = src.indexOf('typeof process.execve === "function"');
+  const guardedRefusalAt = src.lastIndexOf('PIPELINE_CANDIDATE_PROCESS_GUARD === "1"');
+  const fallbackAt = src.lastIndexOf("spawnSync(process.execPath");
+  assert.ok(execAt >= 0);
+  assert.ok(guardedRefusalAt > execAt);
+  assert.ok(fallbackAt > guardedRefusalAt);
 });
 
 for (const launcher of LAUNCHERS) {
