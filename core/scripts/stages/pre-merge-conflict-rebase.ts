@@ -452,6 +452,7 @@ export async function defaultResolveMergeConflicts(
 
   try {
     await invokeFn(harness, worktreePath, prompt, {
+      pipelineConfig: cfg,
       timeoutSec: cfg.fix_timeout,
       model: cfg.models?.fix ?? null,
       sandbox: cfg.harness_sandbox,

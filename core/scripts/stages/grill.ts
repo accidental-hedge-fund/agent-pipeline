@@ -1117,6 +1117,7 @@ export function realGrillDeps(cfg: PipelineConfig): GrillDeps {
     resolveIntegrationBase: async () => gitIntegrationBase(cfg.repo_dir, cfg.base_branch),
     runImplementer: async (prompt) => {
       const result = await invoke(implementer, cfg.repo_dir, prompt, {
+        pipelineConfig: cfg,
         stream: false,
         model: planningModel,
         reasoningEffort: planningEffort,

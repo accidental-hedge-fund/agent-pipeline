@@ -660,6 +660,7 @@ export async function performPreMergeAutoFix(
     shouldAttemptSalvage: ({ confirmedNoNewCommit }) => confirmedNoNewCommit,
     invoke: () =>
       invokeFn(harness, wt.path, prompt, {
+        pipelineConfig: cfg,
         timeoutSec: cfg.fix_timeout,
         model: cfg.models?.fix ?? null,
         sandbox: cfg.harness_sandbox,

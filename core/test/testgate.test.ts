@@ -24,7 +24,7 @@ import {
 import { CANDIDATE_PROCESS_GUARD_ENV } from "../scripts/ship-end-candidate.ts";
 import type { HarnessResult, InvokeOptions } from "../scripts/harness.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
-import { defaultRunStoreDeps } from "../scripts/run-store.ts";
+import { defaultRunStoreDeps, type RunStoreDeps } from "../scripts/run-store.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures + helpers
@@ -91,6 +91,33 @@ function cleanGitDeps(): Pick<TestGateDeps, "gitHead" | "gitDirty" | "verifyTest
 
 const passResult: RunTestsResult = { passed: true, output: "ok", durationSec: 1 };
 const failResult: RunTestsResult = { passed: false, output: "FAIL: 1 test failed", durationSec: 1 };
+
+for (const enabled of [false, true]) {
+  test(`test gate forwards resolved observability to command and fix accounting (enabled=${enabled})`, async () => {
+    const cfg = cfgWith({ max_attempts: 1 });
+    cfg.observability = { enabled, exporter: { type: "file", directory: "/telemetry/test" } };
+    const exported: Array<PipelineConfig["observability"] | undefined> = [];
+    const invocations: InvokeOptions[] = [];
+    const runStoreDeps: RunStoreDeps = {
+      readFile: async () => "{}",
+      writeFile: async () => {}, appendFile: async () => {}, rename: async () => {},
+      mkdir: async () => {}, readdir: async () => [], stat: async () => ({ mtime: new Date(0) }),
+      accountingSink: async (_dir, _record, config) => { exported.push(config); },
+    };
+    let commands = 0;
+    const out = await runTestGate(cfg, 42, "/wt", {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => commands++ === 0 ? failResult : passResult,
+      invoke: async (_h, _dir, _prompt, options) => { invocations.push(options!); return okInvoke(); },
+      ...cleanGitDeps(),
+    }, "42-test", "test-gate", undefined, "/runs/42-test", runStoreDeps);
+    assert.equal(out.passed, true);
+    assert.equal(commands, 2);
+    assert.deepEqual(exported, [cfg.observability, cfg.observability]);
+    assert.equal(invocations.length, 1);
+    assert.equal(invocations[0].pipelineConfig, cfg);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Detection

@@ -457,6 +457,7 @@ export async function advanceDesignGate(
       triggerSummary,
     });
     let result = await invokeFn(implementerHarness, wt.path, basePrompt, {
+      pipelineConfig: cfg,
       timeoutSec: cfg.implementation_timeout,
       model: cfg.models.implementing,
     });
@@ -467,6 +468,7 @@ export async function advanceDesignGate(
     if (!parsed.record) {
       const reaskPrompt = `${basePrompt}\n\nYour previous response could not be parsed: ${parsed.errors.join("; ")}. Return ONLY the valid JSON object — no other text.`;
       result = await invokeFn(implementerHarness, wt.path, reaskPrompt, {
+        pipelineConfig: cfg,
         timeoutSec: cfg.implementation_timeout,
         model: cfg.models.implementing,
       });
@@ -498,6 +500,7 @@ export async function advanceDesignGate(
     const model = state.reviewerIdentity?.model;
     const effort = state.reviewerIdentity?.effort;
     const invokeOpts: InvokeOptions = {
+      pipelineConfig: cfg,
       timeoutSec: cfg.review_timeout,
       model,
       reasoningEffort: effort,
@@ -570,6 +573,7 @@ export async function advanceDesignGate(
       challengesText: formatChallengesForResponse(blocking),
     });
     const result = await invokeFn(implementerHarness, wt.path, prompt, {
+      pipelineConfig: cfg,
       timeoutSec: cfg.fix_timeout,
       model: cfg.models.fix,
     });

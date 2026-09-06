@@ -827,6 +827,7 @@ async function runVisualFixRound(
     invoke: async () => {
       const fixModel = cfg.models.fix;
       return deps.invoke(harness, wtPath, prompt, {
+        pipelineConfig: cfg,
         timeoutSec: cfg.fix_timeout,
         model: fixModel,
         sandbox: cfg.harness_sandbox,
@@ -1084,7 +1085,7 @@ export async function advanceVisual(
           makeCommandRecord(cfg.visual_gate.command, 1, 0, lastResult.output),
         ).catch(() => {});
       }
-      await recordVisualAccounting(opts, issueNumber, cfg.visual_gate.command, lastResult, new Date(), new Date());
+      await recordVisualAccounting(opts, cfg, issueNumber, cfg.visual_gate.command, lastResult, new Date(), new Date());
       break;
     }
 
@@ -1128,7 +1129,7 @@ export async function advanceVisual(
         ),
       ).catch(() => {});
     }
-    await recordVisualAccounting(opts, issueNumber, cfg.visual_gate.command, lastResult, startedAt, endedAt);
+    await recordVisualAccounting(opts, cfg, issueNumber, cfg.visual_gate.command, lastResult, startedAt, endedAt);
 
     if (lastResult.passed) break;
     if (lastResult.timedOut || lastResult.spawnError) break;
@@ -1348,6 +1349,7 @@ function buildVisualComment(opts: {
 
 async function recordVisualAccounting(
   opts: AdvanceVisualOpts,
+  cfg: PipelineConfig,
   issueNumber: number,
   command: string,
   result: VisualRunResult,
@@ -1378,6 +1380,7 @@ async function recordVisualAccounting(
       usage: { command },
     }),
     opts.runStoreDeps,
+    cfg.observability,
   ).catch(() => {});
 }
 

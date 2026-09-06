@@ -2283,6 +2283,7 @@ export function makeOpenspecPlanningHooks(
           wt.path,
           openspecPlanPrompt,
           {
+            pipelineConfig: innerCfg,
             timeoutSec: innerCfg.implementation_timeout,
             model: planModel,
             reasoningEffort: innerCfg.effort?.planning,
@@ -2359,6 +2360,7 @@ export function makeOpenspecPlanningHooks(
               opts.executorHttpDeps,
             )) ??
             (await inv(primary, wt.path, repairPrompt, {
+              pipelineConfig: innerCfg,
               timeoutSec: innerCfg.implementation_timeout,
               model: planModel,
               reasoningEffort: innerCfg.effort?.planning,
@@ -2704,6 +2706,7 @@ export function makeOpenspecPlanningHooks(
       }
       const inv = deps.invoke ?? invoke;
       return inv(primary, wt.path, prompt, {
+        pipelineConfig: innerCfg,
         timeoutSec: innerCfg.implementation_timeout,
         model: opts.model ?? innerCfg.models.planning,
         reasoningEffort: innerCfg.effort?.planning,
@@ -3447,6 +3450,7 @@ export async function invokeImplementer(
     model,
   });
   return inv(harness, wtPath, prompt, {
+    pipelineConfig: cfg,
     timeoutSec: cfg.implementation_timeout,
     model,
     reasoningEffort: cfg.effort?.implementing,
@@ -3514,6 +3518,7 @@ export async function invokePlanStep(
   const dir = (cfg.harness_sandbox && harness === "claude") ? wtPath : cfg.repo_dir;
   const model = opts.model ?? cfg.models.planning;
   return inv(harness, dir, prompt, {
+    pipelineConfig: cfg,
     timeoutSec: cfg.implementation_timeout,
     model,
     reasoningEffort: cfg.effort?.planning,

@@ -9,7 +9,7 @@ import { DELTA_REVIEW_MARKER_PREFIX, extractReviewedSha } from "./stages/review.
 import type { Outcome, PipelineConfig, Stage } from "./types.ts";
 import { withTrailers } from "./traceability.ts";
 import type { ValidateResult } from "./openspec.ts";
-import type { HarnessResult } from "./harness.ts";
+import type { HarnessResult, InvokeOptions } from "./harness.ts";
 
 /** One branch commit with the repo-relative paths it changed. Ordered: index 0
  * is the earliest commit in the range, last is HEAD. */
@@ -383,7 +383,7 @@ export type InvokeFn = (
   harness: string,
   wtPath: string,
   prompt: string,
-  opts?: { timeoutSec?: number; model?: string | null; sandbox?: boolean },
+  opts?: InvokeOptions,
 ) => Promise<HarnessResult>;
 
 /** Inject type — matches `openspec.validateItem` from openspec.ts. */
@@ -431,6 +431,7 @@ export async function performBoundedSpecRepair(
 
   const prompt = buildSpecRepairPrompt(changeId, issueNumber, pipelineRunId);
   const result = await invokeFn(harness, wtPath, prompt, {
+    pipelineConfig: cfg,
     timeoutSec: cfg.fix_timeout,
     model: cfg.models?.fix ?? null,
     sandbox: cfg.harness_sandbox,

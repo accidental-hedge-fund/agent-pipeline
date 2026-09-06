@@ -897,6 +897,7 @@ export async function advanceFix(
       opts.executorHttpDeps,
     );
     return delegated ?? await invoke(harness, wt.path, attemptPrompt, {
+      pipelineConfig: cfg,
       timeoutSec,
       model,
       reasoningEffort: cfg.effort?.fix,

@@ -204,6 +204,21 @@ test("visual-gate: skip path — disabled config → silent label swap to eval-g
   assert.equal(log.comments.length, 0);
 });
 
+for (const enabled of [false, true]) {
+  test(`visual command accounting receives resolved observability (enabled=${enabled})`, async () => {
+    const cfg = baseCfg({ max_attempts: 1 });
+    cfg.observability = { enabled, exporter: { type: "file", directory: "/telemetry/visual" } };
+    const appended: string[] = [];
+    const captured: PipelineConfig["observability"][] = [];
+    const runStoreDeps = appendOnlyRunStore(appended);
+    runStoreDeps.accountingSink = async (_runDir, _record, config) => { captured.push(config!); };
+    await advanceVisual(cfg, 43, { runDir: "/runs/43", runStoreDeps }, makeDeps(makeCallLog(), [passResult()]));
+    assert.deepEqual(captured, [cfg.observability]);
+    assert.equal(captured[0], cfg.observability, "already resolved configuration must be passed, not reconstructed");
+    assert.equal(appendedEvents(appended).filter((event) => event.type === "stage_accounting").length, 1);
+  });
+}
+
 test("visual-gate: exit 0 + gate mode → transitions to eval-gate", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });

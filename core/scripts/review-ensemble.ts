@@ -635,6 +635,7 @@ export async function invokeReviewEnsemble(
         reasoningEffort: agent.effort,
         promptDelivery: agent.promptDelivery,
         ...options.invokeOpts,
+        pipelineConfig: cfg,
         ...(options.invokeOpts?.accounting
           ? {
               accounting: {

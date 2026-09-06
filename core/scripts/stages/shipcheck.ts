@@ -609,6 +609,7 @@ export async function advance(
         reviewerModelSourceWasAuto(cfg, undefined),
       );
       const harnessResult = await defaultInvoke(reviewerHarness, worktreeDir, prompt, {
+        pipelineConfig: cfg,
         timeoutSec,
         model,
         accounting: opts.runDir
