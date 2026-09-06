@@ -993,7 +993,7 @@ Nested fields:
 #### `review_policy.max_delta_rounds`
 
 - **Type:** integer
-- **Description:** Cap on pre-merge delta review rounds per item (#483), counted durably from the issue's delta-review comment thread. Independent of max_adversarial_rounds. At the ceiling, ceiling_action disposes of the item's outstanding blocking delta findings instead of running another delta review. Default 4.
+- **Description:** Durable cap on pre-merge delta review rounds per item (#483). A new candidate head gets one fresh review when the previous head exhausted the cap, preventing stale budget from permanently parking a fix while retaining the anti-churn ceiling. Independent of max_adversarial_rounds. Default 4.
 
 #### `review_policy.min_confidence`
 

@@ -245,7 +245,7 @@ The pipeline SHALL expose a pure, deterministic function that returns the number
 
 ### Requirement: Pre-merge SHALL cap delta rounds per item at `review_policy.max_delta_rounds` and apply `ceiling_action` at the ceiling
 
-Before invoking the reviewer for a pre-merge delta round, `enforceReviewShaGate` SHALL compare the item's durable delta-round count to `review_policy.max_delta_rounds`. When the count is greater than or equal to the cap, the pipeline SHALL NOT invoke the reviewer for another delta round and SHALL instead dispose of the item's outstanding blocking delta findings through the configured `ceiling_action`:
+Before invoking the reviewer for a pre-merge delta round, `enforceReviewShaGate` SHALL compare the item's durable delta-round count to `review_policy.max_delta_rounds`. When historical rounds have exhausted the cap but their latest trusted artifact targets a superseded head, a genuinely new candidate head SHALL receive one fresh review instead of inheriting the stale ceiling. Once a trusted delta-review artifact is recorded for that new head, the durable item-level ceiling applies again. Otherwise, when the count is greater than or equal to the cap, the pipeline SHALL NOT invoke the reviewer for another delta round and SHALL instead dispose of the current candidate's outstanding blocking delta findings through the configured `ceiling_action`:
 
 - Under `ceiling_action: park`, the pipeline SHALL route the item to the `needs-human` terminal with a punch list of the unresolved blocking delta findings.
 - Under `ceiling_action: demote_and_advance`, the pipeline SHALL record below-high blocking delta findings as audited advisory dispositions, capture them in a single tracked follow-up issue, and allow pre-merge to proceed.
@@ -255,10 +255,17 @@ The comment the pipeline posts at the ceiling SHALL name the observed round coun
 
 #### Scenario: At the cap the reviewer is not invoked again
 
-- **WHEN** an item's durable delta-round count equals `review_policy.max_delta_rounds` and pre-merge re-enters the SHA gate with a changed diff hash
+- **WHEN** an item's durable delta-round count equals `review_policy.max_delta_rounds`, its latest delta artifact targets the current candidate, and pre-merge re-enters the SHA gate with a changed diff hash
 - **THEN** the pipeline SHALL NOT invoke the delta-review seam
 - **AND** SHALL apply the configured `ceiling_action`
 - **AND** SHALL post a comment naming the observed count, the cap, and the applied action
+
+#### Scenario: Superseding candidate resets exhausted delta budget
+
+- **GIVEN** a prior candidate head exhausted `review_policy.max_delta_rounds`
+- **WHEN** a fix produces a new candidate head
+- **THEN** the stale ceiling SHALL NOT prevent the new candidate's first delta review
+- **AND** after that review is recorded for the new head, the durable item-level ceiling SHALL apply again
 
 #### Scenario: Ceiling under park routes to needs-human
 
@@ -354,7 +361,7 @@ For each pre-merge delta round performed, the pipeline SHALL emit one `delta_rou
 
 ### Requirement: The five-round oscillation history SHALL be covered by a regression test
 
-The test suite SHALL include a regression test replaying the observed five-delta-round history (PraxisIQ/fuseiq-core#95): four rounds of genuine blocking findings followed by a fifth round re-raising a settled axis under new finding keys, re-worded titles, declining confidence, and a recommendation that reinstates a design a prior round required removed. The test SHALL use fake comment fixtures with no network, git, or subprocess access, and SHALL assert both that the cap prevents the fifth round from being reviewed under the default configuration and that, when the fifth round's findings are partitioned, they are demoted rather than blocking.
+The test suite SHALL include a regression test replaying the observed five-delta-round history (PraxisIQ/fuseiq-core#95): four rounds of genuine blocking findings followed by a successor candidate re-raising a settled axis under new finding keys, re-worded titles, declining confidence, and a recommendation that reinstates a design a prior round required removed. The test SHALL use fake comment fixtures with no network, git, or subprocess access, and SHALL assert both that a successor candidate receives a fresh bounded review budget and that its re-raised settled findings are demoted rather than blocking. A separate same-candidate fixture SHALL prove the cap prevents an additional review at the configured ceiling.
 
 #### Scenario: Replay asserts the loop is bounded and the round-5 findings are demoted
 
@@ -708,4 +715,3 @@ When a prior delta or autofix path claimed docs-stale / CHANGELOG / `generate-do
 
 - **WHEN** delta or deterministic check at live head H finds a blocking docs-freshness defect
 - **THEN** pre-merge SHALL route that finding through the existing fix-round / residual block path for H
-

@@ -533,6 +533,38 @@ export function renderResolvedFindingVerification(
 // Durable delta-round counting (#483)
 // ---------------------------------------------------------------------------
 
+/** Return whether a delta-review artifact is bound to the exact candidate head. */
+export function deltaReviewTargetsCandidate(body: string, candidateSha: string): boolean {
+  const artifactSha = extractReviewArtifact(body)?.reviewedSha;
+  if (artifactSha) return artifactSha.toLowerCase() === candidateSha.toLowerCase();
+  const matches = [...body.matchAll(/<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->/gi)];
+  return matches.at(-1)?.[1]?.toLowerCase() === candidateSha.toLowerCase();
+}
+
+/** Whether the latest durable delta ceiling belongs to a superseded candidate. */
+export function hasSupersededDeltaCeiling(
+  comments: { author: string | null; body: string }[],
+  opts: { actor: string | null; trustedOverrideActors?: string[]; candidateSha: string },
+): boolean {
+  if (opts.actor === null) return false;
+  const trusted = new Set<string>(opts.trustedOverrideActors ?? []);
+  trusted.add(opts.actor);
+  const trustedComments = comments.filter((c) => c.author !== null && trusted.has(c.author));
+  const ceiling = trustedComments
+    .filter((c) => c.body.startsWith("## Pipeline: Pre-merge delta round ceiling reached"))
+    .at(-1);
+  if (!ceiling) return false;
+  const bound = [...ceiling.body.matchAll(/<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->/gi)]
+    .at(-1)?.[1];
+  if (bound) return bound.toLowerCase() !== opts.candidateSha.toLowerCase();
+  // Backward compatibility for ceilings emitted before they carried a binding:
+  // the latest trusted delta artifact was the candidate that exhausted it.
+  const priorDelta = trustedComments
+    .filter((c) => c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX))
+    .at(-1);
+  return !!priorDelta && !deltaReviewTargetsCandidate(priorDelta.body, opts.candidateSha);
+}
+
 /**
  * Counts an issue's prior pre-merge delta rounds purely from its comment
  * thread (#483): a comment counts as one delta round when its body begins
@@ -546,18 +578,16 @@ export function renderResolvedFindingVerification(
  */
 export function countDeltaRounds(
   comments: { author: string | null; body: string }[],
-  opts: { actor: string | null; trustedOverrideActors?: string[] },
+  opts: { actor: string | null; trustedOverrideActors?: string[]; candidateSha?: string },
 ): number {
   if (opts.actor === null) return 0;
   const trusted = new Set<string>(opts.trustedOverrideActors ?? []);
   trusted.add(opts.actor);
-  let count = 0;
-  for (const c of comments) {
-    if (c.author !== null && trusted.has(c.author) && c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX)) {
-      count++;
-    }
-  }
-  return count;
+  return comments.filter((c) =>
+      c.author !== null &&
+      trusted.has(c.author) &&
+      c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX)
+  ).length;
 }
 
 // ---------------------------------------------------------------------------

@@ -77,9 +77,18 @@ function makeDeps(opts: {
   ceilingAction: "park" | "demote_and_advance";
   runDeltaReview?: RunDeltaReviewFn;
   getCommitDeltaDiff?: () => Promise<string>;
+  priorCeilingSha?: string;
 }): { deps: ShaGateDeps; rec: Rec; cfg: PipelineConfig } {
   const rec: Rec = { comments: [], transitions: [], blocked: [], createIssueCalls: [], addIssueCommentCalls: [] };
   const comments = fourPriorDeltaComments(opts.finalBlocking);
+  if (opts.priorCeilingSha) {
+    comments.push({
+      author: TEST_ACTOR,
+      body:
+        "## Pipeline: Pre-merge delta round ceiling reached — human decision required\n" +
+        `<!-- reviewed-sha: ${opts.priorCeilingSha} -->`,
+    });
+  }
   const cfg = {
     review_policy: {
       block_threshold: "low", min_confidence: 0,
@@ -212,6 +221,25 @@ test("enforceReviewShaGate: below the cap, the existing delta-review path is unc
     await enforceReviewShaGate(cfg, 483, 99, deps);
   });
   assert.equal(reviewerCalls, 1, "below the cap, the delta reviewer runs exactly as before");
+});
+
+test("enforceReviewShaGate: a fixed successor gets reviewed after a superseded ceiling", async (t) => {
+  let reviewerCalls = 0;
+  const { deps, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING],
+    maxDeltaRounds: 4,
+    ceilingAction: "park",
+    priorCeilingSha: SHA_4,
+    runDeltaReview: async () => {
+      reviewerCalls += 1;
+      return { verdict: "approve", findings: [], summary: "fixed" } as DeltaReviewResult;
+    },
+    getCommitDeltaDiff: async () => diffFor(5),
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfg, 483, 99, deps);
+  });
+  assert.equal(reviewerCalls, 1, "stale exhausted history must not park the successor without review");
 });
 
 test("enforceReviewShaGate: hitting the delta-round ceiling never consumes max_adversarial_rounds budget", async (t) => {
