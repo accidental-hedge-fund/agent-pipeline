@@ -871,3 +871,14 @@ The durable loop supervisor SHALL treat a dead worker, stale heartbeat, or recov
 - **WHEN** the Liveness Provider reattaches a loop supervisor after worker death
 - **THEN** the Logical Operation identity SHALL stay the same
 - **AND** the resume SHALL NOT count as a new external admission
+
+### Requirement: Supervisor and nested advance SHALL share the persistent run-store root
+
+Before pinning a nested advance run id, the owning supervisor SHALL resolve the same persistent primary-checkout run-store root used by the child advance. Start linkage, event polling, write-health reads, and terminal evidence classification SHALL use that resolved root even when the supervisor was launched from a disposable linked worktree.
+
+#### Scenario: Linked-worktree supervisor observes primary-checkout child evidence
+
+- **WHEN** a supervisor launched from linked worktree W dispatches a nested advance
+- **AND** the child persists the pinned run beneath primary checkout P
+- **THEN** the supervisor SHALL publish and poll the events path beneath P
+- **AND** SHALL NOT wait on or advertise W's disposable run path

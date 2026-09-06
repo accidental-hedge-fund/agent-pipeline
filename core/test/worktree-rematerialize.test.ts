@@ -138,6 +138,32 @@ test("ensureManagedWorktree: missing + open PR head → create + HEAD match → 
   assert.equal(events[0].result, "pass");
 });
 
+test("ensureManagedWorktree: retained linked-PR branch survives a later issue-title rename (#1478)", async () => {
+  let titleRead = false;
+  let createdSlug = "";
+  const out = await ensureManagedWorktree(cfg, ISSUE, {
+    recoveryTarget: { branch: BRANCH, headSha: TIP_SHA },
+    getOnDiskForIssue: async () => null,
+    getIssueTitle: async () => {
+      titleRead = true;
+      return "Completely Renamed Issue";
+    },
+    gitCmd: async () => ({ stdout: `${TIP_SHA}\trefs/heads/${BRANCH}\n`, stderr: "", code: 0 }),
+    resolveOpenPrHeadForBranch: async (_cfg, branch) => {
+      assert.equal(branch, BRANCH);
+      return { prNumber: PR, headSha: TIP_SHA };
+    },
+    createWorktree: async (_cfg, _issue, slug) => {
+      createdSlug = slug;
+      return { path: WT_PATH, branch: BRANCH };
+    },
+    gitInWorktree: async () => ({ stdout: `${TIP_SHA}\n`, stderr: "", code: 0 }),
+  });
+  assert.equal(out.result, "pass");
+  assert.equal(titleRead, false, "exact PR recovery must not derive identity from mutable title");
+  assert.equal(createdSlug, SLUG);
+});
+
 test("ensureManagedWorktree: stale metadata without on-disk path → rematerialize", async () => {
   // getOnDiskForIssue returns null even if "manager" might remember something.
   let createCalls = 0;

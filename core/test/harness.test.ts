@@ -20,6 +20,8 @@ import * as path from "node:path";
 import { EventEmitter } from "node:events";
 import {
   invoke,
+  harnessChildEnvOverlay,
+  harnessChildOmittedEnvNames,
   runCapped,
   formatStderrExcerpt,
   parseHarnessTelemetry,
@@ -1904,6 +1906,34 @@ test("invoke(): no opts.env → the real spawned child sees no PIPELINE_RUN_ID (
   } finally {
     if (prior !== undefined) process.env.PIPELINE_RUN_ID = prior;
     else delete process.env.PIPELINE_RUN_ID;
+  }
+});
+
+test("invoke(): ship/FRG controller authority is absent from the harness child (#1478)", async () => {
+  const prior = new Map<string, string | undefined>();
+  for (const name of harnessChildOmittedEnvNames()) {
+    prior.set(name, process.env[name]);
+    process.env[name] = `outer-${name}`;
+  }
+  try {
+    const overlay = harnessChildEnvOverlay({ PIPELINE_RUN_ID: "1478-run" });
+    for (const name of harnessChildOmittedEnvNames()) {
+      assert.equal(overlay[name], undefined);
+    }
+    const cli = makeScript(
+      "print-isolated-env",
+      `printf '%s|%s' "${"$"}{AGENT_PIPELINE_FACTORY_CONTROL:-<unset>}" "${"$"}{PIPELINE_RUN_ID:-<unset>}"`,
+    );
+    const result = await invoke(cli, tmpRoot, "prompt", {
+      stream: false,
+      env: { PIPELINE_RUN_ID: "1478-run" },
+    });
+    assert.equal(result.stdout, "<unset>|1478-run");
+  } finally {
+    for (const [name, value] of prior) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 

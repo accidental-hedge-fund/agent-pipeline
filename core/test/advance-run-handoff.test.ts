@@ -227,6 +227,28 @@ test("runAdvance roots finalizable run artifacts outside a disposable linked wor
   }
 });
 
+test("durable park releases its worktree only after run_complete and summary are committed (#1478)", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-release-order-"));
+  const domain = `advance-release-order-${process.pid}-${Date.now()}`;
+  const expectedRunDir = runDirPath(repoDir, runIdFor(ISSUE, STARTED_AT));
+  let releaseCalls = 0;
+  const { deps } = stubHandoffAdvance(repoDir, {
+    releaseParkedWorktree: async () => {
+      releaseCalls++;
+      assert.ok(fs.existsSync(path.join(expectedRunDir, "summary.json")));
+      assert.match(fs.readFileSync(path.join(expectedRunDir, "events.jsonl"), "utf8"), /"type":"run_complete"/);
+      return { action: "released", reason: "released after finalize", branch: "pipeline/1049-x", worktree: "/wt" };
+    },
+  });
+  try {
+    await withoutHostPinAuthorityEnv(() => runAdvance(handoffCfg(repoDir, domain), ISSUE, {}, deps));
+    assert.equal(releaseCalls, 1);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(`/tmp/pipeline-${domain}`, { recursive: true, force: true });
+  }
+});
+
 function stubHandoffAdvance(
   repoDir: string,
   extra: Partial<AdvanceDeps> = {},

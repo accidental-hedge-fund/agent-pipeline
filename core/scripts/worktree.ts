@@ -1497,6 +1497,9 @@ export type EnsureManagedWorktreeResult =
 
 /** Injectable deps for {@link ensureManagedWorktree}. No real network/git in tests. */
 export interface EnsureManagedWorktreeDeps {
+  /** Exact linked-PR identity retained by a recovery caller. Avoids deriving
+   * a different branch when the issue title changed after PR creation. */
+  recoveryTarget?: { branch: string; headSha: string };
   getOnDiskForIssue?: (
     cfg: PipelineConfig,
     issueNumber: number,
@@ -1750,18 +1753,35 @@ export async function ensureManagedWorktree(
     };
   }
 
-  let title: string;
-  try {
-    title = await getTitleFn(cfg, issueNumber);
-  } catch (err) {
-    const reason = boundRematerializeReason(
-      `cannot resolve issue title for rematerialize: ${(err as Error).message ?? String(err)}`,
-    );
-    await recordRematerializeGate(deps, "fail", reason);
-    return { result: "fail", worktree: null, reason, blockerKind: "worktree-missing" };
+  let slug: string;
+  let branch: string;
+  const recoveryTarget = deps.recoveryTarget;
+  if (recoveryTarget) {
+    const prefix = `pipeline/${issueNumber}-`;
+    const targetSha = recoveryTarget.headSha.trim().toLowerCase();
+    if (!recoveryTarget.branch.startsWith(prefix) || !/^[0-9a-f]{40}$/.test(targetSha)) {
+      const reason = boundRematerializeReason(
+        `linked PR recovery identity is invalid for issue #${issueNumber}`,
+      );
+      await recordRematerializeGate(deps, "fail", reason);
+      return { result: "fail", worktree: null, reason, blockerKind: "worktree-missing" };
+    }
+    branch = recoveryTarget.branch;
+    slug = branch.slice(prefix.length);
+  } else {
+    let title: string;
+    try {
+      title = await getTitleFn(cfg, issueNumber);
+    } catch (err) {
+      const reason = boundRematerializeReason(
+        `cannot resolve issue title for rematerialize: ${(err as Error).message ?? String(err)}`,
+      );
+      await recordRematerializeGate(deps, "fail", reason);
+      return { result: "fail", worktree: null, reason, blockerKind: "worktree-missing" };
+    }
+    slug = slugify(title) || `issue-${issueNumber}`;
+    branch = branchName(issueNumber, slug);
   }
-  const slug = slugify(title) || `issue-${issueNumber}`;
-  const branch = branchName(issueNumber, slug);
 
   // Recoverability pre-check: do not create from base alone when rematerializing.
   const lsRemote = await gitFn(
@@ -1781,7 +1801,8 @@ export async function ensureManagedWorktree(
   } catch {
     prHead = null;
   }
-  const prSha = prHead && prHead.headSha.length > 0 ? prHead.headSha : null;
+  const prSha = recoveryTarget?.headSha ??
+    (prHead && prHead.headSha.length > 0 ? prHead.headSha : null);
 
   if (!remoteTip && !prSha) {
     const reason = boundRematerializeReason(

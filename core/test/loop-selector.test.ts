@@ -337,6 +337,42 @@ test("realDispatchItem pins --run-id, fires start linkage, returns truthful evid
   assert.ok(!isSyntheticLoopEvidencePipelineRunId(response.evidence.pipeline_run_id));
 });
 
+test("realDispatchItem polls the persistent primary run root from a linked supervisor (#1478)", async () => {
+  const fixedNow = new Date("2026-07-29T13:49:56.421Z");
+  const expectedPin = pinAdvanceRunIdentity("/primary", 623, fixedNow);
+  const observedPaths: string[] = [];
+  const dispatch = realDispatchItem(
+    { repo_dir: "/linked" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      resolveRunStoreRepoDir: async (repoDir) => {
+        assert.equal(repoDir, "/linked");
+        return "/primary";
+      },
+      eventsPathExists: (candidate) => {
+        observedPaths.push(candidate);
+        return candidate === expectedPin.events_path;
+      },
+      spawn: (() => fakeSpawnChild()) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: ["pipeline:ready-to-deploy"], state: "open" }) as never,
+      getPrForIssue: async () => 99,
+    },
+  );
+  const response = await dispatch({
+    schema: "pipeline/loop-execution@1",
+    item_id: "623",
+    repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: "loop-run-primary-root",
+  });
+  assert.ok(observedPaths.includes(expectedPin.events_path));
+  assert.equal(response.evidence.events_path, expectedPin.events_path);
+  assert.equal(response.evidence.events_path?.startsWith("/linked/"), false);
+});
+
 test("realDispatchItem spawn failure keeps pin id but omits live events_path (#667)", async () => {
   const fixedNow = new Date("2026-07-29T13:49:56.421Z");
   const expectedPin = pinAdvanceRunIdentity("/repo", 623, fixedNow);

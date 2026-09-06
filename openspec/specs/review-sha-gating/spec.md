@@ -352,6 +352,19 @@ Ready-to-deploy SHALL run this guard immediately before terminal finalization, i
 - **AND** SHALL NOT dispatch review from `cfg.repo_dir`
 - **AND** SHALL fail closed without transitioning to `review-1` when rematerialization or exact-HEAD verification fails
 
+#### Scenario: Linked PR identity survives issue-title changes
+
+- **WHEN** an issue title changed after its pipeline branch and PR were created
+- **AND** later-stage recovery must rematerialize an absent worktree
+- **THEN** recovery SHALL use the linked PR's exact branch and HEAD rather than deriving a new slug from the current issue title
+
+#### Scenario: Archive currency survives a new physical advance run
+
+- **WHEN** OpenSpec archival records an exact pipeline-owned S-to-H transition in one physical advance run
+- **AND** a later supervisor dispatch starts a new physical run while GitHub's commit list still lags
+- **THEN** later-stage currency SHALL load the issue's durable prior-run transition evidence
+- **AND** SHALL treat H as current only when an exact validated transition chain reaches H
+
 #### Scenario: PR HEAD movement during epoch-restart bind restarts reconcile
 
 - **WHEN** later-stage bind targets HEAD H

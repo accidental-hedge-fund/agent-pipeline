@@ -1647,6 +1647,8 @@ export interface RealDispatchItemDeps {
    * (#1327). Multi-item callers omit this so `--once` stays off the child argv.
    */
   childAdvance?: OneItemChildAdvanceInputs;
+  /** Persistent run-store owner shared with the nested advance child. */
+  resolveRunStoreRepoDir?: typeof resolveRunStoreRepoDir;
 }
 
 export function realDispatchItem(
@@ -1690,6 +1692,10 @@ export function realDispatchItem(
 
   return async (request, hooks): Promise<LoopExecutionResponse> => {
     const issueNumber = Number(request.item_id);
+    const runStoreRepoDir = await (deps.resolveRunStoreRepoDir ?? resolveRunStoreRepoDir)(
+      cfg.repo_dir,
+      gitInWorktree,
+    );
     // Pin before spawn so the child uses the same `.agent-pipeline/runs/<run-id>/`
     // (detached-launch pattern). Start linkage + live events_path are published
     // only after the pinned run store is confirmed initialized — never on bare
@@ -1701,10 +1707,10 @@ export function realDispatchItem(
         ? childAdvance?.runId
           ? {
               pipeline_run_id: childAdvance.runId,
-              run_dir: runDirPath(cfg.repo_dir, childAdvance.runId),
-              events_path: path.join(runDirPath(cfg.repo_dir, childAdvance.runId), "events.jsonl"),
+              run_dir: runDirPath(runStoreRepoDir, childAdvance.runId),
+              events_path: path.join(runDirPath(runStoreRepoDir, childAdvance.runId), "events.jsonl"),
             }
-          : pinAdvanceRunIdentity(cfg.repo_dir, issueNumber, nowFn())
+          : pinAdvanceRunIdentity(runStoreRepoDir, issueNumber, nowFn())
         : null;
 
     let startLinkage: Promise<void> = Promise.resolve();

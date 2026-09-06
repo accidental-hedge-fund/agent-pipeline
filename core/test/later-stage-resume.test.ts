@@ -116,6 +116,7 @@ type DriveOpts = {
   worktreeNotAncestor?: boolean;
   /** After the first managed-worktree fetch, PR HEAD becomes this SHA (H→J race). */
   prHeadAfterFetch?: string;
+  priorArchiveTransition?: { from: string; to: string };
 };
 
 type DriveResult = {
@@ -228,6 +229,27 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
       max_delta_rounds: 4,
     },
   } as unknown as PipelineConfig;
+
+  if (opts.priorArchiveTransition) {
+    const priorDir = path.join(
+      repoDir,
+      ".agent-pipeline",
+      "runs",
+      `${ISSUE}-2026-09-05T00-00-00-000Z`,
+    );
+    fs.mkdirSync(priorDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(priorDir, "events.jsonl"),
+      JSON.stringify({
+        schema_version: "1",
+        type: "pipeline_internal_candidate_transition",
+        at: "2026-09-05T00:00:00Z",
+        cause: "openspec_archive",
+        from_sha: opts.priorArchiveTransition.from,
+        to_sha: opts.priorArchiveTransition.to,
+      }) + "\n",
+    );
+  }
 
   const deps: AdvanceDeps = {
     resolvePinnedEngineIdentity: () => ENGINE,
@@ -480,6 +502,18 @@ test("pipeline-internal-only commits keep later-stage dispatch", async () => {
     reviewSha: SHA_S,
   });
   assert.ok(r.dispatchStages.includes("visual-gate"), "internal-only must dispatch visual-gate");
+  assert.equal(r.transitions.some((t) => t.to === "review-1"), false);
+});
+
+test("OpenSpec archive transition remains current across physical advance runs (#1478)", async () => {
+  const r = await driveLaterStage({
+    startStage: "visual-gate",
+    prHead: SHA_H,
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+    priorArchiveTransition: { from: SHA_S, to: SHA_H },
+  });
+  assert.ok(r.dispatchStages.includes("visual-gate"));
   assert.equal(r.transitions.some((t) => t.to === "review-1"), false);
 });
 
