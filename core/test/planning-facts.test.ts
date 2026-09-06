@@ -698,6 +698,41 @@ test("defaultSpawnProvider timeout waits for close and does not treat later exit
 
 test("defaultSpawnProvider does not succeed while containment still has descendants", async () => {
   const child = fakeProviderChild();
+  const remaining = [4242];
+  let killed = false;
+  const containment: ProviderContainment = {
+    dir: "/sys/fs/cgroup/fake",
+    addPid() {},
+    remainingPids: () => remaining,
+    killRemaining() {
+      killed = true;
+    },
+    close() {},
+  };
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(
+    { ...boundedSpawnReq, maxStderrBytes: 1_024 },
+    spawnImpl,
+    containment,
+  );
+  child.emit("close", 0);
+  const result = await pending;
+  assert.equal(killed, true);
+  assert.equal(result.descendants_remaining, true);
+  assert.equal(result.timed_out, false);
+  assert.equal(result.spawn_error ?? false, false);
+  assert.equal(result.exit_code, 0);
+  const err = result.stderr.toString("utf8");
+  assert.match(err, /\/sys\/fs\/cgroup\/fake/);
+  assert.match(err, /4242/);
+  assert.ok(
+    result.duration_ms >= 1000,
+    `containment drain deadline must be 1000ms, duration was ${result.duration_ms}`,
+  );
+});
+
+test("defaultSpawnProvider reports no remaining descendants after kill empties the cgroup", async () => {
+  const child = fakeProviderChild();
   let remaining = [4242];
   let killed = false;
   const containment: ProviderContainment = {
@@ -715,8 +750,9 @@ test("defaultSpawnProvider does not succeed while containment still has descenda
   child.emit("close", 0);
   const result = await pending;
   assert.equal(killed, true);
-  assert.equal(result.descendants_remaining, true);
-  assert.equal(result.exit_code, 0);
+  assert.equal(result.descendants_remaining, false);
+  assert.equal(result.timed_out, false);
+  assert.equal(result.spawn_error ?? false, false);
 });
 
 test("defaultSpawnProvider still kills containment when cgroup.procs looks empty", async () => {
@@ -737,6 +773,30 @@ test("defaultSpawnProvider still kills containment when cgroup.procs looks empty
   const result = await pending;
   assert.ok(killed >= 1, "empty cgroup.procs must not skip cgroup.kill");
   assert.equal(result.descendants_remaining, false);
+});
+
+test("defaultSpawnProvider does not drain remainingPids without a cgroup dir", async () => {
+  const child = fakeProviderChild();
+  const remaining = [4242];
+  let killed = false;
+  const containment: ProviderContainment = {
+    addPid() {},
+    remainingPids: () => remaining,
+    killRemaining() {
+      killed = true;
+    },
+    close() {},
+  };
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(boundedSpawnReq, spawnImpl, containment);
+  child.emit("close", 0);
+  const result = await pending;
+  assert.equal(killed, true);
+  assert.equal(result.descendants_remaining, false);
+  assert.ok(
+    result.duration_ms < 500,
+    `no-cgroup path must not wait the drain deadline, duration was ${result.duration_ms}`,
+  );
 });
 
 test("escaped descendants after a successful-looking spawn fail containment", async () => {
@@ -851,7 +911,16 @@ function spawnSetsIdDaemon(dir: string, containment?: ProviderContainment) {
   fs.writeFileSync(
     script,
     `#!/bin/sh
-( setsid sh -c 'sleep 0.4; echo pwned > pwned.txt' < /dev/null > /dev/null 2>&1 & )
+( setsid sh -c 'echo ready > ready.txt; sleep 0.4; echo pwned > pwned.txt' < /dev/null > /dev/null 2>&1 & )
+n=0
+while [ ! -f ready.txt ]; do
+  n=$((n + 1))
+  if [ "$n" -gt 200 ]; then
+    echo 'ready timeout' >&2
+    exit 1
+  fi
+  sleep 0.01
+done
 printf '%s\\n' '{"schema_version":1,"facts":{"alembic_head":"0074"}}'
 `,
     { mode: 0o755 },
@@ -896,6 +965,7 @@ test("defaultSpawnProvider cgroup containment kills a setsid daemon before a del
     /* nested cgroup is optional; subreaper must contain without it */
   }
   const result = await spawnSetsIdDaemon(dir, containment);
+  assert.equal(fs.existsSync(path.join(dir, "ready.txt")), true, "parent must wait for daemon readiness before finishing");
   await new Promise((r) => setTimeout(r, 600));
   assert.equal(fs.existsSync(path.join(dir, "pwned.txt")), false, "daemonized descendant must not write after observation");
   assert.equal(result.timed_out, false);

@@ -152,7 +152,7 @@ export interface SpawnProviderResult {
   stdout_exceeded?: boolean;
   /** True when capture stopped at maxStderrBytes and the provider was terminated. */
   stderr_exceeded?: boolean;
-  /** True when containment still held descendant PIDs after the direct child closed. */
+  /** True when the containment drain observed remaining PIDs after descendant kill. */
   descendants_remaining?: boolean;
 }
 
@@ -394,6 +394,8 @@ export function worktreeSnapshotsDiffer(pre: WorktreeSnapshot, post: WorktreeSna
 
 const PROVIDER_KILL_GRACE_MS = 200;
 const PROVIDER_KILL_FOLLOWUP_MS = 200;
+const PROVIDER_CONTAINMENT_DRAIN_MS = 1000;
+const PROVIDER_CONTAINMENT_DRAIN_POLL_MS = 10;
 
 function asBuffer(chunk: Buffer | string): Buffer {
   return Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -683,16 +685,26 @@ export function defaultSpawnProvider(
       descendants_remaining: extra.descendants_remaining,
     });
     const reapContainment = async (): Promise<boolean> => {
-      const remaining = containment.remainingPids();
       // Always send cgroup.kill (or per-pid SIGKILL). A setsid grandchild can
       // sit in the nested cgroup while cgroup.procs looks empty for a tick.
       // The empty-procs short-circuit skipped kill on GitHub Actions (#1300 CI).
       containment.killRemaining();
-      const deadline = Date.now() + PROVIDER_KILL_GRACE_MS + PROVIDER_KILL_FOLLOWUP_MS;
-      while (Date.now() < deadline && containment.remainingPids().length > 0) {
-        await new Promise((r) => setTimeout(r, 10));
+      if (!containment.dir) {
+        return false;
       }
-      return remaining.length > 0 || containment.remainingPids().length > 0;
+      const deadline = Date.now() + PROVIDER_CONTAINMENT_DRAIN_MS;
+      let leftover = containment.remainingPids();
+      while (Date.now() < deadline && leftover.length > 0) {
+        await new Promise((r) => setTimeout(r, PROVIDER_CONTAINMENT_DRAIN_POLL_MS));
+        leftover = containment.remainingPids();
+      }
+      if (leftover.length === 0) {
+        return false;
+      }
+      const diagnostic = `containment drain timed out: cgroup ${containment.dir} remaining pids: ${leftover.join(",")}`;
+      stderr =
+        stderr.length === 0 ? Buffer.from(diagnostic) : Buffer.concat([stderr, Buffer.from(`\n${diagnostic}`)]);
+      return true;
     };
     let child: ChildProcess;
     let command = req.command;
