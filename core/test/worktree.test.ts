@@ -768,6 +768,47 @@ test("createWorktree: no stale worktree → does not call removeWorktree", async
   assert.equal(removeCalled, false, "removeWorktree must not be called when the issue has no active worktree");
 });
 
+test("createWorktree: adopted PR recovery creates the synthetic workspace at the verified PR head", async () => {
+  const cfg = makeCreateCfg();
+  const head = "a".repeat(40);
+  const calls: string[][] = [];
+  const deps: CreateWorktreeDeps = {
+    recoveryStart: {
+      deliveryBranch: "fix/release-convergence-durable",
+      headSha: head,
+      prNumber: 1480,
+    },
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args) => {
+      calls.push(args);
+      if (args[0] === "rev-parse" && args[1] === "FETCH_HEAD") {
+        return { code: 0, stdout: `${head}\n`, stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    ...noopMutexDeps,
+  };
+
+  await createWorktree(cfg, 42, "adopted-pr-1480", deps);
+  assert.ok(calls.some((args) => args.join(" ") === "fetch origin pull/1480/head"));
+  assert.ok(
+    calls.some(
+      (args) =>
+        args[0] === "worktree" &&
+        args[1] === "add" &&
+        args.at(-1) === head &&
+        args.includes("pipeline/42-adopted-pr-1480"),
+    ),
+  );
+  assert.ok(
+    !calls.some((args) => args.includes("fix/release-convergence-durable")),
+    "delivery branch is only a source; the managed local branch remains synthetic",
+  );
+});
+
 test("createWorktree: capacity check still fires when OTHER issues fill the pool", async () => {
   // The target issue is excluded from the capacity count, but OTHER issues
   // occupying the pool must still raise the capacity error.

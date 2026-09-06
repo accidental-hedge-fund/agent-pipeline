@@ -2796,6 +2796,7 @@ export async function runAdvance(
                     recoveryTarget: {
                       branch: live.head_ref,
                       headSha: live.head_sha ?? "",
+                      prNumber,
                     },
                   });
                 }),
