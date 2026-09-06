@@ -2722,6 +2722,18 @@ function procGroup(pid: number): number | undefined {
   }
 }
 
+function procStartTime(pid: number): string | undefined {
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const i = s.lastIndexOf(")");
+    if (i < 0) return undefined;
+    // Fields after the command start at stat field 3 (state); starttime is 22.
+    return s.slice(i + 2).trim().split(/\s+/)[19] || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function readProcArgv(pid: number): string[] {
   try {
     return fs
@@ -2770,7 +2782,7 @@ function liveOwnedDetachFixturePids(
   dir: string,
   stateRoot: string,
   version: string,
-  ownedGroups: ReadonlySet<number> = new Set(),
+  ownedGroups: ReadonlyMap<number, string> = new Map(),
 ): Array<{ pid: number; source: string; argv: string[] }> {
   const seen = new Set<number>();
   const out: Array<{ pid: number; source: string; argv: string[] }> = [];
@@ -2809,9 +2821,12 @@ function liveOwnedDetachFixturePids(
     if (!/^\d+$/.test(ent)) continue;
     const pid = Number(ent);
     const group = procGroup(pid);
+    const ownedGroupStart =
+      group === undefined ? undefined : ownedGroups.get(group);
     if (
       group === undefined ||
-      !ownedGroups.has(group) ||
+      ownedGroupStart === undefined ||
+      procStartTime(group) !== ownedGroupStart ||
       seen.has(pid) ||
       procLiveness(pid) !== "live"
     ) {
@@ -2840,7 +2855,7 @@ function killOwnedDetachFixturePids(
   dir: string,
   stateRoot: string,
   version: string,
-): Set<number> {
+): Map<number, string> {
   const directOwners = [
     ...procsWithNeedle(dir),
     ...procsWithNeedle(version).filter((proc) =>
@@ -2851,15 +2866,18 @@ function killOwnedDetachFixturePids(
   if (playbookPid !== undefined) {
     directOwners.push({ pid: playbookPid, argv: readProcArgv(playbookPid) });
   }
-  const groups = new Set<number>();
+  const groups = new Map<number, string>();
   for (const owner of directOwners) {
     const group = procGroup(owner.pid);
-    if (group === owner.pid) groups.add(group);
+    const startTime = procStartTime(owner.pid);
+    if (group === owner.pid && startTime !== undefined) {
+      groups.set(group, startTime);
+    }
   }
-  for (const group of groups) {
+  for (const [group, startTime] of groups) {
     if (
       procGroup(group) !== group ||
-      !argvOwnsFixture(readProcArgv(group), dir, version)
+      procStartTime(group) !== startTime
     ) {
       continue;
     }
@@ -2959,8 +2977,12 @@ async function reapDetachFixture(opts: {
     } catch (err) {
       if (!isStillMutatingUnlinkError(err)) throw err;
       lastUnlinkErr = err;
-      for (const group of killOwnedDetachFixturePids(dir, stateRoot, version)) {
-        ownedGroups.add(group);
+      for (const [group, startTime] of killOwnedDetachFixturePids(
+        dir,
+        stateRoot,
+        version,
+      )) {
+        ownedGroups.set(group, startTime);
       }
       return false;
     }
