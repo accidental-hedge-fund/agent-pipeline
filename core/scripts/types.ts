@@ -1097,6 +1097,16 @@ export interface PlanningFactsConfig {
   max_prompt_chars: number;
 }
 
+/** Provider-neutral, metadata-only usage telemetry configured in pipeline.yml. */
+export interface ObservabilityConfig {
+  enabled: boolean;
+  exporter: {
+    type: "file";
+    /** Absolute or ~/ path; the exporter owns inbox/ and context/ below it. */
+    directory: string;
+  };
+}
+
 export interface PipelineConfig {
   profile_name: string;
   invocation: string;
@@ -1414,6 +1424,9 @@ export interface PipelineConfig {
    * Also overridable via env `AGENT_PIPELINE_PRODUCTION_PIN`.
    */
   production_engine_pin_path?: string;
+  // Metadata-only usage telemetry. File export is opt-in and independent of
+  // papercuts, event_sink, and any downstream observability provider.
+  observability: ObservabilityConfig;
   // Agent-logged minor-friction capture (#419). Opt-in; default disabled so
   // existing runs are unchanged. When enabled, the engine passes run/stage
   // identity env vars to harness child processes and injects a prompt
@@ -1822,6 +1835,13 @@ export const DEFAULT_CONFIG: Omit<
     }>,
   },
   doctor: { runOnStart: false, failFast: false },
+  observability: {
+    enabled: false,
+    exporter: {
+      type: "file",
+      directory: "~/.local/state/agent-pipeline/observability",
+    },
+  },
   papercuts: {
     enabled: false,
     auto_file: false,

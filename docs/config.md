@@ -574,6 +574,24 @@ Nested fields:
 - **Type:** string | string
 - **Description:** Model alias for the sweep spec-generation step (implementer harness), or "auto".
 
+### `observability`
+
+- **Type:** object
+- **Default:** `{"enabled":false,"exporter":{"type":"file","directory":"~/.local/state/agent-pipeline/observability"}}`
+- **Description:** Opt-in, provider-neutral usage observability configured only in pipeline.yml. Independent of papercuts and event_sink; disabled by default. Local export failures never change stage outcomes.
+
+Nested fields:
+
+#### `observability.enabled`
+
+- **Type:** boolean
+- **Description:** When true, export metadata-only stage usage and native-session correlation to the configured local file spool. Default false; no environment override. No prompts, outputs, credentials, or network delivery.
+
+#### `observability.exporter`
+
+- **Type:** object
+- **Description:** Local exporter configuration. Backend URLs and credentials belong to the independent collector, not pipeline.yml.
+
 ### `openspec`
 
 - **Type:** object

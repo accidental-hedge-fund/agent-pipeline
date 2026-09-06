@@ -982,6 +982,28 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Opt-in, default-absent privacy-safe product-fault reporting settings (#502)."),
+  // Provider-neutral metadata-only usage export. The repository YAML is its
+  // sole authority; no environment or host-profile override enables it.
+  observability: z
+    .object({
+      enabled: z.boolean().optional().describe("When true, export metadata-only stage usage and native-session correlation to the configured local file spool. Default false; no environment override. No prompts, outputs, credentials, or network delivery."),
+      exporter: z
+        .object({
+          type: z.literal("file").optional().describe("Provider-neutral exporter type. Only file is supported; an independent collector may forward the spool to any backend."),
+          directory: z
+            .string()
+            .min(1)
+            .regex(/^(?:\/|~\/)[^\0\r\n]*$/, "Must be an absolute path or start with ~/; relative paths, NUL, and newlines are not allowed")
+            .optional()
+            .describe("Local spool root containing inbox/ usage records and context/ native-session correlations. Absolute POSIX path or ~/ path; ~ expands to the current user's home at export time. No environment-variable interpolation. Default ~/.local/state/agent-pipeline/observability."),
+        })
+        .strict()
+        .optional()
+        .describe("Local exporter configuration. Backend URLs and credentials belong to the independent collector, not pipeline.yml."),
+    })
+    .strict()
+    .optional()
+    .describe("Opt-in, provider-neutral usage observability configured only in pipeline.yml. Independent of papercuts and event_sink; disabled by default. Local export failures never change stage outcomes."),
   // Opt-in agent-logged friction capture (#419). When enabled, the engine adds
   // identity env vars to harness child processes and injects a prompt
   // instruction telling the agent to log minor friction via `pipeline
@@ -2336,6 +2358,13 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     loop: {
       native_goal_attestation:
         fileConfig.loop?.native_goal_attestation ?? DEFAULT_CONFIG.loop.native_goal_attestation,
+    },
+    observability: {
+      enabled: fileConfig.observability?.enabled ?? DEFAULT_CONFIG.observability.enabled,
+      exporter: {
+        type: fileConfig.observability?.exporter?.type ?? DEFAULT_CONFIG.observability.exporter.type,
+        directory: fileConfig.observability?.exporter?.directory ?? DEFAULT_CONFIG.observability.exporter.directory,
+      },
     },
     papercuts: {
       enabled: fileConfig.papercuts?.enabled ?? DEFAULT_CONFIG.papercuts.enabled,
@@ -3755,6 +3784,11 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
   const reviewPolicy = { ...d.review_policy, ...config.review_policy };
   const doctor = { ...d.doctor, ...config.doctor };
   const loopCfg = { ...d.loop, ...config.loop };
+  const observability = {
+    ...d.observability,
+    ...config.observability,
+    exporter: { ...d.observability.exporter, ...config.observability?.exporter },
+  };
   const papercuts = { ...d.papercuts, ...config.papercuts };
   const corrections = { ...d.corrections, ...config.corrections };
   const durableRuns = { ...d.durable_runs, ...config.durable_runs };
@@ -4170,6 +4204,16 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       : [
         "# loop: # pipeline:loop native-goal capability attestation (#506) — uncomment to override automatic detection",
         `#   native_goal_attestation: ${yamlScalar(loopCfg.native_goal_attestation)} # ${sd("loop.native_goal_attestation", "auto (default) detects automatically; available/unavailable overrides detection")}`,
+      ].join("\n"),
+    "",
+    config.observability !== undefined
+      ? `observability: # SECURITY: opt-in metadata-only local usage export; an independent collector controls network delivery\n${yamlBlock(observability, 2)}`
+      : [
+        "# observability: # SECURITY: opt-in metadata-only local usage export; no backend dependency or network delivery from the pipeline",
+        `#   enabled: ${yamlScalar(observability.enabled)} # ${sd("observability.enabled", "enable metadata-only usage export; disabled by default, configured only here")}`,
+        `#   exporter: # ${sd("observability.exporter", "provider-neutral local exporter")}`,
+        `#     type: ${yamlScalar(observability.exporter.type)} # ${sd("observability.exporter.type", "file exporter; a separate collector owns backend delivery")}`,
+        `#     directory: ${yamlScalar(observability.exporter.directory)} # ${sd("observability.exporter.directory", "absolute or ~/ spool root containing inbox/ and context/")}`,
       ].join("\n"),
     "",
     config.papercuts !== undefined
@@ -4589,6 +4633,11 @@ function normalizeForSync(config: PartialConfig): unknown {
     },
     doctor: { ...d.doctor, ...config.doctor },
     loop: { ...d.loop, ...config.loop },
+    observability: {
+      ...d.observability,
+      ...config.observability,
+      exporter: { ...d.observability.exporter, ...config.observability?.exporter },
+    },
     papercuts: { ...d.papercuts, ...config.papercuts },
     corrections: { ...d.corrections, ...config.corrections },
     durable_runs: { ...d.durable_runs, ...config.durable_runs },

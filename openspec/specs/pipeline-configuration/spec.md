@@ -93,6 +93,47 @@ An unknown key under `doctor:` SHALL be rejected by strict schema validation, co
 - **WHEN** `.github/pipeline.yml` sets `doctor: { autoFix: true }`
 - **THEN** `resolveConfig()` SHALL throw a parse error identifying `autoFix` as an unknown key under `doctor`
 
+### Requirement: Usage observability is opt-in and configured only in pipeline.yml
+
+`PartialConfigSchema` SHALL accept an optional strict `observability` block with
+`enabled` (boolean, default `false`) and a strict `exporter` object containing
+`type` (the literal `file`, default `file`) and `directory` (nonempty absolute
+POSIX or `~/` path, default `~/.local/state/agent-pipeline/observability`).
+Unspecified nested fields SHALL retain their defaults. Relative paths, NUL,
+newlines, unsupported exporter types, and unknown keys SHALL fail validation.
+The exporter SHALL expand `~/` using the current user's home directory at export
+time and SHALL NOT interpolate environment variables.
+
+Repository YAML SHALL be the sole configuration authority for usage observability;
+environment variables, host profiles, `papercuts`, and `event_sink` SHALL NOT enable
+it or override its exporter configuration. File export SHALL remain backend-neutral,
+metadata-only, local, and non-fatal to stage outcomes. The spool directory contains
+`inbox/` usage events and `context/` native-session correlations. Collector endpoints
+and credentials SHALL NOT be part of this product configuration.
+
+#### Scenario: Observability absent or explicitly disabled
+
+- **WHEN** `observability` is absent or sets `enabled: false`
+- **THEN** the resolved config SHALL keep usage export disabled
+- **AND** enabling `papercuts` or setting observability-named environment variables SHALL NOT enable it
+
+#### Scenario: Opt-in with nested defaults
+
+- **WHEN** the repository sets `observability: { enabled: true }`
+- **THEN** the resolved exporter SHALL be `file` with directory `~/.local/state/agent-pipeline/observability`
+- **AND** a declared exporter directory SHALL override only that nested default
+
+#### Scenario: Provider-specific or ambiguous configuration is rejected
+
+- **WHEN** a repository sets an unsupported exporter type, a backend credential, or a relative spool directory
+- **THEN** config validation SHALL reject the setting with a field-specific diagnostic
+
+#### Scenario: Configuration remains discoverable and repeatable
+
+- **WHEN** an operator uses `pipeline init`, `pipeline config schema`, or the generated configuration reference
+- **THEN** each observability setting and its disabled defaults SHALL be documented
+- **AND** `pipeline config sync` SHALL preserve the operator's existing observability block without enabling an absent one
+
 ### Requirement: Config SHALL accept an optional `format_gate` array
 
 `PartialConfigSchema` SHALL accept an optional `format_gate` key. When present, it SHALL validate as an array of objects, each with the following fields:
