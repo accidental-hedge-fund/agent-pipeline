@@ -161,6 +161,17 @@ export function assertRequiredAdmissionRoute(
   admissionRouteTrace.getStore()?.add(route);
 }
 
+/** Validate an entrypoint using the route inventory's authoritative boundary. */
+export function assertRequiredAdmissionRouteForEntrypoint(
+  route: RequiredAdmissionRouteName,
+  entrypoint: RequiredPublicEntrypoint,
+): void {
+  assertAdmissionRouteInventoryComplete();
+  const matches = REQUIRED_ADMISSION_ROUTES.filter((row) => row.route === route);
+  if (matches.length !== 1) throw new Error(`required admission route is not inventoried exactly once: ${route}`);
+  assertRequiredAdmissionRoute(route, entrypoint, matches[0]!.boundary);
+}
+
 const GENERATED_HOST_ADMISSION_ROUTES = {
   claude: "host.claude-code",
   codex: "host.codex",

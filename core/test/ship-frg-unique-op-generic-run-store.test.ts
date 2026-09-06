@@ -1334,7 +1334,7 @@ test("single parent plus nested loop child observes both entrypoints (#1440)", a
 
 test("pipeline single/merge/merge-queue execute only after acknowledged public admission (#1440)", () => {
   const src = readFileSync(join(CORE_ROOT, "scripts/pipeline.ts"), "utf8");
-  assert.match(src, /persistPublicAdmission:\s*true/);
+  assert.match(src, /admission:\s*["']single["']/);
   const mergeDispatch = src.slice(src.indexOf("// Early merge dispatch"));
   const persistMerge = mergeDispatch.indexOf("await executeAfterPublicAdmission");
   const mergePr = mergeDispatch.indexOf("mergePr(prNumber");

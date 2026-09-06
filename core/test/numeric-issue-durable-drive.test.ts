@@ -32,6 +32,7 @@ import {
   type RunLoopEngineInput,
   type RunSubcommandDeps,
   type SingleIssueCommandDeps,
+  type SingleIssueCommandOutput,
 } from "../scripts/pipeline.ts";
 import {
   parseNestedAdvanceChildArgv,
@@ -158,6 +159,140 @@ test("mutating pipeline <N> and pipeline single <N> attach to the same one-item 
   } finally {
     console.error = originalError;
     console.log = originalLog;
+    process.exitCode = priorExit;
+  }
+});
+
+test("mutating pipeline <N> persists drive admission and carries its logical id into the one-item loop (#1493)", async () => {
+  const admissions: string[] = [];
+  const operationKeys: string[] = [];
+  let loopLogicalOperationId: string | undefined;
+  const originalError = console.error;
+  const originalLog = console.log;
+  const priorExit = process.exitCode;
+  console.error = () => {};
+  console.log = () => {};
+  process.exitCode = undefined;
+  try {
+    await admitMutatingNumericDrive(cfg(), 42, { profile: "claude" }, {
+      runSingleIssue: (raw, opts, _deps, output) =>
+        runSingleIssueCommand(
+          raw,
+          opts,
+          {
+            resolveConfig: () => cfg(),
+            resolveIssueNumber: async (_c, n) => n,
+            persistPublicAdmission: async (input) => {
+              admissions.push(`${input.kind}:${input.route}`);
+              operationKeys.push(input.operationKey ?? "");
+              return {
+                acknowledged: true,
+                runId: "drive-test",
+                runDir: "/repo/.agent-pipeline/runs/drive-test",
+                logicalOperationId: "lop-drive-test",
+              } as never;
+            },
+            runLoopEngine: async (input) => {
+              loopLogicalOperationId = input.logicalOperationId;
+              return driveResult("loop-drive");
+            },
+            writeStdoutLine: () => {},
+          },
+          output,
+        ),
+    });
+    assert.deepEqual(admissions, ["drive:drive.numeric"]);
+    assert.match(operationKeys[0]!, /^drive:owner\/repo:42:[0-9a-f-]{36}$/);
+    assert.equal(loopLogicalOperationId, "lop-drive-test");
+  } finally {
+    console.error = originalError;
+    console.log = originalLog;
+    process.exitCode = priorExit;
+  }
+});
+
+test("fresh numeric drive invocations use distinct admission identities (#1493)", async () => {
+  const operationKeys: string[] = [];
+  const originalError = console.error;
+  const originalLog = console.log;
+  const priorExit = process.exitCode;
+  console.error = () => {};
+  console.log = () => {};
+  process.exitCode = undefined;
+  const runSingleIssue = (raw: string | undefined, opts: CliOpts, _deps?: SingleIssueCommandDeps, output?: SingleIssueCommandOutput) =>
+    runSingleIssueCommand(raw, opts, {
+      resolveConfig: () => cfg(),
+      resolveIssueNumber: async (_c, n) => n,
+      persistPublicAdmission: async (input) => {
+        operationKeys.push(input.operationKey ?? "");
+        return {
+          acknowledged: true,
+          runId: `drive-${operationKeys.length}`,
+          runDir: `/repo/.agent-pipeline/runs/drive-${operationKeys.length}`,
+          logicalOperationId: `lop-drive-${operationKeys.length}`,
+        } as never;
+      },
+      runLoopEngine: async () => driveResult(),
+      writeStdoutLine: () => {},
+    }, output);
+  try {
+    await admitMutatingNumericDrive(cfg(), 42, { profile: "claude" }, { runSingleIssue });
+    await admitMutatingNumericDrive(cfg(), 42, { profile: "claude" }, { runSingleIssue });
+    assert.equal(operationKeys.length, 2);
+    assert.notEqual(operationKeys[0], operationKeys[1]);
+  } finally {
+    console.error = originalError;
+    console.log = originalLog;
+    process.exitCode = priorExit;
+  }
+});
+
+test("mutating pipeline <N> fails closed before its loop when drive admission is refused (#1493)", async () => {
+  let loops = 0;
+  const originalError = console.error;
+  const priorExit = process.exitCode;
+  console.error = () => {};
+  process.exitCode = undefined;
+  try {
+    await admitMutatingNumericDrive(cfg(), 42, { profile: "claude" }, {
+      runSingleIssue: (raw, opts, _deps, output) =>
+        runSingleIssueCommand(
+          raw,
+          opts,
+          {
+            resolveConfig: () => cfg(),
+            resolveIssueNumber: async (_c, n) => n,
+            persistPublicAdmission: async () => ({
+              acknowledged: false,
+              kind: "drive",
+              runId: "drive-refused",
+              logicalOperationId: "lop-drive-refused",
+              repository: "owner/repo",
+              domain: "owner-repo",
+              issue: 42,
+              startedAt: "2026-09-06T00:00:00Z",
+              approvedRoot: null,
+              runDir: null,
+              binding: {},
+              failure: {
+                kind: "approved_root_unavailable",
+                step: "resolve_approved_root",
+                diagnostic: "no approved root",
+              },
+            }) as never,
+            runLoopEngine: async () => {
+              loops += 1;
+              return driveResult();
+            },
+            writeStdoutLine: () => {},
+          },
+          output,
+        ),
+    });
+    assert.equal(loops, 0);
+    assert.equal(process.exitCode, 1);
+  } finally {
+    console.error = originalError;
     process.exitCode = priorExit;
   }
 });

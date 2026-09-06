@@ -432,7 +432,7 @@ test("hard gate executes inventoried production admission routes (#1454)", async
         persistPublicAdmission: persist,
       };
       await runSingleIssueCommand("1454", { profile: "codex" } as CliOpts, singleDeps, {
-        persistPublicAdmission: true,
+        admission: "single",
       });
       assert.deepEqual(events.slice(-2), ["admit:single.direct", "protected:single.direct"]);
 

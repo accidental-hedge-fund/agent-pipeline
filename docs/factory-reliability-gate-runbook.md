@@ -145,12 +145,12 @@ roots; a path that escapes into the candidate worktree is not loaded. The
 same durable `run_id` in both roots is scored once. GitHub labels, comment
 prose, and factory-gate 2-item pack proofs are not unique-operation proof.
 
-Public `pipeline single`, `pipeline merge`, and `pipeline merge-queue`
+Public numeric `pipeline <N>`, `pipeline single`, `pipeline merge`, and `pipeline merge-queue`
 admissions persist recognizable run artifacts into the same dual-root pair
 unique-operation collection scores: `runsDir(resolveFactoryControlRoot(...))`
 when that factory-control root is known, plus loop state-home
 `<resolveStateHome()>/runs`. Persist uses the existing generic store
-(`run.json.kind`, `run_start.entrypoint`, documented prefixes `single-`,
+(`run.json.kind`, `run_start.entrypoint`, documented prefixes `drive-`, `single-`,
 `merge-`, `merge-queue-` / `mq-`). Persist does not write only to a
 candidate-worktree `repoDir` that collection does not read and then treat
 that write as coverage. When the factory-control root is unknown, the public
