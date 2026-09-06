@@ -744,14 +744,21 @@ export function defaultSpawnProvider(
       }
       const deadline = Date.now() + PROVIDER_CONTAINMENT_DRAIN_MS;
       let observed = observeRemainingPids();
+      let observedAt = Date.now();
       while (
-        Date.now() < deadline &&
+        observedAt < deadline &&
         (observed.error != null || (observed.pids?.length ?? 0) > 0)
       ) {
         await new Promise((r) => setTimeout(r, PROVIDER_CONTAINMENT_DRAIN_POLL_MS));
         observed = observeRemainingPids();
+        observedAt = Date.now();
       }
-      if (observed.error == null && (observed.pids?.length ?? 0) === 0) {
+      // A post-deadline empty read is not a timely empty-cgroup observation.
+      if (
+        observedAt <= deadline &&
+        observed.error == null &&
+        (observed.pids?.length ?? 0) === 0
+      ) {
         return { descendants_remaining: false };
       }
       const leftover = observed.pids ?? [];

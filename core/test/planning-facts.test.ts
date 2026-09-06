@@ -733,6 +733,40 @@ test("defaultSpawnProvider does not succeed while containment still has descenda
   );
 });
 
+test("defaultSpawnProvider rejects an empty cgroup observed after the drain deadline", async () => {
+  const child = fakeProviderChild();
+  let calls = 0;
+  const containment: ProviderContainment = {
+    dir: "/sys/fs/cgroup/fake",
+    addPid() {},
+    remainingPids: () => {
+      calls += 1;
+      if (calls === 1) return [4242];
+      // Block the event loop so a poll scheduled before 1,000 ms completes after it.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_200);
+      return [];
+    },
+    killRemaining() {},
+    close() {},
+  };
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(
+    { ...boundedSpawnReq, maxStderrBytes: 1_024 },
+    spawnImpl,
+    containment,
+  );
+  child.emit("close", 0);
+  const result = await pending;
+  assert.equal(result.descendants_remaining, true);
+  assert.equal(result.timed_out, false);
+  assert.equal(result.spawn_error ?? false, false);
+  assert.equal(result.containment_cgroup, "/sys/fs/cgroup/fake");
+  assert.ok(
+    result.duration_ms >= 1000,
+    `event-loop delay must cross the drain deadline, duration was ${result.duration_ms}`,
+  );
+});
+
 test("defaultSpawnProvider reports no remaining descendants after kill empties the cgroup", async () => {
   const child = fakeProviderChild();
   let remaining = [4242];
