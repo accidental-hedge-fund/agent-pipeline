@@ -30,6 +30,15 @@ Item-local Cooling created by a Recovery Episode SHALL persist the candidate epo
 - **THEN** RecoverySupervisor SHALL persist a new Recovery Episode for that key
 - **AND** the prior episode's cursor SHALL NOT authorize treatment on the new key
 
+#### Scenario: Candidate movement supersedes an interrupted old-epoch claim
+
+- **WHEN** a non-candidate-changing recovery claim remains `started` for epoch E1
+- **AND** fresh observation proves that the candidate has moved to epoch E2
+- **THEN** RecoverySupervisor SHALL durably supersede the E1 claim without executing it
+- **AND** SHALL admit a fresh E2 Recovery Episode in the same cycle
+- **AND** E1 attempt bounds, class-budget projections, or Cooling SHALL NOT cool or exhaust E2
+- **AND** a candidate-changing repair claim that itself produced E2 SHALL instead remain resumable for postcondition reconciliation
+
 #### Scenario: Prose variation does not reset the cursor
 
 - **WHEN** two observations differ only in incidental formatting or comment prose and normalize to the same evidence identity

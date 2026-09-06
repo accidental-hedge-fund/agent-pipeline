@@ -2622,7 +2622,7 @@ test("regression (#787): an unobservable fresh head does not fail a started reco
   );
 });
 
-test("a started recovery claim is failed as stale when the freshly observed head genuinely differs", async () => {
+test("candidate movement supersedes a stale recovery claim and starts a fresh candidate episode", async () => {
   const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
   const contract = testContract({
     recovery_policy: {
@@ -2670,9 +2670,12 @@ test("a started recovery claim is failed as stale when the freshly observed head
   await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
 
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(recoveryCalls, 1, "the stale claim is never re-executed");
-  assert.equal(finalLedger.recovery_attempts[0].outcome, "failed");
-  assert.match(finalLedger.recovery_attempts[0].error ?? "", /stale/);
+  assert.equal(recoveryCalls, 2, "the stale claim is not replayed, but the new candidate gets a fresh attempt");
+  assert.equal(finalLedger.recovery_attempts.length, 2);
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "superseded");
+  assert.match(finalLedger.recovery_attempts[1].candidate_epoch ?? "", /head=def456/);
+  assert.notEqual(finalLedger.recovery_attempts[1].outcome, "superseded");
+  assert.equal(finalLedger.cooling, undefined, "old-candidate exhaustion cannot cool the new candidate");
   assert.ok((await readEvents(deps, "run-1")).some((event) => event.kind === "loop_recovery_attempt_stale"));
 });
 
