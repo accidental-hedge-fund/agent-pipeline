@@ -1003,9 +1003,35 @@ function crossReferencedEventNode(
 function timelinePageResponse(
   nodes: ReturnType<typeof connectedEventNode>[],
   pageInfo: { hasPreviousPage: boolean; startCursor: string | null } = { hasPreviousPage: false, startCursor: null },
+  closing?: {
+    nodes: Array<{
+      number: number;
+      headRefName: string;
+      title: string;
+      isCrossRepository: boolean;
+    }>;
+    pageInfo?: { hasPreviousPage: boolean; startCursor: string | null };
+  },
 ): string {
   return JSON.stringify({
-    data: { repository: { issue: { timelineItems: { pageInfo, nodes } } } },
+    data: {
+      repository: {
+        issue: {
+          timelineItems: { pageInfo, nodes },
+          ...(closing
+            ? {
+                closedByPullRequestsReferences: {
+                  pageInfo: closing.pageInfo ?? {
+                    hasPreviousPage: false,
+                    startCursor: null,
+                  },
+                  nodes: closing.nodes,
+                },
+              }
+            : {}),
+        },
+      },
+    },
   });
 }
 
@@ -1145,6 +1171,55 @@ test("getPrForIssueAnyState: non-closing pipeline (#N) CrossReferencedEvent reso
       }),
     ]);
   assert.equal(await getPrForIssueAnyState(TIMELINE_CFG, 1258, run), 1262);
+});
+
+test("getPrForIssueAnyState: authoritative closing PR resolves when timeline identity is non-pipeline (#1478)", async () => {
+  // Real GitHub shape from the v1.40.1 recovery: the cross-reference says
+  // willCloseTarget=false after merge, while closedByPullRequestsReferences
+  // still records the PR that actually closed the issue.
+  const run: GhApiRunner = async () =>
+    timelinePageResponse(
+      [
+        crossReferencedEventNode(1480, false, false, {
+          headRefName: "fix/release-convergence-durable",
+          title: "fix(release): make release and FRG convergence durable and idempotent",
+        }),
+      ],
+      undefined,
+      {
+        nodes: [
+          {
+            number: 1480,
+            headRefName: "fix/release-convergence-durable",
+            title: "fix(release): make release and FRG convergence durable and idempotent",
+            isCrossRepository: false,
+          },
+        ],
+      },
+    );
+  assert.equal(await getPrForIssueAnyState(TIMELINE_CFG, 1478, run), 1480);
+});
+
+test("listPrsForIssueAnyState: closing references and safe timeline identities are deduplicated", async () => {
+  const run: GhApiRunner = async () =>
+    timelinePageResponse(
+      [connectedEventNode(42), connectedEventNode(43)],
+      undefined,
+      {
+        nodes: [
+          {
+            number: 42,
+            headRefName: "fix/manual",
+            title: "manual close",
+            isCrossRepository: false,
+          },
+        ],
+      },
+    );
+  assert.deepEqual(await listPrsForIssueAnyState(TIMELINE_CFG, 154, run), {
+    numbers: [42, 43],
+    truncated: false,
+  });
 });
 
 test("getPrForIssueAnyState: an old merged PR beyond a 100-PR window is still found by paginating backward", async () => {
