@@ -199,6 +199,12 @@ train-complete, FRG pack, `pipeline release`, `release finish`, and
 (`SHIP_END_CLI` = `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"`).
 Every accepted candidate root is made runnable before spawn: resolve-and-prepare
 proves candidate readiness as SHA plus nested `core/package-lock.json` digest.
+When candidate `factory-release prepare` launches its request-bound detached
+pack loop, it adopts only the still-live, same-root, same-SHA process lease
+presented by its direct parent. The inner start revalidates that proof and
+transfers ownership to the acknowledged loop supervisor. It does not acquire a
+second lease for the same root, release the parent's lease on failure, or fall
+back to a fresh lease when inherited guard fields are partial or invalid.
 Fail-closed recovery is candidate-local (`npm ci` in that candidate `core/`).
 It is not a global package reinstall. Identity-only resolution does not
 authorize ship-end spawn. Tugboat and in-engine `pipeline ship` share that

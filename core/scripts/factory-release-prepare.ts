@@ -98,6 +98,7 @@ import {
   type FaultRecoveryMatrixRow,
 } from "./fault-recovery-matrix.ts";
 import {
+  bindInheritedCandidateProcessLease,
   defaultResolveAndPrepareDeps,
   hasCandidateProcessGuardEnv,
   resolveAndPrepareCandidateEngine,
@@ -2759,6 +2760,11 @@ export async function productionResumeBoundPackLoop(
       spawn_attempt: { error_code: "candidate_not_ready", at: isoNow(deps.spawnDeps?.now?.() ?? new Date()) },
     };
   }
+  const guardedEngine = bindInheritedCandidateProcessLease(
+    resolved.engine,
+    deps.spawnDeps?.env ?? process.env,
+    deps.resolveCandidateDeps ?? defaultResolveAndPrepareDeps(),
+  );
   const invocation = freezeCandidateInvocation({
     executable: resolved.engine.launcherPath,
     loopRunId: args.loop_run_id,
@@ -2777,7 +2783,7 @@ export async function productionResumeBoundPackLoop(
   }
   const started = await runCandidateEngineProcess({
     consumer: "factory-release.pack-loop.resume",
-    engine: resolved.engine,
+    engine: guardedEngine,
     start: (_checked, candidateEnv) => defaultResumeBoundPackLoop(
       { ...args, candidateInvocation: invocation, candidateEnv },
       deps.spawnDeps,
@@ -3015,6 +3021,11 @@ export async function productionDispatchPackLoop(
   if (!resolved.ok) {
     throw new Error(`pack-loop dispatch: ${resolved.error}`);
   }
+  const guardedEngine = bindInheritedCandidateProcessLease(
+    resolved.engine,
+    deps.env ?? process.env,
+    deps.resolveCandidateDeps ?? defaultResolveAndPrepareDeps(),
+  );
   let invocation = freezeCandidateInvocation({
     executable: resolved.engine.launcherPath,
     loopRunId: loop_run_id,
@@ -3078,7 +3089,7 @@ export async function productionDispatchPackLoop(
   try {
     const started = await runCandidateEngineProcess({
       consumer: "factory-release.pack-loop.start",
-      engine: resolved.engine,
+      engine: guardedEngine,
       start: (_checked, candidateEnv) => spawn({
         repoDir: input.repoDir,
         loop_run_id,

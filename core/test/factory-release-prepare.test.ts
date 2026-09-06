@@ -46,6 +46,7 @@ import {
   persistFactoryReleaseLoopBinding,
   productionCreateOrReusePackIssues,
   productionDispatchPackLoop,
+  productionResumeBoundPackLoop,
   reconcileFrgPackLifecycle,
   rejectForbiddenRequestFields,
   targetCheckoutsForPrepare,
@@ -87,6 +88,7 @@ import {
   uniqueOperationSloFailure,
 } from "../scripts/operation-reliability.ts";
 import { candidateProcessGuardEnv } from "../scripts/ship-end-candidate.ts";
+import { candidateReadyRecordPath } from "../scripts/candidate-engine-readiness.ts";
 
 const MANIFEST_SHA = "a".repeat(64);
 const CANDIDATE = "b".repeat(40);
@@ -2394,6 +2396,61 @@ test("productionDispatchPackLoop re-runs resolve-and-prepare for supplied invoca
   assert.equal(spawned, 0);
 });
 
+test("production dispatch adopts the ship parent lease and transfers it to the detached pack loop (#1503)", async () => {
+  const inherited = inheritedCandidateFixture("factory-release.pack-loop.start");
+  let childEnv: NodeJS.ProcessEnv | undefined;
+  const result = await productionDispatchPackLoop(
+    {
+      repoDir: "/repo",
+      request: baseRequest(),
+      pack: packWithTemplates(),
+      packRunId: "pack-nested-dispatch",
+      issue_numbers: [101, 102],
+      engineTrack: "candidate",
+      label: "factory-gate",
+    },
+    {
+      env: inherited.env,
+      fileExists: () => true,
+      resolveCandidate: inherited.resolveCandidate as never,
+      resolveCandidateDeps: inherited.resolveCandidateDeps,
+      initBoundLoop: async () => ({ loop_run_id: "loop-nested-dispatch" }),
+      persistBinding: async () => {},
+      spawnCandidateLoop: async (args) => {
+        childEnv = args.candidateEnv;
+        return { dispatch_state: "dispatched" as const, pid: 4242 };
+      },
+    },
+  );
+  assert.equal(result.loop_run_id, "loop-nested-dispatch");
+  assert.equal(childEnv?.PIPELINE_CANDIDATE_PROCESS_GUARD, "1");
+  assert.equal(JSON.parse(inherited.files.get(inherited.processLockPath)!).pid, 4242);
+});
+
+test("production resume adopts the ship parent lease and transfers it to the detached pack loop (#1503)", async () => {
+  const inherited = inheritedCandidateFixture("factory-release.pack-loop.resume");
+  const captured: { env?: NodeJS.ProcessEnv; command?: string; args?: readonly string[] } = {};
+  const result = await productionResumeBoundPackLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-nested-resume",
+      candidateInvocation: testInvocation("loop-nested-resume"),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      resolveCandidate: inherited.resolveCandidate as never,
+      resolveCandidateDeps: inherited.resolveCandidateDeps,
+      spawnDeps: {
+        ...spawnDepsForHandoff("loop-nested-resume", captured),
+        env: inherited.env,
+      },
+    },
+  );
+  assert.equal(result.dispatch_state, "dispatched");
+  assert.equal(captured.env?.PIPELINE_CANDIDATE_PROCESS_GUARD, "1");
+  assert.equal(JSON.parse(inherited.files.get(inherited.processLockPath)!).pid, 4242);
+});
+
 test("crash after persist before spawn resumes the same bound run", async () => {
   const files = new Map<string, string>();
   const request = baseRequest();
@@ -2642,6 +2699,63 @@ function preparedCandidateResolver() {
       revalidateBeforeSpawn: () => ({ ok: true as const, engine }),
     };
     return { ok: true as const, engine };
+  };
+}
+
+function inheritedCandidateFixture(
+  consumer: "factory-release.pack-loop.start" | "factory-release.pack-loop.resume",
+) {
+  const engineRoot = "/candidate-engine";
+  const stateDir = "/state";
+  const processLockPath = path.join(
+    stateDir,
+    `pipeline-candidate-process-${crypto.createHash("sha256")
+      .update(engineRoot)
+      .digest("hex")
+      .slice(0, 32)}.lock`,
+  );
+  const readyRecordPath = candidateReadyRecordPath(engineRoot, CANDIDATE, stateDir);
+  const lockBody = `${JSON.stringify({
+    schema: "pipeline-candidate-process-lock/v1",
+    engineRoot,
+    commitSha: CANDIDATE,
+    pid: process.ppid,
+    starttime: "parent-start",
+  })}\n`;
+  const files = new Map<string, string>([[processLockPath, lockBody]]);
+  const proof = {
+    engineRoot,
+    commitSha: CANDIDATE,
+    readyRecordPath,
+    lockfileDigest: "d".repeat(64),
+    processLockPath,
+    processLockDigest: crypto.createHash("sha256").update(lockBody).digest("hex"),
+  };
+  const engine = {
+    engineRoot,
+    launcherPath: CANDIDATE_LAUNCHER,
+    commitSha: CANDIDATE,
+    consumer,
+    acquireProcessLock: () => null,
+    revalidateBeforeSpawn: () => ({ ok: true as const, engine }),
+  };
+  return {
+    engine,
+    env: candidateProcessGuardEnv(proof, { PATH: "/usr/bin" }),
+    files,
+    processLockPath,
+    resolveCandidate: async () => ({ ok: true as const, engine }),
+    resolveCandidateDeps: {
+      readText: (p: string) => files.get(p) ?? null,
+      writeText: (p: string, body: string) => {
+        files.set(p, body);
+        return true;
+      },
+      statePathTrusted: (p: string) =>
+        p === stateDir || p === processLockPath || p === readyRecordPath,
+      processAlive: (pid: number, starttime: string | null) =>
+        pid === process.ppid && starttime === "parent-start",
+    } as never,
   };
 }
 

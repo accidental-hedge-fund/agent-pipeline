@@ -2492,6 +2492,38 @@ This requirement does not collapse production `A` and `B` into one `run_id`. It 
 - **THEN** the attestor SHALL fail closed
 - **AND** it SHALL NOT persist HMAC-pass `latest.json`
 
+### Requirement: Nested pack-loop launch SHALL hand off the existing candidate lease
+
+When an exact-candidate ship coordinator launches `factory-release prepare`
+under a candidate process guard and prepare launches or resumes the same
+candidate's detached pack loop, the nested start SHALL adopt the live parent
+lease only when its guard, canonical root, exact SHA, readiness record, lock
+digest, and direct-parent process identity all match. It SHALL revalidate the
+candidate at the nested start boundary and transfer the lease record to the
+acknowledged detached supervisor. A failed or non-detached nested start SHALL
+leave parent ownership intact. Partial, forged, stale, unreadable, wrong-root,
+wrong-SHA, or wrong-parent inherited evidence SHALL fail closed and SHALL NOT
+fall back to acquiring a fresh lease. An invocation without inherited guard
+fields MAY acquire the ordinary fresh candidate lease.
+
+#### Scenario: Ship prepare hands its lease to a new pack loop
+
+- **WHEN** ship starts candidate `factory-release prepare` with a valid process guard
+- **AND** prepare dispatches the same candidate's request-bound pack loop
+- **THEN** the nested launch SHALL start without contending with its own parent
+- **AND** the process lease SHALL be transferred to the acknowledged loop supervisor PID
+
+#### Scenario: Bound-loop resume uses the same handoff contract
+
+- **WHEN** guarded candidate prepare resumes its bound pack loop
+- **THEN** resume SHALL adopt and transfer the matching parent lease under the same checks
+
+#### Scenario: Invalid inherited evidence does not weaken exclusivity
+
+- **WHEN** any inherited guard field or direct-parent identity is invalid
+- **THEN** the nested candidate process SHALL NOT start
+- **AND** the parent lease SHALL remain intact
+
 ### Requirement: Pack provenance presence SHALL NOT reject a bound from-run attestation
 
 Factory Reliability Gate (FRG) attestation observation SHALL NOT treat `pack_provenance != null` as sufficient grounds to reject HMAC-pass `--from-run` evidence. `pack_provenance` SHALL still fail closed when its own validation fails. `pack_provenance` SHALL NOT substitute for HMAC-covered `factory_release_binding`. A from-run score that includes both `pack_provenance` and a matching `factory_release_binding` SHALL remain observable as accepted when the rest of the binding holds.

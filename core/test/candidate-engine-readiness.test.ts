@@ -21,6 +21,8 @@ import {
   CANDIDATE_PROCESS_GUARD_REL,
   CANDIDATE_ENGINE_CONSUMERS,
   assertCandidateEngineConsumerInventoryComplete,
+  bindInheritedCandidateProcessLease,
+  candidateProcessGuardEnv,
   candidateEngineConsumerInventoryGaps,
   candidateEngineRuntimeBindingGaps,
   runCandidateEngineProcess,
@@ -651,6 +653,93 @@ test("detached pack loop retains the candidate-root lease until the child exits 
   });
   assert.equal(afterChildExit.ok, true);
   assert.equal(reclaimed, 1);
+});
+
+test("nested candidate start inherits the live parent lease and transfers it to the detached supervisor (#1503)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  h.deps.digest = (buf) => createHash("sha256").update(buf).digest("hex");
+  h.deps.processAlive = (pid) => pid === 111 || pid === 4242;
+  const outer = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "ship.stage-adapter" },
+    h.deps,
+  );
+  assert.equal(outer.ok, true);
+  if (!outer.ok) return;
+  const parentLease = outer.engine.acquireProcessLock?.();
+  assert.ok(parentLease);
+
+  const inner = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(inner.ok, true);
+  if (!inner.ok || !parentLease) return;
+  const inherited = bindInheritedCandidateProcessLease(
+    inner.engine,
+    candidateProcessGuardEnv(parentLease.proof),
+    { ...h.deps, parentPid: () => 111 },
+  );
+  const started = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: inherited,
+    start: async () => ({ dispatch_state: "dispatched" as const, pid: 4242 }),
+    detachedSupervisor: (value) => ({ pid: value.pid, starttime: "child-st" }),
+  });
+  assert.equal(started.ok, true);
+  const lockPath = candidateRootLockPath(repo);
+  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 4242);
+  parentLease.release();
+  assert.equal(h.files.has(lockPath), true, "parent release must not remove the transferred lease");
+});
+
+test("partial or wrong-parent nested guard fails closed without deleting the parent lease (#1503)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  h.deps.digest = (buf) => createHash("sha256").update(buf).digest("hex");
+  const prepared = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.resume" },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const parentLease = prepared.engine.acquireProcessLock?.();
+  assert.ok(parentLease);
+  if (!parentLease) return;
+  let starts = 0;
+  const partial = bindInheritedCandidateProcessLease(
+    prepared.engine,
+    { PIPELINE_CANDIDATE_PROCESS_GUARD: "1" },
+    { ...h.deps, parentPid: () => 111 },
+  );
+  const partialResult = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: partial,
+    start: async () => ++starts,
+  });
+  assert.equal(partialResult.ok, false);
+
+  const wrongParent = bindInheritedCandidateProcessLease(
+    prepared.engine,
+    candidateProcessGuardEnv(parentLease.proof),
+    { ...h.deps, parentPid: () => 999 },
+  );
+  const wrongParentResult = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: wrongParent,
+    start: async () => ++starts,
+  });
+  assert.equal(wrongParentResult.ok, false);
+  assert.equal(starts, 0);
+  assert.equal(JSON.parse(h.files.get(candidateRootLockPath(repo))!).pid, 111);
 });
 
 test("candidate process lock serializes distinct SHAs on one canonical root (#1454)", async () => {

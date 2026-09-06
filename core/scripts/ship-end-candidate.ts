@@ -92,6 +92,135 @@ export function hasCandidateProcessGuardEnv(env: NodeJS.ProcessEnv | undefined):
   );
 }
 
+export interface InheritedCandidateProcessLeaseDeps {
+  readText(path: string): string | null;
+  writeText(path: string, body: string, flag: "wx" | "w"): boolean;
+  statePathTrusted(path: string): boolean;
+  processAlive(pid: number, starttime: string | null): boolean;
+  parentPid?(): number;
+}
+
+function hasAnyCandidateProcessGuardEnv(env: NodeJS.ProcessEnv): boolean {
+  return Object.values(CANDIDATE_PROCESS_GUARD_ENV).some((name) => Object.hasOwn(env, name));
+}
+
+/**
+ * Adopt the live parent candidate lease for one nested candidate start.
+ * Release is a no-op while the parent owns the record. A successful detached
+ * handoff rewrites it to the supervisor, so the parent's ownership-safe
+ * release also becomes a no-op.
+ */
+export function inheritCandidateProcessLease(
+  engine: CandidateEngine,
+  env: NodeJS.ProcessEnv,
+  deps: InheritedCandidateProcessLeaseDeps,
+): CandidateProcessLease | null {
+  if (!hasCandidateProcessGuardEnv(env)) return null;
+  const root = String(env[CANDIDATE_PROCESS_GUARD_ENV.root]);
+  const sha = String(env[CANDIDATE_PROCESS_GUARD_ENV.sha]).toLowerCase();
+  const readyRecordPath = String(env[CANDIDATE_PROCESS_GUARD_ENV.readyRecord]);
+  const lockfileDigest = String(env[CANDIDATE_PROCESS_GUARD_ENV.lockfileDigest]).toLowerCase();
+  const processLockPath = String(env[CANDIDATE_PROCESS_GUARD_ENV.processLock]);
+  const processLockDigest = String(env[CANDIDATE_PROCESS_GUARD_ENV.processLockDigest]).toLowerCase();
+  if (
+    path.resolve(root) !== engine.engineRoot ||
+    sha !== engine.commitSha ||
+    !/^[0-9a-f]{64}$/.test(lockfileDigest) ||
+    !/^[0-9a-f]{64}$/.test(processLockDigest) ||
+    !path.isAbsolute(readyRecordPath) ||
+    !path.isAbsolute(processLockPath)
+  ) return null;
+  const stateDir = path.dirname(processLockPath);
+  const expectedLockPath = path.join(
+    stateDir,
+    `pipeline-candidate-process-${createHash("sha256")
+      .update(engine.engineRoot)
+      .digest("hex")
+      .slice(0, 32)}.lock`,
+  );
+  if (
+    processLockPath !== expectedLockPath ||
+    readyRecordPath !== candidateReadyRecordPath(engine.engineRoot, engine.commitSha, stateDir) ||
+    !deps.statePathTrusted(stateDir) ||
+    !deps.statePathTrusted(processLockPath) ||
+    !deps.statePathTrusted(readyRecordPath)
+  ) return null;
+  const body = deps.readText(processLockPath);
+  if (
+    body == null ||
+    createHash("sha256").update(body).digest("hex") !== processLockDigest
+  ) return null;
+  let owner: {
+    schema?: unknown;
+    engineRoot?: unknown;
+    commitSha?: unknown;
+    pid?: unknown;
+    starttime?: unknown;
+  };
+  try {
+    owner = JSON.parse(body) as typeof owner;
+  } catch {
+    return null;
+  }
+  const parentPid = deps.parentPid?.() ?? process.ppid;
+  const starttime = typeof owner.starttime === "string" ? owner.starttime : null;
+  if (
+    owner.schema !== "pipeline-candidate-process-lock/v1" ||
+    owner.engineRoot !== engine.engineRoot ||
+    owner.commitSha !== engine.commitSha ||
+    owner.pid !== parentPid ||
+    !Number.isInteger(owner.pid) ||
+    !deps.processAlive(owner.pid as number, starttime)
+  ) return null;
+  const proof: CandidateProcessGuardProof = {
+    engineRoot: engine.engineRoot,
+    commitSha: engine.commitSha,
+    readyRecordPath,
+    lockfileDigest,
+    processLockPath,
+    processLockDigest,
+  };
+  return {
+    proof,
+    release() {
+      // The parent owns this record until a detached supervisor takes it.
+    },
+    transferTo(nextOwner) {
+      if (
+        !Number.isInteger(nextOwner.pid) ||
+        nextOwner.pid <= 0 ||
+        !deps.statePathTrusted(processLockPath) ||
+        deps.readText(processLockPath) !== body
+      ) return false;
+      const next = `${JSON.stringify({
+        schema: "pipeline-candidate-process-lock/v1",
+        engineRoot: engine.engineRoot,
+        commitSha: engine.commitSha,
+        pid: nextOwner.pid,
+        starttime: nextOwner.starttime,
+      })}\n`;
+      if (!deps.writeText(processLockPath, next, "w")) return false;
+      return deps.statePathTrusted(processLockPath) && deps.readText(processLockPath) === next;
+    },
+  };
+}
+
+/** Prefer a valid inherited guard; any partial or invalid guard fails closed. */
+export function bindInheritedCandidateProcessLease(
+  engine: CandidateEngine,
+  env: NodeJS.ProcessEnv,
+  deps: InheritedCandidateProcessLeaseDeps,
+): CandidateEngine {
+  const acquireFresh = engine.acquireProcessLock;
+  return {
+    ...engine,
+    acquireProcessLock: () => {
+      if (!hasAnyCandidateProcessGuardEnv(env)) return acquireFresh?.() ?? null;
+      return inheritCandidateProcessLease(engine, env, deps);
+    },
+  };
+}
+
 export interface CandidateEngineConsumerRoute {
   consumer: string;
   gate: "resolve-and-prepare";
