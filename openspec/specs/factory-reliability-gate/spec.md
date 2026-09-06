@@ -1,7 +1,9 @@
 # factory-reliability-gate Specification
 
 ## Purpose
-TBD - created by archiving change release-mandatory-factory-reliability-gate. Update Purpose after archive.
+
+Define the release-blocking Factory Reliability Gate, its evidence and attestation contracts, and the candidate-bound lifecycle that proves the pipeline can complete representative work safely before a version ships.
+
 ## Requirements
 ### Requirement: Every release version SHALL require a recorded Factory Reliability Gate pass
 
@@ -2494,8 +2496,9 @@ This requirement does not collapse production `A` and `B` into one `run_id`. It 
 
 ### Requirement: Nested pack-loop launch SHALL hand off the existing candidate lease
 
-When an exact-candidate ship coordinator launches `factory-release prepare`
-under a candidate process guard and prepare launches or resumes the same
+A nested pack-loop launch SHALL safely adopt and hand off its exact-candidate ship coordinator's existing process lease.
+When the coordinator launches `factory-release prepare` under a candidate
+process guard and prepare launches or resumes the same
 candidate's detached pack loop, the nested start SHALL adopt the live parent
 lease only when its guard, canonical root, exact SHA, readiness record, lock
 digest, and direct-parent process identity all match. It SHALL revalidate the
