@@ -762,12 +762,6 @@ export function defaultSpawnProvider(
         return { descendants_remaining: false };
       }
       const leftover = observed.pids ?? [];
-      const diagnostic =
-        observed.error != null
-          ? `containment drain failed: cgroup ${containment.dir} unreadable: ${observed.error}`
-          : `containment drain timed out: cgroup ${containment.dir} remaining pids: ${leftover.join(",")}`;
-      stderr =
-        stderr.length === 0 ? Buffer.from(diagnostic) : Buffer.concat([stderr, Buffer.from(`\n${diagnostic}`)]);
       return {
         descendants_remaining: true,
         containment_cgroup: containment.dir,

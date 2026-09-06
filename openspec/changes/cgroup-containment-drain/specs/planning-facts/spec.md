@@ -55,7 +55,7 @@ The Linux cgroup spawn provider containment drain SHALL use a named 1,000 ms dea
 
 ### Requirement: Drain deadline expiry with remaining members SHALL be a typed closed failure
 
-If the named drain deadline expires with remaining cgroup members, or without a successful empty-cgroup observation, the Linux cgroup spawn provider SHALL return a typed timeout or error that identifies the cgroup and, when known, the remaining PIDs. Remaining PIDs at deadline SHALL be classified as not known complete and not known absent. A failed remaining-PID observation at deadline SHALL be classified the same way. That result SHALL NOT be success. That result SHALL NOT be classified as the provider runtime ceiling. The engine SHALL NOT project a human-authority hold from drain timeout. Observation SHALL keep leftover descendants as typed `planning-facts-provider-contract` with failure class `containment`. The identifying cgroup and remaining-PID fields SHALL be dedicated typed evidence on the spawn result and observation failure. Those fields SHALL remain present when provider stderr is already at `max_stderr_bytes`.
+If the named drain deadline expires with remaining cgroup members, or without a successful empty-cgroup observation, the Linux cgroup spawn provider SHALL return a typed timeout or error that identifies the cgroup and, when known, the remaining PIDs. Remaining PIDs at deadline SHALL be classified as not known complete and not known absent. A failed remaining-PID observation at deadline SHALL be classified the same way. That result SHALL NOT be success. That result SHALL NOT be classified as the provider runtime ceiling. The engine SHALL NOT project a human-authority hold from drain timeout. Observation SHALL keep leftover descendants as typed `planning-facts-provider-contract` with failure class `containment`. The identifying cgroup and remaining-PID fields SHALL be dedicated typed evidence on the spawn result and observation failure. Those fields SHALL remain present when provider stderr is already at `max_stderr_bytes`. The spawn result SHALL NOT append containment diagnostics to stderr. Spawn result stderr length SHALL NOT exceed `max_stderr_bytes` on containment drain failure.
 
 #### Scenario: Deadline expiry names the cgroup and remaining PIDs
 
@@ -72,6 +72,13 @@ If the named drain deadline expires with remaining cgroup members, or without a 
 - **AND** provider stderr already filled the configured cap
 - **THEN** the typed failure SHALL still identify the cgroup
 - **AND** SHALL still identify the remaining PIDs
+
+#### Scenario: Containment drain failure does not exceed stderr capture
+
+- **WHEN** drain deadline expires with remaining members
+- **AND** remaining-PID diagnostics would exceed the configured stderr cap
+- **THEN** spawn result stderr length SHALL NOT exceed `max_stderr_bytes`
+- **AND** the identifying cgroup and remaining PIDs SHALL still be dedicated typed evidence
 
 #### Scenario: Drain timeout is not a human hold and not a runtime-ceiling timeout
 

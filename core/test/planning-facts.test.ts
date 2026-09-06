@@ -722,9 +722,6 @@ test("defaultSpawnProvider does not succeed while containment still has descenda
   assert.equal(result.timed_out, false);
   assert.equal(result.spawn_error ?? false, false);
   assert.equal(result.exit_code, 0);
-  const err = result.stderr.toString("utf8");
-  assert.match(err, /\/sys\/fs\/cgroup\/fake/);
-  assert.match(err, /4242/);
   assert.equal(result.containment_cgroup, "/sys/fs/cgroup/fake");
   assert.deepEqual(result.containment_remaining_pids, [4242]);
   assert.ok(
@@ -910,8 +907,34 @@ test("defaultSpawnProvider keeps containment diagnostics when stderr is already 
   const result = await pending;
   assert.equal(result.descendants_remaining, true);
   assert.equal(result.stderr_exceeded, true);
+  assert.equal(result.stderr.length, 8);
   assert.equal(result.containment_cgroup, "/sys/fs/cgroup/fake");
   assert.deepEqual(result.containment_remaining_pids, [4242]);
+});
+
+test("defaultSpawnProvider does not append containment diagnostics past maxStderrBytes", async () => {
+  const child = fakeProviderChild();
+  const remaining = Array.from({ length: 10_000 }, (_, i) => 10_000 + i);
+  const containment: ProviderContainment = {
+    dir: "/sys/fs/cgroup/fake",
+    addPid() {},
+    remainingPids: () => remaining,
+    killRemaining() {},
+    close() {},
+  };
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(
+    { ...boundedSpawnReq, maxStderrBytes: 0 },
+    spawnImpl,
+    containment,
+  );
+  child.emit("close", 0);
+  const result = await pending;
+  assert.equal(result.descendants_remaining, true);
+  assert.equal(result.stderr.length, 0);
+  assert.equal(result.containment_cgroup, "/sys/fs/cgroup/fake");
+  assert.equal(result.containment_remaining_pids?.length, 10_000);
+  assert.deepEqual(result.containment_remaining_pids?.slice(0, 2), [10_000, 10_001]);
 });
 
 test("escaped descendants after a successful-looking spawn fail containment", async () => {
