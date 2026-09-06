@@ -2954,8 +2954,20 @@ async function reapDetachFixture(opts: {
 
   const ownedGroups = killOwnedDetachFixturePids(dir, stateRoot, version);
   closeFixtureChildStdio(children);
-
-  if (liveOwnedDetachFixturePids(dir, stateRoot, version, ownedGroups).length > 0) {
+  const reapAndAwaitOwnedExit = async (): Promise<void> => {
+    for (const [group, startTime] of killOwnedDetachFixturePids(
+      dir,
+      stateRoot,
+      version,
+    )) {
+      ownedGroups.set(group, startTime);
+    }
+    if (
+      liveOwnedDetachFixturePids(dir, stateRoot, version, ownedGroups).length ===
+      0
+    ) {
+      return;
+    }
     try {
       await waitUntil(
         () =>
@@ -2970,44 +2982,37 @@ async function reapDetachFixture(opts: {
         { cause: err },
       );
     }
-  }
+  };
 
   let lastUnlinkErr: unknown;
-  const tryDelete = (): boolean => {
+  while (remainingMs() > 0) {
+    await reapAndAwaitOwnedExit();
     try {
       fs.rmSync(dir, { recursive: true, force: true });
-      return true;
     } catch (err) {
       if (!isStillMutatingUnlinkError(err)) throw err;
       lastUnlinkErr = err;
-      for (const [group, startTime] of killOwnedDetachFixturePids(
-        dir,
-        stateRoot,
-        version,
-      )) {
-        ownedGroups.set(group, startTime);
-      }
-      return false;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      continue;
     }
-  };
 
-  if (tryDelete()) return;
-
-  try {
-    await waitUntil(tryDelete, remainingMs(), "fixture temp-tree delete after reap");
-  } catch (err) {
-    const remaining = liveOwnedDetachFixturePids(
-      dir,
-      stateRoot,
-      version,
-      ownedGroups,
-    );
-    const code = (lastUnlinkErr as NodeJS.ErrnoException | undefined)?.code;
-    throw new Error(
-      `fixture temp-tree delete still mutating at deadline; live owned pids: ${formatOwnedPids(remaining)}; last unlink: ${code ?? lastUnlinkErr ?? err}`,
-      { cause: lastUnlinkErr ?? err },
-    );
+    // A writer can become visible during rmSync. Reap and observe it before
+    // accepting a successful delete, then retry if it recreated the tree.
+    await reapAndAwaitOwnedExit();
+    if (!fs.existsSync(dir)) return;
   }
+
+  const remaining = liveOwnedDetachFixturePids(
+    dir,
+    stateRoot,
+    version,
+    ownedGroups,
+  );
+  const code = (lastUnlinkErr as NodeJS.ErrnoException | undefined)?.code;
+  throw new Error(
+    `fixture temp-tree delete still mutating at deadline; live owned pids: ${formatOwnedPids(remaining)}; last unlink: ${code ?? lastUnlinkErr ?? "tree recreated after delete"}`,
+    { cause: lastUnlinkErr },
+  );
 }
 
 function writeLongLivedPipelineStub(fakePipeline: string): void {
@@ -3446,6 +3451,7 @@ test("naive rmSync of a mutating tree throws ENOTEMPTY; reapDetachFixture reaps 
   const writerPath = path.join(dir, "writer.mjs");
   let writer: ChildProcess | undefined;
   let writerPid: number | undefined;
+  let cleanupDurationMs = 0;
   try {
     fs.writeFileSync(
       writerPath,
@@ -3465,20 +3471,29 @@ test("naive rmSync of a mutating tree throws ENOTEMPTY; reapDetachFixture reaps 
         '  fs.writeFileSync(path.join(p, "f"), "x");',
         "}",
         'fs.writeFileSync(ready, "ready\\n");',
+        "let stopAt = Number.POSITIVE_INFINITY;",
+        "process.on(\"SIGTERM\", () => {",
+        "  if (!Number.isFinite(stopAt)) stopAt = Date.now() + 300;",
+        "});",
         "let n = 0;",
-        "for (;;) {",
-        "  try {",
-        "    fs.mkdirSync(nest, { recursive: true });",
-        "    fs.writeFileSync(path.join(nest, `f-${n++}`), \"x\");",
-        "    if (n % 8 === 0) {",
-        '      const extra = path.join(root, "w", `b${n}`, "c");',
-        "      fs.mkdirSync(extra, { recursive: true });",
-        '      fs.writeFileSync(path.join(extra, "f"), "x");',
+        "function mutate() {",
+        "  for (let i = 0; i < 32; i++) {",
+        "    try {",
+        "      fs.mkdirSync(nest, { recursive: true });",
+        "      fs.writeFileSync(path.join(nest, `f-${n++}`), \"x\");",
+        "      if (n % 8 === 0) {",
+        '        const extra = path.join(root, "w", `b${n}`, "c");',
+        "        fs.mkdirSync(extra, { recursive: true });",
+        '        fs.writeFileSync(path.join(extra, "f"), "x");',
+        "      }",
+        "    } catch {",
+        "      /* tree may be mid-delete */",
         "    }",
-        "  } catch {",
-        "    /* tree may be mid-delete */",
         "  }",
+        "  if (Date.now() >= stopAt) process.exit(0);",
+        "  setImmediate(mutate);",
         "}",
+        "mutate();",
         "",
       ].join("\n"),
     );
@@ -3506,13 +3521,19 @@ test("naive rmSync of a mutating tree throws ENOTEMPTY; reapDetachFixture reaps 
       `naive rmSync never threw ENOTEMPTY/EBUSY within ${NAIVE_RM_BITE_DEADLINE_MS}ms; ${describePidAndTree(writerPid, dir)}`,
     );
   } finally {
+    const cleanupStart = Date.now();
     await reapDetachFixture({
       dir,
       stateRoot,
       version,
       children: [writer],
     });
+    cleanupDurationMs = Date.now() - cleanupStart;
   }
+  assert.ok(
+    cleanupDurationMs >= 250,
+    `cleanup returned before delayed SIGTERM writer exit (${cleanupDurationMs}ms)`,
+  );
   assert.equal(fs.existsSync(dir), false, "shared seam must delete the temp tree");
   if (writerPid !== undefined) {
     assert.notEqual(

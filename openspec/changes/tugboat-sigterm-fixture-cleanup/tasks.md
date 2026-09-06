@@ -27,3 +27,4 @@
 ## 5. Review hardening
 
 - [x] 5.1 Add a deterministic fixture where an owned process-group leader exits while a descendant remains live, verify the old observer drops that descendant, and retain group tracking without accepting a reused live leader pid.
+- [x] 5.2 Make the mutating writer delay SIGTERM exit and require the cleanup seam to observe owned-process exit before every delete retry and again after a successful delete.

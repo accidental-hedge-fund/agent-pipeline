@@ -63,7 +63,8 @@ Tugboat lifecycle fixture cleanup SHALL terminate only fixture-owned processes: 
 #### Scenario: ENOTEMPTY is not swallowed
 
 - **WHEN** recursive delete of the fixture temp tree hits `ENOTEMPTY` or an equivalent still-mutating unlink error
-- **THEN** cleanup SHALL retry only inside the named deadline after another reap of owned processes
+- **THEN** cleanup SHALL retry only inside the named deadline after another reap and observed exit of owned processes
+- **AND** a successful later delete SHALL NOT count as complete until a post-delete observation also finds no live owned process
 - **AND** if the tree is still mutating at the deadline, cleanup SHALL fail
 - **AND** it SHALL NOT catch-and-ignore that error as a pass
 
