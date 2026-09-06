@@ -799,6 +799,27 @@ test("resolveLinkedPrDelivery: returns the adopted delivery branch and exact liv
   );
 });
 
+test("advanceFix source pin: external no-op delivers on the adopted PR branch and skips push when live head matches (#1478)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const deliveryIdx = src.indexOf("const delivery = await resolveLinkedPrDelivery(");
+  const captureIdx = src.indexOf("if (verifiedOnRemote) externalDeliveryBranch = delivery!.branch;");
+  const branchIdx = src.indexOf("const branch = externalDeliveryBranch ?? branchName(issueNumber, wt.slug);");
+  const adoptedCheckIdx = src.indexOf("if (externalDeliveryBranch) {");
+  const pushIdx = src.indexOf("if (!skipAncestorPush) {");
+  assert.ok(deliveryIdx !== -1, "production external-fix verification must resolve the linked PR delivery identity");
+  assert.ok(captureIdx !== -1, "verified adopted PR head must become the delivery branch");
+  assert.ok(branchIdx !== -1, "push identity must prefer the adopted PR branch over the synthetic workspace branch");
+  assert.ok(adoptedCheckIdx !== -1 && pushIdx !== -1 && adoptedCheckIdx < pushIdx);
+  const skipSlice = src.slice(adoptedCheckIdx, pushIdx);
+  assert.match(skipSlice, /resolvePr\(cfg, externalDeliveryBranch\)/);
+  assert.match(skipSlice, /live\.headSha\.toLowerCase\(\) !== localHead\.toLowerCase\(\)/);
+  assert.match(skipSlice, /skipAncestorPush = true/);
+  assert.ok(
+    !skipSlice.includes("branchName(issueNumber, wt.slug)"),
+    "adopted-PR skip-push must not re-derive the synthetic workspace branch",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // #553: an external stage executor (invokeStageExecutor) is a bare HTTP call
 // with no cwd/worktree concept — it cannot commit into wt.path directly. When

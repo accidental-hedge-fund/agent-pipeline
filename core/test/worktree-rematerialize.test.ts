@@ -190,6 +190,26 @@ test("ensureManagedWorktree: adopted PR rematerializes a synthetic managed branc
   assert.equal(out.worktree?.branch, `pipeline/${ISSUE}-adopted-pr-${PR}`);
 });
 
+test("ensureManagedWorktree: adopted PR recovery without prNumber fails closed", async () => {
+  let createCalls = 0;
+  const out = await ensureManagedWorktree(cfg, ISSUE, {
+    recoveryTarget: { branch: "fix/release-convergence-durable", headSha: TIP_SHA },
+    getOnDiskForIssue: async () => null,
+    getIssueTitle: async () => {
+      throw new Error("must not derive identity from the issue title");
+    },
+    gitCmd: async () => ({ stdout: "", stderr: "", code: 0 }),
+    createWorktree: async () => {
+      createCalls += 1;
+      return { path: WT_PATH, branch: BRANCH };
+    },
+  });
+  assert.equal(out.result, "fail");
+  assert.equal(out.blockerKind, "worktree-missing");
+  assert.match(out.reason, /linked PR recovery identity is invalid/);
+  assert.equal(createCalls, 0);
+});
+
 test("ensureManagedWorktree: stale metadata without on-disk path → rematerialize", async () => {
   // getOnDiskForIssue returns null even if "manager" might remember something.
   let createCalls = 0;

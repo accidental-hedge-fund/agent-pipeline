@@ -13,6 +13,7 @@ import {
   runAdvance,
   type AdvanceDeps,
 } from "../scripts/pipeline-run.ts";
+import { ensureManagedWorktree } from "../scripts/worktree.ts";
 import {
   FACTORY_CONTROL_DIR_ENV,
   PRODUCTION_PIN_ENV,
@@ -75,14 +76,14 @@ function reviewComment(sha: string): string {
   return `## Review 2 (Adversarial) — approve\n\n<!-- reviewed-sha: ${sha} -->`;
 }
 
-function prDetail(headSha: string): PrDetail {
+function prDetail(headSha: string, headRef = `pipeline/${ISSUE}-x`): PrDetail {
   return {
     number: PR,
     title: "T",
     body: "B",
     state: "open",
     url: `https://example.test/pull/${PR}`,
-    head_ref: `pipeline/${ISSUE}-x`,
+    head_ref: headRef,
     head_sha: headSha,
     base_ref: "main",
     mergeable: true,
@@ -112,6 +113,8 @@ type DriveOpts = {
   worktreeHead?: string;
   /** Simulate exact linked-PR rematerialization after park cleanup. */
   rematerializeMissingWorktree?: boolean;
+  /** Adopted PR head_ref used for rematerialize. Default is the synthetic pipeline branch. */
+  adoptedHeadRef?: string;
   worktreeDirty?: boolean;
   worktreeNotAncestor?: boolean;
   /** After the first managed-worktree fetch, PR HEAD becomes this SHA (H→J race). */
@@ -151,8 +154,8 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
   let clearBlockedCalls = 0;
   let finalizeCalls = 0;
   let currencyCalls = 0;
-  const wtSlug = "x";
-  const wtPath = path.join(repoDir, ".worktrees", `pipeline-${ISSUE}-${wtSlug}`);
+  let wtSlug = "x";
+  let wtPath = path.join(repoDir, ".worktrees", `pipeline-${ISSUE}-${wtSlug}`);
   let worktreeHead = opts.worktreeHead ?? null;
   let currentPrHead = opts.prHead;
   const origLog = console.log;
@@ -280,7 +283,7 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
     getPrDetail: async () => {
       if (opts.headError) throw new Error("cannot read PR HEAD");
       if (!currentPrHead) throw new Error("getPrDetail must not run without a PR");
-      return prDetail(currentPrHead);
+      return prDetail(currentPrHead, opts.adoptedHeadRef);
     },
     getPrCommits: async () => opts.commits,
     ...(opts.currencySequence
@@ -295,7 +298,7 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
       : {}),
     getOnDiskForIssue: async () =>
       worktreeHead ? { path: wtPath, slug: wtSlug } : null,
-    rematerializeMissingWorktree: async () => {
+    rematerializeMissingWorktree: async (config, item) => {
       if (!opts.rematerializeMissingWorktree) {
         return {
           result: "fail" as const,
@@ -303,6 +306,29 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
           reason: "linked PR worktree cannot be rematerialized",
           blockerKind: "worktree-missing" as const,
         };
+      }
+      if (opts.adoptedHeadRef) {
+        return ensureManagedWorktree(config, item, {
+          recoveryTarget: {
+            branch: opts.adoptedHeadRef,
+            headSha: currentPrHead ?? "",
+            prNumber: PR,
+          },
+          getOnDiskForIssue: async () => null,
+          gitCmd: async () => ({ stdout: "", stderr: "", code: 0 }),
+          resolveOpenPrHeadForBranch: async () => null,
+          createWorktree: async (_cfg, _issue, slug) => {
+            wtSlug = slug;
+            wtPath = path.join(repoDir, ".worktrees", `pipeline-${ISSUE}-${slug}`);
+            worktreeHead = currentPrHead;
+            return { path: wtPath, branch: `pipeline/${ISSUE}-${slug}` };
+          },
+          gitInWorktree: async () => ({
+            stdout: `${currentPrHead ?? ""}\n`,
+            stderr: "",
+            code: 0,
+          }),
+        });
       }
       worktreeHead = currentPrHead;
       return {
@@ -706,6 +732,22 @@ test("epoch restart rematerializes a missing managed worktree at exact PR HEAD",
   assert.ok(r.transitions.some((t) => t.from === "visual-gate" && t.to === "review-1"));
 });
 
+test("epoch restart rematerializes an adopted PR head after park cleanup (#1478)", async () => {
+  const r = await driveLaterStage({
+    startStage: "visual-gate",
+    prHead: SHA_H,
+    adoptedHeadRef: "fix/release-convergence-durable",
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+    rematerializeMissingWorktree: true,
+  });
+  assert.ok(r.dispatchStages.includes("review-1"));
+  assert.equal(r.dispatchStages.includes("visual-gate"), false);
+  assert.equal(r.reviewDispatchedAtSha, SHA_H);
+  assert.equal(r.reviewDispatchedAtWorktreeHead, SHA_H);
+  assert.ok(r.transitions.some((t) => t.from === "visual-gate" && t.to === "review-1"));
+});
+
 test("epoch restart fails closed when a missing managed worktree cannot be rematerialized", async () => {
   const r = await driveLaterStage({
     startStage: "visual-gate",
@@ -748,6 +790,11 @@ test("nested whole-item, pipeline single, and loop item dispatch share runAdvanc
   assert.match(
     PIPELINE_RUN_SRC,
     /isLaterStageForReviewCurrency\(stage\)/,
+  );
+  assert.match(
+    PIPELINE_RUN_SRC,
+    /recoveryTarget:\s*\{[\s\S]*branch:\s*live\.head_ref[\s\S]*prNumber/,
+    "epoch-restart rematerialize must retain the live adopted PR delivery identity",
   );
   const laterIdx = PIPELINE_RUN_SRC.indexOf("reconcileLaterStageReviewCurrency");
   const rtdFinalizeIdx = PIPELINE_RUN_SRC.indexOf('runTerminalFinalize("in-loop")');
