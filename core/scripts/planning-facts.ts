@@ -110,6 +110,10 @@ export interface PlanningFactsContractFailure {
     ignored?: string;
     exit_code?: number | null;
     duration_ms?: number;
+    /** Dedicated containment diagnostics; independent of stderr capture. */
+    containment_cgroup?: string;
+    containment_remaining_pids?: number[];
+    containment_observe_error?: string;
   };
 }
 
@@ -152,8 +156,14 @@ export interface SpawnProviderResult {
   stdout_exceeded?: boolean;
   /** True when capture stopped at maxStderrBytes and the provider was terminated. */
   stderr_exceeded?: boolean;
-  /** True when the containment drain observed remaining PIDs after descendant kill. */
+  /** True when the containment drain did not observe an empty cgroup after descendant kill. */
   descendants_remaining?: boolean;
+  /** Cgroup path for a typed containment failure; independent of stderr capture. */
+  containment_cgroup?: string;
+  /** Remaining PIDs at drain deadline; independent of stderr capture. */
+  containment_remaining_pids?: number[];
+  /** remainingPids() observation failure; independent of stderr capture. */
+  containment_observe_error?: string;
 }
 
 export interface TrustedProviderFile {
@@ -164,6 +174,10 @@ export interface TrustedProviderFile {
 export interface ProviderContainment {
   dir?: string;
   addPid: (pid: number) => void;
+  /**
+   * Successful empty observation is `[]`. Throws when the cgroup cannot be
+   * read or parsed — that is not an empty observation.
+   */
   remainingPids: () => number[];
   killRemaining: () => void;
   close: () => void;
@@ -445,15 +459,32 @@ export function createCgroupContainment(): ProviderContainment {
   const id = `pipeline-pf-${process.pid}-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
   const dir = path.join(parent, id);
   fs.mkdirSync(dir);
-  const readPids = (): number[] => {
+  const parseCgroupProcs = (text: string): number[] => {
+    const tokens = text.trim().split(/\s+/).filter(Boolean);
+    const pids: number[] = [];
+    for (const token of tokens) {
+      const n = Number(token);
+      if (!Number.isInteger(n) || n <= 0) {
+        throw new Error(`containment: unreadable cgroup ${dir}: invalid pid token`);
+      }
+      pids.push(n);
+    }
+    return pids;
+  };
+  const remainingPids = (): number[] => {
+    let text: string;
     try {
-      return fs
-        .readFileSync(path.join(dir, "cgroup.procs"), "utf8")
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean)
-        .map((p) => Number(p))
-        .filter((n) => Number.isInteger(n) && n > 0);
+      text = fs.readFileSync(path.join(dir, "cgroup.procs"), "utf8");
+    } catch (err) {
+      throw new Error(
+        `containment: unreadable cgroup ${dir}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return parseCgroupProcs(text);
+  };
+  const readPidsBestEffort = (): number[] => {
+    try {
+      return remainingPids();
     } catch {
       return [];
     }
@@ -468,7 +499,7 @@ export function createCgroupContainment(): ProviderContainment {
         /* process already exited */
       }
     },
-    remainingPids: readPids,
+    remainingPids,
     killRemaining() {
       const killFile = path.join(dir, "cgroup.kill");
       try {
@@ -479,7 +510,7 @@ export function createCgroupContainment(): ProviderContainment {
       } catch {
         /* fall through to per-pid kill */
       }
-      for (const pid of readPids()) {
+      for (const pid of readPidsBestEffort()) {
         try {
           process.kill(pid, "SIGKILL");
         } catch {
@@ -653,6 +684,7 @@ export function defaultSpawnProvider(
     let timedOut = false;
     let terminating = false;
     let settled = false;
+    let childCompleted = false;
     let timeoutTimer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
     let followupTimer: NodeJS.Timeout | undefined;
@@ -674,6 +706,9 @@ export function defaultSpawnProvider(
       timed_out: boolean;
       spawn_error?: boolean;
       descendants_remaining?: boolean;
+      containment_cgroup?: string;
+      containment_remaining_pids?: number[];
+      containment_observe_error?: string;
     }): Omit<SpawnProviderResult, "duration_ms"> => ({
       exit_code: extra.exit_code,
       stdout,
@@ -683,28 +718,60 @@ export function defaultSpawnProvider(
       stdout_exceeded: stdoutExceeded,
       stderr_exceeded: stderrExceeded,
       descendants_remaining: extra.descendants_remaining,
+      containment_cgroup: extra.containment_cgroup,
+      containment_remaining_pids: extra.containment_remaining_pids,
+      containment_observe_error: extra.containment_observe_error,
     });
-    const reapContainment = async (): Promise<boolean> => {
+    const observeRemainingPids = (): { pids?: number[]; error?: string } => {
+      try {
+        return { pids: containment.remainingPids() };
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
+    };
+    const reapContainment = async (): Promise<{
+      descendants_remaining: boolean;
+      containment_cgroup?: string;
+      containment_remaining_pids?: number[];
+      containment_observe_error?: string;
+    }> => {
       // Always send cgroup.kill (or per-pid SIGKILL). A setsid grandchild can
       // sit in the nested cgroup while cgroup.procs looks empty for a tick.
       // The empty-procs short-circuit skipped kill on GitHub Actions (#1300 CI).
       containment.killRemaining();
       if (!containment.dir) {
-        return false;
+        return { descendants_remaining: false };
       }
       const deadline = Date.now() + PROVIDER_CONTAINMENT_DRAIN_MS;
-      let leftover = containment.remainingPids();
-      while (Date.now() < deadline && leftover.length > 0) {
+      let observed = observeRemainingPids();
+      while (
+        Date.now() < deadline &&
+        (observed.error != null || (observed.pids?.length ?? 0) > 0)
+      ) {
         await new Promise((r) => setTimeout(r, PROVIDER_CONTAINMENT_DRAIN_POLL_MS));
-        leftover = containment.remainingPids();
+        observed = observeRemainingPids();
       }
-      if (leftover.length === 0) {
-        return false;
+      if (observed.error == null && (observed.pids?.length ?? 0) === 0) {
+        return { descendants_remaining: false };
       }
-      const diagnostic = `containment drain timed out: cgroup ${containment.dir} remaining pids: ${leftover.join(",")}`;
+      const leftover = observed.pids ?? [];
+      const diagnostic =
+        observed.error != null
+          ? `containment drain failed: cgroup ${containment.dir} unreadable: ${observed.error}`
+          : `containment drain timed out: cgroup ${containment.dir} remaining pids: ${leftover.join(",")}`;
       stderr =
         stderr.length === 0 ? Buffer.from(diagnostic) : Buffer.concat([stderr, Buffer.from(`\n${diagnostic}`)]);
-      return true;
+      return {
+        descendants_remaining: true,
+        containment_cgroup: containment.dir,
+        ...(observed.error != null
+          ? { containment_observe_error: observed.error }
+          : { containment_remaining_pids: leftover }),
+      };
+    };
+    const disarmRuntimeTimer = () => {
+      clearTimeout(timeoutTimer);
+      timeoutTimer = undefined;
     };
     let child: ChildProcess;
     let command = req.command;
@@ -756,6 +823,7 @@ export function defaultSpawnProvider(
     }
     const beginTerminate = (reason: "timeout" | "ceiling") => {
       if (settled || terminating) return;
+      if (reason === "timeout" && childCompleted) return;
       terminating = true;
       if (reason === "timeout") timedOut = true;
       containment.killRemaining();
@@ -771,8 +839,8 @@ export function defaultSpawnProvider(
             /* ignore */
           }
           void (async () => {
-            const descendants_remaining = await reapContainment();
-            finish(snapshotResult({ exit_code: child.exitCode, timed_out: timedOut, descendants_remaining }));
+            const drain = await reapContainment();
+            finish(snapshotResult({ exit_code: child.exitCode, timed_out: timedOut, ...drain }));
           })();
         }, PROVIDER_KILL_FOLLOWUP_MS);
       }, PROVIDER_KILL_GRACE_MS);
@@ -799,8 +867,10 @@ export function defaultSpawnProvider(
       beginTerminate("timeout");
     }, req.timeoutMs);
     child.on("error", (err) => {
+      childCompleted = true;
+      disarmRuntimeTimer();
       void (async () => {
-        const descendants_remaining = await reapContainment();
+        const drain = await reapContainment();
         finish({
           exit_code: -1,
           stdout,
@@ -809,14 +879,16 @@ export function defaultSpawnProvider(
           spawn_error: true,
           stdout_exceeded: stdoutExceeded,
           stderr_exceeded: stderrExceeded,
-          descendants_remaining,
+          ...drain,
         });
       })();
     });
     child.on("close", (code) => {
+      childCompleted = true;
+      disarmRuntimeTimer();
       void (async () => {
-        const descendants_remaining = await reapContainment();
-        finish(snapshotResult({ exit_code: code, timed_out: timedOut, descendants_remaining }));
+        const drain = await reapContainment();
+        finish(snapshotResult({ exit_code: code, timed_out: timedOut, ...drain }));
       })();
     });
   });
@@ -1348,13 +1420,24 @@ export async function observePlanningFacts(
       });
     }
     if (spawned.descendants_remaining) {
-      return fail("containment", "escaped descendants remained after provider exit", provider.id, {
+      const detailParts = ["escaped descendants remained after provider exit"];
+      if (spawned.containment_cgroup) detailParts.push(`cgroup ${spawned.containment_cgroup}`);
+      if (spawned.containment_remaining_pids?.length) {
+        detailParts.push(`remaining pids: ${spawned.containment_remaining_pids.join(",")}`);
+      }
+      if (spawned.containment_observe_error) {
+        detailParts.push(`observe error: ${spawned.containment_observe_error}`);
+      }
+      return fail("containment", detailParts.join(": "), provider.id, {
         stdout: truncateUtf8(spawned.stdout, trustedCfg.max_stdout_bytes),
         stderr: truncateUtf8(spawned.stderr, trustedCfg.max_stderr_bytes),
         porcelain: post.porcelain,
         ignored: post.ignored,
         exit_code: spawned.exit_code,
         duration_ms: spawned.duration_ms,
+        containment_cgroup: spawned.containment_cgroup,
+        containment_remaining_pids: spawned.containment_remaining_pids,
+        containment_observe_error: spawned.containment_observe_error,
       });
     }
 

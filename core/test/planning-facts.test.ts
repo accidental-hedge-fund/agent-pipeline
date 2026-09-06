@@ -725,6 +725,8 @@ test("defaultSpawnProvider does not succeed while containment still has descenda
   const err = result.stderr.toString("utf8");
   assert.match(err, /\/sys\/fs\/cgroup\/fake/);
   assert.match(err, /4242/);
+  assert.equal(result.containment_cgroup, "/sys/fs/cgroup/fake");
+  assert.deepEqual(result.containment_remaining_pids, [4242]);
   assert.ok(
     result.duration_ms >= 1000,
     `containment drain deadline must be 1000ms, duration was ${result.duration_ms}`,
@@ -799,6 +801,85 @@ test("defaultSpawnProvider does not drain remainingPids without a cgroup dir", a
   );
 });
 
+test("defaultSpawnProvider fails closed when remainingPids observation throws", async () => {
+  const child = fakeProviderChild();
+  const containment: ProviderContainment = {
+    dir: "/sys/fs/cgroup/fake",
+    addPid() {},
+    remainingPids: () => {
+      throw new Error("EACCES: cgroup.procs");
+    },
+    killRemaining() {},
+    close() {},
+  };
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(
+    { ...boundedSpawnReq, maxStderrBytes: 1_024 },
+    spawnImpl,
+    containment,
+  );
+  child.emit("close", 0);
+  const result = await pending;
+  assert.equal(result.descendants_remaining, true);
+  assert.equal(result.timed_out, false);
+  assert.equal(result.spawn_error ?? false, false);
+  assert.equal(result.containment_cgroup, "/sys/fs/cgroup/fake");
+  assert.match(result.containment_observe_error ?? "", /EACCES/);
+});
+
+test("defaultSpawnProvider does not classify a post-close drain as a runtime timeout", async () => {
+  const child = fakeProviderChild();
+  let firstObserved: number | undefined;
+  const containment: ProviderContainment = {
+    dir: "/sys/fs/cgroup/fake",
+    addPid() {},
+    remainingPids: () => {
+      firstObserved ??= Date.now();
+      return Date.now() - firstObserved < 200 ? [4242] : [];
+    },
+    killRemaining() {},
+    close() {},
+  };
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(
+    { ...boundedSpawnReq, timeoutMs: 50 },
+    spawnImpl,
+    containment,
+  );
+  child.emit("close", 0);
+  const result = await pending;
+  assert.equal(result.timed_out, false);
+  assert.equal(result.descendants_remaining, false);
+  assert.equal(result.exit_code, 0);
+  assert.ok(result.duration_ms >= 200, `drain must outlast timeoutMs, duration was ${result.duration_ms}`);
+});
+
+test("defaultSpawnProvider keeps containment diagnostics when stderr is already at cap", async () => {
+  const child = fakeProviderChild();
+  const remaining = [4242];
+  const containment: ProviderContainment = {
+    dir: "/sys/fs/cgroup/fake",
+    addPid() {},
+    remainingPids: () => remaining,
+    killRemaining() {},
+    close() {},
+  };
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(
+    { ...boundedSpawnReq, maxStderrBytes: 8 },
+    spawnImpl,
+    containment,
+  );
+  child.stderr.emit("data", Buffer.alloc(500, 0x62));
+  await new Promise((r) => setImmediate(r));
+  child.emit("close", 0);
+  const result = await pending;
+  assert.equal(result.descendants_remaining, true);
+  assert.equal(result.stderr_exceeded, true);
+  assert.equal(result.containment_cgroup, "/sys/fs/cgroup/fake");
+  assert.deepEqual(result.containment_remaining_pids, [4242]);
+});
+
 test("escaped descendants after a successful-looking spawn fail containment", async () => {
   const observation = await observePlanningFacts({
     cfg: cfg(),
@@ -818,6 +899,46 @@ test("escaped descendants after a successful-looking spawn fail containment", as
   if (!observation.ok) {
     assert.equal(observation.failureClass, "containment");
     assert.match(observation.reason, /escaped descendants/);
+  }
+});
+
+test("containment diagnostics survive a filled stderr cap", async () => {
+  const observation = await observePlanningFacts({
+    cfg: cfg(),
+    worktreeDir: "/wt",
+    deps: baseDeps({
+      blobs: {
+        ".github/pipeline.yml": Buffer.from(`planning_facts:
+  max_stderr_bytes: 8
+  providers:
+    - id: alembic-head
+      executable: scripts/pipeline/planning-facts/alembic-head
+      required: true
+      facts:
+        alembic_head: string
+`),
+        "scripts/pipeline/planning-facts/alembic-head": TRUSTED_SCRIPT,
+      },
+      spawnImpl: () => ({
+        exit_code: 0,
+        stdout: Buffer.from(JSON.stringify({ schema_version: 1, facts: { alembic_head: "0074" } })),
+        stderr: Buffer.alloc(8, 0x62),
+        timed_out: false,
+        duration_ms: 1,
+        descendants_remaining: true,
+        containment_cgroup: "/sys/fs/cgroup/fake",
+        containment_remaining_pids: [4242],
+      }),
+    }),
+  });
+  assert.equal(observation.ok, false);
+  if (!observation.ok) {
+    assert.equal(observation.failureClass, "containment");
+    assert.match(observation.reason, /\/sys\/fs\/cgroup\/fake/);
+    assert.match(observation.reason, /4242/);
+    assert.equal(observation.evidence?.containment_cgroup, "/sys/fs/cgroup/fake");
+    assert.deepEqual(observation.evidence?.containment_remaining_pids, [4242]);
+    assert.equal((observation.evidence?.stderr ?? "").includes("4242"), false);
   }
 });
 
