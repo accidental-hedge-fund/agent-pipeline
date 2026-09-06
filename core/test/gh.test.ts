@@ -265,7 +265,7 @@ test("isTransientGhError: HTTP 403 without rate-limit body is deterministic", ()
 // This is added in gh.ts for this test module. If it's not present, the tests
 // below will fail at import time (proving the bite).
 
-import { getPrChecks, getPrDiff, ghRunForTest, postComment } from "../scripts/gh.ts";
+import { getPrChecks, getPrDetail, getPrDiff, ghRunForTest, postComment } from "../scripts/gh.ts";
 import type { GhRunOptions } from "../scripts/gh.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import { diffFilePaths } from "../scripts/stages/review-parsing.ts";
@@ -291,6 +291,45 @@ test("ghRun retry loop: transient 401 fails once then succeeds → returns succe
   const result = await ghRunForTest(["issue", "view", "1"], { runner, sleep, retries: 3 });
   assert.equal(result, "success");
   assert.equal(calls, 2, "exactly 2 subprocess invocations");
+});
+
+test("getPrDetail retains repository-qualified head identity from the verified gh shape (#1478)", async () => {
+  let argv: string[] = [];
+  const detail = await getPrDetail(
+    { repo: "acme/repo" } as PipelineConfig,
+    1480,
+    {
+      runner: async (args) => {
+        argv = args;
+        return {
+          stdout: JSON.stringify({
+            number: 1480,
+            title: "t",
+            body: "",
+            state: "OPEN",
+            url: "https://example.test/pr/1480",
+            headRefName: "fix/release",
+            headRefOid: "a".repeat(40),
+            headRepository: { nameWithOwner: "acme/repo" },
+            isCrossRepository: false,
+            baseRefName: "main",
+            mergeable: "MERGEABLE",
+            mergeStateStatus: "CLEAN",
+            isDraft: false,
+            additions: 1,
+            deletions: 0,
+            changedFiles: 1,
+            mergeCommit: null,
+          }),
+        };
+      },
+    },
+  );
+  const jsonFields = argv[argv.indexOf("--json") + 1] ?? "";
+  assert.match(jsonFields, /(?:^|,)headRepository(?:,|$)/);
+  assert.match(jsonFields, /(?:^|,)isCrossRepository(?:,|$)/);
+  assert.equal(detail.head_repo_full_name, "acme/repo");
+  assert.equal(detail.is_cross_repository, false);
 });
 
 test("ghRun retry loop: deterministic 404 is not retried → throws after 1 invocation, sleep never called", async () => {

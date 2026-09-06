@@ -18,11 +18,11 @@ import { clearBlocked, getIssueDetail } from "../gh.ts";
 import { invoke } from "../harness.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import { performPreMergeAutoFix } from "../stages/pre_merge.ts";
+import { resolveLinkedPrDelivery } from "../pr-delivery.ts";
 import { withTrailers } from "../traceability.ts";
 import type { StageDiagnostic } from "../stage-diagnostic.ts";
 import { LABEL_PREFIX, type PipelineConfig } from "../types.ts";
 import {
-  branchName,
   ensureManagedWorktree,
   getOnDiskForIssue,
   gitInWorktree,
@@ -110,6 +110,7 @@ export interface RepairPipelineItemDeps {
   invoke?: typeof invoke;
   performRepair?: typeof performPreMergeAutoFix;
   clearBlocked?: typeof clearBlocked;
+  resolveLinkedPrDelivery?: typeof resolveLinkedPrDelivery;
 }
 
 function expectedHead(candidateIdentity: string): string | null {
@@ -145,6 +146,7 @@ export function createRepairPipelineItemExecutor(
   const invokeHarness = deps.invoke ?? invoke;
   const repair = deps.performRepair ?? performPreMergeAutoFix;
   const unblock = deps.clearBlocked ?? clearBlocked;
+  const resolveDelivery = deps.resolveLinkedPrDelivery ?? resolveLinkedPrDelivery;
 
   return async (input) => {
     const issueNumber = Number(input.itemId);
@@ -156,6 +158,13 @@ export function createRepairPipelineItemExecutor(
     const expected = expectedHead(input.candidateIdentity);
     if (!expected) {
       const error = `repair attempt ${input.attemptId} has no verified head in its candidate identity`;
+      return { succeeded: false, evidence: error, error };
+    }
+
+    const delivery = await resolveDelivery(cfg, issueNumber);
+    if (!delivery) {
+      const error =
+        `repair attempt ${input.attemptId} cannot verify an open same-repository linked PR delivery identity`;
       return { succeeded: false, evidence: error, error };
     }
 
@@ -190,7 +199,19 @@ export function createRepairPipelineItemExecutor(
 
     let wt = await getWorktree(cfg, issueNumber);
     if (!wt) {
-      const materialized = await ensureWorktree(cfg, issueNumber);
+      if (delivery.headSha.toLowerCase() !== expected.toLowerCase()) {
+        const error =
+          `recovery candidate moved before worktree rematerialization: claimed ${expected}, ` +
+          `linked PR is ${delivery.headSha}`;
+        return { succeeded: false, evidence: error, error };
+      }
+      const materialized = await ensureWorktree(cfg, issueNumber, {
+        recoveryTarget: {
+          branch: delivery.branch,
+          headSha: delivery.headSha,
+          prNumber: delivery.prNumber,
+        },
+      });
       if (materialized.result === "fail" || !materialized.worktree) {
         const error =
           materialized.result === "fail"
@@ -223,7 +244,7 @@ export function createRepairPipelineItemExecutor(
             "with uncommitted changes; local/remote drift stays RecoverySupervisor-owned";
           return { succeeded: false, evidence: error, error };
         }
-        const branch = branchName(issueNumber, wt.slug);
+        const branch = delivery.branch;
         const remote = await git(
           wt.path,
           ["ls-remote", "origin", `refs/heads/${branch}`],
@@ -337,7 +358,7 @@ export function createRepairPipelineItemExecutor(
         }
       }
       if (marked) {
-        const branch = branchName(issueNumber, wt.slug);
+        const branch = delivery.branch;
         const remote = await git(
           wt.path,
           ["ls-remote", "origin", `refs/heads/${branch}`],
@@ -467,7 +488,7 @@ export function createRepairPipelineItemExecutor(
           ? path.join(cfg.repo_dir, ".agent-pipeline", "runs", input.runId)
           : undefined;
     const base = cfg.base_branch;
-    const branch = branchName(issueNumber, wt.slug);
+    const branch = delivery.branch;
     const integrity =
       storeRoot && base
         ? {
@@ -527,6 +548,7 @@ export function createRepairPipelineItemExecutor(
       },
       undefined,
       integrity,
+      delivery,
     );
     // Controlled completion (any status): retire the breadcrumb so it can
     // only ever vouch for a genuinely interrupted (crashed) harness run.

@@ -1939,6 +1939,10 @@ export interface PrDetail {
   url: string;
   head_ref: string;
   head_sha: string;
+  /** Repository that owns the PR head ref (`owner/name`), verified from GitHub. */
+  head_repo_full_name?: string;
+  /** True when the PR head repository differs from the base repository. */
+  is_cross_repository?: boolean;
   base_ref: string;
   mergeable: boolean | null;
   mergeable_state: string;

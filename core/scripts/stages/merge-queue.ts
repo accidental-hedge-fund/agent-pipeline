@@ -39,6 +39,7 @@ import {
   type RunReleaseFn,
 } from "./merge-queue-release-when-complete.ts";
 import { performPreMergeAutoFix } from "./pre_merge.ts";
+import { resolveLinkedPrDelivery } from "../pr-delivery.ts";
 import { runRelease } from "./release.ts";
 import {
   applyReadmeLandingContractGate,
@@ -774,6 +775,7 @@ export async function runSharedMechanicalRepair(
     gitInWorktree?: typeof gitInWorktree;
     performRepair?: typeof performPreMergeAutoFix;
     invoke?: typeof invoke;
+    resolveLinkedPrDelivery?: typeof resolveLinkedPrDelivery;
     /** #857 integrity context; production sets store via repo_dir. */
     integrity?: DeterministicRebaseDeps["integrity"];
   } = {},
@@ -783,6 +785,7 @@ export async function runSharedMechanicalRepair(
   const git = deps.gitInWorktree ?? gitInWorktree;
   const repair = deps.performRepair ?? performPreMergeAutoFix;
   const invokeFn = deps.invoke ?? invoke;
+  const resolveDelivery = deps.resolveLinkedPrDelivery ?? resolveLinkedPrDelivery;
 
   if (!cfg.harnesses?.implementer) {
     return {
@@ -792,9 +795,26 @@ export async function runSharedMechanicalRepair(
     };
   }
 
+  const delivery = await resolveDelivery(cfg, candidate.issueNumber, {
+    getPrForIssue: async () => candidate.prNumber,
+  });
+  if (!delivery || delivery.prNumber !== candidate.prNumber) {
+    return {
+      succeeded: false,
+      evidence: "linked open same-repository PR delivery identity is unavailable",
+      error: "unverified PR delivery identity",
+    };
+  }
+
   let wt = await getWorktree(cfg, candidate.issueNumber);
   if (!wt) {
-    const materialized = await ensureWorktree(cfg, candidate.issueNumber);
+    const materialized = await ensureWorktree(cfg, candidate.issueNumber, {
+      recoveryTarget: {
+        branch: delivery.branch,
+        headSha: delivery.headSha,
+        prNumber: delivery.prNumber,
+      },
+    });
     if (materialized.result === "fail" || !materialized.worktree) {
       const detail =
         materialized.result === "fail"
@@ -825,6 +845,9 @@ export async function runSharedMechanicalRepair(
         commitSubjectPrefix: `fix: merge-queue surgical repair`,
         salvageLabel: "merge-queue surgical repair",
       },
+      undefined,
+      undefined,
+      delivery,
     );
 
   const toMechanical = (
@@ -862,7 +885,7 @@ export async function runSharedMechanicalRepair(
       : undefined);
   const base = cfg.base_branch;
   if (!deps.integrity?.skip && storeRoot && base) {
-    const branch = branchName(candidate.issueNumber, wt.slug);
+    const branch = delivery.branch;
     const subject = deps.integrity?.subject ?? {
       run_id: path.basename(storeRoot),
       issue: candidate.issueNumber,

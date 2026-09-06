@@ -850,7 +850,7 @@ test("source wiring: pre_merge autofix/archive and fix rematerialize before bare
   );
   assert.match(
     preMerge,
-    /recoveryTarget:\s*\{[\s\S]*?branch:\s*prDetail\.head_ref[\s\S]*?headSha:\s*prDetail\.head_sha[\s\S]*?prNumber/,
+    /recoveryTarget:\s*\{[\s\S]*?branch:\s*delivery\.branch[\s\S]*?headSha:\s*delivery\.headSha[\s\S]*?prNumber:\s*delivery\.prNumber/,
     "pre-merge autofix rematerialization must retain the adopted PR identity",
   );
   assert.match(

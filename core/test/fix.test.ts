@@ -792,11 +792,54 @@ test("isCommitOnLinkedPr: missing, moved, or unreadable linked PR fails closed",
 
 test("resolveLinkedPrDelivery: returns the adopted delivery branch and exact live head", async () => {
   assert.deepEqual(
-    await resolveLinkedPrDelivery({} as PipelineConfig, 1478, {
+    await resolveLinkedPrDelivery({ repo: "acme/repo" } as PipelineConfig, 1478, {
       getPrForIssue: async () => 1480,
-      getPrDetail: async () => ({ head_ref: "fix/release-convergence-durable", head_sha: SHA_HEAD }) as any,
+      getPrDetail: async () => ({
+        number: 1480,
+        state: "open",
+        head_ref: "fix/release-convergence-durable",
+        head_sha: SHA_HEAD,
+        head_repo_full_name: "acme/repo",
+        is_cross_repository: false,
+      }) as any,
     }),
-    { branch: "fix/release-convergence-durable", headSha: SHA_HEAD, prNumber: 1480 },
+    {
+      branch: "fix/release-convergence-durable",
+      headSha: SHA_HEAD,
+      prNumber: 1480,
+      repository: "acme/repo",
+    },
+  );
+});
+
+test("resolveLinkedPrDelivery: closed or cross-repository PR heads fail closed", async () => {
+  const cfg = { repo: "acme/repo" } as PipelineConfig;
+  const base = {
+    number: 1480,
+    head_ref: "main",
+    head_sha: SHA_HEAD,
+    head_repo_full_name: "acme/repo",
+    is_cross_repository: false,
+  };
+  assert.equal(
+    await resolveLinkedPrDelivery(cfg, 1478, {
+      getPrForIssue: async () => 1480,
+      getPrDetail: async () => ({ ...base, state: "closed" }) as any,
+    }),
+    null,
+  );
+  assert.equal(
+    await resolveLinkedPrDelivery(cfg, 1478, {
+      getPrForIssue: async () => 1480,
+      getPrDetail: async () => ({
+        ...base,
+        state: "open",
+        head_repo_full_name: "attacker/fork",
+        is_cross_repository: true,
+      }) as any,
+    }),
+    null,
+    "a fork branch named main must never authorize a push to base origin/main",
   );
 });
 
@@ -2585,7 +2628,14 @@ test("advanceFix: park-released adopted PR rematerializes with exact recoveryTar
   deps.getOnDiskForIssue = async () => null;
   deps.getPrForIssue = async () => 1480;
   deps.getPrDetail = async () =>
-    ({ head_ref: "fix/release-convergence-durable", head_sha: SHA_HEAD }) as Awaited<
+    ({
+      number: 1480,
+      state: "open",
+      head_ref: "fix/release-convergence-durable",
+      head_sha: SHA_HEAD,
+      head_repo_full_name: "acme/x",
+      is_cross_repository: false,
+    }) as Awaited<
       ReturnType<NonNullable<AdvanceFixDeps["getPrDetail"]>>
     >;
   deps.ensureManagedWorktree = async (_cfg, _issue, ensureDeps) => {

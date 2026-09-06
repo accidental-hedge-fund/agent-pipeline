@@ -33,6 +33,7 @@ import {
   gitExecForwardingEnv,
   runConfiguredGitPush,
 } from "../git-push-auth.ts";
+import type { PrDeliveryAuthority } from "../pr-delivery.ts";
 import {
   declaredScopeFromFindingPaths,
   runCoveredCandidateMutation,
@@ -586,7 +587,7 @@ export async function performPreMergeAutoFix(
   /** #857: when set, head-moving auto-fix runs under candidate-integrity. */
   integrity?: PreMergeAutoFixIntegrityOpts,
   /** Linked PR delivery authority; differs from the managed local branch for adopted PRs. */
-  delivery?: { branch: string; headSha: string; prNumber: number },
+  delivery?: PrDeliveryAuthority,
 ): Promise<PreMergeAutoFixResult> {
   const harness = cfg.harnesses?.implementer;
   if (!harness) return { status: "error" };

@@ -636,7 +636,7 @@ export async function getPrDetail(
       "view",
       String(prNumber),
       "--json",
-      "number,title,body,state,url,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,isDraft,additions,deletions,changedFiles,mergeCommit",
+      "number,title,body,state,url,headRefName,headRefOid,headRepository,isCrossRepository,baseRefName,mergeable,mergeStateStatus,isDraft,additions,deletions,changedFiles,mergeCommit",
       "-R",
       cfg.repo,
     ],
@@ -650,6 +650,8 @@ export async function getPrDetail(
     url: string;
     headRefName: string;
     headRefOid: string;
+    headRepository: { nameWithOwner: string } | null;
+    isCrossRepository: boolean;
     baseRefName: string;
     mergeable: string;
     mergeStateStatus: string;
@@ -670,6 +672,8 @@ export async function getPrDetail(
     url: data.url,
     head_ref: data.headRefName,
     head_sha: data.headRefOid,
+    head_repo_full_name: data.headRepository?.nameWithOwner ?? "",
+    is_cross_repository: data.isCrossRepository,
     base_ref: data.baseRefName,
     mergeable:
       data.mergeable === "MERGEABLE" ? true : data.mergeable === "CONFLICTING" ? false : null,

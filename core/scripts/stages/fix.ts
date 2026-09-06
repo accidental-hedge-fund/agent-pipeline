@@ -128,6 +128,8 @@ import {
   prepareWorktreePushAuthEnv,
   runConfiguredGitPush,
 } from "../git-push-auth.ts";
+import { resolveLinkedPrDelivery } from "../pr-delivery.ts";
+export { resolveLinkedPrDelivery } from "../pr-delivery.ts";
 
 export interface AdvanceFixOpts {
   dryRun?: boolean;
@@ -539,24 +541,6 @@ export async function isCommitOnLinkedPr(
     return Boolean(sha.trim()) && (pr.head_sha ?? "").trim().toLowerCase() === sha.trim().toLowerCase();
   } catch {
     return false;
-  }
-}
-
-export async function resolveLinkedPrDelivery(
-  cfg: PipelineConfig,
-  issueNumber: number,
-  deps: { getPrForIssue?: typeof getPrForIssue; getPrDetail?: typeof getPrDetail } = {},
-): Promise<{ branch: string; headSha: string; prNumber: number } | null> {
-  try {
-    const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber);
-    if (prNumber == null) return null;
-    const pr = await (deps.getPrDetail ?? getPrDetail)(cfg, prNumber);
-    const branch = pr.head_ref.trim();
-    const headSha = (pr.head_sha ?? "").trim().toLowerCase();
-    if (!branch || !/^[0-9a-f]{40}$/.test(headSha)) return null;
-    return { branch, headSha, prNumber };
-  } catch {
-    return null;
   }
 }
 

@@ -49,6 +49,7 @@ import {
 } from "../pipeline-commits.ts";
 import { runCiDocsStaleHeal } from "../ci-docs-stale-heal.ts";
 import type { CheckRun, Outcome, PipelineConfig, Stage } from "../types.ts";
+import { prDeliveryAuthority } from "../pr-delivery.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import { readEvents } from "../run-store.ts";
 import type { RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
@@ -552,6 +553,15 @@ export async function advance(
       deps.attemptPreMergeAutoFix ??
       (cfg.harnesses?.implementer
         ? async (blockingFindings, issueTitle, findingsText, claimAttempt) => {
+            const delivery = prDeliveryAuthority(cfg, prDetail);
+            if (!delivery || delivery.prNumber !== prNumber) {
+              return {
+                status: "rematerialize-failed",
+                blockerKind: "worktree-missing",
+                diagnostic:
+                  "pre-merge autofix refused: open same-repository PR delivery identity is unavailable",
+              };
+            }
             let wt = await getForIssueForAutoFix(cfg, issueNumber);
             if (!wt) {
               const remat = await ensureWtForAutoFix(cfg, issueNumber, {
@@ -559,9 +569,9 @@ export async function advance(
                 runDir: opts.runDir,
                 runStoreDeps: opts.runStoreDeps,
                 recoveryTarget: {
-                  branch: prDetail.head_ref,
-                  headSha: prDetail.head_sha,
-                  prNumber,
+                  branch: delivery.branch,
+                  headSha: delivery.headSha,
+                  prNumber: delivery.prNumber,
                 },
               });
               if (remat.result === "fail") {
@@ -591,9 +601,9 @@ export async function advance(
               claimAttempt,
               undefined,
               {
-                branch: prDetail.head_ref,
-                headSha: prDetail.head_sha,
-                prNumber,
+                branch: delivery.branch,
+                headSha: delivery.headSha,
+                prNumber: delivery.prNumber,
               },
             );
           }

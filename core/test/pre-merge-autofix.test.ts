@@ -1463,6 +1463,7 @@ test("performPreMergeAutoFix: adopted PR prompt and pipeline push retain deliver
       branch: "fix/release-convergence-durable",
       headSha: "sha1",
       prNumber: 1480,
+      repository: "acme/repo",
     },
   );
   assert.deepEqual(result, { status: "fix-committed", headSha: "sha3" });
