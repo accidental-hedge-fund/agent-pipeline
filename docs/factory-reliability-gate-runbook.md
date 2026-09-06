@@ -804,8 +804,10 @@ binding mismatch) are disposed as `terminal_failed`; eligible packs are disposed
 while their evidence remains on disk.
 
 Disposal never merges. It releases each clean, recoverable managed worktree, compare-and-deletes
-same-repository remote branches at the observed PR heads, and closes all bound PRs and issues.
-Unsafe worktree ownership, dirt, local-only commits, or a moved branch fails closed and leaves the
+same-repository remote branches at the observed PR heads, and closes all bound PRs and issues. A PR
+must use the exact managed `pipeline/<issue>-...` fixture branch; a normal PR that merely mentions
+the issue is never cleanup authority. Missing bound issues, malformed or empty legacy identity,
+unsafe worktree ownership, dirt, local-only commits, or a moved branch fail closed and leave the
 version active for the next identical invocation to retry. A successful terminal writes
 `pack-disposition.json` under that request's factory-release artifact directory. Re-running is
 idempotent: absent/closed artifacts remain disposed and no replacement pack is created.

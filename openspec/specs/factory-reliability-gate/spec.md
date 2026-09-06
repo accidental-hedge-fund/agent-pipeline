@@ -420,8 +420,11 @@ reconcile that pack to `terminal_failed`; after structurally eligible scoring it
 it to `completed`. Reconciliation SHALL close
 every bound synthetic issue and every associated open PR without merge, safely release each
 clean managed worktree, and compare-and-delete each same-repository remote branch against the
-observed PR head. Dirty, local-only, ambiguously owned, moved, or otherwise unsafe artifacts
-SHALL fail closed and keep the version active so the same request retries cleanup. Each completed
+observed PR head. A linked PR SHALL be eligible for disposal only when its head follows the managed
+`pipeline/<issue>-...` fixture-branch identity for that exact issue. A missing bound issue, empty or
+malformed legacy issue identity, dirty or local-only worktree, ambiguously owned PR, moved branch,
+or otherwise unsafe artifact SHALL fail closed and keep the version active so the same request
+retries cleanup. Each completed
 terminal reconciliation SHALL write a durable disposition receipt. Re-running the same request
 or successor SHALL be idempotent and SHALL NOT accumulate orphan fixture packs. This prepare
 lifecycle is distinct from the standalone scorer's historical rule that a non-pass does not
@@ -460,6 +463,8 @@ close artifacts as a scoring side effect.
 - **WHEN** an exact pack reaches `completed` or `terminal_failed`
 - **THEN** cleanup SHALL release recoverable managed worktrees before deleting their branches
 - **AND** remote deletion SHALL require the branch to remain at the observed PR head
+- **AND** a merely related PR without the exact managed fixture-branch identity SHALL remain
+  untouched and fail reconciliation closed
 - **AND** no PR SHALL be merged
 - **AND** re-running cleanup after resources are absent or closed SHALL succeed without creating
   replacement resources

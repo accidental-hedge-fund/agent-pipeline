@@ -76,7 +76,7 @@ import {
   resolveStateHome,
   runDir,
 } from "./loop/store.ts";
-import type { LoopContract } from "./loop/types.ts";
+import type { LoopContract, LoopLedger } from "./loop/types.ts";
 import {
   PACK_LOOP_STDERR_HEAD_BYTES,
   PACK_LOOP_STDERR_TAIL_BYTES,
@@ -742,6 +742,10 @@ export interface FrgPackLifecycleResult {
   errors: string[];
 }
 
+export function isManagedFrgFixtureBranch(branch: string, issueNumber: number): boolean {
+  return branch.startsWith(`pipeline/${issueNumber}-`) && branch.length > `pipeline/${issueNumber}-`.length;
+}
+
 /**
  * Give every synthetic fixture in one exact pack a single terminal disposition.
  * Cleanup is ordered so recoverability is retained until the local worktree is
@@ -774,7 +778,10 @@ export async function reconcileFrgPackLifecycle(
       result.errors.push(`issue #${issueNumber}: lookup failed: ${(err as Error).message}`);
       continue;
     }
-    if (!issue) continue;
+    if (!issue) {
+      result.errors.push(`issue #${issueNumber}: bound fixture issue is missing or inaccessible`);
+      continue;
+    }
     if (!issue.labels.includes("factory-gate")) {
       result.errors.push(`issue #${issueNumber}: missing factory-gate provenance label`);
       continue;
@@ -801,8 +808,15 @@ export async function reconcileFrgPackLifecycle(
     for (const pr of prs) {
       try {
         const detail = await deps.getPrBranch(pr);
-        if (!detail || !detail.sameRepository) {
-          result.errors.push(`PR #${pr}: branch is not a same-repository FRG branch`);
+        if (
+          !detail ||
+          !detail.sameRepository ||
+          !isManagedFrgFixtureBranch(detail.branch, issueNumber)
+        ) {
+          result.errors.push(
+            `PR #${pr}: branch is not the managed same-repository fixture branch for ` +
+              `issue #${issueNumber}`,
+          );
           unsafePr = true;
           continue;
         }
@@ -1320,6 +1334,8 @@ export interface FactoryReleasePackInstance {
   loop_run_id: string | null;
   /** Exact synthetic fixtures created for this pack; used for bounded cleanup. */
   issue_numbers?: number[];
+  /** False until every manifest fixture is durably bound. */
+  fixture_set_complete?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -4534,8 +4550,10 @@ async function readFactoryReleaseVersionIndex(
   }
 }
 
-async function lifecycleIssueNumbers(
+export async function lifecycleIssueNumbers(
   index: FactoryReleaseVersionIndex,
+  loadLegacyLedger: (loopRunId: string) => Promise<LoopLedger> =
+    (loopRunId) => readLedger(defaultLoopStoreDeps(), loopRunId),
 ): Promise<number[]> {
   if (Array.isArray(index.issue_numbers)) {
     if (index.fixture_set_complete === false) {
@@ -4559,10 +4577,12 @@ async function lifecycleIssueNumbers(
     );
   }
   try {
-    const ledger = await readLedger(defaultLoopStoreDeps(), index.loop_run_id);
-    return itemsFromLoopLedger(ledger)
-      .map((item) => Number(item.item_id))
-      .filter((n) => Number.isSafeInteger(n) && n > 0);
+    const ledger = await loadLegacyLedger(index.loop_run_id);
+    const raw = itemsFromLoopLedger(ledger).map((item) => Number(item.item_id));
+    if (raw.length === 0 || raw.some((n) => !Number.isSafeInteger(n) || n <= 0)) {
+      throw new Error("ledger contains no complete exact numeric fixture issue set");
+    }
+    return raw;
   } catch (err) {
     throw new Error(
       `factory-release prepare: cannot recover fixture issues for active legacy FRG pack ` +

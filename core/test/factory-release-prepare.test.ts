@@ -31,6 +31,7 @@ import {
   generateDurableUnsignedFrg,
   honestLatestJsonBindsRequest,
   isBoundPackLoopTerminal,
+  lifecycleIssueNumbers,
   isPathInsideCheckout,
   REQUEST_INSIDE_CHECKOUT_TOKEN,
   resolveRequestPathForContainment,
@@ -4336,6 +4337,80 @@ test("FRG pack lifecycle releases worktrees, CAS-deletes branches, and closes ev
   assert.deepEqual(second.closed_prs, []);
   assert.deepEqual(second.closed_issues, []);
   assert.equal(second.errors.length, 0);
+});
+
+test("FRG pack lifecycle fails closed for a missing issue or unrelated PR branch", async () => {
+  let mutations = 0;
+  const baseDeps = {
+    findPrsForIssue: async () => ({ numbers: [301], truncated: false }),
+    getPrBranch: async () => ({
+      branch: "feature/unrelated",
+      headSha: "a".repeat(40),
+      sameRepository: true,
+      state: "open" as const,
+    }),
+    releaseManagedWorktree: async () => {
+      mutations += 1;
+      return { action: "released" as const, reason: "unexpected" };
+    },
+    deleteRemoteBranch: async () => { mutations += 1; },
+    closePr: async () => { mutations += 1; },
+    closeIssue: async () => { mutations += 1; },
+  };
+  const missing = await reconcileFrgPackLifecycle(
+    {
+      version: "1.40.1",
+      packRunId: "pack-missing-issue",
+      issueNumbers: [111],
+      disposition: "superseded",
+    },
+    { ...baseDeps, getIssueStateAndLabels: async () => null },
+  );
+  assert.match(missing.errors[0] ?? "", /bound fixture issue is missing or inaccessible/);
+
+  const unrelated = await reconcileFrgPackLifecycle(
+    {
+      version: "1.40.1",
+      packRunId: "pack-unrelated-pr",
+      issueNumbers: [112],
+      disposition: "superseded",
+    },
+    {
+      ...baseDeps,
+      getIssueStateAndLabels: async () => ({ state: "open" as const, labels: ["factory-gate"] }),
+    },
+  );
+  assert.match(unrelated.errors[0] ?? "", /not the managed same-repository fixture branch/);
+  assert.equal(mutations, 0);
+});
+
+test("legacy lifecycle recovery rejects a readable ledger without exact numeric issues", async () => {
+  const legacyIndex = {
+    schema_version: 1 as const,
+    version: "1.40.1",
+    request_fingerprint: "5".repeat(64),
+    candidate_git_sha: "a".repeat(40),
+    action_id: "legacy-action",
+    pack_run_id: "legacy-empty-pack",
+    loop_run_id: "legacy-empty-loop",
+    disposition: "active" as const,
+  };
+  await assert.rejects(
+    lifecycleIssueNumbers(
+      legacyIndex,
+      async () => JSON.parse('{"schema":1,"run_id":"legacy-empty-loop","items":{}}'),
+    ),
+    /no complete exact numeric fixture issue set/,
+  );
+  await assert.rejects(
+    lifecycleIssueNumbers(
+      legacyIndex,
+      async () => JSON.parse(
+        '{"schema":1,"run_id":"legacy-empty-loop","items":{"not-an-issue":{"state":"ready"}}}',
+      ),
+    ),
+    /no complete exact numeric fixture issue set/,
+  );
 });
 
 test("changed release request disposes the active version pack before generating one successor", async () => {
