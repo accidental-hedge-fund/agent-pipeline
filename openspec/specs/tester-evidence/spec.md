@@ -627,6 +627,14 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 - **AND** SHALL mark scratch unlink, harness-dirt checkpoint, and unpublished-stage publish recipes inapplicable
 - **AND** SHALL NOT present S1 worktree HEAD or S1 Tester evidence as implementation-role proof for S2
 
+#### Scenario: Recovery refreshes a pre-PR trusted-surface decision
+
+- **WHEN** a process persists a blocked or pre-PR trusted-surface decision and then crashes after opening or pushing linked PR P at head S
+- **AND** the recovery recipe can now observe P/S
+- **THEN** recovery SHALL recompute and durably persist trusted-surface identity for S using the blocked run's pinned engine
+- **AND** SHALL pass that fresh same-SHA decision to Tester rebind
+- **AND** SHALL NOT reject an otherwise recoverable P/S binding solely because the earlier pre-PR decision was stale
+
 #### Scenario: PR head movement after execution is a typed mismatch, not a generic wait
 
 - **WHEN** bind and the pre-attempt observer observed PR head S1

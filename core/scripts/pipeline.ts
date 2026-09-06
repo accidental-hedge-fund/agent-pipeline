@@ -90,6 +90,11 @@ import { makePipelineRunId } from "./traceability.ts";
 import { mintLogicalOperationId } from "./logical-operation.ts";
 import { normalizeFullSha } from "./trusted-surface.ts";
 import {
+  computeTrustedSurfaceFromObjectSource,
+  gitRepoObjectSource,
+  type ComputeTrustedSurfaceFromObjectSourceInput,
+} from "./trusted-surface-candidate.ts";
+import {
   branchName,
   ensureManagedWorktree,
   getForIssue,
@@ -152,6 +157,7 @@ import {
   listRunIds,
   parseWriteHealthText,
   persistPublicEntrypointAdmission,
+  persistTrustedSurfaceDecision,
   readTrustedSurfaceDecision,
   resolveRunEngineIdentity,
   runDirPath,
@@ -2047,6 +2053,10 @@ export interface RealExecuteRecoveryDeps {
   getPrForIssue?: typeof getPrForIssue;
   getPrDetail?: typeof getPrDetail;
   readTrustedSurfaceDecision?: typeof import("./run-store.ts").readTrustedSurfaceDecision;
+  computeTrustedSurfaceFromObjectSource?: (
+    input: ComputeTrustedSurfaceFromObjectSourceInput,
+  ) => ReturnType<typeof computeTrustedSurfaceFromObjectSource>;
+  persistTrustedSurfaceDecision?: typeof persistTrustedSurfaceDecision;
   /** Blocked-run engine identity from run.json (not the currently installed engine). */
   resolveRunEngineIdentity?: typeof resolveRunEngineIdentity;
 }
@@ -2793,7 +2803,7 @@ export function realExecuteRecovery(
         const runId = input.evidence?.pipeline_run_id?.trim() ?? "";
         const runDir = runId ? runDirPath(cfg.repo_dir, runId) : "";
         const readTs = deps.readTrustedSurfaceDecision ?? readTrustedSurfaceDecision;
-        const trustedSurface = runDir ? await readTs(runDir).catch(() => null) : null;
+        let trustedSurface = runDir ? await readTs(runDir).catch(() => null) : null;
         let pushedHeadSha: string | null = null;
         try {
           const wt = await getWorktree(cfg, issueNumber);
@@ -2809,6 +2819,31 @@ export function realExecuteRecovery(
           return failed(
             "rebind_tester_evidence_after_pr: blocked run engine identity is absent or malformed",
           );
+        }
+        const livePrHeadSha = normalizeFullSha(prDetail?.head_sha);
+        const storedCandidateSha = normalizeFullSha(trustedSurface?.candidate_sha);
+        if (
+          runDir &&
+          livePrHeadSha &&
+          (!trustedSurface ||
+            trustedSurface.outcome === "blocked" ||
+            storedCandidateSha !== livePrHeadSha)
+        ) {
+          const computeFresh =
+            deps.computeTrustedSurfaceFromObjectSource ?? computeTrustedSurfaceFromObjectSource;
+          const fresh = await computeFresh({
+            candidateSha: livePrHeadSha,
+            enginePin: persistedEngine!,
+            extraPaths: cfg.trusted_surface?.extra_paths ?? [],
+            source: gitRepoObjectSource(cfg.repo_dir, gitInWt, cfg.base_branch),
+          }).catch(() => null);
+          if (fresh) {
+            const persistFresh =
+              deps.persistTrustedSurfaceDecision ?? persistTrustedSurfaceDecision;
+            trustedSurface = await persistFresh(runDir, fresh).catch(() => null);
+          } else {
+            trustedSurface = null;
+          }
         }
         const rebind = await rebindFn({
           cfg,

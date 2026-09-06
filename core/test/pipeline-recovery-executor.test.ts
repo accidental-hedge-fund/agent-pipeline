@@ -617,6 +617,80 @@ test("rebind_tester_evidence_after_pr executes the shared bind and does not repa
   assert.match(result.evidence, /rebind_tester_evidence_after_pr/);
 });
 
+test("rebind_tester_evidence_after_pr refreshes stale pre-PR trusted surface", async () => {
+  const sha = "a".repeat(40);
+  const verifierHash = "c".repeat(64);
+  let computedFor: string | null = null;
+  let persistedFor: string | null = null;
+  let reboundTrustedSurface: { outcome?: string; candidate_sha?: string } | null = null;
+  const freshDecision = {
+    schema_version: 1,
+    path_class_schema_version: 1,
+    outcome: "passthrough",
+    candidate_sha: sha,
+    base_sha: "b".repeat(40),
+    triggering_paths: [],
+    classes: [],
+    effective_verifier_hash: verifierHash,
+    reason: { code: "no_trusted_paths_changed", summary: "passthrough" },
+  } as const;
+  const execute = realExecuteRecovery(cfg(), {
+    resolveRunEngineIdentity: async () => persistedEngineIdentity(),
+    getPrForIssue: async () => 99,
+    getPrDetail: async () => ({ number: 99, head_sha: sha }) as never,
+    readTrustedSurfaceDecision: async () => ({
+      outcome: "blocked",
+      candidate_sha: "0".repeat(40),
+      effective_verifier_hash: null,
+    }) as never,
+    computeTrustedSurfaceFromObjectSource: async (input) => {
+      computedFor = input.candidateSha;
+      assert.equal(input.enginePin.commit_sha, PERSISTED_ENGINE.commit_sha);
+      return freshDecision;
+    },
+    persistTrustedSurfaceDecision: async (_runDir, decision) => {
+      persistedFor = decision.candidate_sha;
+      return decision;
+    },
+    rebindTesterEvidenceAfterPr: async (input) => {
+      reboundTrustedSurface = input.trustedSurface;
+      return {
+        ok: true,
+        action: "bind",
+        candidateSha: sha,
+        evidence: { candidate_sha: sha } as never,
+        suiteCommandInvoked: false,
+      };
+    },
+    clearBlocked: async () => {},
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "stale pre-PR trusted surface",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      trusted_surface_outcome: "blocked",
+      pr_head: sha,
+    },
+  });
+
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "rebind_tester_evidence_after_pr",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+
+  assert.equal(result.succeeded, true, result.error ?? result.evidence);
+  assert.equal(computedFor, sha);
+  assert.equal(persistedFor, sha);
+  assert.deepEqual(reboundTrustedSurface, freshDecision);
+});
+
 test("rebind_tester_evidence_after_pr passes pushed worktree HEAD for the mismatch guard", async () => {
   const pushed = "a".repeat(40);
   const prHead = "b".repeat(40);
