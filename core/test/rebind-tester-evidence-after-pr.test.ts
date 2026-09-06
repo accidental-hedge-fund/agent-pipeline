@@ -61,6 +61,7 @@ import { DEFAULT_CONFIG, type PipelineConfig, type Stage } from "../scripts/type
 
 const SHA_S = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const SHA_C = "cccccccccccccccccccccccccccccccccccccccc";
 const ZERO_SHA = "0".repeat(40);
 const VERIFIER_H = "c".repeat(64);
 const ENGINE_FP = "d".repeat(64);
@@ -851,11 +852,11 @@ async function driveDesignGateAdvance(opts: {
     })) as AdvanceDeps["getIssueDetail"],
     getGhActor: async () => "pipeline-bot",
     getPrForIssue: async () => opts.prNumber,
-    getPrDetail: async () => {
-      if (!opts.prNumber) return null;
+    getPrDetail: async (_cfg, requestedPrNumber) => {
+      if (!requestedPrNumber) return null;
       const sequenced = opts.prHeadSequence?.[prHeadReads++];
       return {
-        number: opts.prNumber,
+        number: requestedPrNumber,
         head_sha: sequenced ?? opts.prHeadSha ?? SHA_S,
       } as never;
     },
@@ -1522,8 +1523,8 @@ test("observer does not accept worktree S1 proof when live PR head is S2", async
     getPrDetail: async () => ({ number: 99, head_sha: SHA_B }) as never,
     getPrDiff: async () => "",
     expectedPrHeadSha: SHA_S,
-    onObservedPrHead: async (liveSha) => {
-      observedLive = liveSha;
+    onObservedPrHead: async (livePr) => {
+      observedLive = livePr.headSha;
     },
     runDir,
     testerIo: io,
@@ -1636,8 +1637,8 @@ test("observer after phase invokes PR-head mismatch hook", async () => {
     getPrDetail: async () => ({ number: 99, head_sha: SHA_B }) as never,
     getPrDiff: async () => "",
     expectedPrHeadSha: SHA_S,
-    onObservedPrHead: async (liveSha) => {
-      observed.push({ phase: "hook", liveSha });
+    onObservedPrHead: async (livePr) => {
+      observed.push({ phase: "hook", liveSha: livePr.headSha });
     },
     runDir,
     testerIo: io,
@@ -1738,7 +1739,7 @@ test("runAdvance rebinds a successful fix-1 push instead of treating it as forei
     startStage: "fix-1",
     prNumber: 99,
     prHeadSha: SHA_S,
-    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B, SHA_B],
     worktreeHead: SHA_S,
     worktreeHeadAfter: SHA_B,
     tester: boundPassed(),
@@ -1773,12 +1774,104 @@ test("runAdvance rebinds a successful fix-1 push instead of treating it as forei
   );
 });
 
+test("delivery observer carries PR number and head as one snapshot", async () => {
+  let prLookups = 0;
+  let observed: { prNumber: number | null; headSha: string | null } | null = null;
+  const observer = createDeliveryStageEvidenceObserver(cfg(), 1468, "fix-1", false, {
+    getIssueDetail: async () => ({
+      number: 1468,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: "https://example.test/1468",
+      labels: ["pipeline:review-2"],
+      comments: [],
+    }),
+    getOnDiskForIssue: async () => ({ path: "/wt/1468", slug: "1468-x" }) as never,
+    gitInWorktree: async (_cwd, args) =>
+      args[0] === "rev-parse"
+        ? { stdout: `${SHA_B}\n`, stderr: "", code: 0 }
+        : { stdout: "core/scripts/pipeline-run.ts\n", stderr: "", code: 0 },
+    getPrForIssue: async () => (++prLookups === 1 ? 99 : 100),
+    getPrDetail: async (_cfg, pr) => ({ number: pr, head_sha: SHA_B }) as never,
+    getPrDiff: async () => "",
+    expectedPrHeadSha: SHA_S,
+    onObservedPrHead: async (livePr) => {
+      observed = livePr;
+    },
+  });
+  await observer("after");
+  assert.deepEqual(observed, { prNumber: 99, headSha: SHA_B });
+  assert.equal(prLookups, 1);
+});
+
+test("delivery observer does not replace a null linked-PR snapshot with a later PR", async () => {
+  let prLookups = 0;
+  let observed: { prNumber: number | null; headSha: string | null } | null = null;
+  const observer = createDeliveryStageEvidenceObserver(cfg(), 1468, "fix-1", false, {
+    getIssueDetail: async () => ({
+      number: 1468,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: "https://example.test/1468",
+      labels: ["pipeline:review-2"],
+      comments: [],
+    }),
+    getOnDiskForIssue: async () => null,
+    getPrForIssue: async () => (++prLookups === 1 ? null : 99),
+    getPrDetail: async (_cfg, pr) => ({ number: pr, head_sha: SHA_B }) as never,
+    getPrDiff: async () => "",
+    expectedPrHeadSha: SHA_S,
+    onObservedPrHead: async (livePr) => {
+      observed = livePr;
+    },
+  });
+  const evidence = await observer("after");
+  assert.deepEqual(observed, { prNumber: null, headSha: null });
+  assert.equal(prLookups, 1);
+  assert.equal(evidence.postconditionProven, false);
+});
+
+test("owned post-attempt rebind fail-closes when P1 advances S2 to S3 during rebind", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "fix-1",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B, SHA_C],
+    worktreeHead: SHA_S,
+    worktreeHeadAfter: SHA_B,
+    tester: boundPassed(),
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    rebind: ownedAwareRebind,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "fix-1" as const,
+      to: "review-2" as const,
+      summary: "fix-1 pushed S2 while S3 raced",
+    }),
+  });
+  const mismatch = driven.rebindCalls[driven.rebindCalls.length - 1];
+  assert.equal(mismatch?.prNumber, 99);
+  assert.equal(mismatch?.prHeadSha, SHA_C);
+  assert.equal(mismatch?.pushedHeadSha, SHA_B);
+  assert.equal(driven.pipelineStage, "fix-1");
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_mismatch",
+  );
+});
+
 test("runAdvance rebinds a successful fix-2 push instead of treating it as foreign PR drift", async () => {
   const driven = await driveDesignGateAdvance({
     startStage: "fix-2",
     prNumber: 99,
     prHeadSha: SHA_S,
-    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B, SHA_B],
     worktreeHead: SHA_S,
     worktreeHeadAfter: SHA_B,
     tester: boundPassed(),
@@ -1811,7 +1904,7 @@ test("runAdvance rebinds a successful pre-merge autofix push instead of treating
     startStage: "pre-merge",
     prNumber: 99,
     prHeadSha: SHA_S,
-    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B, SHA_B],
     worktreeHead: SHA_S,
     worktreeHeadAfter: SHA_B,
     tester: boundPassed(),
@@ -1948,7 +2041,7 @@ test("disabled-gate owned fix-1 push reports S2 post-attempt evidence", async ()
     startStage: "fix-1",
     prNumber: 99,
     prHeadSha: SHA_S,
-    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B, SHA_B],
     worktreeHead: SHA_S,
     worktreeHeadAfter: SHA_B,
     changedPaths: ["core/scripts/pipeline-run.ts"],

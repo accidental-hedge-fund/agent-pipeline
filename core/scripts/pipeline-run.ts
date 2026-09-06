@@ -1163,9 +1163,9 @@ export function createDeliveryStageEvidenceObserver(
   > & {
     /** Confirmed PR head the pre-observer bind used. Observer re-reads the live PR. */
     expectedPrHeadSha?: string | null | (() => string | null);
-    /** Hook after the observer's live PR read for before and after (mismatch / rebind). */
+    /** Hook after one coupled linked-PR identity/head read for before and after. */
     onObservedPrHead?: (
-      liveSha: string | null,
+      livePr: { prNumber: number | null; headSha: string | null },
       phase: "before" | "after",
     ) => Promise<void>;
   } = {},
@@ -1198,7 +1198,7 @@ export function createDeliveryStageEvidenceObserver(
 
     let candidateSha = "";
     let paths: string[] = [];
-    let livePrSha: string | null = null;
+    let livePr: { prNumber: number | null; headSha: string | null } | null = null;
     const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(() => null);
     if (wt) {
       const git = deps.gitInWorktree ?? gitInWorktree;
@@ -1212,25 +1212,31 @@ export function createDeliveryStageEvidenceObserver(
       if (changed.code === 0) paths = changed.stdout.split("\n").filter(Boolean);
     } else {
       const pr = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(() => null);
+      const prDetail = pr
+        ? await (deps.getPrDetail ?? getPrDetail)(cfg, pr).catch(() => null)
+        : null;
+      candidateSha = prDetail?.head_sha.trim().toLowerCase() ?? "";
+      livePr = { prNumber: pr, headSha: normalizeCandidateSha(candidateSha) };
       if (pr) {
-        const prDetail = await (deps.getPrDetail ?? getPrDetail)(cfg, pr).catch(() => null);
-        candidateSha = prDetail?.head_sha.trim().toLowerCase() ?? "";
-        livePrSha = normalizeCandidateSha(candidateSha);
         const diff = await (deps.getPrDiff ?? getPrDiff)(cfg, pr).catch(() => "");
         paths = diffFilePaths(diff);
       }
     }
     if (deps.expectedPrHeadSha != null) {
-      if (!livePrSha) {
+      if (!livePr) {
         const pr = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(() => null);
-        if (pr) {
-          const prDetail = await (deps.getPrDetail ?? getPrDetail)(cfg, pr).catch(() => null);
-          livePrSha = normalizeCandidateSha(prDetail?.head_sha);
-        }
+        const prDetail = pr
+          ? await (deps.getPrDetail ?? getPrDetail)(cfg, pr).catch(() => null)
+          : null;
+        livePr = {
+          prNumber: pr,
+          headSha: normalizeCandidateSha(prDetail?.head_sha),
+        };
       }
       if (deps.onObservedPrHead) {
-        await deps.onObservedPrHead(livePrSha, phase);
+        await deps.onObservedPrHead(livePr, phase);
       }
+      const livePrSha = livePr.headSha;
       const expected = normalizeCandidateSha(
         typeof deps.expectedPrHeadSha === "function"
           ? deps.expectedPrHeadSha()
@@ -3083,7 +3089,7 @@ export async function runAdvance(
       let observerPrHeadBinding: {
         expectedPrHeadSha: () => string | null;
         onObservedPrHead: (
-          liveSha: string | null,
+          livePr: { prNumber: number | null; headSha: string | null },
           phase: "before" | "after",
         ) => Promise<void>;
       } | undefined;
@@ -3233,12 +3239,11 @@ export async function runAdvance(
           }
           observerPrHeadBinding = {
             expectedPrHeadSha: () => handoffPrHeadSha,
-            onObservedPrHead: async (liveSha, phase) => {
+            onObservedPrHead: async (livePr, phase) => {
+              const liveSha = livePr.headSha;
+              const livePrNumber = livePr.prNumber;
               const expected = handoffPrHeadSha;
               if (!expected || liveSha === expected) return;
-              const livePrNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
-                () => null,
-              );
               let ownedMutation = false;
               if (phase === "after" && consumerStageMayPushPrHead(stage) && liveSha) {
                 const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
@@ -3263,6 +3268,26 @@ export async function runAdvance(
                 });
                 if (!rebound.ok) {
                   observerMismatch = rebound;
+                  return;
+                }
+                const postRebindDetail = livePrNumber
+                  ? await (deps.getPrDetail ?? getPrDetail)(cfg, livePrNumber).catch(() => null)
+                  : null;
+                const postRebindSha = normalizeCandidateSha(postRebindDetail?.head_sha);
+                if (
+                  !livePrNumber ||
+                  postRebindDetail?.number !== livePrNumber ||
+                  !postRebindSha ||
+                  postRebindSha !== rebound.candidateSha
+                ) {
+                  const mismatch = await rebindFn({
+                    ...rebindInput(),
+                    prNumber: livePrNumber,
+                    prHeadSha: postRebindSha,
+                    pushedHeadSha: rebound.candidateSha,
+                    reproduce: undefined,
+                  });
+                  if (!mismatch.ok) observerMismatch = mismatch;
                   return;
                 }
                 handoffPrHeadSha = rebound.candidateSha;
