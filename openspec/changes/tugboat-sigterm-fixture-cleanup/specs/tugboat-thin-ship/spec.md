@@ -24,20 +24,32 @@ Spawn-real Tugboat lifecycle fixtures SHALL delete a fixture temp tree only afte
 
 ### Requirement: Tugboat lifecycle fixture cleanup SHALL be ownership-safe, bounded, and fail closed
 
-Tugboat lifecycle fixture cleanup SHALL terminate only fixture-owned processes: processes whose command line contains the fixture temp directory, processes whose command line contains that fixture's unique `--milestone v<version>` coordinate, and the pid recorded in that fixture's `playbook.pid` when present. Cleanup SHALL NOT send a signal to unrelated host processes. Cleanup SHALL use a named finite deadline. Cleanup SHALL NOT poll without a deadline and SHALL NOT sleep without a bound. If owned processes remain, or the temp tree is still mutating, when the deadline expires, cleanup SHALL fail closed and SHALL name remaining owned pids. Cleanup SHALL NOT swallow `ENOTEMPTY` or an equivalent still-mutating unlink error as success. Cleanup SHALL NOT hide a live descendant. Cleanup SHALL NOT weaken the SIGTERM wait-for-live product assertions (fail closed, no `detached tugboat ship` line, unconfirmed child gone, later detach admits exactly one live ship).
+Tugboat lifecycle fixture cleanup SHALL terminate only fixture-owned processes: processes whose command line contains the fixture temp directory, processes whose command line contains that fixture's unique `--milestone v<version>` coordinate, and the pid recorded in that fixture's `playbook.pid` when present and when that pid's current command line still contains the fixture temp directory or that unique milestone coordinate. Cleanup SHALL NOT send a signal to unrelated host processes. Cleanup SHALL treat a zombie (`/proc/<pid>/stat` state `Z`) as not mutating and SHALL NOT use `kill(pid, 0)` alone as the still-mutating test. Cleanup SHALL use a named finite deadline. Cleanup SHALL NOT poll without a deadline and SHALL NOT sleep without a bound. If live owned processes remain, or the temp tree is still mutating, when the deadline expires, cleanup SHALL fail closed and SHALL name remaining owned pids with ownership source and argv. Cleanup SHALL NOT swallow `ENOTEMPTY` or an equivalent still-mutating unlink error as success. Cleanup SHALL NOT hide a live descendant. Cleanup SHALL NOT weaken the SIGTERM wait-for-live product assertions (fail closed, no `detached tugboat ship` line, unconfirmed child gone, later detach admits exactly one live ship).
 
 #### Scenario: Unrelated host processes are not killed
 
 - **WHEN** a lifecycle fixture cleans up
-- **AND** other processes on the host do not match the fixture temp directory, unique milestone coordinate, or recorded `playbook.pid`
+- **AND** other processes on the host do not match the fixture temp directory, unique milestone coordinate, or recorded `playbook.pid` whose current argv still matches
 - **THEN** cleanup SHALL NOT signal those processes
+
+#### Scenario: Reused playbook.pid is not signaled
+
+- **WHEN** a lifecycle fixture's `playbook.pid` names a live pid
+- **AND** that pid's current command line does not contain the fixture temp directory or the fixture's unique milestone coordinate
+- **THEN** cleanup SHALL NOT signal that pid
+
+#### Scenario: Zombie is not treated as still mutating
+
+- **WHEN** a fixture-owned pid exists in `/proc` with stat state `Z`
+- **THEN** cleanup SHALL treat that pid as not mutating
+- **AND** it SHALL NOT wait for `kill(pid, 0)` to throw `ESRCH` before it may delete the temp tree
 
 #### Scenario: Deadline with remaining owned pids fails closed
 
 - **WHEN** the named cleanup deadline expires
-- **AND** at least one fixture-owned process is still live
+- **AND** at least one fixture-owned process is still live (non-zombie)
 - **THEN** cleanup SHALL fail
-- **AND** the failure SHALL name remaining owned pids
+- **AND** the failure SHALL name remaining owned pids with ownership source and argv
 - **AND** the failure SHALL NOT be reported as a successful temp-tree delete
 
 #### Scenario: ENOTEMPTY is not swallowed
@@ -74,13 +86,15 @@ Automated checks SHALL keep the SIGTERM wait-for-live fixture that proves Tugboa
 
 ### Requirement: Automated checks SHALL prove naive mutating-tree delete throws ENOTEMPTY and the shared seam then succeeds
 
-Automated checks SHALL include a bite that keeps a writer mutating a temp tree while a naive recursive delete runs. That naive delete SHALL throw `ENOTEMPTY` or an equivalent still-mutating unlink error. The same checks SHALL then run the shared lifecycle cleanup seam against that writer and SHALL delete the tree only after the writer is reaped. The bite SHALL fail if the shared seam is replaced by an immediate recursive delete, a catch-and-ignore of `ENOTEMPTY`, or a skip of the SIGTERM fixture.
+Automated checks SHALL include a bite that keeps a writer mutating a temp tree while a naive recursive delete runs. The bite SHALL wait for a writer-ready handshake before the naive delete, and SHALL use a bounded contention loop with a named deadline. That naive delete SHALL throw `ENOTEMPTY` or an equivalent still-mutating unlink error. If the naive delete never throws by that deadline, the bite SHALL fail and SHALL report writer pid, liveness, argv, and tree listing. The same checks SHALL then run the shared lifecycle cleanup seam against that writer and SHALL delete the tree only after the writer is reaped. The bite SHALL fail if the shared seam is replaced by an immediate recursive delete, a catch-and-ignore of `ENOTEMPTY`, or a skip of the SIGTERM fixture.
 
 #### Scenario: Naive delete bites on a live writer
 
 - **WHEN** a writer process is creating files under a temp tree
+- **AND** the writer has written its ready handshake
 - **AND** a naive recursive delete of that tree runs without waiting for the writer to exit
 - **THEN** the delete SHALL throw `ENOTEMPTY` or an equivalent still-mutating unlink error
+- **AND** if no such throw occurs before the bite deadline, the check SHALL fail with writer diagnostics
 
 #### Scenario: Shared seam reaps then deletes
 

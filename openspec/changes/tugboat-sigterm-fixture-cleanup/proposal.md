@@ -5,10 +5,10 @@ GitHub Actions run `33995969315` failed `SIGTERM during wait-for-live reaps the 
 ## What Changes
 
 - Make spawn-real Tugboat lifecycle fixture cleanup complete only after it reaps and awaits every fixture-owned process, and after it closes fixture writers and watchers, then deletes the temp tree.
-- Extend the existing `reapDetachFixture` seam in `core/test/tugboat.test.ts` so kill, death observation, stdio close, and temp-tree delete live in one ownership-safe helper. Do not add a second cleanup module, a `core/scripts/` helper, or a cgroup-provider drain.
+- Change `reapDetachFixture` in `core/test/tugboat.test.ts` to an awaited async helper so kill, death observation (`waitUntil`, 15 ms poll, 2,000 ms deadline), stdio close, and temp-tree delete live in one ownership-safe helper. All seven callers `await` it. Do not add a second cleanup module, a `core/scripts/` helper, or a cgroup-provider drain.
 - Keep the SIGTERM product assertions (fail closed, no `detached tugboat ship`, unconfirmed child dead, later detach admits exactly one live ship). Cleanup SHALL NOT hide a live descendant or swallow `ENOTEMPTY` without a reap.
-- Apply that shared seam to the other `reapDetachFixture` callers that still `fs.rmSync` immediately after an un-awaited kill.
-- Add a biting regression: a concurrent writer makes naive `fs.rmSync` throw `ENOTEMPTY`; the shared seam reaps then deletes. Do not skip, quarantine, or mark the SIGTERM fixture flaky.
+- Apply that shared seam to the other `reapDetachFixture` callers that still `fs.rmSync` immediately after an un-awaited kill. The seam owns delete; no kill-then-`rmSync` pair remains.
+- Add a biting regression with a writer-ready handshake and bounded contention: naive `fs.rmSync` throws `ENOTEMPTY`; the shared seam reaps then deletes. Do not skip, quarantine, or mark the SIGTERM fixture flaky.
 
 No **BREAKING** change to public CLI verbs, Tugboat detach product behavior, or host SKILL pages.
 
@@ -25,20 +25,20 @@ No **BREAKING** change to public CLI verbs, Tugboat detach product behavior, or 
 ## Impact
 
 - **Class vs site:** class is spawn-real Tugboat lifecycle fixtures that SIGTERM-or-kill owned children and then `fs.rmSync` a temp tree those children still mutate. Site evidence is the SIGTERM fixture at `core/test/tugboat.test.ts:3127` on Actions run `33995969315`. Shared gate is `reapDetachFixture` (already used by the concurrent detach, wait-for-live, re-parent, and sequential-detach fixtures).
-- **Reuse first:** extend `reapDetachFixture` plus existing `killPids` / `pidsWithCmdlineNeedle` / `waitUntil`. Do not reuse `reapContainment` in `planning-facts.ts` (cgroup spawn provider). Do not invent a generic `safeRm` package.
+- **Reuse first:** extend `reapDetachFixture` plus existing `killPids` / `pidsWithCmdlineNeedle` / `procsWithNeedle` / `waitUntil`. Do not reuse `reapContainment` in `planning-facts.ts` (cgroup spawn provider). Do not invent a generic `safeRm` package.
 - **Code:** `core/test/tugboat.test.ts` only, unless a tiny shared test helper already in that file is the natural place. Tugboat product `examples/supervisor/shell/tugboat.sh` stays unchanged unless a real product leak is proven.
-- **Docs / SKILL:** none. Host SKILL freshness still follows `node scripts/build.mjs` after any `core/` edit.
+- **Docs / SKILL:** none. Host SKILL freshness still follows `node scripts/build.mjs` after any `core/` edit, including this test-only change.
 - **Authority:** no skip, quarantine, merge, or release exception. Exact-head GitHub CI must pass.
 
 ## Acceptance criteria
 
 - [ ] The SIGTERM wait-for-live fixture reaps and awaits every process it spawned, and closes stdout/stderr writers and watchers, before it deletes its temp tree.
 - [ ] After green product assertions, that fixture's cleanup does not throw `ENOTEMPTY` (or any other unlink error caused by a still-mutating tree).
-- [ ] Cleanup is ownership-safe: it kills only fixture-owned pids (temp-dir needle, `--milestone v${version}`, recorded `playbook.pid`). It does not kill unrelated host processes.
-- [ ] Cleanup is bounded: wait and `ENOTEMPTY` retry use a named finite deadline. Unbounded polling and unbounded sleeps are forbidden.
-- [ ] If owned pids remain or the tree is still mutating at the deadline, cleanup fails closed and names remaining pids. It does not swallow the error or hide a live descendant.
+- [ ] Cleanup is ownership-safe: it kills only fixture-owned pids (temp-dir needle, `--milestone v${version}`, recorded `playbook.pid` after current argv still matches). It does not kill unrelated host processes, including a reused pid in `playbook.pid`.
+- [ ] Cleanup is bounded: wait and `ENOTEMPTY` retry use a named 2,000 ms deadline and `waitUntil`'s 15 ms poll. Unbounded polling and unbounded sleeps are forbidden.
+- [ ] If live owned pids remain or the tree is still mutating at the deadline, cleanup fails closed and names remaining pids with ownership source and argv. It does not swallow the error or hide a live descendant. Zombies are not treated as still mutating.
 - [ ] Existing SIGTERM product assertions stay: fail closed, no `detached tugboat ship`, unconfirmed child `ESRCH`, later detach admits exactly one live ship.
-- [ ] A helper-level bite proves naive `fs.rmSync` throws `ENOTEMPTY` while a writer mutates the tree, and the shared seam then reaps and deletes.
+- [ ] A helper-level bite with a writer-ready handshake and bounded contention proves naive `fs.rmSync` throws `ENOTEMPTY` while a writer mutates the tree, and the shared seam then reaps and deletes. If the naive delete never throws by its deadline, the bite fails with diagnostics.
 - [ ] Other `reapDetachFixture` lifecycle fixtures use that same seam instead of kill-then-immediate-`fs.rmSync`.
 - [ ] The SIGTERM fixture is not deleted, skipped, or marked flaky.
 - [ ] `openspec validate tugboat-sigterm-fixture-cleanup` and `npm run ci` pass. Exact-head GitHub CI is green.
