@@ -164,6 +164,32 @@ test("ensureManagedWorktree: retained linked-PR branch survives a later issue-ti
   assert.equal(createdSlug, SLUG);
 });
 
+test("ensureManagedWorktree: adopted PR rematerializes a synthetic managed branch at the exact linked head", async () => {
+  const deliveryBranch = "fix/release-convergence-durable";
+  let recoveryStart: unknown;
+  let createdSlug = "";
+  const out = await ensureManagedWorktree(cfg, ISSUE, {
+    recoveryTarget: { branch: deliveryBranch, headSha: TIP_SHA, prNumber: PR },
+    getOnDiskForIssue: async () => null,
+    gitCmd: async () => ({ stdout: "", stderr: "", code: 0 }),
+    resolveOpenPrHeadForBranch: async () => null,
+    createWorktree: async (_cfg, _issue, slug, deps) => {
+      createdSlug = slug;
+      recoveryStart = deps?.recoveryStart;
+      return { path: WT_PATH, branch: `pipeline/${ISSUE}-${slug}` };
+    },
+    gitInWorktree: async () => ({ stdout: `${TIP_SHA}\n`, stderr: "", code: 0 }),
+  });
+  assert.equal(out.result, "pass");
+  assert.equal(createdSlug, `adopted-pr-${PR}`);
+  assert.deepEqual(recoveryStart, {
+    deliveryBranch,
+    headSha: TIP_SHA,
+    prNumber: PR,
+  });
+  assert.equal(out.worktree?.branch, `pipeline/${ISSUE}-adopted-pr-${PR}`);
+});
+
 test("ensureManagedWorktree: stale metadata without on-disk path → rematerialize", async () => {
   // getOnDiskForIssue returns null even if "manager" might remember something.
   let createCalls = 0;

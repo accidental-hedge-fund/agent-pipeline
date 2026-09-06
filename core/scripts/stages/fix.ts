@@ -541,6 +541,24 @@ export async function isCommitOnLinkedPr(
   }
 }
 
+export async function resolveLinkedPrDelivery(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: { getPrForIssue?: typeof getPrForIssue; getPrDetail?: typeof getPrDetail } = {},
+): Promise<{ branch: string; headSha: string } | null> {
+  try {
+    const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber);
+    if (prNumber == null) return null;
+    const pr = await (deps.getPrDetail ?? getPrDetail)(cfg, prNumber);
+    const branch = pr.head_ref.trim();
+    const headSha = (pr.head_sha ?? "").trim().toLowerCase();
+    if (!branch || !/^[0-9a-f]{40}$/.test(headSha)) return null;
+    return { branch, headSha };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * #553: an external stage executor (`invokeStageExecutor`) is a bare HTTP
  * call — `{stage, prompt}` over the wire, per `executors.ts` — with no cwd or
@@ -1125,6 +1143,7 @@ export async function advanceFix(
   // (fix already applied externally); carries the decided target stage through
   // to the final transition once the normal gates below have validated it.
   let externalAdvance: ExternalCommitAdvanceDecision & { advance: true } | null = null;
+  let externalDeliveryBranch: string | null = null;
   // Which commit-message gate to run when externalAdvance is set (#349 review-1
   // finding 1): "external" only once verifyCommitOnRemote proves the commit(s)
   // already reached origin outside the fix harness; otherwise "harness" keeps
@@ -1193,16 +1212,21 @@ export async function advanceFix(
         // #349 review-2: rewrite headBefore and fall through normal gates.
         headBefore = externalDecision.reviewSha;
         externalAdvance = externalDecision;
-        const verifiedOnRemote = deps.verifyCommitOnRemote
-          ? await deps.verifyCommitOnRemote(
+        let verifiedOnRemote: boolean;
+        if (deps.verifyCommitOnRemote) {
+          verifiedOnRemote = await deps.verifyCommitOnRemote(
               wt.path,
               branchName(issueNumber, wt.slug),
               headAfter,
-            )
-          : await isCommitOnLinkedPr(cfg, issueNumber, headAfter, {
-              getPrForIssue: deps.getPrForIssue,
-              getPrDetail: deps.getPrDetail,
-            });
+            );
+        } else {
+          const delivery = await resolveLinkedPrDelivery(cfg, issueNumber, {
+            getPrForIssue: deps.getPrForIssue,
+            getPrDetail: deps.getPrDetail,
+          });
+          verifiedOnRemote = delivery?.headSha === headAfter.toLowerCase();
+          if (verifiedOnRemote) externalDeliveryBranch = delivery!.branch;
+        }
         commitGateMode = resolveFixCommitGateMode(externalDecision, verifiedOnRemote);
       } else {
         // #473: human-decision park before DNR so mixed rounds never advance.
@@ -1639,7 +1663,7 @@ export async function advanceFix(
     });
   }
 
-  const branch = branchName(issueNumber, wt.slug);
+  const branch = externalDeliveryBranch ?? branchName(issueNumber, wt.slug);
   // #760: transient-retryable push with currency re-sync (no force-push).
   // Authoritative delivery uses configured git.push_auth (#980).
   const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
@@ -1652,7 +1676,20 @@ export async function advanceFix(
   let skipAncestorPush = false;
   if (externalAdvance) {
     const resolvePr = deps.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadForBranch;
-    const ancestorDecision = await decideAncestorPushAfterNoop(branch, {
+    if (externalDeliveryBranch) {
+      const live = await resolvePr(cfg, externalDeliveryBranch).catch(() => null);
+      if (!live || live.headSha.toLowerCase() !== localHead.toLowerCase()) {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason:
+            `${stage}: linked adopted PR head moved or became unreadable after external-fix verification; ` +
+            "RecoverySupervisor must rebind the replacement candidate before delivery",
+        };
+      }
+      skipAncestorPush = true;
+    }
+    const ancestorDecision = skipAncestorPush ? null : await decideAncestorPushAfterNoop(branch, {
       localHead: localHead || "HEAD",
       git: async (args) => gitWt(wt.path, args, { ignoreFailure: true }),
       resolveOpenPrHead: async () => {
@@ -1660,7 +1697,7 @@ export async function advanceFix(
         return pr?.headSha ?? null;
       },
     });
-    if (ancestorDecision.action === "skip") {
+    if (ancestorDecision?.action === "skip") {
       skipAncestorPush = true;
     }
   }

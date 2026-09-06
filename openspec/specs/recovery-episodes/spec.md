@@ -45,6 +45,7 @@ Item-local Cooling created by a Recovery Episode SHALL persist the candidate epo
 - **AND** the worktree HEAD exactly equals the live linked PR HEAD after an external fix
 - **THEN** the linked PR HEAD SHALL prove the external commit is delivered
 - **AND** the synthetic managed branch SHALL NOT cause Pipeline to amend or push-rewrite that commit
+- **AND** an absent workspace SHALL be rematerialized on a stable synthetic managed branch at the verified linked PR head without requiring the delivery branch to use a `pipeline/*` name
 - **AND** an unreadable or moved linked PR HEAD SHALL fail closed
 
 #### Scenario: Prose variation does not reset the cursor

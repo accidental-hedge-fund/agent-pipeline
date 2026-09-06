@@ -30,6 +30,7 @@ import {
   invokeFixHarnessWithRetry,
   isCommitOnRemote,
   isCommitOnLinkedPr,
+  resolveLinkedPrDelivery,
   parseDoesNotReproduceDeclarations,
   parseFindingSummaries,
   parseHumanDecisionDeclarations,
@@ -785,6 +786,16 @@ test("isCommitOnLinkedPr: missing, moved, or unreadable linked PR fails closed",
       getPrForIssue: async () => { throw new Error("offline"); },
     }),
     false,
+  );
+});
+
+test("resolveLinkedPrDelivery: returns the adopted delivery branch and exact live head", async () => {
+  assert.deepEqual(
+    await resolveLinkedPrDelivery({} as PipelineConfig, 1478, {
+      getPrForIssue: async () => 1480,
+      getPrDetail: async () => ({ head_ref: "fix/release-convergence-durable", head_sha: SHA_HEAD }) as any,
+    }),
+    { branch: "fix/release-convergence-durable", headSha: SHA_HEAD },
   );
 });
 
