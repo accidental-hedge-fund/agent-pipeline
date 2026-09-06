@@ -23,3 +23,7 @@
 - [x] 4.2 From `core/`, run `node --test --experimental-strip-types test/tugboat.test.ts` and verify the new bite, the SIGTERM fixture, and sibling lifecycle fixtures pass.
 - [x] 4.3 After the `core/test/tugboat.test.ts` edit, run `node scripts/build.mjs` from the repo root and verify `--check` is clean. This is required after any `core/` change, including test-only files.
 - [x] 4.4 Run `npm run ci` from the repo root and verify it passes.
+
+## 5. Review hardening
+
+- [x] 5.1 Add a deterministic fixture where an owned process-group leader exits while a descendant remains live, verify the old observer drops that descendant, and retain group tracking without accepting a reused live leader pid.

@@ -147,7 +147,7 @@ Each `finally` is `await reapDetachFixture(...)`. The three currently sync tests
   **Mitigation:** Fail closed at the deadline with remaining pids, ownership source, and argv. Do not hang. SIGTERM of sleep stubs should exit well under the bound.
 
 - **[Risk]** Cmdline needles miss a re-parented descendant whose argv no longer contains `dir` or the milestone.  
-  **Mitigation:** Existing product tests already record pid files and session/group reap in Tugboat. Cleanup also kills argv-verified `playbook.pid`. The helper-level writer bite uses a path under `dir` so the `dir` needle matches. Do not broaden to host-wide kill.
+  **Mitigation:** Capture isolated process groups by leader pid plus `/proc` start time while an argv-owned leader exists. Continue observing members when that leader exits; if the leader pid exists, require the captured start time so PID reuse cannot validate a different group. Cleanup also kills argv-verified `playbook.pid`. Do not broaden to host-wide kill.
 
 - **[Risk]** Naive-`rmSync` bite is itself racy and does not throw `ENOTEMPTY` on a quiet runner.  
   **Mitigation:** Ready-file handshake plus bounded contention loop. If naive delete never throws by the 1,000 ms bite deadline, fail with diagnostics. Tightening the writer (more files per tick, held fd) is allowed; removing the bite or skipping on timeout is not.

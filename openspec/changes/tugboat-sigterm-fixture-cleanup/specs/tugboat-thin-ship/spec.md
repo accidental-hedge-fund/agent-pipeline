@@ -52,6 +52,14 @@ Tugboat lifecycle fixture cleanup SHALL terminate only fixture-owned processes: 
 - **AND** the failure SHALL name remaining owned pids with ownership source and argv
 - **AND** the failure SHALL NOT be reported as a successful temp-tree delete
 
+#### Scenario: Process-group descendant remains owned after leader exit
+
+- **WHEN** cleanup has captured a fixture-owned process group by the leader's process identity
+- **AND** that leader exits while a live non-zombie descendant remains in the same process group
+- **THEN** cleanup SHALL continue to treat the descendant as fixture-owned
+- **AND** SHALL NOT declare cleanup complete solely because the original leader no longer exists in `/proc`
+- **AND** a different live process that reuses the leader pid SHALL NOT validate the captured group identity
+
 #### Scenario: ENOTEMPTY is not swallowed
 
 - **WHEN** recursive delete of the fixture temp tree hits `ENOTEMPTY` or an equivalent still-mutating unlink error

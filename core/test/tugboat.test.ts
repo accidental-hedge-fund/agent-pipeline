@@ -2823,10 +2823,13 @@ function liveOwnedDetachFixturePids(
     const group = procGroup(pid);
     const ownedGroupStart =
       group === undefined ? undefined : ownedGroups.get(group);
+    const currentLeaderStart =
+      group === undefined ? undefined : procStartTime(group);
     if (
       group === undefined ||
       ownedGroupStart === undefined ||
-      procStartTime(group) !== ownedGroupStart ||
+      (currentLeaderStart !== undefined &&
+        currentLeaderStart !== ownedGroupStart) ||
       seen.has(pid) ||
       procLiveness(pid) !== "live"
     ) {
@@ -3539,6 +3542,72 @@ test("reapDetachFixture does not signal a reused playbook.pid", async () => {
     "cleanup must not SIGTERM a reused playbook.pid whose argv does not match the fixture",
   );
   assert.equal(fs.existsSync(dir), false);
+});
+
+test("fixture group tracking retains a live descendant after its leader exits", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-leader-exit-"));
+  const stateRoot = path.join(dir, "state");
+  const version = `9.99.${process.pid}.${Date.now()}.leaderexit`;
+  const childPidFile = path.join(dir, "child.pid");
+  const leader = spawn(
+    "bash",
+    [
+      "-c",
+      'sleep 3600 & printf "%s\\n" "$!" > "$1"; sleep 0.4',
+      "fixture-group",
+      childPidFile,
+      dir,
+      "--milestone",
+      `v${version}`,
+    ],
+    { detached: true, stdio: "ignore" },
+  );
+  const leaderPid = leader.pid;
+  assert.ok(leaderPid && leaderPid > 0, "fixture group leader pid missing");
+  const leaderClosed = new Promise<void>((resolve) =>
+    leader.once("close", () => resolve()),
+  );
+  try {
+    await waitUntil(() => fs.existsSync(childPidFile), 2_000, "group child pid");
+    const childPid = Number(fs.readFileSync(childPidFile, "utf8").trim());
+    assert.ok(Number.isSafeInteger(childPid) && childPid > 0, "group child pid invalid");
+    const leaderStart = procStartTime(leaderPid);
+    assert.ok(leaderStart, "group leader start time missing");
+    const ownedGroups = new Map([[leaderPid, leaderStart]]);
+    await leaderClosed;
+    assert.equal(procStartTime(leaderPid), undefined, "leader must be reaped");
+
+    const remaining = liveOwnedDetachFixturePids(
+      dir,
+      stateRoot,
+      version,
+      ownedGroups,
+    );
+    assert.ok(
+      remaining.some(
+        (proc) =>
+          proc.pid === childPid && proc.source === `process-group:${leaderPid}`,
+      ),
+      `live child ${childPid} must remain tracked after leader ${leaderPid} exits: ${formatOwnedPids(remaining)}`,
+    );
+  } finally {
+    try {
+      process.kill(-leaderPid, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+    await waitUntil(
+      () =>
+        !fs.readdirSync("/proc").some((ent) => {
+          if (!/^\d+$/.test(ent)) return false;
+          const pid = Number(ent);
+          return procGroup(pid) === leaderPid && procLiveness(pid) === "live";
+        }),
+      2_000,
+      "leader-exit fixture group to terminate",
+    );
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("wait-for-live expiry reaps a re-parented descendant before unlock", async () => {
