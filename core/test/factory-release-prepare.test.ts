@@ -2809,11 +2809,16 @@ function capturingCandidateSpawn(captured: {
     captured.stdio = options.stdio;
     const child = new EventEmitter() as EventEmitter & {
       unref: () => void;
+      kill: (signal?: NodeJS.Signals | number) => boolean;
       stdout: EventEmitter;
       stderr: EventEmitter;
       pid: number;
     };
     child.unref = () => {};
+    child.kill = (signal) => {
+      queueMicrotask(() => child.emit("exit", null, signal ?? "SIGTERM"));
+      return true;
+    };
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     child.pid = 4242;
@@ -3140,11 +3145,16 @@ test("handoff SHA mismatch fails closed", async () => {
 test("handoff supervisor PID must equal the spawned detached child PID (#1503)", async () => {
   const child = new EventEmitter() as EventEmitter & {
     unref: () => void;
+    kill: (signal?: NodeJS.Signals | number) => boolean;
     stdout: EventEmitter;
     stderr: EventEmitter;
     pid: number;
   };
   child.unref = () => {};
+  child.kill = (signal) => {
+    queueMicrotask(() => child.emit("exit", null, signal ?? "SIGTERM"));
+    return true;
+  };
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.pid = 77;
@@ -3242,7 +3252,10 @@ test("malformed handoff stops a still-running child before return", async () => 
 });
 
 test("candidate lease handoff failure stops the attached child before return (#1503)", async () => {
-  const captured: { killed?: NodeJS.Signals | number; unrefed: boolean } = { unrefed: false };
+  const captured: { signals: Array<NodeJS.Signals | number>; unrefed: boolean } = {
+    signals: [],
+    unrefed: false,
+  };
   const child = new EventEmitter() as EventEmitter & {
     unref: () => void;
     kill: (signal?: NodeJS.Signals | number) => boolean;
@@ -3254,8 +3267,11 @@ test("candidate lease handoff failure stops the attached child before return (#1
     captured.unrefed = true;
   };
   child.kill = (signal) => {
-    captured.killed = signal ?? "SIGTERM";
-    queueMicrotask(() => child.emit("exit", null, "SIGTERM"));
+    const sent = signal ?? "SIGTERM";
+    captured.signals.push(sent);
+    // Deliberately ignore SIGTERM. Only SIGKILL proves that the failure path
+    // escalates and waits for an actual exit before releasing the claim.
+    if (sent === "SIGKILL") queueMicrotask(() => child.emit("exit", null, "SIGKILL"));
     return true;
   };
   child.stdout = new EventEmitter() as EventEmitter & { destroy: () => void };
@@ -3287,7 +3303,7 @@ test("candidate lease handoff failure stops the attached child before return (#1
   );
   assert.equal(result.dispatch_state, "failed");
   assert.match(result.last_error ?? "", /candidate_lease_handoff_failed/);
-  assert.equal(captured.killed, "SIGTERM");
+  assert.deepEqual(captured.signals, ["SIGTERM", "SIGKILL"]);
   assert.equal(captured.unrefed, true);
 });
 

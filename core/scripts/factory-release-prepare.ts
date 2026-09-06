@@ -2285,6 +2285,8 @@ export type CandidateLoopChild = {
   kill?: (signal?: NodeJS.Signals | number) => boolean | void;
   unref?: () => void;
   pid?: number;
+  exitCode?: number | null;
+  signalCode?: NodeJS.Signals | null;
 };
 
 export type CandidateLoopSpawn = (
@@ -2435,17 +2437,31 @@ async function stopFailedPackLoopChild(
   sleep: (ms: number) => Promise<void>,
 ): Promise<void> {
   if (!alreadyExited) {
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
+    let observedExit = false;
+    let resolveExit: (() => void) | undefined;
+    const exited = new Promise<void>((resolve) => {
+      resolveExit = resolve;
+      child.once?.("exit", () => {
+        observedExit = true;
         resolve();
-      };
-      child.once?.("exit", () => finish());
-      child.kill?.("SIGTERM");
-      void sleep(PACK_LOOP_FAILED_CHILD_SETTLE_MS).then(finish);
+      });
     });
+    child.kill?.("SIGTERM");
+    await Promise.race([exited, sleep(PACK_LOOP_FAILED_CHILD_SETTLE_MS)]);
+    if (
+      !observedExit &&
+      child.exitCode == null &&
+      child.signalCode == null
+    ) {
+      child.kill?.("SIGKILL");
+      // Do not release the candidate claim until the OS has actually reaped
+      // the failed detached supervisor. A second timeout would recreate the
+      // ownerless-child race this compensation exists to prevent.
+      await exited;
+    } else if (!observedExit) {
+      resolveExit?.();
+      await exited;
+    }
   }
   child.stdout?.destroy?.();
   child.stderr?.destroy?.();
