@@ -1756,7 +1756,7 @@ export function realDispatchItem(
                 }
               : {}),
           }),
-          { stdio: "inherit", env: nestedAdvanceChildEnv() },
+          { stdio: "inherit", env: { ...nestedAdvanceChildEnv(), PIPELINE_LOOP_RUN_ID: request.run_id } },
         );
         let pollTimer: ReturnType<typeof setInterval> | undefined;
         let settled = false;

@@ -1955,6 +1955,7 @@ export async function runAdvance(
           issue: issueNumber,
           repo: cfg.repo,
           profile: opts.profile ?? null,
+          loopRunId: process.env.PIPELINE_LOOP_RUN_ID,
           startedAt: runStartedAtIso,
           engine: pinnedEngine,
           outerHost,

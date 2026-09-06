@@ -27,6 +27,7 @@
 // openspec/changes/api-executor-experiment-controls/design.md.
 
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import type {
   ExecutorDefinition,
   ModelEndpointDialect,
@@ -723,6 +724,7 @@ export async function invokeExternalExecutor(
     const provenance = result.executor_provenance;
     const record = buildStageAccountingRecord({
       runId: path.basename(opts.accounting.runDir),
+      invocationId: randomUUID(),
       issue: opts.accounting.issue,
       stage: opts.accounting.stage,
       harness: name,
