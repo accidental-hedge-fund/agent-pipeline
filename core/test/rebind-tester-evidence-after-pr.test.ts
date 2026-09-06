@@ -736,7 +736,9 @@ async function driveDesignGateAdvance(opts: {
   rebindCalls: RebindTesterEvidenceAfterPrInput[];
   setBlocked: Array<{ reason: string; kind: string | undefined }>;
   blockerEvents: Array<Record<string, unknown>>;
+  stageCompleteEvents: Array<Record<string, unknown>>;
   dispatchCalls: number;
+  pipelineStage: string | null;
   observerBefore: {
     candidateSha?: string;
     evidenceRole?: string | null;
@@ -876,6 +878,13 @@ async function driveDesignGateAdvance(opts: {
     }) as AdvanceDeps["setBlocked"],
     postComment: async () => {},
     postPrComment: async () => {},
+    transition: async (_c, _n, from, to) => {
+      const fromLabel = `pipeline:${from}`;
+      const toLabel = `pipeline:${to}`;
+      const idx = labels.findIndex((label) => label === fromLabel || label.startsWith("pipeline:"));
+      if (idx >= 0) labels[idx] = toLabel;
+      else labels.push(toLabel);
+    },
     dispatch: async (_c, _n, stage, dispatchOpts, ...rest) => {
       dispatchCalls++;
       if (opts.invokeObserver) {
@@ -895,6 +904,13 @@ async function driveDesignGateAdvance(opts: {
             status: "waiting" as const,
             reason: "delivery-stage evidence binding refused before execution: required implementation evidence role, observed missing",
           };
+      // Real consumer handlers transition the pipeline label during the attempt,
+      // before the post-attempt observer runs.
+      if (result.advanced) {
+        const idx = labels.findIndex((label) => label.startsWith("pipeline:"));
+        if (idx >= 0) labels[idx] = `pipeline:${result.to}`;
+        else labels.push(`pipeline:${result.to}`);
+      }
       if (opts.invokeObserverAfter) {
         const observed = await dispatchOpts?.observeDeliveryStageEvidence?.("after", result);
         if (observed) {
@@ -905,11 +921,6 @@ async function driveDesignGateAdvance(opts: {
           };
         }
       }
-      if (result.advanced) {
-        const idx = labels.findIndex((label) => label.startsWith("pipeline:"));
-        if (idx >= 0) labels[idx] = `pipeline:${result.to}`;
-        else labels.push(`pipeline:${result.to}`);
-      }
       return result;
     },
   };
@@ -918,15 +929,27 @@ async function driveDesignGateAdvance(opts: {
       runAdvance(pipelineCfg, issue, { runId, once: true }, deps),
     );
     const eventsPath = join(runDir, "events.jsonl");
-    const blockerEvents = fs.existsSync(eventsPath)
+    const events = fs.existsSync(eventsPath)
       ? fs
           .readFileSync(eventsPath, "utf8")
           .split("\n")
           .filter(Boolean)
           .map((line) => JSON.parse(line) as Record<string, unknown>)
-          .filter((event) => event.type === "blocker_set")
       : [];
-    return { rebindCalls, setBlocked, blockerEvents, dispatchCalls, observerBefore, observerAfter };
+    const blockerEvents = events.filter((event) => event.type === "blocker_set");
+    const stageCompleteEvents = events.filter((event) => event.type === "stage_complete");
+    const pipelineStage =
+      labels.find((label) => label.startsWith("pipeline:"))?.slice("pipeline:".length) ?? null;
+    return {
+      rebindCalls,
+      setBlocked,
+      blockerEvents,
+      stageCompleteEvents,
+      dispatchCalls,
+      pipelineStage,
+      observerBefore,
+      observerAfter,
+    };
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
@@ -1499,4 +1522,42 @@ test("runAdvance fail-closes post-attempt PR-head drift as typed mismatch, not g
     assert.equal(applicable.includes(skipped), false, skipped);
   }
   assert.equal(applicable.includes(REBIND_TESTER_EVIDENCE_AFTER_PR), true);
+});
+
+test("runAdvance does not leave the consumer stage advanced after post-attempt PR-head drift", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    tester: boundPassed(),
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "design-gate" as const,
+      to: "review-1" as const,
+      summary: "design-gate resolved; advanced to review",
+    }),
+  });
+  assert.ok(driven.dispatchCalls >= 1);
+  assert.equal(driven.observerBefore?.candidateSha, SHA_S);
+  assert.equal(driven.observerAfter?.candidateSha, SHA_B);
+  assert.equal(driven.pipelineStage, "design-gate");
+  assert.equal(
+    driven.stageCompleteEvents.some((event) => event.outcome === "advanced"),
+    false,
+  );
+  assert.ok(
+    driven.stageCompleteEvents.some(
+      (event) => event.stage === "design-gate" && event.outcome === "blocked",
+    ),
+  );
+  const diagnostic = driven.blockerEvents[0]?.diagnostic;
+  assert.equal(
+    (diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_mismatch",
+  );
+  assert.ok(driven.setBlocked.some((row) => /disagrees with pushed head/.test(row.reason)));
 });

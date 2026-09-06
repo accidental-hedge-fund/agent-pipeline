@@ -51,3 +51,7 @@
 
 - [x] 8.1 Recovery fail-closes on malformed persisted `run.json.engine` (missing `root`, non-canonical templates digest, nonempty invalid `commit_sha`) without invoking rebind or clearing the block
 - [x] 8.2 Disabled-gate exact-product-proof path applies live PR-head confirmation and observer binding; S1/S2 disagreement fail-closes with `tester_rebind_pr_head_mismatch`
+
+## 9. Review 1 (post-attempt label/lifecycle) regressions
+
+- [x] 9.1 Post-attempt S1→S2 drift with a transition-recording consumer handler fail-closes without leaving `pipeline:` on the forward stage and without recording `stage_complete` as `advanced`

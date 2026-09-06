@@ -3247,6 +3247,74 @@ export async function runAdvance(
         throw err;
       }
 
+      // Post-attempt S1→S2 drift is fail-closed before lifecycle completion.
+      // Consumer handlers may already have swapped the pipeline label (e.g.
+      // design-gate → review-1). Compensate that transition and replace the
+      // in-memory outcome so stage_complete is not recorded as advanced.
+      if (observerMismatch) {
+        if (!opts.dryRun) {
+          const liveStage = pickStage(
+            (await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber).catch(() => null))
+              ?.labels ?? [],
+          );
+          if (liveStage && liveStage !== stage) {
+            await (deps.transition ?? transition)(
+              cfg,
+              issueNumber,
+              liveStage,
+              stage,
+              `tester rebind: PR head moved after ${stage}; restoring consumer stage after failed post-attempt binding`,
+            ).catch(() => {});
+          }
+        }
+        out = {
+          advanced: false,
+          status: "blocked",
+          reason: observerMismatch.summary,
+          blockerKind: "harness-failure",
+          diagnostic: observerMismatch.diagnostic,
+        };
+        if (!opts.dryRun) {
+          await (deps.setBlocked ?? setBlocked)(
+            cfg,
+            issueNumber,
+            observerMismatch.summary,
+            stage,
+            "harness-failure",
+          ).catch(() => {});
+        }
+      } else if (
+        !out.advanced &&
+        out.status === "waiting" &&
+        isConsumerImplementationStage(stage)
+      ) {
+        const orderingDiagnostic = testerEvidenceOrderingDiagnosticForRefuse({
+          stage,
+          bindingFailure: out.reason,
+          prHead: handoffPrHeadSha,
+          trustedSurface: currentTrustedSurface,
+          subjectOmittedBecauseUnobservable: testerSubjectOmitted,
+        });
+        if (orderingDiagnostic) {
+          out = {
+            advanced: false,
+            status: "blocked",
+            reason: out.reason,
+            blockerKind: "harness-failure",
+            diagnostic: orderingDiagnostic,
+          };
+          if (!opts.dryRun) {
+            await (deps.setBlocked ?? setBlocked)(
+              cfg,
+              issueNumber,
+              out.reason,
+              stage,
+              "harness-failure",
+            ).catch(() => {});
+          }
+        }
+      }
+
       // Post-dispatch: collect commits produced during this stage (before recording exit).
       // stageCommits is declared outside the stateDir block so it is also available
       // for the stage_complete event appended to events.jsonl below.
@@ -3337,54 +3405,6 @@ export async function runAdvance(
                 at: stageExitedAt,
               },
               runStoreDeps,
-            ).catch(() => {});
-          }
-        }
-      }
-      if (observerMismatch) {
-        out = {
-          advanced: false,
-          status: "blocked",
-          reason: observerMismatch.summary,
-          blockerKind: "harness-failure",
-          diagnostic: observerMismatch.diagnostic,
-        };
-        if (!opts.dryRun) {
-          await (deps.setBlocked ?? setBlocked)(
-            cfg,
-            issueNumber,
-            observerMismatch.summary,
-            stage,
-            "harness-failure",
-          ).catch(() => {});
-        }
-      } else if (
-        !out.advanced &&
-        out.status === "waiting" &&
-        isConsumerImplementationStage(stage)
-      ) {
-        const orderingDiagnostic = testerEvidenceOrderingDiagnosticForRefuse({
-          stage,
-          bindingFailure: out.reason,
-          prHead: handoffPrHeadSha,
-          trustedSurface: currentTrustedSurface,
-          subjectOmittedBecauseUnobservable: testerSubjectOmitted,
-        });
-        if (orderingDiagnostic) {
-          out = {
-            advanced: false,
-            status: "blocked",
-            reason: out.reason,
-            blockerKind: "harness-failure",
-            diagnostic: orderingDiagnostic,
-          };
-          if (!opts.dryRun) {
-            await (deps.setBlocked ?? setBlocked)(
-              cfg,
-              issueNumber,
-              out.reason,
-              stage,
-              "harness-failure",
             ).catch(() => {});
           }
         }
