@@ -157,6 +157,8 @@ export function formatMissingEnginesNodeDiagnostic(opts = {}) {
  *   home?: string,
  *   resolve?: typeof resolveEnginesNode,
  *   spawn?: typeof spawnSync,
+ *   exec?: (file: string, args: string[], env: NodeJS.ProcessEnv) => never,
+ *   requireSameProcess?: boolean,
  *   pathExists?: (p: string) => boolean,
  *   stderr?: (s: string) => void,
  * }} opts
@@ -171,6 +173,7 @@ export function reexecOntoEnginesNode(opts) {
   const argv = opts.argv ?? [];
   const resolve = opts.resolve ?? resolveEnginesNode;
   const spawn = opts.spawn ?? spawnSync;
+  const exec = opts.exec;
   const stderr = opts.stderr ?? ((s) => process.stderr.write(s));
 
   const major = parseNodeMajor(execVersion);
@@ -195,8 +198,24 @@ export function reexecOntoEnginesNode(opts) {
     return { action: "continue" };
   }
 
+  const childEnv = envPreferringNode(resolved.path, env);
+  if (exec) {
+    try {
+      exec(resolved.path, [resolved.path, scriptPath, ...argv], childEnv);
+    } catch (err) {
+      stderr(
+        `pipeline: failed to exec engines Node at ${resolved.path}: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+      return { action: "exit", status: 1 };
+    }
+  }
+  if (opts.requireSameProcess) {
+    stderr("pipeline: guarded candidate runtime bootstrap requires same-process exec on this platform\n");
+    return { action: "exit", status: 78 };
+  }
+
   const result = spawn(resolved.path, [scriptPath, ...argv], {
-    env: envPreferringNode(resolved.path, env),
+    env: childEnv,
     stdio: "inherit",
   });
   if (result.error) {

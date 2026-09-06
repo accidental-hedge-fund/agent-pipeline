@@ -150,7 +150,13 @@ async function reexecOntoEnginesNodeIfNeeded() {
     process.exit(1);
   }
   const mod = await import(pathToFileURL(resolverPath).href);
-  const result = mod.reexecOntoEnginesNode({ scriptPath, argv: rawArgs });
+  const guarded = process.env.PIPELINE_CANDIDATE_PROCESS_GUARD === "1";
+  const result = mod.reexecOntoEnginesNode({
+    scriptPath,
+    argv: rawArgs,
+    ...(typeof process.execve === "function" ? { exec: process.execve.bind(process) } : {}),
+    requireSameProcess: guarded,
+  });
   if (result.action === "continue") return;
   if (result.signal) {
     try {
@@ -245,5 +251,29 @@ if (!String(process.env.AGENT_PIPELINE_PRODUCTION_PIN ?? "").trim()) {
 const guard = join(here, "candidate-process-guard.mjs");
 const guardArgs = process.env.PIPELINE_CANDIDATE_PROCESS_GUARD === "1" ? ["--import", guard] : [];
 const args = [...guardArgs, "--experimental-strip-types", entry, ...rawArgs];
+// Replace the stable launcher with the core CLI instead of inserting a wrapper
+// process. Candidate FRG operations bind their process lease to this launcher's
+// parent, so preserving our PID also preserves the fail-closed owner ancestry
+// that nested candidate operations verify. Node >=24 is guaranteed above.
+if (typeof process.execve === "function") {
+  try {
+    process.execve(process.execPath, [process.execPath, ...args], process.env);
+  } catch (err) {
+    process.stderr.write(
+      `pipeline: could not enter the core CLI: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    process.exit(1);
+  }
+}
+
+// process.execve is unavailable on Windows. Preserve ordinary CLI behavior
+// there, but never pretend a guarded candidate launch retained direct-parent
+// ancestry when the platform cannot provide same-process exec.
+if (process.env.PIPELINE_CANDIDATE_PROCESS_GUARD === "1") {
+  process.stderr.write(
+    "pipeline: guarded candidate launch requires same-process exec on this platform\n",
+  );
+  process.exit(78);
+}
 const run = spawnSync(process.execPath, args, { stdio: "inherit" });
 process.exit(run.status ?? 1);

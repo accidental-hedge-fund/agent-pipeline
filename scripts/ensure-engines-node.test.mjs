@@ -225,6 +225,58 @@ test("reexecOntoEnginesNode: Node 22 + fake 24 spawns with argv preserved and PA
   assert.match(calls[0].opts.env.PATH, /\/keep-me/);
 });
 
+test("reexecOntoEnginesNode: same-process bootstrap exec preserves argv and PATH (#1507)", () => {
+  const calls = [];
+  const result = reexecOntoEnginesNode({
+    execVersion: "22.23.2",
+    execPath: "/old/node",
+    scriptPath: "/skill/scripts/pipeline-launcher.mjs",
+    argv: ["factory-release", "prepare"],
+    env: { PATH: "/keep-me:/bin" },
+    resolve: () => ({ path: "/opt/node24/bin/node", major: 24 }),
+    exec: (file, args, env) => {
+      calls.push({ file, args, env });
+      throw new Error("injected exec stop");
+    },
+    spawn: () => {
+      throw new Error("must not spawn after exec attempt");
+    },
+    stderr: () => {},
+  });
+  assert.deepEqual(result, { action: "exit", status: 1 });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, "/opt/node24/bin/node");
+  assert.deepEqual(calls[0].args, [
+    "/opt/node24/bin/node",
+    "/skill/scripts/pipeline-launcher.mjs",
+    "factory-release",
+    "prepare",
+  ]);
+  assert.equal(calls[0].env.PATH.split(delimiter)[0], "/opt/node24/bin");
+});
+
+test("reexecOntoEnginesNode: guarded bootstrap without exec fails before spawn (#1507)", () => {
+  let spawned = 0;
+  let err = "";
+  const result = reexecOntoEnginesNode({
+    execVersion: "20.19.0",
+    execPath: "/old/node",
+    scriptPath: "/candidate/scripts/pipeline-launcher.mjs",
+    resolve: () => ({ path: "/opt/node24/bin/node", major: 24 }),
+    requireSameProcess: true,
+    spawn: () => {
+      spawned += 1;
+      return { status: 0 };
+    },
+    stderr: (s) => {
+      err += s;
+    },
+  });
+  assert.deepEqual(result, { action: "exit", status: 78 });
+  assert.equal(spawned, 0);
+  assert.match(err, /guarded candidate runtime bootstrap requires same-process exec/);
+});
+
 test("reexecOntoEnginesNode: Node 18.20.0 and 20.19.0 TypeScript argv also spawn", () => {
   for (const ver of ["18.20.0", "20.19.0"]) {
     /** @type {string[][]} */
