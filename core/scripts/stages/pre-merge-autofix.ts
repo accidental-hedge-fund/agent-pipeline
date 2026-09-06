@@ -27,7 +27,12 @@ import { branchName, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import type { InvokeFn } from "../openspec-consistency.ts";
 import type { PipelineConfig, ReviewFinding } from "../types.ts";
-import { DEFAULT_GIT_PUSH_AUTH, gitExecForwardingEnv, runConfiguredGitPush } from "../git-push-auth.ts";
+import {
+  DEFAULT_GIT_PUSH_AUTH,
+  deliveryPushRefspec,
+  gitExecForwardingEnv,
+  runConfiguredGitPush,
+} from "../git-push-auth.ts";
 import {
   declaredScopeFromFindingPaths,
   runCoveredCandidateMutation,
@@ -580,6 +585,8 @@ export async function performPreMergeAutoFix(
   claimAttempt?: () => Promise<boolean>,
   /** #857: when set, head-moving auto-fix runs under candidate-integrity. */
   integrity?: PreMergeAutoFixIntegrityOpts,
+  /** Linked PR delivery authority; differs from the managed local branch for adopted PRs. */
+  delivery?: { branch: string; headSha: string; prNumber: number },
 ): Promise<PreMergeAutoFixResult> {
   const harness = cfg.harnesses?.implementer;
   if (!harness) return { status: "error" };
@@ -590,6 +597,8 @@ export async function performPreMergeAutoFix(
   const preStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
   if (preStatus.code !== 0 || preStatus.stdout.trim() !== "") return { status: "error" };
 
+  const managedBranch = branchName(issueNumber, wt.slug);
+  const deliveryBranch = delivery?.branch ?? managedBranch;
   const prompt = buildFixPrompt({
     cfg,
     issueNumber,
@@ -597,6 +606,7 @@ export async function performPreMergeAutoFix(
     reviewFindings: findingsText,
     fixRound: 1,
     pipelineRunId,
+    deliveryBranch,
   });
 
   const runBody = () =>
@@ -752,12 +762,11 @@ export async function performPreMergeAutoFix(
       }
 
       // Push the fix commit to the PR head (configured push-auth, #980).
-      const branch = branchName(issueNumber, wt.slug);
       const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
       const pushRes = await runConfiguredGitPush({
         cwd: wt.path,
         auth: pushAuth,
-        args: ["push", "origin", branch],
+        args: ["push", "origin", deliveryPushRefspec(managedBranch, deliveryBranch)],
         deps: {
           gitConfigGet: async (cwd, key) => {
             const r = await gitFn(cwd, ["config", "--get", key], { ignoreFailure: true });

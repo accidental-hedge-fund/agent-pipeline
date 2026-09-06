@@ -1431,6 +1431,51 @@ test("performPreMergeAutoFix finding-1 (bite): clean commit path → fix-committ
   assert.equal(resetCall, undefined, "clean path must NOT call reset --hard");
 });
 
+test("performPreMergeAutoFix: adopted PR prompt and pipeline push retain delivery authority (#1478)", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    { code: 0, stdout: "" },
+    { code: 0, stdout: "" },
+    { code: 0, stdout: "sha1" },
+    { code: 0, stdout: "sha2" },
+    { code: 0, stdout: "" },
+    { code: 0, stdout: "" },
+    { code: 0, stdout: "sha3" },
+    { code: 0, stdout: "" },
+  ]);
+  let prompt = "";
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: need fix",
+    "Test issue",
+    { path: "/fake/worktree", slug: "adopted-pr-1480" },
+    gitFn,
+    async (_harness, _cwd, value) => {
+      prompt = value;
+      return makeSucceedInvoke()(_harness, _cwd, value, {});
+    },
+    undefined,
+    {},
+    undefined,
+    undefined,
+    {
+      branch: "fix/release-convergence-durable",
+      headSha: "sha1",
+      prNumber: 1480,
+    },
+  );
+  assert.deepEqual(result, { status: "fix-committed", headSha: "sha3" });
+  assert.match(prompt, /git push origin HEAD:fix\/release-convergence-durable/);
+  assert.ok(
+    calls.some((args) =>
+      args[0] === "push" && args[1] === "origin" &&
+      args[2] === "HEAD:fix/release-convergence-durable"
+    ),
+    "pre-merge autofix must push local HEAD to the adopted PR delivery branch",
+  );
+});
+
 test("performPreMergeAutoFix #553: harness cwd equals the salvage-inspected worktree path (worktree-locality invariant)", async () => {
   const { fn: gitFn } = makeSeqGitFn([
         // status --porcelain (pre-fix: clean)

@@ -33,6 +33,16 @@ export const PIPELINE_GIT_PUSH_TOKEN_VALUE_ENV = "PIPELINE_GIT_PUSH_TOKEN_VALUE"
 /** Marker env so harnesses / diagnostics can see the configured mechanism. */
 export const PIPELINE_GIT_PUSH_AUTH_ENV = "PIPELINE_GIT_PUSH_AUTH";
 
+/**
+ * Build an explicit source-to-destination refspec when a managed workspace's
+ * local branch differs from the remote branch that owns delivery (for example,
+ * an adopted PR). A bare destination name is interpreted by Git as a local
+ * source ref and fails when only the synthetic workspace branch exists.
+ */
+export function deliveryPushRefspec(localBranch: string, deliveryBranch: string): string {
+  return localBranch === deliveryBranch ? deliveryBranch : `HEAD:${deliveryBranch}`;
+}
+
 const HTTPS_TOKEN_PREFIX = "https-token:";
 
 /** Known GitHub workflow-scope refusal text fragments (case-insensitive match). */

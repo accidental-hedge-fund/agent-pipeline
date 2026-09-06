@@ -556,9 +556,13 @@ export async function advance(
             if (!wt) {
               const remat = await ensureWtForAutoFix(cfg, issueNumber, {
                 getOnDiskForIssue: getForIssueForAutoFix,
-                getIssueTitle: async () => issueTitle,
                 runDir: opts.runDir,
                 runStoreDeps: opts.runStoreDeps,
+                recoveryTarget: {
+                  branch: prDetail.head_ref,
+                  headSha: prDetail.head_sha,
+                  prNumber,
+                },
               });
               if (remat.result === "fail") {
                 return {
@@ -585,6 +589,12 @@ export async function advance(
               salvageFnForAutoFix,
               {},
               claimAttempt,
+              undefined,
+              {
+                branch: prDetail.head_ref,
+                headSha: prDetail.head_sha,
+                prNumber,
+              },
             );
           }
         : undefined);

@@ -43,10 +43,11 @@ Item-local Cooling created by a Recovery Episode SHALL persist the candidate epo
 
 - **WHEN** a managed recovery worktree uses a synthetic branch name that differs from its linked adopted PR head branch
 - **THEN** Pipeline SHALL bind the linked PR branch as delivery authority before invoking the fix harness
-- **AND** a harness-created follow-up commit, delegated-executor synchronization, timeout recovery, and final push SHALL retain that delivery authority rather than targeting the synthetic branch
+- **AND** a harness-created follow-up commit, delegated-executor synchronization, timeout recovery, pre-merge autofix, and final push SHALL retain that delivery authority rather than targeting the synthetic branch
+- **AND** a pipeline-owned push from the synthetic workspace SHALL use an explicit local-HEAD-to-delivery-branch refspec
 - **AND** when the worktree HEAD exactly equals the live linked PR HEAD after an external fix, the linked PR HEAD SHALL prove the external commit is delivered
 - **AND** the synthetic managed branch SHALL NOT cause Pipeline to amend or push-rewrite that commit
-- **AND** an absent workspace SHALL be rematerialized on a stable synthetic managed branch at the verified linked PR head without requiring the delivery branch to use a `pipeline/*` name
+- **AND** an absent workspace at a fix or later stage SHALL be rematerialized on a stable synthetic managed branch at the verified linked PR head without requiring the delivery branch to use a `pipeline/*` name
 - **AND** an unreadable or moved linked PR HEAD SHALL fail closed
 
 #### Scenario: Prose variation does not reset the cursor

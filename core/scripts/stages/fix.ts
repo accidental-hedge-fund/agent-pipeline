@@ -122,6 +122,7 @@ import {
 } from "../transient-wrappers.ts";
 import {
   DEFAULT_GIT_PUSH_AUTH,
+  deliveryPushRefspec,
   formatPushAuthFailure,
   gitExecForwardingEnv,
   prepareWorktreePushAuthEnv,
@@ -545,7 +546,7 @@ export async function resolveLinkedPrDelivery(
   cfg: PipelineConfig,
   issueNumber: number,
   deps: { getPrForIssue?: typeof getPrForIssue; getPrDetail?: typeof getPrDetail } = {},
-): Promise<{ branch: string; headSha: string } | null> {
+): Promise<{ branch: string; headSha: string; prNumber: number } | null> {
   try {
     const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber);
     if (prNumber == null) return null;
@@ -553,7 +554,7 @@ export async function resolveLinkedPrDelivery(
     const branch = pr.head_ref.trim();
     const headSha = (pr.head_sha ?? "").trim().toLowerCase();
     if (!branch || !/^[0-9a-f]{40}$/.test(headSha)) return null;
-    return { branch, headSha };
+    return { branch, headSha, prNumber };
   } catch {
     return null;
   }
@@ -605,15 +606,34 @@ export async function advanceFix(
 
   const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
   const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
   let wt = await getOnDiskFn(cfg, issueNumber);
   if (!wt) {
     // Rematerialize once before parking (#769) — park-release may have deleted
-    // a clean tree while the PR branch remains recoverable.
-    const remat = await ensureFn(cfg, issueNumber, {
-      getOnDiskForIssue: getOnDiskFn,
-      runDir: opts.runDir,
-      runStoreDeps: opts.runStoreDeps,
+    // a clean tree while the PR branch remains recoverable. Adopted PRs live
+    // on a distinct delivery branch; resolve that exact identity first and
+    // fail closed rather than deriving a synthetic branch from the issue title.
+    const recoveryIdentity = await resolveLinkedPrDelivery(cfg, issueNumber, {
+      getPrForIssue: deps.getPrForIssue,
+      getPrDetail: deps.getPrDetail,
     });
+    const remat = recoveryIdentity
+      ? await ensureFn(cfg, issueNumber, {
+          getOnDiskForIssue: getOnDiskFn,
+          runDir: opts.runDir,
+          runStoreDeps: opts.runStoreDeps,
+          recoveryTarget: {
+            branch: recoveryIdentity.branch,
+            headSha: recoveryIdentity.headSha,
+            prNumber: recoveryIdentity.prNumber,
+          },
+        })
+      : {
+          result: "fail" as const,
+          worktree: null,
+          reason: "linked open PR is unavailable for exact recovery",
+          blockerKind: "worktree-missing" as const,
+        };
     if (remat.result === "fail") {
       if (isOccupiedWorktreeFault(remat)) {
         return { advanced: false, status: "waiting", reason: remat.reason };
@@ -623,14 +643,14 @@ export async function advanceFix(
       // Separate calls keep explicit BlockerKind string literals visible to the
       // blocked-recipes exhaustiveness scan (nested ternaries confuse its paren walk).
       if (remat.blockerKind === "worktree-capacity") {
-        await setBlocked(cfg, issueNumber, reason, stage, "worktree-capacity");
+        await setBlockedFn(cfg, issueNumber, reason, stage, "worktree-capacity");
         return { advanced: false, status: "blocked", reason, blockerKind: "worktree-capacity" };
       }
       if (remat.blockerKind === "worktree-creation-failed") {
-        await setBlocked(cfg, issueNumber, reason, stage, "worktree-creation-failed");
+        await setBlockedFn(cfg, issueNumber, reason, stage, "worktree-creation-failed");
         return { advanced: false, status: "blocked", reason, blockerKind: "worktree-creation-failed" };
       }
-      await setBlocked(cfg, issueNumber, reason, stage, "worktree-missing");
+      await setBlockedFn(cfg, issueNumber, reason, stage, "worktree-missing");
       return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
     }
     wt = { path: remat.worktree.path, slug: remat.worktree.slug };
@@ -639,7 +659,6 @@ export async function advanceFix(
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const getGhActorFn = deps.getGhActor ?? getGhActor;
   const postCommentFn = deps.postComment ?? postComment;
-  const setBlockedFn = deps.setBlocked ?? setBlocked;
   const transitionFn = deps.transition ?? transition;
   const detail = await getIssueDetailFn(cfg, issueNumber);
 
@@ -1725,7 +1744,7 @@ export async function advanceFix(
           const res = await runConfiguredGitPush({
             cwd: wt.path,
             auth: pushAuth,
-            args: ["push", "origin", branch],
+            args: ["push", "origin", deliveryPushRefspec(managedBranch, branch)],
             deps: {
               gitConfigGet: async (cwd, key) => {
                 const r = await gitWt(cwd, ["config", "--get", key], {

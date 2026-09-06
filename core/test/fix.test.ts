@@ -40,6 +40,7 @@ import {
   type AdvanceFixDeps,
 } from "../scripts/stages/fix.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
+import { deliveryPushRefspec } from "../scripts/git-push-auth.ts";
 
 const execFileAsync = promisify(execFile);
 import { formatReviewComment } from "../scripts/stages/review.ts";
@@ -795,8 +796,47 @@ test("resolveLinkedPrDelivery: returns the adopted delivery branch and exact liv
       getPrForIssue: async () => 1480,
       getPrDetail: async () => ({ head_ref: "fix/release-convergence-durable", head_sha: SHA_HEAD }) as any,
     }),
-    { branch: "fix/release-convergence-durable", headSha: SHA_HEAD },
+    { branch: "fix/release-convergence-durable", headSha: SHA_HEAD, prNumber: 1480 },
   );
+});
+
+test("deliveryPushRefspec: adopted synthetic workspace pushes HEAD to the delivery branch", () => {
+  assert.equal(
+    deliveryPushRefspec("pipeline/1478-adopted-pr-1480", "fix/release-convergence-durable"),
+    "HEAD:fix/release-convergence-durable",
+  );
+  assert.equal(deliveryPushRefspec("pipeline/1478-x", "pipeline/1478-x"), "pipeline/1478-x");
+});
+
+test("adopted synthetic workspace: harness commit reaches the delivery branch only via HEAD:<delivery> (#1478)", async () => {
+  const { cloneDir, cleanup } = await makeRemoteAndClone();
+  const delivery = "fix/release-convergence-durable";
+  const synthetic = "pipeline/1478-adopted-pr-1480";
+  try {
+    await execFileAsync("git", ["checkout", "-b", delivery], { cwd: cloneDir });
+    await execFileAsync("git", ["push", "-u", "origin", delivery], { cwd: cloneDir });
+    await execFileAsync("git", ["checkout", "-b", synthetic], { cwd: cloneDir });
+    await execFileAsync("git", ["branch", "-D", delivery], { cwd: cloneDir });
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "fix: harness commit on synthetic branch"], {
+      cwd: cloneDir,
+    });
+    const { stdout: localHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const sha = localHead.trim();
+
+    await assert.rejects(
+      () => execFileAsync("git", ["push", "origin", delivery], { cwd: cloneDir }),
+      /src refspec|does not match/i,
+    );
+    await execFileAsync("git", ["push", "origin", deliveryPushRefspec(synthetic, delivery)], { cwd: cloneDir });
+    const { stdout: remoteHead } = await execFileAsync(
+      "git",
+      ["ls-remote", "origin", `refs/heads/${delivery}`],
+      { cwd: cloneDir },
+    );
+    assert.equal(remoteHead.trim().split(/\s+/)[0], sha);
+  } finally {
+    await cleanup();
+  }
 });
 
 test("advanceFix source pin: adopted delivery identity is bound before the harness and retained when the harness commits (#1478)", async () => {
@@ -811,6 +851,16 @@ test("advanceFix source pin: adopted delivery identity is bound before the harne
   assert.match(src, /headBranch: deliveryBranch/);
   assert.match(src, /let externalDeliveryBranch: string \| null = linkedDelivery\?\.branch \?\? null/);
   assert.match(src, /const branch = externalDeliveryBranch \?\? deliveryBranch/);
+  assert.match(
+    src,
+    /args:\s*\["push",\s*"origin",\s*deliveryPushRefspec\(managedBranch,\s*branch\)\]/,
+    "pipeline-owned final push must use HEAD:<delivery> when the local branch is synthetic",
+  );
+  const rematIdx = src.indexOf("if (!wt) {");
+  const ensureIdx = src.indexOf("await ensureFn(", rematIdx);
+  assert.ok(rematIdx !== -1 && ensureIdx !== -1);
+  assert.match(src.slice(rematIdx, ensureIdx), /recoveryIdentity = await resolveLinkedPrDelivery/);
+  assert.match(src.slice(ensureIdx, ensureIdx + 500), /recoveryTarget:/);
 });
 
 // ---------------------------------------------------------------------------
@@ -2525,6 +2575,65 @@ function makeAckFixDeps(comments: { author: string; body: string; createdAt: str
   };
   return { deps, rec };
 }
+
+test("advanceFix: park-released adopted PR rematerializes with exact recoveryTarget (#1478)", async (t) => {
+  let captured: { branch: string; headSha: string; prNumber?: number } | undefined;
+  const { deps } = makeAckFixDeps([
+    { author: "pipeline-bot", body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
+    { author: "alice", body: "please also change X", createdAt: "2026-01-02T00:00:00Z" },
+  ]);
+  deps.getOnDiskForIssue = async () => null;
+  deps.getPrForIssue = async () => 1480;
+  deps.getPrDetail = async () =>
+    ({ head_ref: "fix/release-convergence-durable", head_sha: SHA_HEAD }) as Awaited<
+      ReturnType<NonNullable<AdvanceFixDeps["getPrDetail"]>>
+    >;
+  deps.ensureManagedWorktree = async (_cfg, _issue, ensureDeps) => {
+    captured = ensureDeps?.recoveryTarget;
+    return {
+      result: "pass",
+      worktree: {
+        path: "/tmp/wt",
+        slug: "adopted-pr-1480",
+        branch: "pipeline/1478-adopted-pr-1480",
+      },
+      reason: "recreated from adopted PR head",
+    };
+  };
+  await quietFix(t, async () => {
+    await advanceFix(ACK_CFG, 1099, 1, {}, deps);
+  });
+  assert.deepEqual(captured, {
+    branch: "fix/release-convergence-durable",
+    headSha: SHA_HEAD,
+    prNumber: 1480,
+  });
+});
+
+test("advanceFix: missing linked PR identity fails closed before title-derived rematerialize (#1478)", async (t) => {
+  let ensureCalls = 0;
+  const { deps, rec } = makeAckFixDeps([]);
+  deps.getOnDiskForIssue = async () => null;
+  deps.getPrForIssue = async () => null;
+  deps.ensureManagedWorktree = async () => {
+    ensureCalls += 1;
+    return {
+      result: "fail",
+      worktree: null,
+      reason: "must not derive identity from the issue title",
+      blockerKind: "worktree-missing",
+    };
+  };
+  let outcome: Awaited<ReturnType<typeof advanceFix>> | undefined;
+  await quietFix(t, async () => {
+    outcome = await advanceFix(ACK_CFG, 1099, 1, {}, deps);
+  });
+  assert.equal(ensureCalls, 0);
+  assert.equal(outcome?.advanced, false);
+  assert.equal(outcome && "blockerKind" in outcome ? outcome.blockerKind : undefined, "worktree-missing");
+  assert.equal(rec.blocked[0]?.kind, "worktree-missing");
+  assert.match(rec.blocked[0]?.reason ?? "", /linked open PR is unavailable for exact recovery/);
+});
 
 test("advanceFix: please-also from a non-pipeline author setBlocked needs-human (#1099)", async (t) => {
   const { deps, rec } = makeAckFixDeps([

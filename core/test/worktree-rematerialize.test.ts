@@ -850,6 +850,16 @@ test("source wiring: pre_merge autofix/archive and fix rematerialize before bare
   );
   assert.match(
     preMerge,
+    /recoveryTarget:\s*\{[\s\S]*?branch:\s*prDetail\.head_ref[\s\S]*?headSha:\s*prDetail\.head_sha[\s\S]*?prNumber/,
+    "pre-merge autofix rematerialization must retain the adopted PR identity",
+  );
+  assert.match(
+    preMerge,
+    /deliveryPushRefspec\(managedBranch, deliveryBranch\)/,
+    "pre-merge autofix delivery must not push the synthetic workspace branch",
+  );
+  assert.match(
+    preMerge,
     /fixRes\.status === "rematerialize-failed"/,
     "SHA-gate residual/delta paths must branch on rematerialize-failed",
   );
