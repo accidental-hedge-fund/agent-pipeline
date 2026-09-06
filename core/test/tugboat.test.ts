@@ -3712,12 +3712,7 @@ test("reapDetachFixture captures a leader-gone group from its marked non-leader"
     assert.notEqual(procLiveness(childPid), "live", "unmarked group child leaked");
     assert.equal(fs.existsSync(dir), false);
   } finally {
-    try {
-      process.kill(-leaderPid, "SIGTERM");
-    } catch {
-      /* already gone */
-    }
-    fs.rmSync(dir, { recursive: true, force: true });
+    await reapDetachFixture({ dir, stateRoot, version, children: [leader] });
   }
 });
 
