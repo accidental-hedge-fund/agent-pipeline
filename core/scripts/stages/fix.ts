@@ -797,6 +797,16 @@ export async function advanceFix(
   // prompt via a short pre-round read; the shared helper re-captures for the
   // commit-range (reattach may not change HEAD content).
   const preRoundHead = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
+  // A managed worktree's local branch is workspace identity, not necessarily
+  // the delivery identity. Bind the linked PR branch before invoking the
+  // harness so commits, delegated-executor sync, timeout recovery, and the
+  // final push all target the adopted PR rather than an orphan synthetic ref.
+  const linkedDelivery = await resolveLinkedPrDelivery(cfg, issueNumber, {
+    getPrForIssue: deps.getPrForIssue,
+    getPrDetail: deps.getPrDetail,
+  });
+  const managedBranch = branchName(issueNumber, wt.slug);
+  const deliveryBranch = linkedDelivery?.branch ?? managedBranch;
 
   // Use branch-diff to identify the OpenSpec change this branch introduced rather
   // than changes[0], which may be an unrelated pre-existing change in the worktree.
@@ -820,6 +830,7 @@ export async function advanceFix(
     // at this point equals the reviewed SHA (no commits have happened yet).
     // A does-not-reproduce declaration must exactly match this value.
     reviewedSha: preRoundHead,
+    deliveryBranch,
   });
   const model = opts.model ?? cfg.models.fix;
   // External stage executor delegation (#314): fix-1/fix-2 are
@@ -967,7 +978,7 @@ export async function advanceFix(
       // below, so the executor's real result and the pipeline's inspection can
       // never diverge.
       if (result.executor_name) {
-        await syncWorktreeToDelegatedExecutorResult(wt.path, branchName(issueNumber, wt.slug));
+        await syncWorktreeToDelegatedExecutorResult(wt.path, deliveryBranch);
       }
       return { result, retryResult };
     },
@@ -1030,7 +1041,7 @@ export async function advanceFix(
       const timeoutPark = resolveTimeoutParkForUnpublishedCommit(
         {
           issueNumber,
-          headBranch: branchName(issueNumber, wt.slug),
+          headBranch: deliveryBranch,
           porcelain: statusR.code === 0 ? statusR.stdout : "",
           extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
           commitsAheadOfBase: true,
@@ -1143,7 +1154,7 @@ export async function advanceFix(
   // (fix already applied externally); carries the decided target stage through
   // to the final transition once the normal gates below have validated it.
   let externalAdvance: ExternalCommitAdvanceDecision & { advance: true } | null = null;
-  let externalDeliveryBranch: string | null = null;
+  let externalDeliveryBranch: string | null = linkedDelivery?.branch ?? null;
   // Which commit-message gate to run when externalAdvance is set (#349 review-1
   // finding 1): "external" only once verifyCommitOnRemote proves the commit(s)
   // already reached origin outside the fix harness; otherwise "harness" keeps
@@ -1216,7 +1227,7 @@ export async function advanceFix(
         if (deps.verifyCommitOnRemote) {
           verifiedOnRemote = await deps.verifyCommitOnRemote(
               wt.path,
-              branchName(issueNumber, wt.slug),
+              deliveryBranch,
               headAfter,
             );
         } else {
@@ -1663,7 +1674,7 @@ export async function advanceFix(
     });
   }
 
-  const branch = externalDeliveryBranch ?? branchName(issueNumber, wt.slug);
+  const branch = externalDeliveryBranch ?? deliveryBranch;
   // #760: transient-retryable push with currency re-sync (no force-push).
   // Authoritative delivery uses configured git.push_auth (#980).
   const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;

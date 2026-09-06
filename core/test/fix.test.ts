@@ -799,6 +799,20 @@ test("resolveLinkedPrDelivery: returns the adopted delivery branch and exact liv
   );
 });
 
+test("advanceFix source pin: adopted delivery identity is bound before the harness and retained when the harness commits (#1478)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const resolveIdx = src.indexOf("const linkedDelivery = await resolveLinkedPrDelivery(");
+  const promptIdx = src.indexOf("const prompt = buildFixPrompt(", resolveIdx);
+  const roundIdx = src.indexOf("const roundResult = await runHarnessRound", promptIdx);
+  assert.ok(resolveIdx !== -1 && promptIdx !== -1 && roundIdx !== -1);
+  assert.ok(resolveIdx < promptIdx && promptIdx < roundIdx, "delivery authority must be fixed before invoking the harness");
+  assert.match(src.slice(promptIdx, roundIdx), /deliveryBranch,/);
+  assert.match(src, /syncWorktreeToDelegatedExecutorResult\(wt\.path, deliveryBranch\)/);
+  assert.match(src, /headBranch: deliveryBranch/);
+  assert.match(src, /let externalDeliveryBranch: string \| null = linkedDelivery\?\.branch \?\? null/);
+  assert.match(src, /const branch = externalDeliveryBranch \?\? deliveryBranch/);
+});
+
 // ---------------------------------------------------------------------------
 // #553: an external stage executor (invokeStageExecutor) is a bare HTTP call
 // with no cwd/worktree concept — it cannot commit into wt.path directly. When

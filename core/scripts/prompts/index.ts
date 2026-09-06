@@ -556,6 +556,10 @@ export interface BuildFixArgs {
    * exercise the declaration instruction.
    */
   reviewedSha?: string;
+  /** Remote branch that owns delivery for this fix. This can differ from the
+   * managed worktree's local synthetic branch when the pipeline adopts an
+   * existing PR. */
+  deliveryBranch?: string;
 }
 
 export function buildFixPrompt(a: BuildFixArgs): string {
@@ -572,6 +576,9 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     spec_context: specContextSection(a.specContext),
     spec_revision_instruction: fixSpecRevisionInstruction(a.specContext),
     reviewed_sha: a.reviewedSha ?? "(unknown — no reviewed SHA supplied)",
+    delivery_branch_instruction: a.deliveryBranch
+      ? `\n\n## Delivery branch (required)\n\nThe linked PR's authoritative remote branch is \`${a.deliveryBranch}\`. The current local branch may be a pipeline-managed workspace identity with a different name. Do not pull, rebase from, or push the local branch's same-named remote. If you push, use exactly \`git push origin HEAD:${a.deliveryBranch}\`.`
+      : "",
     papercut_instruction: papercutInstructionSection(a.cfg),
   });
 }

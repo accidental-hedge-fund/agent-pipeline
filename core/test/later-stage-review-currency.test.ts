@@ -9,7 +9,7 @@ import {
   reconcileLaterStageReviewCurrency,
 } from "../scripts/stages/later-stage-review-currency.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
-import { worktreePath } from "../scripts/worktree.ts";
+import { ensureManagedWorktree, worktreePath } from "../scripts/worktree.ts";
 
 const SHA_S = "a".repeat(40);
 const SHA_H = "b".repeat(40);
@@ -558,6 +558,39 @@ test("bindEpochRestartWorktreeToHead: rematerializes the exact PR head after par
   assert.equal(result.kind, "bound");
   if (result.kind === "bound") assert.equal(result.worktreeHead, SHA_H);
   assert.equal(rec.calls.some((args) => args[0] === "reset"), false);
+});
+
+test("bindEpochRestartWorktreeToHead: rematerializes an adopted PR after park cleanup (#1478)", async () => {
+  const rec = gitCallsRecorder();
+  rec.setHead(SHA_H);
+  const adoptedSlug = "adopted-pr-1480";
+  const cfg = bindCfg();
+  const adoptedPath = worktreePath(cfg, BIND_ISSUE, adoptedSlug);
+  let createdSlug = "";
+  const result = await bindEpochRestartWorktreeToHead(cfg, BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => null,
+    gitInWorktree: rec.git,
+    resolveOpenPrHead: async () => SHA_H,
+    rematerializeMissingWorktree: async (config, issue) =>
+      ensureManagedWorktree(config, issue, {
+        recoveryTarget: {
+          branch: "fix/release-convergence-durable",
+          headSha: SHA_H,
+          prNumber: 1480,
+        },
+        getOnDiskForIssue: async () => null,
+        gitCmd: async () => ({ stdout: "", stderr: "", code: 0 }),
+        resolveOpenPrHeadForBranch: async () => null,
+        createWorktree: async (_cfg, _issue, slug) => {
+          createdSlug = slug;
+          return { path: adoptedPath, branch: `pipeline/${BIND_ISSUE}-${slug}` };
+        },
+        gitInWorktree: async () => ({ stdout: `${SHA_H}\n`, stderr: "", code: 0 }),
+      }),
+  });
+  assert.equal(createdSlug, adoptedSlug);
+  assert.equal(result.kind, "bound");
+  if (result.kind === "bound") assert.equal(result.worktreeHead, SHA_H);
 });
 
 test("bindEpochRestartWorktreeToHead: live PR HEAD J during bind does not move worktree to H", async () => {
