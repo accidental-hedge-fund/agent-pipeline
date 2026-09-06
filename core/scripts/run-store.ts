@@ -122,6 +122,40 @@ export function runsDir(repoDir: string): string {
   return artifactSubdir(repoDir, RUNS_ARTIFACT);
 }
 
+export type RunStoreRootGitRunner = (
+  cwd: string,
+  args: string[],
+  opts?: { ignoreFailure?: boolean },
+) => Promise<{ stdout: string; stderr: string; code: number }>;
+
+/** First registered worktree is Git's persistent primary checkout. */
+export function primaryWorktreeFromPorcelain(raw: string): string | null {
+  for (const line of raw.split("\n")) {
+    if (!line.startsWith("worktree ")) continue;
+    const candidate = line.slice("worktree ".length).trim();
+    return candidate || null;
+  }
+  return null;
+}
+
+/**
+ * Keep run artifacts outside disposable linked worktrees. A normal checkout
+ * resolves to itself; a managed linked worktree resolves to the primary
+ * registered checkout. Git/read failures retain the caller path.
+ */
+export async function resolveRunStoreRepoDir(
+  repoDir: string,
+  git: RunStoreRootGitRunner,
+): Promise<string> {
+  const listed = await git(repoDir, ["worktree", "list", "--porcelain"], {
+    ignoreFailure: true,
+  }).catch(() => null);
+  if (!listed || listed.code !== 0) return repoDir;
+  const primary = primaryWorktreeFromPorcelain(listed.stdout);
+  if (!primary) return repoDir;
+  return path.isAbsolute(primary) ? path.normalize(primary) : path.resolve(repoDir, primary);
+}
+
 /** Absolute path of a single run's directory. */
 export function runDirPath(repoDir: string, runId: RunId): string {
   return path.join(runsDir(repoDir), runId);

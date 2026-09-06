@@ -85,6 +85,7 @@ import {
   persistTrustedSurfaceDecision,
   readEvents,
   readTrustedSurfaceDecision,
+  resolveRunStoreRepoDir,
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
@@ -814,6 +815,8 @@ export interface AdvanceDeps {
    * failures without touching the real FS or spawning an event-sink command.
    */
   runStore?: Partial<RunStoreDeps>;
+  /** Persistent checkout that owns run artifacts; defaults to Git primary worktree. */
+  resolveRunStoreRepoDir?: typeof resolveRunStoreRepoDir;
 }
 
 /**
@@ -1684,6 +1687,7 @@ export async function runAdvance(
     // 'starting' and 'run id' lines below. Skipped under --dry-run.
     // runStoreDeps is mutated after the tee starts so --json-events events bypass it.
     let runDir: string | undefined;
+    let runStoreRepoDir = cfg.repo_dir;
     /** Open planning-leverage phase instances keyed by delivery phase (#702). */
     const openPhaseInstances = new Map<string, { phase_instance_id: string; started_at: string }>();
     /**
@@ -1721,7 +1725,11 @@ export async function runAdvance(
       // Use the run id pinned by a detached launcher when present, so the detached
       // caller and the inner run share one `.agent-pipeline/runs/<run-id>` (#155).
       const runId = opts.runId ?? runIdFor(issueNumber, runStartedAt);
-      runDir = runDirPath(cfg.repo_dir, runId);
+      runStoreRepoDir = await (deps.resolveRunStoreRepoDir ?? resolveRunStoreRepoDir)(
+        cfg.repo_dir,
+        deps.gitInWorktree ?? gitInWorktree,
+      );
+      runDir = runDirPath(runStoreRepoDir, runId);
       // stdoutWrite for initRunDir uses the original stdout (before tee starts);
       // this ensures run_start appears on stdout without going to terminal.log.
       if (opts.jsonEvents) {
@@ -2204,11 +2212,11 @@ export async function runAdvance(
       const candidates: DurablePinCandidate[] = [];
       if (runDir) {
         const currentId = path.basename(runDir);
-        const ids = await listRunIds(cfg.repo_dir, runStoreDeps).catch(() => [] as string[]);
+        const ids = await listRunIds(runStoreRepoDir, runStoreDeps).catch(() => [] as string[]);
         const prefix = `${issueNumber}-`;
         for (const id of ids) {
           if (!id.startsWith(prefix) || id === currentId) continue;
-          const priorDir = runDirPath(cfg.repo_dir, id);
+          const priorDir = runDirPath(runStoreRepoDir, id);
           const prior = await readTrustedSurfaceDecision(priorDir, runStoreDeps);
           const events = await readEvents(priorDir, runStoreDeps).catch(() => []);
           candidates.push(
@@ -3157,11 +3165,11 @@ export async function runAdvance(
             const sha = normalizeCandidateSha(candidateSha);
             if (!sha) return null;
             const currentId = path.basename(runDir);
-            const ids = await listRunIds(cfg.repo_dir, runStoreDeps).catch(() => [] as string[]);
+            const ids = await listRunIds(runStoreRepoDir, runStoreDeps).catch(() => [] as string[]);
             const prefix = `${issueNumber}-`;
             for (const id of ids) {
               if (!id.startsWith(prefix) || id === currentId) continue;
-              const priorDir = runDirPath(cfg.repo_dir, id);
+              const priorDir = runDirPath(runStoreRepoDir, id);
               const priorRead = await readTesterEvidence(priorDir, deps.testerIo);
               const matched = shaMatchedPassedTesterEvidence(
                 priorRead.status === "ok" ? priorRead.evidence : null,

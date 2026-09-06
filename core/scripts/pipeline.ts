@@ -159,6 +159,7 @@ import {
   persistPublicEntrypointAdmission,
   persistTrustedSurfaceDecision,
   readTrustedSurfaceDecision,
+  resolveRunStoreRepoDir,
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
@@ -2057,6 +2058,7 @@ export interface RealExecuteRecoveryDeps {
     input: ComputeTrustedSurfaceFromObjectSourceInput,
   ) => ReturnType<typeof computeTrustedSurfaceFromObjectSource>;
   persistTrustedSurfaceDecision?: typeof persistTrustedSurfaceDecision;
+  resolveRunStoreRepoDir?: typeof resolveRunStoreRepoDir;
   /** Blocked-run engine identity from run.json (not the currently installed engine). */
   resolveRunEngineIdentity?: typeof resolveRunEngineIdentity;
 }
@@ -2801,7 +2803,13 @@ export function realExecuteRecovery(
           ? await getDetailPr(cfg, prNumber).catch(() => null)
           : null;
         const runId = input.evidence?.pipeline_run_id?.trim() ?? "";
-        const runDir = runId ? runDirPath(cfg.repo_dir, runId) : "";
+        const runStoreRepoDir = runId
+          ? await (deps.resolveRunStoreRepoDir ?? resolveRunStoreRepoDir)(
+              cfg.repo_dir,
+              gitInWt,
+            )
+          : cfg.repo_dir;
+        const runDir = runId ? runDirPath(runStoreRepoDir, runId) : "";
         const readTs = deps.readTrustedSurfaceDecision ?? readTrustedSurfaceDecision;
         let trustedSurface = runDir ? await readTs(runDir).catch(() => null) : null;
         let pushedHeadSha: string | null = null;

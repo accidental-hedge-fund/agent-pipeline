@@ -3,6 +3,28 @@
 ## Purpose
 TBD - created by archiving change desktop-run-artifact-contract. Update Purpose after archive.
 ## Requirements
+
+### Requirement: Run artifacts survive managed worktree cleanup
+
+When a pipeline command starts from a linked worktree, the system SHALL store
+its run directory beneath the repository's persistent primary registered
+worktree. The run directory SHALL remain writable while the managed linked
+worktree is removed and while terminal events, summaries, metrics, and
+write-health records are finalized.
+
+#### Scenario: Ready-to-deploy removes its linked worktree
+
+- **WHEN** a stateful advance reaches ready-to-deploy from a managed linked
+  worktree
+- **THEN** the linked worktree may be removed without removing the run directory
+- **AND** terminal finalization can append events and write the final summary,
+  metrics, and write-health records
+
+#### Scenario: Primary checkout discovery is unavailable
+
+- **WHEN** Git cannot enumerate registered worktrees
+- **THEN** the system falls back to the caller checkout for backward-compatible
+  run storage
 ### Requirement: Pipeline creates a stable, crash-safe run directory before the first stage
 The pipeline orchestrator SHALL create a run directory at `.agent-pipeline/runs/<run-id>/` before any stage handler is called for a dispatch cycle. The `<run-id>` SHALL be a deterministic, filesystem-safe string formed from the issue number and the UTC dispatch start timestamp including milliseconds (e.g. `<issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ>`). Millisecond precision is required so that two dispatches for the same issue starting in the same second produce distinct run directories. The run-id SHALL remain constant across all stages within a single dispatch cycle.
 
@@ -240,4 +262,3 @@ because `engine.version` (or other pre-#763 engine identity) is present.
   but no `discovery_channel` field
 - **THEN** the run-level discovery channel SHALL be treated as missing-attribution
 - **AND** collectors SHALL NOT count that arrival as `live-run`
-

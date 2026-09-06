@@ -5,6 +5,30 @@ The test/build gate runs the target repo's own test/build command in the worktre
 
 ## Requirements
 
+### Requirement: Exact immutable candidate evidence is reusable across runs
+
+The gate SHALL reuse a prior passed Tester evidence record for the same issue
+and candidate commit instead of executing the suite again only when the prior
+record is schema-valid and its effective command/config digest, allowlisted
+toolchain fingerprint, pinned engine identity, verifier surface, and required
+evidence-set revision all match the current gate. Before reuse, the current
+worktree SHALL pass the same product-dirt check required before execution. A
+changed or unavailable execution identity SHALL cause the command to run.
+
+#### Scenario: Fresh physical run evaluates an unchanged candidate
+
+- **WHEN** a fresh pipeline run reaches the test gate for a commit with matching
+  passed evidence under every execution identity
+- **THEN** the prior evidence is rebound to the fresh run identity
+- **AND** the test command is not executed again
+
+#### Scenario: Verifier or environment identity changed
+
+- **WHEN** candidate SHA matches but the gate config, toolchain, engine,
+  verifier surface, or required evidence set differs
+- **THEN** the prior evidence is not reusable
+- **AND** the test command executes normally
+
 ### Requirement: Disabled gate is skipped
 When `cfg.test_gate.enabled` is `false`, the gate SHALL return a skipped result immediately without detecting or running any command.
 

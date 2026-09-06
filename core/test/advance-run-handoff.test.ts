@@ -192,6 +192,41 @@ test("top-level runAdvance executor emits advance_run_handoff before first dispa
   }
 });
 
+test("runAdvance roots finalizable run artifacts outside a disposable linked worktree", async () => {
+  const primaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-primary-"));
+  const linkedDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-linked-"));
+  const domain = `advance-persistent-${process.pid}-${Date.now()}`;
+  const expectedStoreId = runIdFor(ISSUE, STARTED_AT);
+  const { deps, lines } = stubHandoffAdvance(linkedDir, {
+    resolveRunStoreRepoDir: async (repoDir) => {
+      assert.equal(repoDir, linkedDir);
+      return primaryDir;
+    },
+  });
+  const prevExit = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await withoutHostPinAuthorityEnv(() =>
+      runAdvance(handoffCfg(linkedDir, domain), ISSUE, {}, deps),
+    );
+    assert.equal(lines.length, 1);
+    const handoff = JSON.parse(lines[0]!) as Record<string, unknown>;
+    const persistentRunDir = runDirPath(primaryDir, expectedStoreId);
+    assert.equal(handoff.run_dir, persistentRunDir);
+    assert.ok(fs.existsSync(path.join(persistentRunDir, "summary.json")));
+    assert.equal(fs.existsSync(runDirPath(linkedDir, expectedStoreId)), false);
+
+    fs.rmSync(linkedDir, { recursive: true, force: true });
+    const events = fs.readFileSync(path.join(persistentRunDir, "events.jsonl"), "utf8");
+    assert.match(events, /"type":"run_complete"/);
+  } finally {
+    process.exitCode = prevExit;
+    fs.rmSync(primaryDir, { recursive: true, force: true });
+    fs.rmSync(linkedDir, { recursive: true, force: true });
+    fs.rmSync(`/tmp/pipeline-${domain}`, { recursive: true, force: true });
+  }
+});
+
 function stubHandoffAdvance(
   repoDir: string,
   extra: Partial<AdvanceDeps> = {},

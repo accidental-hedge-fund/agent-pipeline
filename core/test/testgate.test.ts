@@ -10,6 +10,7 @@ import { EventEmitter } from "node:events";
 import {
   detectTestCommand,
   enforceTestFixCommitFormat,
+  isReusablePassedTesterEvidence,
   runTestGate,
   runTests,
   shellSplit,
@@ -589,6 +590,108 @@ test("gate: initial run passes → attempts 0, no fix invoked", async () => {
   assert.equal(out.passed, true);
   assert.equal(out.attempts, 0);
   assert.equal(invoked, 0);
+});
+
+test("gate: exact candidate/config/toolchain/verifier evidence is adopted without rerunning", async () => {
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "reuse-run-"));
+  let ran = false;
+  let adoptedRunId = "";
+  const sha = "a".repeat(40);
+  const out = await runTestGate(
+    cfgWith({ command: "npm test" }),
+    1,
+    "/wt/current",
+    {
+      runTests: async () => {
+        ran = true;
+        return passResult;
+      },
+      gitHead: async () => sha,
+      gitDirty: async () => false,
+      resolvePinnedEngineIdentity: () => ({
+        version: "1.40.1",
+        templates_fingerprint: "b".repeat(64),
+        commit_sha: "c".repeat(40),
+      }),
+      findReusableTesterEvidence: async (_dir, issue, expected) => {
+        assert.equal(issue, 1);
+        const prior = {
+          ...expected,
+          run_id: "1-prior",
+          worktree_id: "prior",
+          commands: [{
+            identity: "npm test",
+            exit_code: 0,
+            duration_ms: 10,
+            status: "passed" as const,
+            output_excerpt: "ok",
+          }],
+          evidence_subject: expected.evidence_subject
+            ? { ...expected.evidence_subject, run_id: "1-prior" }
+            : undefined,
+        };
+        assert.equal(isReusablePassedTesterEvidence(prior, expected), true);
+        return prior;
+      },
+      writeTesterEvidence: async (_dir, evidence) => {
+        adoptedRunId = evidence.run_id;
+        return { ok: true };
+      },
+    },
+    "pipeline-run",
+    "implementing",
+    undefined,
+    runDir,
+  );
+  assert.equal(ran, false);
+  assert.equal(out.passed, true);
+  assert.equal(out.attempts, 0);
+  assert.equal(adoptedRunId, path.basename(runDir));
+});
+
+test("exact suite reuse rejects changed execution identities", () => {
+  const prior = {
+    schema_version: 1 as const,
+    kind: "pipeline.tester_evidence" as const,
+    candidate_sha: "a".repeat(40),
+    run_id: "1-prior",
+    issue: 1,
+    pr: null,
+    worktree_id: "prior",
+    config_digest: "b".repeat(64),
+    toolchain_fingerprint: { node: "v24", platform: "linux", arch: "x64" },
+    started_at: "2026-09-06T00:00:00Z",
+    ended_at: "2026-09-06T00:00:01Z",
+    duration_ms: 1000,
+    overall_status: "passed" as const,
+    commands: [{ identity: "npm test", exit_code: 0, duration_ms: 1000, status: "passed" as const, output_excerpt: "ok" }],
+    output_excerpt: "ok",
+    producer: { component: "test-build-gate" as const, engine_version: "1.40.1" },
+    evidence_subject: {
+      schema_version: 1 as const,
+      domain: "acme",
+      issue: 1,
+      pr: null,
+      run_id: "1-prior",
+      candidate_sha: "a".repeat(40),
+      diff_hash: null,
+      policy_hash: "c".repeat(64),
+      engine_fingerprint: "d".repeat(64),
+      verifier_fingerprint: "e".repeat(64),
+      required_evidence_set_revision: "f".repeat(64),
+    },
+  };
+  const expected = {
+    ...prior,
+    run_id: "1-current",
+    worktree_id: "current",
+    evidence_subject: { ...prior.evidence_subject, run_id: "1-current" },
+  };
+  assert.equal(isReusablePassedTesterEvidence(prior, expected), true);
+  assert.equal(isReusablePassedTesterEvidence({ ...prior, candidate_sha: "0".repeat(40) }, expected), false);
+  assert.equal(isReusablePassedTesterEvidence({ ...prior, config_digest: "0".repeat(64) }, expected), false);
+  assert.equal(isReusablePassedTesterEvidence({ ...prior, toolchain_fingerprint: { node: "v25" } }, expected), false);
+  assert.equal(isReusablePassedTesterEvidence({ ...prior, evidence_subject: { ...prior.evidence_subject, verifier_fingerprint: "0".repeat(64) } }, expected), false);
 });
 
 test("gate: fail then fix then pass → attempts 1", async () => {

@@ -25,6 +25,7 @@ import {
   listRunIds,
   parseWriteHealthText,
   persistPublicEntrypointAdmission,
+  primaryWorktreeFromPorcelain,
   publicEntrypointRunIdFor,
   resolvePublicAdmissionPersistRoot,
   resolvePublicAdmissionClaimRoot,
@@ -32,6 +33,7 @@ import {
   readWriteHealth,
   recordWriteHealthFailure,
   resolveRunEngineIdentity,
+  resolveRunStoreRepoDir,
   runDirPath,
   runIdFor,
   trainRunIdFor,
@@ -110,6 +112,42 @@ test("runDirPath: resolves to <repoDir>/.agent-pipeline/runs/<runId>", () => {
   assert.equal(
     runDirPath(REPO_DIR, id),
     path.join(REPO_DIR, ".agent-pipeline", "runs", id),
+  );
+});
+
+test("run-store root: linked worktree resolves to persistent primary checkout", async () => {
+  const linked = "/repo/.claude/worktrees/fix+x";
+  const primary = "/repo";
+  const porcelain = [
+    `worktree ${primary}`,
+    "HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "branch refs/heads/main",
+    "",
+    `worktree ${linked}`,
+    "HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "branch refs/heads/fix/x",
+    "",
+  ].join("\n");
+  assert.equal(primaryWorktreeFromPorcelain(porcelain), primary);
+  const resolved = await resolveRunStoreRepoDir(
+    linked,
+    async (_cwd, args) => {
+      assert.deepEqual(args, ["worktree", "list", "--porcelain"]);
+      return { stdout: porcelain, stderr: "", code: 0 };
+    },
+  );
+  assert.equal(resolved, primary);
+  assert.equal(runDirPath(resolved, "155-test"), "/repo/.agent-pipeline/runs/155-test");
+});
+
+test("run-store root: git discovery failure retains caller checkout", async () => {
+  const linked = "/repo/.claude/worktrees/fix+x";
+  assert.equal(
+    await resolveRunStoreRepoDir(
+      linked,
+      async () => ({ stdout: "", stderr: "not a repository", code: 128 }),
+    ),
+    linked,
   );
 });
 
