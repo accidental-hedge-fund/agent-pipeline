@@ -39,6 +39,14 @@ Item-local Cooling created by a Recovery Episode SHALL persist the candidate epo
 - **AND** E1 attempt bounds, class-budget projections, or Cooling SHALL NOT cool or exhaust E2
 - **AND** a candidate-changing repair claim that itself produced E2 SHALL instead remain resumable for postcondition reconciliation
 
+#### Scenario: Adopted PR identity is delivery authority during fix recovery
+
+- **WHEN** a managed recovery worktree uses a synthetic branch name that differs from its linked adopted PR head branch
+- **AND** the worktree HEAD exactly equals the live linked PR HEAD after an external fix
+- **THEN** the linked PR HEAD SHALL prove the external commit is delivered
+- **AND** the synthetic managed branch SHALL NOT cause Pipeline to amend or push-rewrite that commit
+- **AND** an unreadable or moved linked PR HEAD SHALL fail closed
+
 #### Scenario: Prose variation does not reset the cursor
 
 - **WHEN** two observations differ only in incidental formatting or comment prose and normalize to the same evidence identity

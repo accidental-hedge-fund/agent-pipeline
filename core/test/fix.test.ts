@@ -29,6 +29,7 @@ import {
   FIX_RETRY_MIN_BUDGET_SEC,
   invokeFixHarnessWithRetry,
   isCommitOnRemote,
+  isCommitOnLinkedPr,
   parseDoesNotReproduceDeclarations,
   parseFindingSummaries,
   parseHumanDecisionDeclarations,
@@ -757,6 +758,34 @@ test("isCommitOnRemote: fetch failure with stale tracking ref containing the sha
   } finally {
     await cleanup();
   }
+});
+
+test("isCommitOnLinkedPr: adopted PR head proves an external commit despite a different managed branch", async () => {
+  assert.equal(
+    await isCommitOnLinkedPr({} as PipelineConfig, 1478, SHA_HEAD, {
+      getPrForIssue: async () => 1480,
+      getPrDetail: async () => ({ head_ref: "fix/release-convergence-durable", head_sha: SHA_HEAD }) as any,
+    }),
+    true,
+  );
+});
+
+test("isCommitOnLinkedPr: missing, moved, or unreadable linked PR fails closed", async () => {
+  const cfg = {} as PipelineConfig;
+  assert.equal(await isCommitOnLinkedPr(cfg, 1478, SHA_HEAD, { getPrForIssue: async () => null }), false);
+  assert.equal(
+    await isCommitOnLinkedPr(cfg, 1478, SHA_HEAD, {
+      getPrForIssue: async () => 1480,
+      getPrDetail: async () => ({ head_ref: "fix/release-convergence-durable", head_sha: SHA_REVIEWED }) as any,
+    }),
+    false,
+  );
+  assert.equal(
+    await isCommitOnLinkedPr(cfg, 1478, SHA_HEAD, {
+      getPrForIssue: async () => { throw new Error("offline"); },
+    }),
+    false,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -2501,4 +2530,3 @@ test("advanceFix: ambiguous trusted unmarked note recovers to planning, not need
   assert.deepEqual(rec.transitions, ["planning"]);
   assert.equal(rec.blocked.some((b) => b.kind === "needs-human"), false);
 });
-

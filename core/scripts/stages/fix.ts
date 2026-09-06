@@ -11,6 +11,7 @@ import {
   findLatestCommentMatching,
   getGhActor,
   getIssueDetail,
+  getPrDetail,
   getPrForIssue,
   postComment,
   setBlocked,
@@ -198,14 +199,9 @@ export interface AdvanceFixDeps {
    * used. Tests inject fakes so no real git/build subprocess is invoked.
    */
   buildSideEffects?: BuildSideEffectsDeps;
-  /**
-   * Verifies that `sha` is already present on `origin/<branch>` (#349 review-1
-   * finding 1). Used to confirm an external-commit advance decision was truly
-   * applied outside the fix harness (pushed to the remote by a human) rather
-   * than being a local-only leftover commit from a prior fix-harness run that
-   * was blocked before it could push. Defaults to `isCommitOnRemote`. Tests
-   * inject a fake so no real git fetch/subprocess runs.
-   */
+  /** Legacy/injected remote verification seam. Production verifies the linked
+   * PR's actual head, because an adopted PR branch need not equal the managed
+   * worktree's synthetic branch name. */
   verifyCommitOnRemote?: (wtPath: string, branch: string, sha: string) => Promise<boolean>;
   /**
    * Injectable per-attempt fix-harness invoker for the crash-retry loop
@@ -283,6 +279,8 @@ export interface AdvanceFixDeps {
    * Tests inject fakes so afterRound never hits the GitHub API.
    */
   getPrForIssue?: typeof getPrForIssue;
+  /** Linked PR detail for exact external-commit verification. */
+  getPrDetail?: typeof getPrDetail;
   /**
    * Shared unpublished-commit publish executor. Tests inject fakes.
    */
@@ -519,6 +517,28 @@ export async function isCommitOnRemote(wtPath: string, branch: string, sha: stri
     { ignoreFailure: true },
   );
   return check.code === 0;
+}
+
+/**
+ * Proves that an externally-applied fix is the exact current head of the PR
+ * linked to this issue. The linked PR is the delivery authority; the local
+ * managed branch name is only workspace identity and can differ for adopted
+ * PRs. An unreadable/missing/moved PR fails closed.
+ */
+export async function isCommitOnLinkedPr(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  sha: string,
+  deps: { getPrForIssue?: typeof getPrForIssue; getPrDetail?: typeof getPrDetail } = {},
+): Promise<boolean> {
+  try {
+    const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber);
+    if (prNumber == null) return false;
+    const pr = await (deps.getPrDetail ?? getPrDetail)(cfg, prNumber);
+    return Boolean(sha.trim()) && (pr.head_sha ?? "").trim().toLowerCase() === sha.trim().toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1173,12 +1193,16 @@ export async function advanceFix(
         // #349 review-2: rewrite headBefore and fall through normal gates.
         headBefore = externalDecision.reviewSha;
         externalAdvance = externalDecision;
-        const verifyOnRemote = deps.verifyCommitOnRemote ?? isCommitOnRemote;
-        const verifiedOnRemote = await verifyOnRemote(
-          wt.path,
-          branchName(issueNumber, wt.slug),
-          headAfter,
-        );
+        const verifiedOnRemote = deps.verifyCommitOnRemote
+          ? await deps.verifyCommitOnRemote(
+              wt.path,
+              branchName(issueNumber, wt.slug),
+              headAfter,
+            )
+          : await isCommitOnLinkedPr(cfg, issueNumber, headAfter, {
+              getPrForIssue: deps.getPrForIssue,
+              getPrDetail: deps.getPrDetail,
+            });
         commitGateMode = resolveFixCommitGateMode(externalDecision, verifiedOnRemote);
       } else {
         // #473: human-decision park before DNR so mixed rounds never advance.
