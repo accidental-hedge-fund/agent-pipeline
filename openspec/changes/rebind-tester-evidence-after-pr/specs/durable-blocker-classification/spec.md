@@ -61,3 +61,12 @@ The engine SHALL NOT add a new `DurableBlockerClass` for this case. The engine S
 - **THEN** recovery SHALL fail closed
 - **AND** SHALL NOT clear `pipeline:blocked`
 - **AND** SHALL NOT rewrite Tester evidence with the currently installed engine identity
+
+#### Scenario: recovery fail-closes when blocked-run engine identity is malformed
+
+- **WHEN** recovery runs the bind-or-reproduce recipe
+- **AND** the blocked run's `run.json.engine` is missing `root`, has a non-canonical `templates_fingerprint`, or records a nonempty `commit_sha` that is not a full SHA
+- **THEN** recovery SHALL fail closed
+- **AND** SHALL NOT clear `pipeline:blocked`
+- **AND** SHALL NOT invoke bind or reproduce
+- **AND** SHALL NOT rewrite Tester evidence with the currently installed engine identity

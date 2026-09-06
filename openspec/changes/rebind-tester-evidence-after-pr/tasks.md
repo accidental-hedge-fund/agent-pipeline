@@ -45,3 +45,8 @@
 
 - [x] 7.1 Fail closed on every typed `RebindTesterEvidenceResult` failure before dispatching any consumer implementation stage (`review-1`, `fix-1`, `pre-merge` included)
 - [x] 7.2 Recovery does not treat disabled-gate `not-applicable` as a recovered blocker and does not clear `pipeline:blocked` without bind/reproduce proof
+
+## 8. Review 2 (pre-merge delta) regressions
+
+- [x] 8.1 Recovery fail-closes on malformed persisted `run.json.engine` (missing `root`, non-canonical templates digest, nonempty invalid `commit_sha`) without invoking rebind or clearing the block
+- [x] 8.2 Disabled-gate exact-product-proof path applies live PR-head confirmation and observer binding; S1/S2 disagreement fail-closes with `tester_rebind_pr_head_mismatch`

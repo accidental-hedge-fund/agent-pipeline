@@ -3134,9 +3134,10 @@ export async function runAdvance(
           // Later-stage review-currency reroute already ran before this hook.
           // A typed rebind failure must fail closed at every consumer stage.
           return await failClosedRebind(rebind);
-        } else if (rebind.action !== "not-applicable") {
-          // Reread the live PR head immediately before dispatch. A concurrent
-          // push after the bind-time read must not authorize an obsolete SHA.
+        } else {
+          // Reread the live PR head immediately before dispatch, including the
+          // disabled-gate `not-applicable` path. A concurrent push after the
+          // bind-time read must not authorize an obsolete worktree SHA.
           const confirmPrNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
             () => null,
           );

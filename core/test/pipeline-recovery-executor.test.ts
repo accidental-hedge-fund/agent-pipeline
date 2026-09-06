@@ -958,6 +958,65 @@ test("rebind_tester_evidence_after_pr bind uses blocked-run engine A after insta
   }
 });
 
+test("rebind_tester_evidence_after_pr fail-closes when blocked-run engine identity is malformed", async () => {
+  const malformed = [
+    { ...PERSISTED_ENGINE, root: undefined },
+    { ...PERSISTED_ENGINE, root: "   " },
+    { ...PERSISTED_ENGINE, templates_fingerprint: "not-a-digest" },
+    { ...PERSISTED_ENGINE, templates_fingerprint: "E".repeat(64) },
+    { ...PERSISTED_ENGINE, commit_sha: "not-a-sha" },
+    { ...PERSISTED_ENGINE, commit_sha: "deadbeef" },
+  ];
+  for (const engine of malformed) {
+    let clears = 0;
+    let rebindCalls = 0;
+    const execute = realExecuteRecovery(cfg(), {
+      clearBlocked: async () => { clears++; },
+      resolveRunEngineIdentity: async () => engine as never,
+      getPrForIssue: async () => 99,
+      getPrDetail: async () => ({ number: 99, head_sha: "a".repeat(40) }) as never,
+      readTrustedSurfaceDecision: async () => ({
+        outcome: "passthrough",
+        candidate_sha: "a".repeat(40),
+        effective_verifier_hash: "c".repeat(64),
+      }) as never,
+      rebindTesterEvidenceAfterPr: async () => {
+        rebindCalls++;
+        return {
+          ok: true,
+          action: "bind",
+          candidateSha: "a".repeat(40),
+          evidence: { candidate_sha: "a".repeat(40) } as never,
+          suiteCommandInvoked: false,
+        };
+      },
+    });
+    const diagnostic = buildStageDiagnostic({
+      reasonCode: "workflow-engine-defect",
+      blockerKind: "harness-failure",
+      reason: "required implementation evidence role, observed missing",
+      stage: "design-gate",
+      evidenceOrdering: {
+        kind: "tester_rebind_after_pr",
+        required_role: "implementation",
+        observed_role: "missing",
+        trusted_surface_outcome: "passthrough",
+        pr_head: "a".repeat(40),
+      },
+    });
+    const result = await execute({
+      ...mechanicalInput(),
+      action: "rebind_tester_evidence_after_pr",
+      blockerClass: "workflow-engine-defect",
+      diagnostic,
+    });
+    assert.equal(result.succeeded, false, JSON.stringify(engine));
+    assert.equal(clears, 0, JSON.stringify(engine));
+    assert.equal(rebindCalls, 0, JSON.stringify(engine));
+    assert.match(result.error ?? "", /engine identity is absent or malformed/);
+  }
+});
+
 test("rebind_tester_evidence_after_pr fail-closes when blocked-run engine identity is absent", async () => {
   let clears = 0;
   let rebindCalls = 0;

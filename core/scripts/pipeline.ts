@@ -2051,20 +2051,33 @@ export interface RealExecuteRecoveryDeps {
   resolveRunEngineIdentity?: typeof resolveRunEngineIdentity;
 }
 
+const TEMPLATES_FINGERPRINT_RE = /^[0-9a-f]{64}$/;
+
 function engineFingerprintFromPersistedRunEngine(
   engine: RunEngineIdentity | null | undefined,
 ): string | null {
   if (!engine || typeof engine !== "object") return null;
   if (typeof engine.version !== "string" || !engine.version.trim()) return null;
-  if (typeof engine.templates_fingerprint !== "string" || !engine.templates_fingerprint.trim()) {
+  if (typeof engine.root !== "string" || !engine.root.trim()) return null;
+  if (
+    typeof engine.templates_fingerprint !== "string" ||
+    !TEMPLATES_FINGERPRINT_RE.test(engine.templates_fingerprint)
+  ) {
     return null;
   }
+  const rawCommit = engine.commit_sha;
+  if (rawCommit === undefined || rawCommit === null || rawCommit === "") {
+    return buildEngineFingerprint({
+      version: engine.version,
+      templates_fingerprint: engine.templates_fingerprint,
+    });
+  }
+  const commitSha = normalizeFullSha(typeof rawCommit === "string" ? rawCommit : null);
+  if (!commitSha) return null;
   return buildEngineFingerprint({
     version: engine.version,
     templates_fingerprint: engine.templates_fingerprint,
-    ...(typeof engine.commit_sha === "string" && engine.commit_sha
-      ? { commit_sha: engine.commit_sha }
-      : {}),
+    commit_sha: commitSha,
   });
 }
 

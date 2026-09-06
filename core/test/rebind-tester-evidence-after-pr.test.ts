@@ -721,6 +721,7 @@ async function driveDesignGateAdvance(opts: {
   prHeadSha?: string | null;
   prHeadSequence?: string[];
   worktreeHead?: string | null;
+  changedPaths?: string[];
   tester?: TesterEvidence | null;
   priorTester?: TesterEvidence | null;
   startStage?: Stage;
@@ -834,7 +835,14 @@ async function driveDesignGateAdvance(opts: {
       if (args[0] === "rev-parse" && args.includes("HEAD")) {
         return { stdout: `${opts.worktreeHead ?? ""}\n`, stderr: "", code: opts.worktreeHead ? 0 : 1 };
       }
-      if (args[0] === "diff" || args[0] === "log" || args[0] === "show") {
+      if (args[0] === "diff") {
+        return {
+          stdout: (opts.changedPaths ?? []).join("\n") + (opts.changedPaths?.length ? "\n" : ""),
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (args[0] === "log" || args[0] === "show") {
         return { stdout: "", stderr: "", code: 0 };
       }
       return { stdout: "", stderr: "", code: 0 };
@@ -1313,6 +1321,50 @@ test("observer does not accept worktree S1 proof when live PR head is S2", async
   assert.equal(evidence.candidateSha, SHA_B);
   assert.equal(evidence.evidenceRole, null);
   assert.ok(binding);
+});
+
+test("disabled-gate runAdvance fail-closes when PR head moves before observer", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    changedPaths: ["core/scripts/pipeline-run.ts"],
+    testGateEnabled: false,
+  });
+  assert.ok(driven.rebindCalls.length >= 2);
+  assert.equal(driven.rebindCalls[0]?.prHeadSha, SHA_S);
+  assert.equal(driven.rebindCalls[1]?.prHeadSha, SHA_B);
+  assert.equal(driven.rebindCalls[1]?.pushedHeadSha, SHA_S);
+  assert.equal(driven.dispatchCalls, 0);
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_mismatch",
+  );
+});
+
+test("disabled-gate observer does not accept worktree S1 proof when live PR head is S2", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    changedPaths: ["core/scripts/pipeline-run.ts"],
+    testGateEnabled: false,
+    invokeObserver: true,
+  });
+  assert.ok(driven.dispatchCalls >= 1);
+  assert.ok(driven.rebindCalls.length >= 2);
+  const lastRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
+  assert.equal(lastRebind?.prHeadSha, SHA_B);
+  assert.equal(lastRebind?.pushedHeadSha, SHA_S);
+  assert.equal(driven.observerBefore?.evidenceRole, null);
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_mismatch",
+  );
 });
 
 test("runAdvance fail-closes when PR head moves after confirmation with worktree present", async () => {
