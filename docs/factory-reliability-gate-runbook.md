@@ -795,10 +795,13 @@ Optional repeated CLI tokens:
 ### Synthetic pack lifecycle
 
 The factory-release path keeps one active synthetic pack per target version. It records the
-pack's exact issue numbers before loop dispatch, so even a failed spawn remains cleanable. A
-changed candidate/action must dispose the previous pack as `superseded` before creating its one
-successor. Terminal ineligible packs are disposed as `terminal_failed`; eligible packs are
-disposed as `completed` while their evidence remains on disk.
+pack's exact issue numbers before loop dispatch, so even a failed spawn remains cleanable. Issue
+creation is journaled after every reuse/create; an incomplete fixture-set marker blocks a changed
+request until the same request re-observes and finishes the exact binding. A changed
+candidate/action must dispose the previous pack as `superseded` before creating its one successor.
+Terminal ineligible packs and other terminal failures after fixture creation (including a manifest
+binding mismatch) are disposed as `terminal_failed`; eligible packs are disposed as `completed`
+while their evidence remains on disk.
 
 Disposal never merges. It releases each clean, recoverable managed worktree, compare-and-deletes
 same-repository remote branches at the observed PR heads, and closes all bound PRs and issues.

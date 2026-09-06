@@ -415,8 +415,9 @@ on release-eligible pass as specified by the post-pass disposition requirements.
 reused for a pack into durable pack-instance and per-version state before dispatching the pack
 loop. At most one pack for a release version SHALL remain active. Before a changed request
 fingerprint may create a successor, prepare SHALL reconcile the prior pack to `superseded`.
-After terminal ineligible scoring it SHALL reconcile that pack to `terminal_failed`; after
-structurally eligible scoring it SHALL reconcile it to `completed`. Reconciliation SHALL close
+After terminal ineligible scoring or any other terminal failure after fixture creation it SHALL
+reconcile that pack to `terminal_failed`; after structurally eligible scoring it SHALL reconcile
+it to `completed`. Reconciliation SHALL close
 every bound synthetic issue and every associated open PR without merge, safely release each
 clean managed worktree, and compare-and-delete each same-repository remote branch against the
 observed PR head. Dirty, local-only, ambiguously owned, moved, or otherwise unsafe artifacts
@@ -431,6 +432,20 @@ close artifacts as a scoring side effect.
 - **WHEN** issue creation succeeds and pack-loop dispatch fails
 - **THEN** `pack-instance.json` SHALL already contain the exact synthetic issue numbers
 - **AND** terminal cleanup SHALL be able to reconcile those issues without discovery by title
+
+#### Scenario: Partial issue creation fails closed
+
+- **WHEN** issue creation or its response fails after any fixture may have been created
+- **THEN** prepare SHALL retain an active incomplete fixture-set marker and every issue number it
+  can re-observe for that pack
+- **AND** a changed request SHALL NOT create a successor until the same request has completed the
+  exact fixture binding
+
+#### Scenario: Post-creation binding failure disposes the pack
+
+- **WHEN** a generated pack fails its request manifest binding after fixture creation
+- **THEN** prepare SHALL reconcile its exact fixtures to `terminal_failed`
+- **AND** cleanup failure SHALL retain the pack as active for an idempotent cleanup retry
 
 #### Scenario: Changed candidate disposes the former pack before creating a successor
 

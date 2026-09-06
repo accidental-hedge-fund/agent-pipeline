@@ -409,12 +409,7 @@ export interface FactoryReleasePrepareDeps {
    */
   scoreBoundPackLoop?: ScoreBoundPackLoop;
   /** Dispose exact synthetic fixtures on supersession or pack terminal. */
-  reconcilePackLifecycle?(input: {
-    version: string;
-    packRunId: string;
-    issueNumbers: readonly number[];
-    disposition: FrgPackTerminalDisposition;
-  }): Promise<FrgPackLifecycleResult>;
+  reconcilePackLifecycle?(input: FrgPackLifecycleInput): Promise<FrgPackLifecycleResult>;
   /** Optional log sink. */
   log?(msg: string): void;
   /**
@@ -696,6 +691,13 @@ export function factoryReleaseVersionIndexPath(repoDir: string, version: string)
 
 export type FrgPackTerminalDisposition = "superseded" | "terminal_failed" | "completed";
 
+export interface FrgPackLifecycleInput {
+  version: string;
+  packRunId: string;
+  issueNumbers: readonly number[];
+  disposition: FrgPackTerminalDisposition;
+}
+
 export interface FactoryReleaseVersionIndex {
   schema_version: 1;
   version: string;
@@ -706,6 +708,8 @@ export interface FactoryReleaseVersionIndex {
   loop_run_id?: string | null;
   frg_run_id?: string;
   issue_numbers?: number[];
+  /** False while issue creation is incomplete; a successor must not dispose this pack. */
+  fixture_set_complete?: boolean;
   disposition?: "active" | FrgPackTerminalDisposition;
   disposition_at?: string;
 }
@@ -746,12 +750,7 @@ export interface FrgPackLifecycleResult {
  * GitHub or the worktree manager already reports absent/closed.
  */
 export async function reconcileFrgPackLifecycle(
-  input: {
-    version: string;
-    packRunId: string;
-    issueNumbers: readonly number[];
-    disposition: FrgPackTerminalDisposition;
-  },
+  input: FrgPackLifecycleInput,
   deps: FrgPackLifecycleDeps,
 ): Promise<FrgPackLifecycleResult> {
   const result: FrgPackLifecycleResult = {
@@ -1352,6 +1351,8 @@ export interface CreateOrReusePackIssuesInput {
   pack: LoadedFrgPack;
   packRunId: string;
   rendered: RenderedFrgIssue[];
+  /** Persist the exact prefix after every successful reuse/create side effect. */
+  onIssueNumbersBound?: (issueNumbers: readonly number[]) => Promise<void>;
 }
 
 export type CreateOrReusePackIssues = (
@@ -1517,6 +1518,7 @@ export interface DurableReconcilePackLoopCtx {
   requestFingerprint: string;
   /** Filled as soon as issue creation succeeds, before loop dispatch. */
   issueNumbers?: number[];
+  fixtureSetComplete?: boolean;
   writeFile: (path: string, body: string, mode?: number) => Promise<void>;
   mkdir?: (path: string, opts?: { recursive?: boolean; mode?: number }) => Promise<void>;
   readFile: (path: string) => Promise<string>;
@@ -1579,6 +1581,9 @@ async function persistFactoryReleasePackInstance(
       frg_run_id: ctx.frgRunId,
       loop_run_id: loopRunId,
       ...(ctx.issueNumbers ? { issue_numbers: [...ctx.issueNumbers] } : {}),
+      ...(ctx.fixtureSetComplete === undefined
+        ? {}
+        : { fixture_set_complete: ctx.fixtureSetComplete }),
       created_at: createdAt,
       updated_at: isoNow(ctx.now()),
     } satisfies FactoryReleasePackInstance),
@@ -1781,12 +1786,49 @@ export async function defaultStartBoundPackLoop(
         `issues; manifest minimum_fresh_issues is ${minimum}`,
     );
   }
+  const persistFixtureBinding = async (
+    issueNumbers: readonly number[],
+    fixtureSetComplete: boolean,
+  ): Promise<void> => {
+    ctx.issueNumbers = [...issueNumbers];
+    ctx.fixtureSetComplete = fixtureSetComplete;
+    await persistFactoryReleasePackInstance(ctx, null);
+    const versionIndexPath = factoryReleaseVersionIndexPath(
+      ctx.repoDir,
+      ctx.request.target_version,
+    );
+    if (ctx.mkdir) {
+      await ctx.mkdir(path.dirname(versionIndexPath), { recursive: true, mode: 0o700 });
+    }
+    await ctx.writeFile(
+      versionIndexPath,
+      canonicalJson({
+        schema_version: 1,
+        version: ctx.request.target_version,
+        request_fingerprint: ctx.requestFingerprint,
+        candidate_git_sha: ctx.request.integrated_candidate.git_sha,
+        action_id: ctx.request.action_id,
+        pack_run_id: ctx.packRunId,
+        loop_run_id: null,
+        frg_run_id: ctx.frgRunId,
+        issue_numbers: [...issueNumbers],
+        fixture_set_complete: fixtureSetComplete,
+        disposition: "active",
+      } satisfies FactoryReleaseVersionIndex),
+      0o600,
+    );
+  };
+  // Publish creation intent before the first GitHub mutation. If the process
+  // dies during an ambiguous create, a changed request cannot silently dispose
+  // an incomplete set; the same request must re-observe and finish binding it.
+  await persistFixtureBinding([], false);
   const created = await create({
     repoDir: ctx.repoDir,
     request: ctx.request,
     pack: ctx.pack,
     packRunId: ctx.packRunId,
     rendered,
+    onIssueNumbersBound: (numbers) => persistFixtureBinding(numbers, false),
   });
   if (created.issue_numbers.length < minimum) {
     throw new Error(
@@ -1797,28 +1839,7 @@ export async function defaultStartBoundPackLoop(
   // Bind the complete fixture set before dispatch. A spawn failure must not
   // strand issues that only existed in GitHub and were absent from durable
   // release state.
-  ctx.issueNumbers = [...created.issue_numbers];
-  await persistFactoryReleasePackInstance(ctx, null);
-  const versionIndexPath = factoryReleaseVersionIndexPath(ctx.repoDir, ctx.request.target_version);
-  if (ctx.mkdir) {
-    await ctx.mkdir(path.dirname(versionIndexPath), { recursive: true, mode: 0o700 });
-  }
-  await ctx.writeFile(
-    versionIndexPath,
-    canonicalJson({
-      schema_version: 1,
-      version: ctx.request.target_version,
-      request_fingerprint: ctx.requestFingerprint,
-      candidate_git_sha: ctx.request.integrated_candidate.git_sha,
-      action_id: ctx.request.action_id,
-      pack_run_id: ctx.packRunId,
-      loop_run_id: null,
-      frg_run_id: ctx.frgRunId,
-      issue_numbers: [...created.issue_numbers],
-      disposition: "active",
-    } satisfies FactoryReleaseVersionIndex),
-    0o600,
-  );
+  await persistFixtureBinding(created.issue_numbers, true);
   const selector = ctx.pack.manifest.selector;
   const label = selector.type === "label" ? selector.value : "factory-gate";
   return dispatch({
@@ -2087,8 +2108,12 @@ export async function productionCreateOrReusePackIssues(
       const cfg = resolveConfig({ repoPath: input.repoDir });
       return createIssue(cfg, title, body, labels);
     });
-  const open = await list(input.request.repository, input.pack.manifest.issue_labels);
+  let open = await list(input.request.repository, input.pack.manifest.issue_labels);
   const numbers: number[] = [];
+  const bind = async (issueNumber: number): Promise<void> => {
+    if (!numbers.includes(issueNumber)) numbers.push(issueNumber);
+    await input.onIssueNumbersBound?.([...numbers]);
+  };
   for (const rendered of input.rendered) {
     const existing = open.find(
       (issue) =>
@@ -2096,10 +2121,29 @@ export async function productionCreateOrReusePackIssues(
         issue.body.includes(rendered.provenance.template_id),
     );
     if (existing) {
-      numbers.push(existing.number);
+      await bind(existing.number);
       continue;
     }
-    numbers.push(await create(rendered.title, rendered.body, rendered.labels));
+    try {
+      await bind(await create(rendered.title, rendered.body, rendered.labels));
+    } catch (err) {
+      // Re-observe the pack after an ambiguous create. If GitHub committed the
+      // issue but the response or durable callback failed, bind every visible
+      // fixture prefix before surfacing the error.
+      open = await list(input.request.repository, input.pack.manifest.issue_labels);
+      const recovered = input.rendered
+        .map((candidate) => open.find(
+          (issue) =>
+            issue.body.includes(input.packRunId) &&
+            issue.body.includes(candidate.provenance.template_id),
+        )?.number)
+        .filter((n): n is number => Number.isSafeInteger(n) && (n ?? 0) > 0);
+      for (const issueNumber of recovered) await bind(issueNumber);
+      throw new Error(
+        `factory-release prepare: fixture issue create/reuse failed after binding ` +
+          `[${numbers.join(",")}]: ${(err as Error).message}`,
+      );
+    }
   }
   return { issue_numbers: numbers };
 }
@@ -4470,7 +4514,14 @@ async function readFactoryReleaseVersionIndex(
       typeof parsed.version !== "string" ||
       typeof parsed.request_fingerprint !== "string" ||
       typeof parsed.candidate_git_sha !== "string" ||
-      typeof parsed.action_id !== "string"
+      typeof parsed.action_id !== "string" ||
+      (parsed.issue_numbers !== undefined &&
+        (!Array.isArray(parsed.issue_numbers) ||
+          parsed.issue_numbers.some((n) => !Number.isSafeInteger(n) || n <= 0))) ||
+      (parsed.fixture_set_complete !== undefined &&
+        typeof parsed.fixture_set_complete !== "boolean") ||
+      (parsed.disposition !== undefined &&
+        !["active", "superseded", "terminal_failed", "completed"].includes(parsed.disposition))
     ) {
       throw new Error("invalid schema");
     }
@@ -4487,16 +4538,36 @@ async function lifecycleIssueNumbers(
   index: FactoryReleaseVersionIndex,
 ): Promise<number[]> {
   if (Array.isArray(index.issue_numbers)) {
-    return index.issue_numbers.filter((n) => Number.isSafeInteger(n) && n > 0);
+    if (index.fixture_set_complete === false) {
+      throw new Error(
+        `factory-release prepare: active FRG pack ${index.pack_run_id ?? index.request_fingerprint} ` +
+          "has an incomplete fixture binding; retry the same request before superseding it",
+      );
+    }
+    if (index.issue_numbers.length === 0) {
+      throw new Error(
+        `factory-release prepare: active FRG pack ${index.pack_run_id ?? index.request_fingerprint} ` +
+          "has no bound fixture issues; refusing cleanup",
+      );
+    }
+    return [...index.issue_numbers];
   }
-  if (!index.loop_run_id) return [];
+  if (!index.loop_run_id) {
+    throw new Error(
+      `factory-release prepare: active legacy FRG lifecycle index for v${index.version} ` +
+        "has neither issue_numbers nor loop_run_id; refusing cleanup",
+    );
+  }
   try {
     const ledger = await readLedger(defaultLoopStoreDeps(), index.loop_run_id);
     return itemsFromLoopLedger(ledger)
       .map((item) => Number(item.item_id))
       .filter((n) => Number.isSafeInteger(n) && n > 0);
-  } catch {
-    return [];
+  } catch (err) {
+    throw new Error(
+      `factory-release prepare: cannot recover fixture issues for active legacy FRG pack ` +
+        `${index.pack_run_id ?? index.request_fingerprint}: ${(err as Error).message}`,
+    );
   }
 }
 
@@ -4508,9 +4579,26 @@ async function loadCurrentPackInstance(
   if (!(await deps.fileExists(filePath))) return null;
   try {
     const parsed = JSON.parse(await deps.readFile(filePath)) as FactoryReleasePackInstance;
-    return parsed.kind === "factory_release_pack_instance" ? parsed : null;
-  } catch {
-    return null;
+    if (parsed.kind !== "factory_release_pack_instance") throw new Error("invalid kind");
+    if (
+      parsed.issue_numbers !== undefined &&
+      (!Array.isArray(parsed.issue_numbers) ||
+        parsed.issue_numbers.some((n) => !Number.isSafeInteger(n) || n <= 0))
+    ) {
+      throw new Error("invalid issue_numbers");
+    }
+    if (
+      parsed.fixture_set_complete !== undefined &&
+      typeof parsed.fixture_set_complete !== "boolean"
+    ) {
+      throw new Error("invalid fixture_set_complete");
+    }
+    return parsed;
+  } catch (err) {
+    throw new Error(
+      `factory-release prepare: unreadable active pack instance at ${filePath}: ` +
+        `${(err as Error).message}`,
+    );
   }
 }
 
@@ -4890,7 +4978,18 @@ export async function runFactoryReleasePrepare(
       manifestPath,
     });
     const instance = await loadCurrentPackInstance(deps, workDir);
-    const currentIssues = instance?.issue_numbers ?? [];
+    let currentIssues = instance?.issue_numbers;
+    if (
+      !currentIssues &&
+      priorVersion?.request_fingerprint === fingerprint &&
+      (priorVersion.disposition === undefined || priorVersion.disposition === "active") &&
+      Array.isArray(priorVersion.issue_numbers) &&
+      priorVersion.issue_numbers.length > 0
+    ) {
+      currentIssues = [...priorVersion.issue_numbers];
+    }
+    let issueIdentityMissing = (!currentIssues || currentIssues.length === 0) && instance !== null;
+    currentIssues ??= [];
     const currentIndex: FactoryReleaseVersionIndex = {
       schema_version: 1,
       version: request.target_version,
@@ -4901,6 +5000,9 @@ export async function runFactoryReleasePrepare(
       loop_run_id: instance?.loop_run_id ?? generated.loop_run_id ?? generated.frg.loop_run_id,
       frg_run_id: instance?.frg_run_id ?? generated.frg.frg_run_id,
       issue_numbers: currentIssues,
+      ...(instance?.fixture_set_complete === undefined
+        ? {}
+        : { fixture_set_complete: instance.fixture_set_complete }),
       disposition: "active",
     };
     if (generated.in_progress && generated.loop_run_id) {
@@ -4925,6 +5027,21 @@ export async function runFactoryReleasePrepare(
         exitCode: 0,
         result: inProgressResult(request, generated.loop_run_id, runningId, generated.liveness),
       };
+    }
+    if (
+      issueIdentityMissing &&
+      priorVersion?.request_fingerprint === fingerprint &&
+      (priorVersion.disposition === undefined || priorVersion.disposition === "active")
+    ) {
+      currentIssues = await lifecycleIssueNumbers(priorVersion);
+      currentIndex.issue_numbers = [...currentIssues];
+      issueIdentityMissing = currentIssues.length === 0;
+    }
+    if (issueIdentityMissing) {
+      throw new Error(
+        `factory-release prepare: active pack instance ${instance!.pack_run_id} has no ` +
+          "recoverable issue_numbers; refusing terminal reconciliation",
+      );
     }
     if (!generated.structurally_eligible) {
       const msg =
@@ -4975,17 +5092,38 @@ export async function runFactoryReleasePrepare(
       unsigned.pack_id !== request.frg_manifest.pack_id ||
       unsigned.manifest_sha256 !== request.frg_manifest.sha256
     ) {
-      const msg = "factory-release prepare: generated pack does not match request manifest binding";
+      const mismatchMessage =
+        "factory-release prepare: generated pack does not match request manifest binding";
+      const cleanup = await reconcileLifecycle({
+        version: request.target_version,
+        packRunId: currentIndex.pack_run_id ?? `unknown-${fingerprint.slice(0, 12)}`,
+        issueNumbers: currentIssues,
+        disposition: "terminal_failed",
+      });
+      await persistPackDisposition(
+        deps,
+        opts.repoDir,
+        currentIndex,
+        cleanup.errors.length > 0 ? "active" : "terminal_failed",
+        currentIssues,
+        cleanup,
+      );
+      const defectClass = cleanup.errors.length > 0
+        ? "frg_pack_cleanup_failed"
+        : "pack_mismatch";
+      const msg = cleanup.errors.length > 0
+        ? `${mismatchMessage}; FRG fixture cleanup incomplete: ${cleanup.errors.join("; ")}`
+        : mismatchMessage;
       store = {
         ...store,
         phase: "failed",
-        failure: { defect_class: "pack_mismatch", message: msg },
+        failure: { defect_class: defectClass, message: msg },
         updated_at: isoNow(deps.now()),
       };
       await saveCheckpoint(deps, checkpointPath, store);
       return {
         exitCode: 1,
-        result: failedResult(request, "pack_mismatch", msg, checkpointId("failed", fingerprint)),
+        result: failedResult(request, defectClass, msg, checkpointId("failed", fingerprint)),
       };
     }
     const completedCleanup = await reconcileLifecycle({
@@ -5038,27 +5176,6 @@ export async function runFactoryReleasePrepare(
       updated_at: isoNow(deps.now()),
     };
     await saveCheckpoint(deps, checkpointPath, store);
-    await deps.mkdir(path.dirname(factoryReleaseVersionIndexPath(opts.repoDir, request.target_version)), {
-      recursive: true,
-      mode: 0o700,
-    });
-    await deps.writeFile(
-      factoryReleaseVersionIndexPath(opts.repoDir, request.target_version),
-      canonicalJson({
-        schema_version: 1,
-        version: request.target_version,
-        request_fingerprint: fingerprint,
-        candidate_git_sha: request.integrated_candidate.git_sha,
-        action_id: request.action_id,
-        pack_run_id: unsigned.pack_run_id,
-        loop_run_id: unsigned.loop_run_id,
-        frg_run_id: unsigned.frg_run_id,
-        issue_numbers: currentIssues,
-        disposition: "completed",
-        disposition_at: isoNow(deps.now()),
-      }),
-      0o600,
-    );
   }
 
   // --- Attestation observation ---
