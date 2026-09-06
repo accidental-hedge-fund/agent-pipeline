@@ -3040,8 +3040,10 @@ interface IssueTimelinePage {
 }
 
 interface IssueClosingPrPage {
-  hasPreviousPage: boolean;
-  startCursor: string | null;
+  pageInfo: {
+    hasPreviousPage: boolean;
+    startCursor: string | null;
+  };
   nodes: IssueTimelinePr[];
 }
 
@@ -3057,7 +3059,27 @@ function isSameRepoTimelinePr(pr: IssueTimelinePr | null | undefined): pr is Iss
 function isSameRepoClosingPr(
   pr: IssueTimelinePr | null | undefined,
 ): pr is IssueTimelinePr & { number: number } {
-  return Boolean(pr && typeof pr.number === "number" && !pr.isCrossRepository);
+  return Boolean(
+    pr &&
+    typeof pr.number === "number" &&
+    pr.isCrossRepository === false,
+  );
+}
+
+function appendClosingPrPage(
+  closing: IssueClosingPrPage,
+  out: number[],
+  seen: Set<number>,
+): number {
+  let appended = 0;
+  for (let i = closing.nodes.length - 1; i >= 0; i--) {
+    const pr = closing.nodes[i]!;
+    if (!isSameRepoClosingPr(pr) || seen.has(pr.number)) continue;
+    seen.add(pr.number);
+    out.push(pr.number);
+    appended++;
+  }
+  return appended;
 }
 
 /** Pipeline squash identity for any-state lookup: head `pipeline/<N>-*` or
@@ -3204,14 +3226,8 @@ async function paginateIssueTimelinePrs(
     if (page === 0) {
       const closing = issue?.closedByPullRequestsReferences;
       if (closing) {
-        for (let i = closing.nodes.length - 1; i >= 0; i--) {
-          const pr = closing.nodes[i]!;
-          if (!isSameRepoClosingPr(pr)) continue;
-          if (seen.has(pr.number)) continue;
-          seen.add(pr.number);
-          out.push(pr.number);
-          if (opts.stopOnFirst) return { numbers: out, truncated: false };
-        }
+        const appended = appendClosingPrPage(closing, out, seen);
+        if (opts.stopOnFirst && appended > 0) return { numbers: out, truncated: false };
         closingBefore = closing.pageInfo.hasPreviousPage
           ? closing.pageInfo.startCursor
           : null;
@@ -3262,14 +3278,8 @@ async function paginateIssueTimelinePrs(
     };
     const closing = data.data.repository.issue?.closedByPullRequestsReferences;
     if (!closing) break;
-    for (let i = closing.nodes.length - 1; i >= 0; i--) {
-      const pr = closing.nodes[i]!;
-      if (!isSameRepoClosingPr(pr)) continue;
-      if (seen.has(pr.number)) continue;
-      seen.add(pr.number);
-      out.push(pr.number);
-      if (opts.stopOnFirst) return { numbers: out, truncated: false };
-    }
+    const appended = appendClosingPrPage(closing, out, seen);
+    if (opts.stopOnFirst && appended > 0) return { numbers: out, truncated: false };
     closingBefore = closing.pageInfo.hasPreviousPage
       ? closing.pageInfo.startCursor
       : null;

@@ -1008,7 +1008,7 @@ function timelinePageResponse(
       number: number;
       headRefName: string;
       title: string;
-      isCrossRepository: boolean;
+      isCrossRepository?: boolean;
     }>;
     pageInfo?: { hasPreviousPage: boolean; startCursor: string | null };
   },
@@ -1029,6 +1029,29 @@ function timelinePageResponse(
                 },
               }
             : {}),
+        },
+      },
+    },
+  });
+}
+
+function closingPageResponse(
+  nodes: Array<{
+    number: number;
+    headRefName: string;
+    title: string;
+    isCrossRepository?: boolean;
+  }>,
+  pageInfo: { hasPreviousPage: boolean; startCursor: string | null } = {
+    hasPreviousPage: false,
+    startCursor: null,
+  },
+): string {
+  return JSON.stringify({
+    data: {
+      repository: {
+        issue: {
+          closedByPullRequestsReferences: { pageInfo, nodes },
         },
       },
     },
@@ -1220,6 +1243,69 @@ test("listPrsForIssueAnyState: closing references and safe timeline identities a
     numbers: [42, 43],
     truncated: false,
   });
+});
+
+test("listPrsForIssueAnyState: closing references reject fork and missing provenance", async () => {
+  const run: GhApiRunner = async () =>
+    timelinePageResponse([], undefined, {
+      nodes: [
+        {
+          number: 40,
+          headRefName: "fix/valid",
+          title: "valid same-repository close",
+          isCrossRepository: false,
+        },
+        {
+          number: 41,
+          headRefName: "fix/fork",
+          title: "fork close",
+          isCrossRepository: true,
+        },
+        {
+          number: 42,
+          headRefName: "fix/unknown",
+          title: "missing provenance",
+        },
+      ],
+    });
+  assert.deepEqual(await listPrsForIssueAnyState(TIMELINE_CFG, 154, run), {
+    numbers: [40],
+    truncated: false,
+  });
+});
+
+test("listPrsForIssueAnyState: paginates authoritative closing references backward", async () => {
+  let calls = 0;
+  const run: GhApiRunner = async (args) => {
+    calls++;
+    if (calls === 1) {
+      return timelinePageResponse([], undefined, {
+        nodes: [
+          {
+            number: 1481,
+            headRefName: "fix/newer",
+            title: "newer close",
+            isCrossRepository: false,
+          },
+        ],
+        pageInfo: { hasPreviousPage: true, startCursor: "closing-cursor-1" },
+      });
+    }
+    assert.ok(args.includes("before=closing-cursor-1"));
+    return closingPageResponse([
+      {
+        number: 1480,
+        headRefName: "fix/older",
+        title: "older close",
+        isCrossRepository: false,
+      },
+    ]);
+  };
+  assert.deepEqual(await listPrsForIssueAnyState(TIMELINE_CFG, 1478, run), {
+    numbers: [1481, 1480],
+    truncated: false,
+  });
+  assert.equal(calls, 2);
 });
 
 test("getPrForIssueAnyState: an old merged PR beyond a 100-PR window is still found by paginating backward", async () => {
