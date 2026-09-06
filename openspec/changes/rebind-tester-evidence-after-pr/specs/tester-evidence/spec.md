@@ -78,7 +78,7 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 
 ### Requirement: Pipeline SHALL fail closed when PR head or trusted-surface identity cannot be observed after push
 
-If, after the implementation commit is pushed, the linked PR head is missing, is not a full 40-character hex SHA, or disagrees with the pushed head, or trusted-surface identity cannot be resolved, the pipeline SHALL fail closed with a typed actionable blocker. The pipeline SHALL NOT run a consumer delivery-stage observer against missing implementation-role evidence as if the post-PR bind had succeeded. The blocker code SHALL be machine-readable on the observation or run evidence and SHALL NOT be only the generic `required implementation evidence role, observed missing` string.
+If, after the implementation commit is pushed, the linked PR head is missing, is not a full 40-character hex SHA, or disagrees with the pushed head, or trusted-surface identity cannot be resolved, the pipeline SHALL fail closed with a typed actionable blocker. The pipeline SHALL NOT run a consumer delivery-stage observer against missing implementation-role evidence as if the post-PR bind had succeeded. This fail-closed rule SHALL apply at every consumer implementation stage, including `design-gate`, `review-1`, `fix-1`, and `pre-merge`. The blocker code SHALL be machine-readable on the observation or run evidence and SHALL NOT be only the generic `required implementation evidence role, observed missing` string.
 
 #### Scenario: missing PR head after push is a typed blocker
 
@@ -94,6 +94,13 @@ If, after the implementation commit is pushed, the linked PR head is missing, is
 - **AND** trusted-surface for S cannot be resolved to `passthrough` or `rebound` with a trustworthy verifier pin
 - **THEN** the pipeline SHALL persist a typed actionable blocker
 - **AND** SHALL NOT bind a fabricated subject onto Tester evidence for S
+
+#### Scenario: later consumer stages fail closed on typed rebind failure
+
+- **WHEN** the shared bind-or-reproduce path returns a typed failure at `review-1`, `fix-1`, or `pre-merge`
+- **THEN** the pipeline SHALL fail closed with that typed actionable blocker
+- **AND** SHALL NOT dispatch the consumer delivery-stage observer
+- **AND** SHALL NOT replace the typed blocker with generic `required implementation evidence role, observed missing`
 
 ### Requirement: Post-PR Tester rebind regressions SHALL fail the unit suite
 

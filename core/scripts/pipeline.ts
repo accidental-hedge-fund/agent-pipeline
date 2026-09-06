@@ -2808,6 +2808,11 @@ export function realExecuteRecovery(
         if (!rebind.ok) {
           return failed(`${rebind.code}: ${rebind.summary}`);
         }
+        if (rebind.action === "not-applicable") {
+          return failed(
+            "rebind_tester_evidence_after_pr: not-applicable is not a recovered blocker; leave blocked for the consumer observer",
+          );
+        }
         try {
           await clear(cfg, issueNumber);
         } catch (err) {

@@ -805,6 +805,49 @@ test("rebind_tester_evidence_after_pr binds a subject-less passed record with pi
   }
 });
 
+test("rebind_tester_evidence_after_pr disabled-gate not-applicable does not report recovered", async () => {
+  let clears = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    clearBlocked: async () => { clears++; },
+    getPrForIssue: async () => 99,
+    getPrDetail: async () => ({ number: 99, head_sha: "a".repeat(40) }) as never,
+    readTrustedSurfaceDecision: async () => ({
+      outcome: "passthrough",
+      candidate_sha: "a".repeat(40),
+      effective_verifier_hash: "c".repeat(64),
+    }) as never,
+    rebindTesterEvidenceAfterPr: async () => ({
+      ok: true,
+      action: "not-applicable",
+      candidateSha: "a".repeat(40),
+      evidence: null,
+      suiteCommandInvoked: false,
+    }),
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "required implementation evidence role, observed missing",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      trusted_surface_outcome: "passthrough",
+      pr_head: "a".repeat(40),
+    },
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "rebind_tester_evidence_after_pr",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(clears, 0);
+  assert.match(result.error ?? "", /not-applicable/);
+});
+
 test("rebind_tester_evidence_after_pr fail-closed does not report recovered", async () => {
   let clears = 0;
   const execute = realExecuteRecovery(cfg(), {

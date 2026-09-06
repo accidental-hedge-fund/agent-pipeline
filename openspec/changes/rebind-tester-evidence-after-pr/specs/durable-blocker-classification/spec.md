@@ -4,7 +4,7 @@
 
 When a consumer delivery stage refuses with missing implementation-role evidence after a linked PR exists and trusted-surface for that SHA is `passthrough` or `rebound` (or after SHA-matched Tester evidence omitted `evidence_subject` only because trusted-surface was not yet candidate-observable), the engine SHALL classify that diagnostic as a deterministic evidence-ordering case under existing `workflow-engine-defect`. Recovery SHALL apply the shared Tester bind-or-reproduce recipe for that diagnostic. Recovery SHALL NOT claim or charge `unlink_engine_scratch`, `checkpoint_owned_harness_dirt`, or `publish_unpublished_stage_commit` for that diagnostic. Those three recipes SHALL be recorded as inapplicable skips and SHALL NOT consume a later strategy bound. Classification SHALL use structured diagnostic or evidence fields, not harness name, issue labels, or free-form prose.
 
-The engine SHALL NOT add a new `DurableBlockerClass` for this case. The engine SHALL NOT treat this diagnostic as human authority. If PR head or trusted-surface identity still cannot be observed, the typed fail-closed blocker from Tester rebind SHALL apply; recovery SHALL NOT invent a subject or skip delivery-stage binding.
+The engine SHALL NOT add a new `DurableBlockerClass` for this case. The engine SHALL NOT treat this diagnostic as human authority. If PR head or trusted-surface identity still cannot be observed, the typed fail-closed blocker from Tester rebind SHALL apply; recovery SHALL NOT invent a subject or skip delivery-stage binding. Recovery SHALL NOT treat a helper `not-applicable` result as a repaired blocker, and SHALL NOT clear `pipeline:blocked` unless bind or reproduce produced current-SHA implementation-role Tester evidence.
 
 #### Scenario: scratch and publish are not charged for the evidence-ordering refuse
 
@@ -37,3 +37,11 @@ The engine SHALL NOT add a new `DurableBlockerClass` for this case. The engine S
 - **THEN** recovery SHALL fail closed with the typed blocker
 - **AND** SHALL NOT mark the consumer stage complete
 - **AND** SHALL NOT write a fabricated `evidence_subject`
+
+#### Scenario: disabled-gate not-applicable is not recovered
+
+- **WHEN** recovery runs the bind-or-reproduce recipe
+- **AND** the helper reports `ok: true` with action `not-applicable` because `test_gate.enabled` is false and no SHA-matched passed Tester record exists
+- **THEN** recovery SHALL NOT clear `pipeline:blocked`
+- **AND** SHALL NOT report the blocker recovered
+- **AND** SHALL leave the blocker in place for the consumer observer to evaluate exact product-path proof

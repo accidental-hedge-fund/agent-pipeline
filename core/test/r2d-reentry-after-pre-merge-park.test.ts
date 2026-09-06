@@ -334,6 +334,13 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
           listChangedPaths: async () => ({ paths: [] }),
           resolveBaseSha: async () => OTHER,
         },
+    rebindTesterEvidenceAfterPr: async () => ({
+      ok: true,
+      action: "already-bound",
+      candidateSha: opts.prHead ?? PIN,
+      evidence: { candidate_sha: opts.prHead ?? PIN } as never,
+      suiteCommandInvoked: false,
+    }),
     dispatch: async (_cfg, _n, stage) => {
       dispatchStages.push(stage);
       if (stage === "ready-to-deploy") {

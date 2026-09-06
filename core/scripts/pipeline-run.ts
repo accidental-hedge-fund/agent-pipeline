@@ -3089,13 +3089,9 @@ export async function runAdvance(
         };
         const rebind = await rebindFn(rebindInput());
         if (!rebind.ok) {
-          // Design-gate is the first consumer after push: fail closed.
-          // Later consumer stages still attempt bind/reproduce, but a blocked
-          // trusted-surface or unreproducible record must not prevent
-          // later-stage currency reroute or exact product-path proof.
-          if (stage === "design-gate") {
-            return await failClosedRebind(rebind);
-          }
+          // Later-stage review-currency reroute already ran before this hook.
+          // A typed rebind failure must fail closed at every consumer stage.
+          return await failClosedRebind(rebind);
         } else if (rebind.action !== "not-applicable") {
           // Reread the live PR head immediately before dispatch. A concurrent
           // push after the bind-time read must not authorize an obsolete SHA.

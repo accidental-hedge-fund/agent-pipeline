@@ -37,3 +37,8 @@
 - [x] 6.3 Successor run adopts a prior-run SHA-matched passed Tester record without a second suite command
 - [x] 6.4 Idempotent pre-observer bind/reproduce and ordering-diagnostic conversion use `isConsumerImplementationStage` (resume at review-1)
 - [x] 6.5 PR head movement between bind and observer fail-closes with `tester_rebind_pr_head_mismatch`
+
+## 7. Review 1 regressions
+
+- [x] 7.1 Fail closed on every typed `RebindTesterEvidenceResult` failure before dispatching any consumer implementation stage (`review-1`, `fix-1`, `pre-merge` included)
+- [x] 7.2 Recovery does not treat disabled-gate `not-applicable` as a recovered blocker and does not clear `pipeline:blocked` without bind/reproduce proof

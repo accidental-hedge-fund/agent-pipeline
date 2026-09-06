@@ -30,6 +30,7 @@ import {
 } from "../scripts/production-engine-pin.ts";
 import {
   buildTesterEvidenceOrderingDiagnostic,
+  buildTesterRebindFailClosedDiagnostic,
   filterRecipesForTesterEvidenceOrdering,
   filterRecipesForWorkflowEngineDiagnostic,
   isConsumerImplementationStage,
@@ -546,6 +547,12 @@ test("3.3 nested advance, single, loop, and FRG share runAdvance rebind", async 
   assert.match(runAdvanceSrc, /pushedHeadSha/);
   assert.match(runAdvanceSrc, /testerEvidenceOrderingDiagnosticForRefuse/);
   assert.match(runAdvanceSrc, /resolvePriorShaMatchedTester/);
+  assert.match(runAdvanceSrc, /if \(!rebind\.ok\) \{/);
+  assert.match(runAdvanceSrc, /return await failClosedRebind\(rebind\)/);
+  assert.doesNotMatch(
+    runAdvanceSrc,
+    /if \(stage === "design-gate"\) \{\s*return await failClosedRebind/,
+  );
   assert.doesNotMatch(runAdvanceSrc, /existingTester\.status === "missing"/);
   const nestedSrc = await readFile(join(__dirname, "../scripts/nested-advance.ts"), "utf8");
   assert.match(nestedSrc, /runAdvance/);
@@ -909,6 +916,7 @@ test("runAdvance fail-closes when the linked PR is unobservable", async () => {
   assert.equal(driven.rebindCalls.length, 1);
   assert.equal(driven.rebindCalls[0]?.prNumber, null);
   assert.equal(driven.rebindCalls[0]?.prHeadSha, null);
+  assert.equal(driven.dispatchCalls, 0);
   assert.ok(driven.setBlocked.some((row) => /PR head|unobservable/i.test(row.reason)));
   assert.equal(driven.blockerEvents[0]?.blocker_kind, "harness-failure");
   assert.equal(
@@ -916,6 +924,58 @@ test("runAdvance fail-closes when the linked PR is unobservable", async () => {
       ?.detail?.evidence_ordering?.blocker_code,
     "tester_rebind_pr_head_unobservable",
   );
+});
+
+test("runAdvance fail-closes later consumer stages on typed rebind failure", async () => {
+  for (const startStage of ["review-1", "fix-1", "pre-merge"] as const) {
+    const driven = await driveDesignGateAdvance({
+      startStage,
+      prNumber: 99,
+      prHeadSha: SHA_S,
+      worktreeHead: SHA_S,
+      rebind: async () => ({
+        ok: false,
+        code: "tester_rebind_trusted_surface_unobservable",
+        summary:
+          "tester rebind: trusted-surface is not passthrough/rebound with a trustworthy verifier pin",
+        candidateSha: SHA_S,
+        evidence: null,
+        diagnostic: buildTesterRebindFailClosedDiagnostic({
+          stage: startStage,
+          code: "tester_rebind_trusted_surface_unobservable",
+          summary:
+            "tester rebind: trusted-surface is not passthrough/rebound with a trustworthy verifier pin",
+          prHead: SHA_S,
+          trustedSurfaceOutcome: "blocked",
+        }),
+        blocker: {
+          schema_version: 1,
+          kind: "tester_rebind_blocker",
+          code: "tester_rebind_trusted_surface_unobservable",
+          candidate_sha: SHA_S,
+          pr: 99,
+          summary: "blocked trusted-surface",
+        },
+      }),
+    });
+    assert.equal(driven.dispatchCalls, 0, startStage);
+    assert.ok(
+      driven.setBlocked.some((row) => /trusted-surface/i.test(row.reason)),
+      startStage,
+    );
+    assert.equal(
+      (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+        ?.detail?.evidence_ordering?.blocker_code,
+      "tester_rebind_trusted_surface_unobservable",
+      startStage,
+    );
+    assert.ok(
+      !driven.setBlocked.some((row) =>
+        /required implementation evidence role, observed missing/.test(row.reason),
+      ),
+      startStage,
+    );
+  }
 });
 
 test("runAdvance fail-closes when PR head disagrees with the pushed head", async () => {
