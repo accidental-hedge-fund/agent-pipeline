@@ -728,6 +728,8 @@ async function driveDesignGateAdvance(opts: {
   testGateEnabled?: boolean;
   /** Invoke the delivery observer created by runAdvance (post-confirmation race). */
   invokeObserver?: boolean;
+  /** Also invoke the post-attempt observer (S1-before / S2-after race). */
+  invokeObserverAfter?: boolean;
   rebind?: AdvanceDeps["rebindTesterEvidenceAfterPr"];
   dispatch?: AdvanceDeps["dispatch"];
 }): Promise<{
@@ -736,6 +738,11 @@ async function driveDesignGateAdvance(opts: {
   blockerEvents: Array<Record<string, unknown>>;
   dispatchCalls: number;
   observerBefore: {
+    candidateSha?: string;
+    evidenceRole?: string | null;
+    artifactIdentity?: string | null;
+  } | null;
+  observerAfter: {
     candidateSha?: string;
     evidenceRole?: string | null;
     artifactIdentity?: string | null;
@@ -758,6 +765,11 @@ async function driveDesignGateAdvance(opts: {
   const rebindCalls: RebindTesterEvidenceAfterPrInput[] = [];
   const setBlocked: Array<{ reason: string; kind: string | undefined }> = [];
   let observerBefore: {
+    candidateSha?: string;
+    evidenceRole?: string | null;
+    artifactIdentity?: string | null;
+  } | null = null;
+  let observerAfter: {
     candidateSha?: string;
     evidenceRole?: string | null;
     artifactIdentity?: string | null;
@@ -883,6 +895,16 @@ async function driveDesignGateAdvance(opts: {
             status: "waiting" as const,
             reason: "delivery-stage evidence binding refused before execution: required implementation evidence role, observed missing",
           };
+      if (opts.invokeObserverAfter) {
+        const observed = await dispatchOpts?.observeDeliveryStageEvidence?.("after", result);
+        if (observed) {
+          observerAfter = {
+            candidateSha: observed.candidateSha,
+            evidenceRole: observed.evidenceRole ?? null,
+            artifactIdentity: observed.artifactIdentity ?? null,
+          };
+        }
+      }
       if (result.advanced) {
         const idx = labels.findIndex((label) => label.startsWith("pipeline:"));
         if (idx >= 0) labels[idx] = `pipeline:${result.to}`;
@@ -904,7 +926,7 @@ async function driveDesignGateAdvance(opts: {
           .map((line) => JSON.parse(line) as Record<string, unknown>)
           .filter((event) => event.type === "blocker_set")
       : [];
-    return { rebindCalls, setBlocked, blockerEvents, dispatchCalls, observerBefore };
+    return { rebindCalls, setBlocked, blockerEvents, dispatchCalls, observerBefore, observerAfter };
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
@@ -1388,4 +1410,93 @@ test("runAdvance fail-closes when PR head moves after confirmation with worktree
     "tester_rebind_pr_head_mismatch",
   );
   assert.ok(driven.setBlocked.some((row) => /disagrees with pushed head/.test(row.reason)));
+});
+
+test("observer after phase invokes PR-head mismatch hook", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1468";
+  plant(io, runDir, boundPassed());
+  const observed: Array<{ phase: string; liveSha: string | null }> = [];
+  const observer = createDeliveryStageEvidenceObserver(cfg(), 1468, "design-gate", false, {
+    getIssueDetail: async () => ({
+      number: 1468,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: "https://example.test/1468",
+      labels: ["pipeline:design-gate"],
+      comments: [],
+    }),
+    getOnDiskForIssue: async () => ({ path: "/wt/1468", slug: "1468-x" }) as never,
+    gitInWorktree: async (_cwd, args) => {
+      if (args[0] === "rev-parse") {
+        return { stdout: `${SHA_S}\n`, stderr: "", code: 0 };
+      }
+      if (args[0] === "diff") {
+        return { stdout: "core/scripts/pipeline-run.ts\n", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    getPrForIssue: async () => 99,
+    getPrDetail: async () => ({ number: 99, head_sha: SHA_B }) as never,
+    getPrDiff: async () => "",
+    expectedPrHeadSha: SHA_S,
+    onObservedPrHead: async (liveSha) => {
+      observed.push({ phase: "hook", liveSha });
+    },
+    runDir,
+    testerIo: io,
+  });
+  const after = await observer("after");
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0]?.liveSha, SHA_B);
+  assert.equal(after.candidateSha, SHA_B);
+  assert.equal(after.evidenceRole, null);
+  assert.equal(after.postconditionProven, false);
+});
+
+test("runAdvance fail-closes post-attempt PR-head drift as typed mismatch, not generic wait", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    tester: boundPassed(),
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    dispatch: async () => ({
+      advanced: false as const,
+      status: "waiting" as const,
+      reason:
+        "delivery-stage Candidate binding changed during execution; RecoverySupervisor retains ownership and must rerun the stage against the replacement candidate",
+    }),
+  });
+  assert.ok(driven.dispatchCalls >= 1);
+  assert.equal(driven.observerBefore?.candidateSha, SHA_S);
+  assert.equal(driven.observerBefore?.evidenceRole, "implementation");
+  assert.equal(driven.observerAfter?.candidateSha, SHA_B);
+  assert.equal(driven.observerAfter?.evidenceRole, null);
+  const lastRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
+  assert.equal(lastRebind?.prHeadSha, SHA_B);
+  assert.equal(lastRebind?.pushedHeadSha, SHA_S);
+  const diagnostic = driven.blockerEvents[0]?.diagnostic;
+  assert.equal(
+    (diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_mismatch",
+  );
+  assert.ok(driven.setBlocked.some((row) => /disagrees with pushed head/.test(row.reason)));
+  assert.ok(
+    !driven.setBlocked.some((row) => /Candidate binding changed during execution/.test(row.reason)),
+  );
+  assert.equal(isTesterEvidenceOrderingDiagnostic(diagnostic), true);
+  const applicable = filterRecipesForWorkflowEngineDiagnostic(
+    DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes,
+    diagnostic,
+  );
+  for (const skipped of TESTER_EVIDENCE_ORDERING_INAPPLICABLE_RECIPES) {
+    assert.equal(applicable.includes(skipped), false, skipped);
+  }
+  assert.equal(applicable.includes(REBIND_TESTER_EVIDENCE_AFTER_PR), true);
 });

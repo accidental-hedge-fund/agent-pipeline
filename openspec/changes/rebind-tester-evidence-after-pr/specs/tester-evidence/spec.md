@@ -94,6 +94,15 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 - **OR** SHALL rebind or reproduce for S2 before treating the observation as proven
 - **AND** SHALL NOT present S1 worktree HEAD or S1 Tester evidence as implementation-role proof for S2
 
+#### Scenario: PR head movement after execution is a typed mismatch, not a generic wait
+
+- **WHEN** bind and the pre-attempt observer observed PR head S1
+- **AND** the consumer stage executes
+- **AND** the post-attempt observer's live PR read observes S2 where S1 ≠ S2
+- **THEN** the pipeline SHALL fail closed with typed blocker `tester_rebind_pr_head_mismatch`
+- **AND** SHALL NOT leave the outcome as generic Candidate-binding-changed waiting
+- **AND** recovery SHALL NOT treat `unlink_engine_scratch`, `checkpoint_owned_harness_dirt`, or `publish_unpublished_stage_commit` as eligible for that diagnostic
+
 #### Scenario: disabled-gate exact-proof still fail-closes when PR head moved
 
 - **WHEN** `test_gate.enabled` is false

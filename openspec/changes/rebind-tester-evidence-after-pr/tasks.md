@@ -40,6 +40,7 @@
 - [x] 6.6 Enabled `test_gate` later-stage resume without a worktree fail-closes (no `not-applicable` skip)
 - [x] 6.7 Post-confirmation PR-head movement at the observer with a worktree present fail-closes with `tester_rebind_pr_head_mismatch`
 - [x] 6.8 Recovery derives `engine_fingerprint` from blocked `run.json.engine` (A), not the currently installed engine (B); absent/malformed identity fail-closes
+- [x] 6.9 Post-attempt observer PR-head movement (S1 before execution, S2 after) fail-closes with `tester_rebind_pr_head_mismatch`; unrelated recovery recipes are ineligible
 
 ## 7. Review 1 regressions
 

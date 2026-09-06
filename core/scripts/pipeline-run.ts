@@ -1100,7 +1100,7 @@ export function createDeliveryStageEvidenceObserver(
   > & {
     /** Confirmed PR head the pre-observer bind used. Observer re-reads the live PR. */
     expectedPrHeadSha?: string | null | (() => string | null);
-    /** Pre-attempt hook after the observer's live PR read (mismatch / rebind). */
+    /** Hook after the observer's live PR read for before and after (mismatch / rebind). */
     onObservedPrHead?: (liveSha: string | null) => Promise<void>;
   } = {},
 ): DeliveryStageEvidenceObserver {
@@ -1162,7 +1162,7 @@ export function createDeliveryStageEvidenceObserver(
           livePrSha = normalizeCandidateSha(prDetail?.head_sha);
         }
       }
-      if (phase === "before" && deps.onObservedPrHead) {
+      if (deps.onObservedPrHead) {
         await deps.onObservedPrHead(livePrSha);
       }
       const expected = normalizeCandidateSha(
