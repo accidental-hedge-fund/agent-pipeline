@@ -391,31 +391,17 @@ test("implement deliverable observer keeps planning identity distinct and invali
   assert.equal(isExactImplementationDeliverable(implementation, sha1), true);
   assert.equal(isExactImplementationDeliverable(implementation, sha2), false);
 
-  for (const implementationPath of [
+  for (const unprovedPath of [
+    "openspec/specs/operation-reliability/spec.md",
+    "docs/cli.md",
+    ".github/workflows/ci.yml",
+    "config/policy.yml",
     "core/test/recovery.test.ts",
     "test/recovery.spec.js",
     "fixtures/recovery.ts",
     "examples/recovery.py",
     "scripts/recovery.sh",
     "tools/recovery.ts",
-  ]) {
-    const testOrTooling = observeImplementDeliverablePaths({
-      paths: [implementationPath],
-      candidateSha: sha1,
-    });
-    assert.equal(testOrTooling.role, "implementation", implementationPath);
-    assert.equal(
-      isExactImplementationDeliverable(testOrTooling, sha1),
-      true,
-      implementationPath,
-    );
-  }
-
-  for (const unprovedPath of [
-    "openspec/specs/operation-reliability/spec.md",
-    "docs/cli.md",
-    ".github/workflows/ci.yml",
-    "config/policy.yml",
   ]) {
     const unproved = observeImplementDeliverablePaths({
       paths: [unprovedPath],
