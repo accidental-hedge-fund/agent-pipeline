@@ -21,6 +21,10 @@ import {
   CANDIDATE_PROCESS_GUARD_REL,
   CANDIDATE_ENGINE_CONSUMERS,
   assertCandidateEngineConsumerInventoryComplete,
+  bindInheritedCandidateProcessLease,
+  candidateProcessClaimPath,
+  candidateProcessHandoffPath,
+  candidateProcessGuardEnv,
   candidateEngineConsumerInventoryGaps,
   candidateEngineRuntimeBindingGaps,
   runCandidateEngineProcess,
@@ -605,14 +609,16 @@ test("detached pack loop retains the candidate-root lease until the child exits 
   const first = await runCandidateEngineProcess({
     consumer: "factory-release.pack-loop.start",
     engine: prepared.engine,
-    start: async () => ({ dispatch_state: "dispatched" as const, pid: 4242 }),
-    detachedSupervisor: (value) =>
-      value.dispatch_state === "dispatched" ? { pid: value.pid, starttime: null } : null,
+    start: async (_engine, _env, handoff) => {
+      assert.equal(handoff({ pid: 4242, starttime: null }), true);
+      return { dispatch_state: "dispatched" as const, pid: 4242 };
+    },
   });
   assert.equal(first.ok, true);
   const lockPath = candidateRootLockPath(repo);
   assert.equal(h.files.has(lockPath), true, "lease must remain after detached handoff");
-  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 4242);
+  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 111);
+  assert.equal(JSON.parse(h.files.get(candidateProcessHandoffPath(lockPath))!).pid, 4242);
 
   const resumePrepared = await sharedResolveAndPrepareCandidateEngine(
     { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.resume" },
@@ -653,6 +659,234 @@ test("detached pack loop retains the candidate-root lease until the child exits 
   assert.equal(reclaimed, 1);
 });
 
+test("nested candidate start inherits the live parent lease and transfers it to the detached supervisor (#1503)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  h.deps.digest = (buf) => createHash("sha256").update(buf).digest("hex");
+  h.deps.processAlive = (pid) => pid === 111 || pid === 4242;
+  const outer = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "ship.stage-adapter" },
+    h.deps,
+  );
+  assert.equal(outer.ok, true);
+  if (!outer.ok) return;
+  const parentLease = outer.engine.acquireProcessLock?.();
+  assert.ok(parentLease);
+
+  const inner = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(inner.ok, true);
+  if (!inner.ok || !parentLease) return;
+  const inherited = bindInheritedCandidateProcessLease(
+    inner.engine,
+    candidateProcessGuardEnv(parentLease.proof),
+    { ...h.deps, parentPid: () => 111 },
+  );
+  let childGuardEnv: NodeJS.ProcessEnv | undefined;
+  const started = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: inherited,
+    start: async (_engine, env, handoff) => {
+      childGuardEnv = env;
+      assert.equal(handoff({ pid: 4242, starttime: "child-st" }), true);
+      return { dispatch_state: "dispatched" as const, pid: 4242 };
+    },
+  });
+  assert.equal(started.ok, true);
+  const lockPath = candidateRootLockPath(repo);
+  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 111);
+  assert.equal(JSON.parse(h.files.get(candidateProcessHandoffPath(lockPath))!).pid, 4242);
+  assert.ok(childGuardEnv);
+  const afterTransferGuard = verifyCandidateProcessGuard(childGuardEnv, {
+    realpath: (p: string) => p === repo
+      ? repo
+      : p.endsWith("candidate-process-guard.mjs")
+        ? path.join(repo, CANDIDATE_PROCESS_GUARD_REL)
+        : p,
+    readFile: (p: string) => {
+      if (p === lockPath) return Buffer.from(h.files.get(p)!);
+      if (p === parentLease.proof.readyRecordPath) return Buffer.from(h.files.get(p)!);
+      if (p === lockfile) return LOCKFILE_V1;
+      throw new Error(`unexpected guard read ${p}`);
+    },
+    git: (_root: string, args: string[]) => args[0] === "status" ? "" : `${SHA}\n`,
+  });
+  assert.deepEqual(afterTransferGuard, { ok: true });
+  parentLease.release();
+  assert.equal(h.files.has(lockPath), true, "parent release must not remove the transferred lease");
+});
+
+test("nested candidate claim serializes launch before either child can start (#1503)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  h.deps.digest = (buf) => createHash("sha256").update(buf).digest("hex");
+  h.deps.processAlive = (pid) => pid === 111 || pid === 4242;
+  const outer = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "ship.stage-adapter" },
+    h.deps,
+  );
+  const inner = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(outer.ok, true);
+  assert.equal(inner.ok, true);
+  if (!outer.ok || !inner.ok) return;
+  const parentLease = outer.engine.acquireProcessLock?.();
+  assert.ok(parentLease);
+  if (!parentLease) return;
+  const guarded = bindInheritedCandidateProcessLease(
+    inner.engine,
+    candidateProcessGuardEnv(parentLease.proof),
+    { ...h.deps, parentPid: () => 111 },
+  );
+  let allowFirst: (() => void) | undefined;
+  let firstHandoff: ((owner: { pid: number; starttime: string | null }) => boolean) | undefined;
+  const first = runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: guarded,
+    start: async (_engine, _env, handoff) => {
+      firstHandoff = handoff;
+      await new Promise<void>((resolve) => {
+        allowFirst = resolve;
+      });
+      assert.equal(handoff({ pid: 4242, starttime: null }), true);
+      return "first";
+    },
+  });
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  assert.ok(firstHandoff);
+  assert.equal(h.files.has(candidateProcessClaimPath(parentLease.proof.processLockPath)), true);
+  assert.equal(
+    inner.engine.acquireProcessLock?.(),
+    null,
+    "fresh acquisition/reclamation must contend on the same launch claim",
+  );
+  let losingStarts = 0;
+  const second = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: guarded,
+    start: async () => {
+      losingStarts += 1;
+      return "second";
+    },
+  });
+  assert.equal(second.ok, false);
+  assert.equal(losingStarts, 0, "the claim loser must not start a child");
+  allowFirst?.();
+  assert.equal((await first).ok, true);
+  assert.equal(h.files.has(candidateProcessClaimPath(parentLease.proof.processLockPath)), false);
+  assert.equal(JSON.parse(h.files.get(candidateProcessHandoffPath(parentLease.proof.processLockPath))!).pid, 4242);
+});
+
+test("partial or wrong-parent nested guard fails closed without deleting the parent lease (#1503)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  h.deps.digest = (buf) => createHash("sha256").update(buf).digest("hex");
+  const prepared = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.resume" },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const parentLease = prepared.engine.acquireProcessLock?.();
+  assert.ok(parentLease);
+  if (!parentLease) return;
+  let starts = 0;
+  const partial = bindInheritedCandidateProcessLease(
+    prepared.engine,
+    { PIPELINE_CANDIDATE_PROCESS_GUARD: "1" },
+    { ...h.deps, parentPid: () => 111 },
+  );
+  const partialResult = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: partial,
+    start: async () => ++starts,
+  });
+  assert.equal(partialResult.ok, false);
+
+  const forgedDigest = bindInheritedCandidateProcessLease(
+    prepared.engine,
+    {
+      ...candidateProcessGuardEnv(parentLease.proof),
+      PIPELINE_CANDIDATE_PROCESS_LOCKFILE_DIGEST: "a".repeat(64),
+    },
+    { ...h.deps, parentPid: () => 111 },
+  );
+  const forgedDigestResult = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: forgedDigest,
+    start: async () => ++starts,
+  });
+  assert.equal(forgedDigestResult.ok, false);
+
+  const readyBody = h.files.get(parentLease.proof.readyRecordPath)!;
+  h.files.delete(parentLease.proof.readyRecordPath);
+  const unreadableReady = bindInheritedCandidateProcessLease(
+    prepared.engine,
+    candidateProcessGuardEnv(parentLease.proof),
+    { ...h.deps, parentPid: () => 111 },
+  );
+  const unreadableReadyResult = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: unreadableReady,
+    start: async () => ++starts,
+  });
+  assert.equal(unreadableReadyResult.ok, false);
+  h.files.set(parentLease.proof.readyRecordPath, readyBody);
+
+  const wrongParent = bindInheritedCandidateProcessLease(
+    prepared.engine,
+    candidateProcessGuardEnv(parentLease.proof),
+    { ...h.deps, parentPid: () => 999 },
+  );
+  const wrongParentResult = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: wrongParent,
+    start: async () => ++starts,
+  });
+  assert.equal(wrongParentResult.ok, false);
+  assert.equal(starts, 0);
+  assert.equal(JSON.parse(h.files.get(candidateRootLockPath(repo))!).pid, 111);
+});
+
+test("candidate lease handoff is exclusive and never overwrites an existing sidecar (#1503)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  const prepared = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const lease = prepared.engine.acquireProcessLock?.();
+  assert.ok(lease);
+  if (!lease) return;
+  const handoffPath = candidateProcessHandoffPath(lease.proof.processLockPath);
+  h.files.set(handoffPath, "foreign-handoff\n");
+  assert.equal(lease.transferTo?.({ pid: 4242, starttime: null }), false);
+  assert.equal(h.files.get(handoffPath), "foreign-handoff\n");
+  assert.equal(h.files.has(lease.proof.processLockPath), true);
+});
+
 test("candidate process lock serializes distinct SHAs on one canonical root (#1454)", async () => {
   const repo = "/repo";
   const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
@@ -676,8 +910,10 @@ test("candidate process lock serializes distinct SHAs on one canonical root (#14
   const started = await runCandidateEngineProcess({
     consumer: "factory-release.pack-loop.start",
     engine: first.engine,
-    start: async () => ({ dispatch_state: "dispatched" as const, pid: 4242 }),
-    detachedSupervisor: (value) => ({ pid: value.pid, starttime: null }),
+    start: async (_engine, _env, handoff) => {
+      assert.equal(handoff({ pid: 4242, starttime: null }), true);
+      return { dispatch_state: "dispatched" as const, pid: 4242 };
+    },
   });
   assert.equal(started.ok, true);
 

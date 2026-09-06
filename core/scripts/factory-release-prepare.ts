@@ -98,6 +98,7 @@ import {
   type FaultRecoveryMatrixRow,
 } from "./fault-recovery-matrix.ts";
 import {
+  bindInheritedCandidateProcessLease,
   defaultResolveAndPrepareDeps,
   hasCandidateProcessGuardEnv,
   resolveAndPrepareCandidateEngine,
@@ -1415,17 +1416,6 @@ export interface PackLoopSpawnResult {
   spawn_attempt?: FactoryReleaseSpawnAttempt;
 }
 
-/** Live detached pack-loop supervisor that must keep the candidate-root lease. */
-export function packLoopDetachedSupervisor(
-  value: void | PackLoopSpawnResult,
-): { pid: number; starttime: string | null } | null {
-  if (!value || value.dispatch_state !== "dispatched") return null;
-  if (typeof value.pid !== "number" || !Number.isInteger(value.pid) || value.pid <= 0) {
-    return null;
-  }
-  return { pid: value.pid, starttime: null };
-}
-
 export interface DispatchPackLoopInput {
   repoDir: string;
   request: FactoryReleasePrepareRequest;
@@ -2241,7 +2231,8 @@ export type SpawnCandidateLoop = (args: {
   label: string;
   candidateInvocation?: CandidateInvocation;
   candidateEnv?: NodeJS.ProcessEnv;
-}) => Promise<void | PackLoopSpawnResult>;
+}, handoffCandidateLease?: (owner: { pid: number; starttime: string | null }) => boolean) =>
+  Promise<void | PackLoopSpawnResult>;
 
 /**
  * Wait for detached `spawn` or `error` before treating launch as confirmed.
@@ -2294,6 +2285,8 @@ export type CandidateLoopChild = {
   kill?: (signal?: NodeJS.Signals | number) => boolean | void;
   unref?: () => void;
   pid?: number;
+  exitCode?: number | null;
+  signalCode?: NodeJS.Signals | null;
 };
 
 export type CandidateLoopSpawn = (
@@ -2444,17 +2437,31 @@ async function stopFailedPackLoopChild(
   sleep: (ms: number) => Promise<void>,
 ): Promise<void> {
   if (!alreadyExited) {
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
+    let observedExit = false;
+    let resolveExit: (() => void) | undefined;
+    const exited = new Promise<void>((resolve) => {
+      resolveExit = resolve;
+      child.once?.("exit", () => {
+        observedExit = true;
         resolve();
-      };
-      child.once?.("exit", () => finish());
-      child.kill?.("SIGTERM");
-      void sleep(PACK_LOOP_FAILED_CHILD_SETTLE_MS).then(finish);
+      });
     });
+    child.kill?.("SIGTERM");
+    await Promise.race([exited, sleep(PACK_LOOP_FAILED_CHILD_SETTLE_MS)]);
+    if (
+      !observedExit &&
+      child.exitCode == null &&
+      child.signalCode == null
+    ) {
+      child.kill?.("SIGKILL");
+      // Do not release the candidate claim until the OS has actually reaped
+      // the failed detached supervisor. A second timeout would recreate the
+      // ownerless-child race this compensation exists to prevent.
+      await exited;
+    } else if (!observedExit) {
+      resolveExit?.();
+      await exited;
+    }
   }
   child.stdout?.destroy?.();
   child.stderr?.destroy?.();
@@ -2548,6 +2555,7 @@ export async function defaultSpawnCandidateLoop(
     candidateEnv?: NodeJS.ProcessEnv;
   },
   deps: SpawnCandidateLoopDeps = {},
+  handoffCandidateLease?: (owner: { pid: number; starttime: string | null }) => boolean,
 ): Promise<PackLoopSpawnResult> {
   const sourceEnv = deps.env ?? process.env;
   const now = deps.now ?? (() => new Date());
@@ -2645,13 +2653,41 @@ export async function defaultSpawnCandidateLoop(
         supervisor,
         realpath: deps.realpath,
       });
-      if (valid.ok) {
+      const supervisorPid =
+        typeof supervisor?.pid === "number" && Number.isInteger(supervisor.pid) && supervisor.pid > 0
+          ? supervisor.pid
+          : null;
+      if (valid.ok && supervisorPid === child.pid) {
+        if (
+          handoffCandidateLease &&
+          !handoffCandidateLease({ pid: supervisorPid, starttime: null })
+        ) {
+          await stopFailedPackLoopChild(child, exitCode !== undefined, sleep);
+          const excerpt = await finishStderrEvidence(deps, evidencePath, pipes);
+          return {
+            dispatch_state: "failed",
+            pid: supervisorPid,
+            observation_deadline: deadline,
+            last_error: formatPackLoopLastError({
+              errorCode: "candidate_lease_handoff_failed",
+              excerpt: excerpt.excerpt,
+              evidencePath: excerpt.path,
+              writeError: excerpt.writeError,
+            }),
+            stderr_evidence_path: excerpt.path,
+            spawn_attempt: {
+              pid: supervisorPid,
+              error_code: "candidate_lease_handoff_failed",
+              at: isoNow(now()),
+            },
+          };
+        }
         child.unref?.();
         return {
           dispatch_state: "dispatched",
-          pid: child.pid,
+          pid: supervisorPid,
           observation_deadline: deadline,
-          spawn_attempt: { pid: child.pid, at: isoNow(now()) },
+          spawn_attempt: { pid: supervisorPid, at: isoNow(now()) },
         };
       }
       await stopFailedPackLoopChild(child, exitCode !== undefined, sleep);
@@ -2661,7 +2697,7 @@ export async function defaultSpawnCandidateLoop(
         pid: child.pid,
         observation_deadline: deadline,
         last_error: formatPackLoopLastError({
-          errorCode: "handoff_mismatch",
+          errorCode: valid.ok ? "supervisor_pid_mismatch" : "handoff_mismatch",
           excerpt: excerpt.excerpt,
           evidencePath: excerpt.path,
           writeError: excerpt.writeError,
@@ -2725,8 +2761,9 @@ export async function defaultResumeBoundPackLoop(
     candidateEnv?: NodeJS.ProcessEnv;
   },
   deps: SpawnCandidateLoopDeps = {},
+  handoffCandidateLease?: (owner: { pid: number; starttime: string | null }) => boolean,
 ): Promise<PackLoopSpawnResult> {
-  return defaultSpawnCandidateLoop(args, deps);
+  return defaultSpawnCandidateLoop(args, deps, handoffCandidateLease);
 }
 
 /** Resume uses a fresh exact-candidate proof; a stored launcher identity alone never authorizes spawn. */
@@ -2759,6 +2796,11 @@ export async function productionResumeBoundPackLoop(
       spawn_attempt: { error_code: "candidate_not_ready", at: isoNow(deps.spawnDeps?.now?.() ?? new Date()) },
     };
   }
+  const guardedEngine = bindInheritedCandidateProcessLease(
+    resolved.engine,
+    deps.spawnDeps?.env ?? process.env,
+    deps.resolveCandidateDeps ?? defaultResolveAndPrepareDeps(),
+  );
   const invocation = freezeCandidateInvocation({
     executable: resolved.engine.launcherPath,
     loopRunId: args.loop_run_id,
@@ -2777,12 +2819,12 @@ export async function productionResumeBoundPackLoop(
   }
   const started = await runCandidateEngineProcess({
     consumer: "factory-release.pack-loop.resume",
-    engine: resolved.engine,
-    start: (_checked, candidateEnv) => defaultResumeBoundPackLoop(
+    engine: guardedEngine,
+    start: (_checked, candidateEnv, handoff) => defaultResumeBoundPackLoop(
       { ...args, candidateInvocation: invocation, candidateEnv },
       deps.spawnDeps,
+      handoff,
     ),
-    detachedSupervisor: packLoopDetachedSupervisor,
   });
   if (started.ok) return started.value;
   return {
@@ -3015,6 +3057,11 @@ export async function productionDispatchPackLoop(
   if (!resolved.ok) {
     throw new Error(`pack-loop dispatch: ${resolved.error}`);
   }
+  const guardedEngine = bindInheritedCandidateProcessLease(
+    resolved.engine,
+    deps.env ?? process.env,
+    deps.resolveCandidateDeps ?? defaultResolveAndPrepareDeps(),
+  );
   let invocation = freezeCandidateInvocation({
     executable: resolved.engine.launcherPath,
     loopRunId: loop_run_id,
@@ -3053,7 +3100,7 @@ export async function productionDispatchPackLoop(
   if (persistBound) await persistBound(loop_run_id, "bound");
   const spawn =
     deps.spawnCandidateLoop ??
-    ((spawnArgs) =>
+    ((spawnArgs, handoffCandidateLease) =>
       defaultSpawnCandidateLoop(
         {
           repoDir: spawnArgs.repoDir,
@@ -3073,13 +3120,14 @@ export async function productionDispatchPackLoop(
             if (deps.spawnDeps?.onAccepted) await deps.spawnDeps.onAccepted(info);
           },
         },
+        handoffCandidateLease,
       ));
   let spawnResult: void | PackLoopSpawnResult;
   try {
     const started = await runCandidateEngineProcess({
       consumer: "factory-release.pack-loop.start",
-      engine: resolved.engine,
-      start: (_checked, candidateEnv) => spawn({
+      engine: guardedEngine,
+      start: (_checked, candidateEnv, handoff) => spawn({
         repoDir: input.repoDir,
         loop_run_id,
         issue_numbers: input.issue_numbers,
@@ -3087,8 +3135,7 @@ export async function productionDispatchPackLoop(
         label: input.label,
         candidateInvocation: invocation,
         candidateEnv,
-      }),
-      detachedSupervisor: packLoopDetachedSupervisor,
+      }, handoff),
     });
     if (!started.ok) throw new Error(`pack-loop dispatch: ${started.error}`);
     spawnResult = started.value;

@@ -41,11 +41,11 @@ import {
   isPendingLoopDispatch,
   isPostPilotReleaseVersion,
   observeDetachedChildStart,
-  packLoopDetachedSupervisor,
   parseFactoryReleasePrepareRequest,
   persistFactoryReleaseLoopBinding,
   productionCreateOrReusePackIssues,
   productionDispatchPackLoop,
+  productionResumeBoundPackLoop,
   reconcileFrgPackLifecycle,
   rejectForbiddenRequestFields,
   targetCheckoutsForPrepare,
@@ -86,7 +86,14 @@ import {
   uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
 } from "../scripts/operation-reliability.ts";
-import { candidateProcessGuardEnv } from "../scripts/ship-end-candidate.ts";
+import {
+  candidateProcessGuardEnv,
+  candidateProcessHandoffPath,
+} from "../scripts/ship-end-candidate.ts";
+import {
+  candidateReadyRecordPath,
+  READY_RECORD_SCHEMA,
+} from "../scripts/candidate-engine-readiness.ts";
 
 const MANIFEST_SHA = "a".repeat(64);
 const CANDIDATE = "b".repeat(40);
@@ -2394,6 +2401,68 @@ test("productionDispatchPackLoop re-runs resolve-and-prepare for supplied invoca
   assert.equal(spawned, 0);
 });
 
+test("production dispatch adopts the ship parent lease and transfers it to the detached pack loop (#1503)", async () => {
+  const inherited = inheritedCandidateFixture("factory-release.pack-loop.start");
+  let childEnv: NodeJS.ProcessEnv | undefined;
+  const result = await productionDispatchPackLoop(
+    {
+      repoDir: "/repo",
+      request: baseRequest(),
+      pack: packWithTemplates(),
+      packRunId: "pack-nested-dispatch",
+      issue_numbers: [101, 102],
+      engineTrack: "candidate",
+      label: "factory-gate",
+    },
+    {
+      env: inherited.env,
+      fileExists: () => true,
+      resolveCandidate: inherited.resolveCandidate as never,
+      resolveCandidateDeps: inherited.resolveCandidateDeps,
+      initBoundLoop: async () => ({ loop_run_id: "loop-nested-dispatch" }),
+      persistBinding: async () => {},
+      spawnCandidateLoop: async (args, handoff) => {
+        childEnv = args.candidateEnv;
+        assert.equal(handoff?.({ pid: 4242, starttime: null }), true);
+        return { dispatch_state: "dispatched" as const, pid: 4242 };
+      },
+    },
+  );
+  assert.equal(result.loop_run_id, "loop-nested-dispatch");
+  assert.equal(childEnv?.PIPELINE_CANDIDATE_PROCESS_GUARD, "1");
+  assert.equal(
+    JSON.parse(inherited.files.get(candidateProcessHandoffPath(inherited.processLockPath))!).pid,
+    4242,
+  );
+});
+
+test("production resume adopts the ship parent lease and transfers it to the detached pack loop (#1503)", async () => {
+  const inherited = inheritedCandidateFixture("factory-release.pack-loop.resume");
+  const captured: { env?: NodeJS.ProcessEnv; command?: string; args?: readonly string[] } = {};
+  const result = await productionResumeBoundPackLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-nested-resume",
+      candidateInvocation: testInvocation("loop-nested-resume"),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      resolveCandidate: inherited.resolveCandidate as never,
+      resolveCandidateDeps: inherited.resolveCandidateDeps,
+      spawnDeps: {
+        ...spawnDepsForHandoff("loop-nested-resume", captured),
+        env: inherited.env,
+      },
+    },
+  );
+  assert.equal(result.dispatch_state, "dispatched");
+  assert.equal(captured.env?.PIPELINE_CANDIDATE_PROCESS_GUARD, "1");
+  assert.equal(
+    JSON.parse(inherited.files.get(candidateProcessHandoffPath(inherited.processLockPath))!).pid,
+    4242,
+  );
+});
+
 test("crash after persist before spawn resumes the same bound run", async () => {
   const files = new Map<string, string>();
   const request = baseRequest();
@@ -2645,6 +2714,84 @@ function preparedCandidateResolver() {
   };
 }
 
+function inheritedCandidateFixture(
+  consumer: "factory-release.pack-loop.start" | "factory-release.pack-loop.resume",
+) {
+  const engineRoot = "/candidate-engine";
+  const stateDir = "/state";
+  const processLockPath = path.join(
+    stateDir,
+    `pipeline-candidate-process-${crypto.createHash("sha256")
+      .update(engineRoot)
+      .digest("hex")
+      .slice(0, 32)}.lock`,
+  );
+  const readyRecordPath = candidateReadyRecordPath(engineRoot, CANDIDATE, stateDir);
+  const lockBody = `${JSON.stringify({
+    schema: "pipeline-candidate-process-lock/v1",
+    engineRoot,
+    commitSha: CANDIDATE,
+    pid: process.ppid,
+    starttime: "parent-start",
+  })}\n`;
+  const lockfile = Buffer.from("candidate-lockfile");
+  const lockfileDigest = "d".repeat(64);
+  const files = new Map<string, string>([
+    [processLockPath, lockBody],
+    [readyRecordPath, `${JSON.stringify({
+      schema: READY_RECORD_SCHEMA,
+      engineRoot,
+      commitSha: CANDIDATE,
+      lockfileDigest,
+    })}\n`],
+  ]);
+  const proof = {
+    engineRoot,
+    commitSha: CANDIDATE,
+    readyRecordPath,
+    lockfileDigest,
+    processLockPath,
+    processLockDigest: crypto.createHash("sha256").update(lockBody).digest("hex"),
+  };
+  const engine = {
+    engineRoot,
+    launcherPath: CANDIDATE_LAUNCHER,
+    commitSha: CANDIDATE,
+    consumer,
+    acquireProcessLock: () => null,
+    revalidateBeforeSpawn: () => ({ ok: true as const, engine }),
+  };
+  return {
+    engine,
+    env: candidateProcessGuardEnv(proof, { PATH: "/usr/bin" }),
+    files,
+    processLockPath,
+    resolveCandidate: async () => ({ ok: true as const, engine }),
+    resolveCandidateDeps: {
+      readFile: (p: string) => {
+        if (p === path.join(engineRoot, "core", "package-lock.json")) return lockfile;
+        throw new Error(`unexpected read ${p}`);
+      },
+      readText: (p: string) => files.get(p) ?? null,
+      writeText: (p: string, body: string, flag: "wx" | "w") => {
+        if (flag === "wx" && files.has(p)) return false;
+        files.set(p, body);
+        return true;
+      },
+      remove: (p: string) => {
+        files.delete(p);
+      },
+      digest: (body: Buffer) => body.equals(lockfile) ? lockfileDigest : "f".repeat(64),
+      statePathTrusted: (p: string) =>
+        p === stateDir || files.has(p),
+      processAlive: (pid: number, starttime: string | null) =>
+        (pid === process.ppid && starttime === "parent-start") ||
+        (pid === process.pid && starttime === "nested-start"),
+      parentIdentity: () => ({ pid: process.pid, starttime: "nested-start" }),
+    } as never,
+  };
+}
+
 function capturingCandidateSpawn(captured: {
   env?: NodeJS.ProcessEnv;
   command?: string;
@@ -2662,11 +2809,16 @@ function capturingCandidateSpawn(captured: {
     captured.stdio = options.stdio;
     const child = new EventEmitter() as EventEmitter & {
       unref: () => void;
+      kill: (signal?: NodeJS.Signals | number) => boolean;
       stdout: EventEmitter;
       stderr: EventEmitter;
       pid: number;
     };
     child.unref = () => {};
+    child.kill = (signal) => {
+      queueMicrotask(() => child.emit("exit", null, signal ?? "SIGTERM"));
+      return true;
+    };
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     child.pid = 4242;
@@ -2865,16 +3017,6 @@ test("missing candidate invocation fails closed and does not exec PATH pipeline"
   );
 });
 
-test("pack-loop detached supervisor is the dispatched child pid (#1454)", () => {
-  assert.deepEqual(
-    packLoopDetachedSupervisor({ dispatch_state: "dispatched", pid: 4242 }),
-    { pid: 4242, starttime: null },
-  );
-  assert.equal(packLoopDetachedSupervisor({ dispatch_state: "bound", pid: 4242 }), null);
-  assert.equal(packLoopDetachedSupervisor({ dispatch_state: "dispatched" }), null);
-  assert.equal(packLoopDetachedSupervisor(undefined), null);
-});
-
 test("raw pack-loop consumer cannot spawn without an executable process-boundary proof (#1454)", async () => {
   let spawned = false;
   const result = await defaultSpawnCandidateLoop(
@@ -3000,6 +3142,47 @@ test("handoff SHA mismatch fails closed", async () => {
   assert.match(result.last_error ?? "", /handoff_mismatch|candidate_sha/);
 });
 
+test("handoff supervisor PID must equal the spawned detached child PID (#1503)", async () => {
+  const child = new EventEmitter() as EventEmitter & {
+    unref: () => void;
+    kill: (signal?: NodeJS.Signals | number) => boolean;
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+    pid: number;
+  };
+  child.unref = () => {};
+  child.kill = (signal) => {
+    queueMicrotask(() => child.emit("exit", null, signal ?? "SIGTERM"));
+    return true;
+  };
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.pid = 77;
+  queueMicrotask(() => child.emit("spawn"));
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-supervisor-pid-mismatch",
+      candidateInvocation: testInvocation("loop-supervisor-pid-mismatch"),
+      candidateEnv: testCandidateEnv(),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      spawn: (() => child) as never,
+      env: { PATH: "/usr/bin" },
+      fileExists: () => true,
+      readHandoff: async () => validHandoff("loop-supervisor-pid-mismatch"),
+      readSupervisor: async () => validHandoff("loop-supervisor-pid-mismatch").supervisor,
+      realpath: (p: string) => p,
+      storeRunDir: "/state/runs/loop-supervisor-pid-mismatch",
+      sleep: async () => {},
+      now: () => new Date("2026-08-29T00:00:01.000Z"),
+    },
+  );
+  assert.equal(result.dispatch_state, "failed");
+  assert.match(result.last_error ?? "", /supervisor_pid_mismatch/);
+});
+
 test("malformed handoff stops a still-running child before return", async () => {
   const captured: {
     killed?: NodeJS.Signals | number;
@@ -3066,6 +3249,62 @@ test("malformed handoff stops a still-running child before return", async () => 
   assert.equal(captured.killed, "SIGTERM");
   assert.equal(captured.unrefed, true);
   assert.equal(captured.pipesDestroyed, 2);
+});
+
+test("candidate lease handoff failure stops the attached child before return (#1503)", async () => {
+  const captured: { signals: Array<NodeJS.Signals | number>; unrefed: boolean } = {
+    signals: [],
+    unrefed: false,
+  };
+  const child = new EventEmitter() as EventEmitter & {
+    unref: () => void;
+    kill: (signal?: NodeJS.Signals | number) => boolean;
+    stdout: EventEmitter & { destroy: () => void };
+    stderr: EventEmitter & { destroy: () => void };
+    pid: number;
+  };
+  child.unref = () => {
+    captured.unrefed = true;
+  };
+  child.kill = (signal) => {
+    const sent = signal ?? "SIGTERM";
+    captured.signals.push(sent);
+    // Deliberately ignore SIGTERM. Only SIGKILL proves that the failure path
+    // escalates and waits for an actual exit before releasing the claim.
+    if (sent === "SIGKILL") queueMicrotask(() => child.emit("exit", null, "SIGKILL"));
+    return true;
+  };
+  child.stdout = new EventEmitter() as EventEmitter & { destroy: () => void };
+  child.stderr = new EventEmitter() as EventEmitter & { destroy: () => void };
+  child.stdout.destroy = () => {};
+  child.stderr.destroy = () => {};
+  child.pid = 4242;
+  queueMicrotask(() => child.emit("spawn"));
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-lease-handoff-failure",
+      candidateInvocation: testInvocation("loop-lease-handoff-failure"),
+      candidateEnv: testCandidateEnv(),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      spawn: (() => child) as never,
+      env: { PATH: "/usr/bin" },
+      fileExists: () => true,
+      readHandoff: async () => validHandoff("loop-lease-handoff-failure"),
+      readSupervisor: async () => validHandoff("loop-lease-handoff-failure").supervisor,
+      realpath: (p: string) => p,
+      storeRunDir: "/state/runs/loop-lease-handoff-failure",
+      sleep: async () => {},
+      now: () => new Date("2026-08-29T00:00:01.000Z"),
+    },
+    () => false,
+  );
+  assert.equal(result.dispatch_state, "failed");
+  assert.match(result.last_error ?? "", /candidate_lease_handoff_failed/);
+  assert.deepEqual(captured.signals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(captured.unrefed, true);
 });
 
 test("resume OS accept persists starting so a later invoke does not spawn a second child", async () => {

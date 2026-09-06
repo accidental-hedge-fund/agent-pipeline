@@ -1,7 +1,9 @@
 # factory-reliability-gate Specification
 
 ## Purpose
-TBD - created by archiving change release-mandatory-factory-reliability-gate. Update Purpose after archive.
+
+Define the release-blocking Factory Reliability Gate, its evidence and attestation contracts, and the candidate-bound lifecycle that proves the pipeline can complete representative work safely before a version ships.
+
 ## Requirements
 ### Requirement: Every release version SHALL require a recorded Factory Reliability Gate pass
 
@@ -2491,6 +2493,46 @@ This requirement does not collapse production `A` and `B` into one `run_id`. It 
 - **AND** collected `pack_provenance.candidate_git_sha` is `D` distinct from `C`
 - **THEN** the attestor SHALL fail closed
 - **AND** it SHALL NOT persist HMAC-pass `latest.json`
+
+### Requirement: Nested pack-loop launch SHALL hand off the existing candidate lease
+
+A nested pack-loop launch SHALL safely adopt and hand off its exact-candidate ship coordinator's existing process lease.
+When the coordinator launches `factory-release prepare` under a candidate
+process guard and prepare launches or resumes the same
+candidate's detached pack loop, the nested start SHALL adopt the live parent
+lease only when its guard, canonical root, exact SHA, readiness record, lock
+digest, and direct-parent process identity all match. It SHALL revalidate the
+candidate at the nested start boundary and transfer the lease record to the
+acknowledged detached supervisor through an atomic, exclusively created
+handoff record while keeping the child-guard-bound parent lock immutable. The
+acknowledged supervisor PID SHALL equal the spawned child PID. One exclusive
+claim SHALL serialize inherited launch and handoff against another launch and
+stale-owner reclamation. Transfer SHALL finish before the child is detached; a
+failed transfer SHALL stop and reap the child. A failed or non-detached nested start SHALL
+leave parent ownership intact. Partial, forged, stale, unreadable, wrong-root,
+wrong-SHA, or wrong-parent inherited evidence SHALL fail closed and SHALL NOT
+fall back to acquiring a fresh lease. An invocation without inherited guard
+fields MAY acquire the ordinary fresh candidate lease.
+
+#### Scenario: Ship prepare hands its lease to a new pack loop
+
+- **WHEN** ship starts candidate `factory-release prepare` with a valid process guard
+- **AND** prepare dispatches the same candidate's request-bound pack loop
+- **THEN** the nested launch SHALL start without contending with its own parent
+- **AND** the process lease SHALL be transferred to the acknowledged loop supervisor PID
+- **AND** the immutable parent-lock digest SHALL remain valid before and after transfer
+- **AND** a competing nested launch or stale-owner reclaimer SHALL NOT start while the claim is held
+
+#### Scenario: Bound-loop resume uses the same handoff contract
+
+- **WHEN** guarded candidate prepare resumes its bound pack loop
+- **THEN** resume SHALL adopt and transfer the matching parent lease under the same checks
+
+#### Scenario: Invalid inherited evidence does not weaken exclusivity
+
+- **WHEN** any inherited guard field or direct-parent identity is invalid
+- **THEN** the nested candidate process SHALL NOT start
+- **AND** the parent lease SHALL remain intact
 
 ### Requirement: Pack provenance presence SHALL NOT reject a bound from-run attestation
 
