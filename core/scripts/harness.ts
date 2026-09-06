@@ -384,6 +384,8 @@ export interface HarnessResult {
 }
 
 export interface InvokeOptions {
+  /** Already-loaded repository config; no ambient host config is consulted. */
+  pipelineConfig?: Pick<PipelineConfig, "observability">;
   /** Inject local telemetry I/O; no dashboard/network dependency. */
   observabilityDeps?: ObservabilityDeps;
   /** Per-call wall-clock timeout in seconds. */
@@ -713,7 +715,7 @@ export async function invoke(
     runDir: opts.accounting.runDir, issue: opts.accounting.issue,
     stage: opts.accounting.stage, harness, cwd,
     startedAt: startedAt.toISOString(),
-  }, opts.observabilityDeps).catch(() => null) : null;
+  }, opts.pipelineConfig?.observability, opts.observabilityDeps).catch(() => null) : null;
   try {
     let abortBackgroundWait:
       | ((
@@ -941,6 +943,7 @@ export async function invoke(
       opts.accounting.runDir,
       record,
       opts.accounting.runStoreDeps,
+      opts.pipelineConfig?.observability,
     ).catch(() => {});
   }
   await observation?.finish(result.stdout, new Date().toISOString()).catch(() => {});

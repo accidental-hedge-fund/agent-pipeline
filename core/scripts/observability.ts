@@ -1,4 +1,4 @@
-/** Optional, metadata-only handoff to the host's observability exporter.
+/** Optional, metadata-only handoff to any host-local observability consumer.
  * No HTTP or dashboard SDK runs in a pipeline process. Final accounting owns
  * pipeline usage; native transcript observations supply the detailed timeline.
  */
@@ -7,10 +7,11 @@ import * as path from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { sanitizeStageAccountingRecord } from "./accounting.ts";
-import type { StageAccountingRecord } from "./types.ts";
+import type { ObservabilityConfig, StageAccountingRecord } from "./types.ts";
+
+export const OBSERVABILITY_SCHEMA_VERSION = 1;
 
 export interface ObservabilityDeps {
-  env: NodeJS.ProcessEnv;
   home: string;
   read: (file: string) => Promise<string>;
   list: (dir: string) => Promise<string[]>;
@@ -21,7 +22,6 @@ export interface ObservabilityDeps {
 }
 
 export const defaultObservabilityDeps: ObservabilityDeps = {
-  env: process.env,
   home: homedir(),
   read: (file) => fs.readFile(file, "utf8"),
   list: (dir) => fs.readdir(dir),
@@ -29,8 +29,16 @@ export const defaultObservabilityDeps: ObservabilityDeps = {
     await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
     const temp = `${file}.${randomUUID()}.tmp`;
     try {
-      await fs.writeFile(temp, `${JSON.stringify(data)}\n`, { mode: 0o600, flag: "wx" });
+      const handle = await fs.open(temp, "wx", 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify(data)}\n`);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
       await fs.rename(temp, file);
+      const directory = await fs.open(path.dirname(file), "r");
+      try { await directory.sync(); } finally { await directory.close(); }
     } finally {
       await fs.unlink(temp).catch(() => {});
     }
@@ -40,24 +48,18 @@ export const defaultObservabilityDeps: ObservabilityDeps = {
   uuid: randomUUID,
 };
 
-export function observabilityPaths(deps: ObservabilityDeps) {
-  const state = path.join(deps.home, ".local", "state", "agent-observability");
+export function observabilityPaths(config: ObservabilityConfig, deps: ObservabilityDeps) {
+  const directory = config.exporter.directory;
+  const state = directory.startsWith("~/") ? path.join(deps.home, directory.slice(2)) : directory;
   return {
-    inbox: deps.env.AGENT_OBSERVABILITY_INBOX || path.join(state, "inbox"),
+    inbox: path.join(state, "inbox"),
     context: path.join(state, "context"),
-    config: path.join(deps.home, ".config", "agent-observability", "config.json"),
   };
 }
 
-export async function observabilityEnabled(deps = defaultObservabilityDeps): Promise<boolean> {
-  if (["0", "off", "false"].includes(deps.env.AGENT_OBSERVABILITY_ENABLED ?? "")) return false;
-  if (["1", "on", "true"].includes(deps.env.AGENT_OBSERVABILITY_ENABLED ?? "")) return true;
-  try {
-    const config = JSON.parse(await deps.read(observabilityPaths(deps).config));
-    return config !== null && typeof config === "object" && config.enabled !== false;
-  } catch {
-    return false;
-  }
+/** Already-resolved pipeline.yml configuration is the sole feature authority. */
+export function observabilityEnabled(config?: ObservabilityConfig): config is ObservabilityConfig {
+  return config?.enabled === true && config.exporter?.type === "file";
 }
 
 export function observabilityHarness(harness: string): string {
@@ -105,9 +107,10 @@ export interface InvocationObservation {
  * sessions while it exists, closing the transcript-before-identity race. */
 export async function beginInvocationObservation(
   input: { runDir: string; issue: number; stage: string; harness: string; cwd: string; startedAt: string },
+  config?: ObservabilityConfig,
   deps = defaultObservabilityDeps,
 ): Promise<InvocationObservation | null> {
-  if (!await observabilityEnabled(deps)) return null;
+  if (!observabilityEnabled(config)) return null;
   const id = deps.uuid();
   const harness = observabilityHarness(input.harness);
   const runId = path.basename(input.runDir);
@@ -118,9 +121,9 @@ export async function beginInvocationObservation(
     ...(meta.repo ? { work_item_id: `${meta.repo}#${input.issue}` } : {}),
     issue: input.issue,
   };
-  const contextDir = observabilityPaths(deps).context;
+  const contextDir = observabilityPaths(config, deps).context;
   const active = path.join(contextDir, `active--${id}.json`);
-  const base = { harness, start_time: input.startedAt, cwd: input.cwd, pid: process.pid, metadata };
+  const base = { schema_version: OBSERVABILITY_SCHEMA_VERSION, producer: "agent-pipeline", harness, start_time: input.startedAt, cwd: input.cwd, pid: process.pid, metadata };
   try {
     await deps.write(active, base);
   } catch (error) {
@@ -149,6 +152,8 @@ export async function beginInvocationObservation(
     env: {
       AGENT_OBSERVABILITY_WORKLOAD: "agent-pipeline",
       AGENT_OBSERVABILITY_ACCOUNTING_OWNER: "pipeline",
+      AI_OBSERVABILITY_WORKLOAD: "agent-pipeline",
+      AI_OBSERVABILITY_ACCOUNTING_OWNER: "pipeline",
       PIPELINE_RUN_ID: runId, PIPELINE_STAGE: input.stage,
       PIPELINE_ISSUE: String(input.issue), PIPELINE_HARNESS: harness,
       PIPELINE_INVOCATION_ID: id,
@@ -196,6 +201,7 @@ export function accountingObservation(record: StageAccountingRecord, metadata: R
   const hasUsage = inclusiveInput != null || output != null;
   const hasCost = r.cost_usd != null;
   return {
+    schema_version: OBSERVABILITY_SCHEMA_VERSION, producer: "agent-pipeline",
     event_id: `pipeline:${id}`, harness,
     // This is explicitly an invocation aggregate, never a fabricated native session.
     session_id: `pipeline:${r.run_id}:${id}`,
@@ -231,11 +237,12 @@ export function accountingObservation(record: StageAccountingRecord, metadata: R
 export async function enqueueAccountingObservation(
   runDir: string,
   record: StageAccountingRecord,
+  config?: ObservabilityConfig,
   deps = defaultObservabilityDeps,
 ): Promise<void> {
-  if (!await observabilityEnabled(deps)) return;
+  if (!observabilityEnabled(config)) return;
   try {
-    const { inbox } = observabilityPaths(deps);
+    const { inbox } = observabilityPaths(config, deps);
     let files: string[] = [];
     try { files = await deps.list(inbox); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;

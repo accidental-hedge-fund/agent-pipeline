@@ -28,6 +28,7 @@ import {
   type IssueHistoryEntry,
   type ReviewFindingRecord,
   type StageAccountingRecord,
+  type ObservabilityConfig,
 } from "./types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 import { stageDurationMs } from "./evidence-bundle.ts";
@@ -1051,7 +1052,7 @@ export function writeHealthForOperatorSurface(
 
 export interface RunStoreDeps {
   /** Optional local-only export; injected test deps perform no ambient I/O. */
-  accountingSink?: (runDir: string, record: StageAccountingRecord) => Promise<void>;
+  accountingSink?: (runDir: string, record: StageAccountingRecord, config?: ObservabilityConfig) => Promise<void>;
   readFile: (p: string) => Promise<string>;
   writeFile: (p: string, data: string) => Promise<void>;
   /** Append to file using O_APPEND semantics (create if absent). */
@@ -2202,6 +2203,7 @@ export async function emitStageAccounting(
   runDir: string,
   record: StageAccountingRecord,
   deps: RunStoreDeps = defaultRunStoreDeps,
+  observability?: ObservabilityConfig,
 ): Promise<void> {
   const event: StageAccountingEvent = {
     ...sanitizeStageAccountingRecord(record),
@@ -2216,7 +2218,7 @@ export async function emitStageAccounting(
     );
   }
   try {
-    await deps.accountingSink?.(runDir, event);
+    await deps.accountingSink?.(runDir, event, observability);
   } catch (err) {
     console.warn(`[pipeline] observability export failed (non-fatal): ${(err as Error).message}`);
   }

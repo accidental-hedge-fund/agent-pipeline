@@ -21,6 +21,36 @@ import {
 } from "../scripts/types.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import { defaultRunStoreDeps } from "../scripts/run-store.ts";
+import type { RunStoreDeps } from "../scripts/run-store.ts";
+import { DEFAULT_CONFIG } from "../scripts/types.ts";
+import { accountingObservation } from "../scripts/observability.ts";
+
+test("stage API dispatch threads its loaded observability config to accounting, including explicit off", async () => {
+  for (const enabled of [false, true]) {
+    const observability = { ...DEFAULT_CONFIG.observability, enabled };
+    const cfg = { ...baseCfg(), observability };
+    const received: object[] = [];
+    const runStoreDeps = {
+      appendFile: async () => {},
+      accountingSink: async (_dir, record, config) => {
+        assert.equal(config, observability, "stage config, not opts or ambient config, owns export policy");
+        received.push(accountingObservation(record));
+      },
+    } as RunStoreDeps;
+    const fetchImpl = (async (_url, init) => fakeResponse(init ? {
+      model: "local-model", choices: [{ message: { content: "PRIVATE RESPONSE" } }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    } : {})) as typeof fetch;
+    const result = await invokeStageExecutor("review-1", cfg, "PRIVATE PROMPT", {
+      timeoutSec: 5,
+      pipelineConfig: { observability: { ...observability, enabled: !enabled } },
+      accounting: { runDir: "/repo/.agent-pipeline/runs/run-1", issue: 42, stage: "review-1", runStoreDeps },
+    }, { fetchImpl });
+    assert.equal(result?.success, true);
+    assert.equal(received.length, 1);
+    assert.doesNotMatch(JSON.stringify(received), /PRIVATE RESPONSE|PRIVATE PROMPT/);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Stage-set invariants (#314 task 2.4) — types are stripped at runtime, so the

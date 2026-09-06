@@ -391,6 +391,8 @@ export async function preflightExecutor(
 }
 
 export interface InvokeExecutorOptions {
+  /** The same resolved repository configuration used for stage dispatch. */
+  pipelineConfig?: Pick<PipelineConfig, "observability">;
   timeoutSec: number;
   accounting?: {
     runDir: string;
@@ -763,7 +765,7 @@ export async function invokeExternalExecutor(
           ? { ...(provenance.usage ?? {}), cost_usd: provenance.cost_usd ?? undefined }
           : undefined,
     });
-    await emitStageAccounting(opts.accounting.runDir, record, opts.accounting.runStoreDeps).catch(() => {});
+    await emitStageAccounting(opts.accounting.runDir, record, opts.accounting.runStoreDeps, opts.pipelineConfig?.observability).catch(() => {});
   }
 
   return result;
@@ -797,7 +799,7 @@ function extractStdout(definition: ExecutorDefinition, json: unknown): string | 
  */
 export async function invokeStageExecutor(
   stage: ModelInvokingStage,
-  cfg: Pick<PipelineConfig, "stage_executors" | "executors">,
+  cfg: Pick<PipelineConfig, "stage_executors" | "executors"> & Partial<Pick<PipelineConfig, "observability">>,
   prompt: string,
   opts: InvokeExecutorOptions,
   deps: ExecutorHttpDeps = {},
@@ -818,5 +820,8 @@ export async function invokeStageExecutor(
     });
   }
 
-  return invokeExternalExecutor(stage, assignment, prompt, opts, deps, override);
+  return invokeExternalExecutor(stage, assignment, prompt, {
+    ...opts,
+    pipelineConfig: cfg.observability ? { observability: cfg.observability } : undefined,
+  }, deps, override);
 }
