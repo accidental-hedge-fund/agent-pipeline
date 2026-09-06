@@ -61,3 +61,8 @@
 - [x] 10.1 Successful `fix-1`, `fix-2`, and pre-merge autofix pushes rebind/reproduce the new head instead of `tester_rebind_pr_head_mismatch`
 - [x] 10.2 Unowned S1→S2 at `fix-1` (worktree remains S1) still fail-closes with `tester_rebind_pr_head_mismatch`
 - [x] 10.3 Compensating label restoration failure persists `tester_rebind_stage_label_unrestored` and does not record `stage_complete` as `advanced`
+
+## 11. Review 1 (owned successor proof vs missing-label restoration)
+
+- [x] 11.1 Owned `fix-1`/`fix-2`/`pre-merge` push returns post-attempt observer evidence for S2 (not a copy of S1) and the adapter accepts that S2 snapshot as stage-owned successor binding
+- [x] 11.2 Compensating restoration that leaves no `pipeline:*` stage label persists `tester_rebind_stage_label_unrestored`

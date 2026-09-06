@@ -117,6 +117,8 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 - **AND** SHALL NOT fail closed with `tester_rebind_pr_head_mismatch` solely because the stage produced S2
 - **AND** SHALL NOT restore the consumer stage label
 - **AND** SHALL allow the handler outcome to stand when S2 binding succeeds
+- **AND** the post-attempt observer SHALL report candidate SHA S2 as the completion proof
+- **AND** SHALL NOT report S1 Tester evidence or S1 Candidate identity as that post-attempt proof
 
 #### Scenario: failed restoration of the consumer stage label is a typed reconciliation blocker
 
@@ -125,6 +127,13 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 - **THEN** the pipeline SHALL persist typed blocker `tester_rebind_stage_label_unrestored`
 - **AND** SHALL NOT silently discard the restoration failure
 - **AND** SHALL NOT record `stage_complete` as `advanced` for that consumer stage
+
+#### Scenario: missing pipeline stage label is not a restored consumer stage
+
+- **WHEN** post-attempt unowned PR-head movement requires restoring the consumer stage label
+- **AND** the live issue has no `pipeline:*` stage label after the compensating transition
+- **THEN** the pipeline SHALL persist typed blocker `tester_rebind_stage_label_unrestored`
+- **AND** SHALL NOT treat a missing stage label as confirmation of the original consumer stage
 
 #### Scenario: disabled-gate exact-proof still fail-closes when PR head moved
 

@@ -371,6 +371,124 @@ test("1.4 evidence producer cannot establish an artifact for a replacement Candi
   if (!out.advanced) assert.match(out.reason, /Candidate binding changed during execution/);
 });
 
+test("1.4 stage-owned successor binding keeps the handler outcome and records S2 (#1468)", async () => {
+  const beforeSha = "a".repeat(40);
+  const afterSha = "b".repeat(40);
+  const before = {
+    candidateSha: beforeSha,
+    candidateEpoch: beforeSha,
+    evidenceRole: "implementation" as const,
+    artifactIdentity: `tester:${beforeSha}`,
+    postconditionProven: true,
+  };
+  const after = {
+    candidateSha: afterSha,
+    candidateEpoch: afterSha,
+    evidenceRole: "implementation" as const,
+    artifactIdentity: `tester:${afterSha}`,
+    postconditionProven: true,
+  };
+  const sink = memoryObservationSink();
+  const out = await runDeliveryStageAdapter({
+    stage: "fix-1",
+    cfg: cfg(),
+    issueNumber: 1468,
+    logicalOperationId: "lop-owned-successor-1468",
+    requireEvidenceBeforeAttempt: true,
+    reportObservation: sink.reportObservation,
+    stageOwnedSuccessorEvidence: () => after,
+    observeEvidence: async (phase) => phase === "before" ? before : after,
+    attempt: async () => ({
+      advanced: true,
+      from: "fix-1",
+      to: "review-2",
+      summary: "fix-1 pushed S2",
+    }),
+  });
+  assert.equal(out.advanced, true);
+  assert.equal(sink.observations.length, 1);
+  assert.equal(sink.observations[0]?.complete, true);
+  assert.equal(sink.observations[0]?.candidate_epoch, afterSha);
+  assert.equal(sink.observations[0]?.artifact_identity, `tester:${afterSha}`);
+});
+
+test("1.4 SHA change without stage-owned successor evidence still waits (#1468)", async () => {
+  const beforeSha = "a".repeat(40);
+  const afterSha = "b".repeat(40);
+  const before = {
+    candidateSha: beforeSha,
+    candidateEpoch: beforeSha,
+    evidenceRole: "implementation" as const,
+    artifactIdentity: `tester:${beforeSha}`,
+    postconditionProven: true,
+  };
+  const after = {
+    candidateSha: afterSha,
+    candidateEpoch: afterSha,
+    evidenceRole: "implementation" as const,
+    artifactIdentity: `tester:${afterSha}`,
+    postconditionProven: true,
+  };
+  const out = await runDeliveryStageAdapter({
+    stage: "fix-1",
+    cfg: cfg(),
+    issueNumber: 1468,
+    logicalOperationId: "lop-unowned-successor-1468",
+    requireEvidenceBeforeAttempt: true,
+    observeEvidence: async (phase) => phase === "before" ? before : after,
+    attempt: async () => ({
+      advanced: true,
+      from: "fix-1",
+      to: "review-2",
+      summary: "must not certify a foreign successor",
+    }),
+  });
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /Candidate binding changed during execution/);
+});
+
+test("1.4 stage-owned successor evidence that does not match S2 still waits (#1468)", async () => {
+  const beforeSha = "a".repeat(40);
+  const afterSha = "b".repeat(40);
+  const otherSha = "c".repeat(40);
+  const before = {
+    candidateSha: beforeSha,
+    candidateEpoch: beforeSha,
+    evidenceRole: "implementation" as const,
+    artifactIdentity: `tester:${beforeSha}`,
+    postconditionProven: true,
+  };
+  const after = {
+    candidateSha: afterSha,
+    candidateEpoch: afterSha,
+    evidenceRole: "implementation" as const,
+    artifactIdentity: `tester:${afterSha}`,
+    postconditionProven: true,
+  };
+  const out = await runDeliveryStageAdapter({
+    stage: "fix-1",
+    cfg: cfg(),
+    issueNumber: 1468,
+    logicalOperationId: "lop-mismatched-successor-1468",
+    requireEvidenceBeforeAttempt: true,
+    stageOwnedSuccessorEvidence: () => ({
+      ...after,
+      candidateSha: otherSha,
+      candidateEpoch: otherSha,
+      artifactIdentity: `tester:${otherSha}`,
+    }),
+    observeEvidence: async (phase) => phase === "before" ? before : after,
+    attempt: async () => ({
+      advanced: true,
+      from: "fix-1",
+      to: "review-2",
+      summary: "must not accept a mismatched successor snapshot",
+    }),
+  });
+  assert.equal(out.advanced, false);
+  if (!out.advanced) assert.match(out.reason, /Candidate binding changed during execution/);
+});
+
 test("1.4 protected dispatch rejects completion when the Candidate binding changes during execution (#1454)", async () => {
   const beforeSha = "a".repeat(40);
   const afterSha = "b".repeat(40);

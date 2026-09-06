@@ -739,6 +739,8 @@ async function driveDesignGateAdvance(opts: {
   invokeObserverAfter?: boolean;
   /** Injected compensating transition throws (label restoration failure). */
   compensationTransitionFails?: boolean;
+  /** Compensating transition removes the forward label and does not add the consumer stage. */
+  compensationStripsStageLabel?: boolean;
   rebind?: AdvanceDeps["rebindTesterEvidenceAfterPr"];
   dispatch?: AdvanceDeps["dispatch"];
 }): Promise<{
@@ -752,11 +754,13 @@ async function driveDesignGateAdvance(opts: {
     candidateSha?: string;
     evidenceRole?: string | null;
     artifactIdentity?: string | null;
+    postconditionProven?: boolean;
   } | null;
   observerAfter: {
     candidateSha?: string;
     evidenceRole?: string | null;
     artifactIdentity?: string | null;
+    postconditionProven?: boolean;
   } | null;
 }> {
   const repoDir = fs.mkdtempSync(join(os.tmpdir(), "rebind-run-advance-"));
@@ -779,11 +783,13 @@ async function driveDesignGateAdvance(opts: {
     candidateSha?: string;
     evidenceRole?: string | null;
     artifactIdentity?: string | null;
+    postconditionProven?: boolean;
   } | null = null;
   let observerAfter: {
     candidateSha?: string;
     evidenceRole?: string | null;
     artifactIdentity?: string | null;
+    postconditionProven?: boolean;
   } | null = null;
   const startStage = opts.startStage ?? "design-gate";
   const labels = [`pipeline:${startStage}`];
@@ -896,6 +902,12 @@ async function driveDesignGateAdvance(opts: {
       if (opts.compensationTransitionFails) {
         throw new Error("github unavailable");
       }
+      if (opts.compensationStripsStageLabel) {
+        for (let i = labels.length - 1; i >= 0; i--) {
+          if (labels[i]!.startsWith("pipeline:")) labels.splice(i, 1);
+        }
+        return;
+      }
       const fromLabel = `pipeline:${from}`;
       const toLabel = `pipeline:${to}`;
       const idx = labels.findIndex((label) => label === fromLabel || label.startsWith("pipeline:"));
@@ -911,6 +923,7 @@ async function driveDesignGateAdvance(opts: {
             candidateSha: observed.candidateSha,
             evidenceRole: observed.evidenceRole ?? null,
             artifactIdentity: observed.artifactIdentity ?? null,
+            postconditionProven: observed.postconditionProven,
           };
         }
       }
@@ -938,6 +951,7 @@ async function driveDesignGateAdvance(opts: {
             candidateSha: observed.candidateSha,
             evidenceRole: observed.evidenceRole ?? null,
             artifactIdentity: observed.artifactIdentity ?? null,
+            postconditionProven: observed.postconditionProven,
           };
         }
       }
@@ -1159,11 +1173,18 @@ async function ownedAwareRebind(input: RebindTesterEvidenceAfterPrInput) {
     return rebindTesterEvidenceAfterPr(input);
   }
   const sha = prHead ?? SHA_S;
+  const evidence = boundPassedAt(sha);
+  if (input.io?.writeFile) {
+    await input.io.writeFile(
+      testerEvidencePath(input.runDir),
+      `${JSON.stringify(evidence, null, 2)}\n`,
+    );
+  }
   return {
     ok: true as const,
     action: "bind" as const,
     candidateSha: sha,
-    evidence: boundPassedAt(sha),
+    evidence,
     suiteCommandInvoked: sha !== SHA_S,
   };
 }
@@ -1640,6 +1661,10 @@ test("runAdvance rebinds a successful fix-1 push instead of treating it as forei
   const lastRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
   assert.equal(lastRebind?.prHeadSha, SHA_B);
   assert.equal(lastRebind?.pushedHeadSha, SHA_B);
+  assert.equal(driven.observerBefore?.candidateSha, SHA_S);
+  assert.equal(driven.observerAfter?.candidateSha, SHA_B);
+  assert.equal(driven.observerAfter?.evidenceRole, "implementation");
+  assert.equal(driven.observerAfter?.postconditionProven, true);
   assert.equal(driven.pipelineStage, "review-2");
   assert.equal(driven.setBlocked.length, 0);
   assert.equal(
@@ -1675,6 +1700,9 @@ test("runAdvance rebinds a successful fix-2 push instead of treating it as forei
   const lastRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
   assert.equal(lastRebind?.prHeadSha, SHA_B);
   assert.equal(lastRebind?.pushedHeadSha, SHA_B);
+  assert.equal(driven.observerAfter?.candidateSha, SHA_B);
+  assert.equal(driven.observerAfter?.evidenceRole, "implementation");
+  assert.equal(driven.observerAfter?.postconditionProven, true);
   assert.equal(driven.pipelineStage, "pre-merge");
   assert.equal(driven.setBlocked.length, 0);
   assert.equal(
@@ -1705,6 +1733,9 @@ test("runAdvance rebinds a successful pre-merge autofix push instead of treating
   const lastRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
   assert.equal(lastRebind?.prHeadSha, SHA_B);
   assert.equal(lastRebind?.pushedHeadSha, SHA_B);
+  assert.equal(driven.observerAfter?.candidateSha, SHA_B);
+  assert.equal(driven.observerAfter?.evidenceRole, "implementation");
+  assert.equal(driven.observerAfter?.postconditionProven, true);
   assert.equal(driven.pipelineStage, "visual-gate");
   assert.equal(driven.setBlocked.length, 0);
   assert.equal(
@@ -1777,4 +1808,76 @@ test("runAdvance records a reconciliation blocker when post-attempt label restor
     "tester_rebind_stage_label_unrestored",
   );
   assert.ok(driven.setBlocked.some((row) => /restoring design-gate failed/.test(row.reason)));
+});
+
+test("runAdvance records unrestored when compensation leaves no pipeline stage label", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    tester: boundPassed(),
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    compensationStripsStageLabel: true,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "design-gate" as const,
+      to: "review-1" as const,
+      summary: "design-gate resolved; advanced to review",
+    }),
+  });
+  assert.equal(
+    driven.stageCompleteEvents.some((event) => event.outcome === "advanced"),
+    false,
+  );
+  assert.ok(
+    driven.stageCompleteEvents.some(
+      (event) => event.stage === "design-gate" && event.outcome === "blocked",
+    ),
+  );
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_stage_label_unrestored",
+  );
+  assert.ok(driven.setBlocked.some((row) => /restoring design-gate failed/.test(row.reason)));
+  assert.equal(
+    driven.pipelineStage === "design-gate" || driven.pipelineStage === null,
+    true,
+  );
+});
+
+test("disabled-gate owned fix-1 push reports S2 post-attempt evidence", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "fix-1",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    worktreeHeadAfter: SHA_B,
+    changedPaths: ["core/scripts/pipeline-run.ts"],
+    testGateEnabled: false,
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    rebind: async (input) => ({
+      ok: true as const,
+      action: "not-applicable" as const,
+      candidateSha: (input.prHeadSha as string | null) ?? SHA_S,
+      evidence: null,
+      suiteCommandInvoked: false,
+    }),
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "fix-1" as const,
+      to: "review-2" as const,
+      summary: "fix-1 pushed a new head with the test gate disabled",
+    }),
+  });
+  assert.equal(driven.observerBefore?.candidateSha, SHA_S);
+  assert.equal(driven.observerAfter?.candidateSha, SHA_B);
+  assert.equal(driven.observerAfter?.evidenceRole, "implementation");
+  assert.equal(driven.observerAfter?.postconditionProven, true);
+  assert.equal(driven.setBlocked.length, 0);
+  assert.equal(driven.pipelineStage, "review-2");
 });

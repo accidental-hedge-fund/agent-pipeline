@@ -190,6 +190,7 @@ import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
 import {
+  freezeDeliveryStageEvidence,
   isDeliveryStage,
   requiredEvidenceRoleForStage,
   runDeliveryStageAdapter,
@@ -290,6 +291,12 @@ export interface AdvanceOpts {
   logicalOperationId?: string | null;
   /** Exact observer run before and after a delivery-stage attempt. */
   observeDeliveryStageEvidence?: DeliveryStageEvidenceObserver;
+  /**
+   * Proven S2 Candidate after a stage-owned push. Forwarded to the delivery
+   * adapter so S2 proof can stand without reporting the pre-attempt S1 binding
+   * as S2 evidence.
+   */
+  stageOwnedSuccessorEvidence?: () => DeliveryStageEvidence | null;
 }
 
 /** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
@@ -1107,8 +1114,11 @@ async function restoreConsumerStageAfterPostAttemptMismatch(input: {
       continue;
     }
     liveStage = pickStage(detail.labels);
-    if (!liveStage || liveStage === input.consumerStage) {
+    if (liveStage === input.consumerStage) {
       return { ok: true, liveStage };
+    }
+    if (!liveStage) {
+      continue;
     }
     try {
       await input.transition(
@@ -1124,7 +1134,7 @@ async function restoreConsumerStageAfterPostAttemptMismatch(input: {
   }
   const detail = await input.getIssueDetail(input.cfg, input.issueNumber).catch(() => null);
   liveStage = detail ? pickStage(detail.labels) : null;
-  if (detail && (!liveStage || liveStage === input.consumerStage)) {
+  if (liveStage === input.consumerStage) {
     return { ok: true, liveStage };
   }
   return { ok: false, liveStage };
@@ -1322,6 +1332,7 @@ export async function dispatch(
       evidenceProducerBeforeAttempt: evidenceProducer,
       observeEvidence: opts.observeDeliveryStageEvidence,
       producerCompletionEvidence: evidenceProducer ? () => producerCompletionEvidence : undefined,
+      stageOwnedSuccessorEvidence: opts.stageOwnedSuccessorEvidence,
       attempt,
     });
   }
@@ -3287,21 +3298,17 @@ export async function runAdvance(
                 ...observerPrHeadBinding,
               })
             : undefined);
-        let preAttemptObserverEvidence: DeliveryStageEvidence | null = null;
+        let ownedSuccessorEvidence: DeliveryStageEvidence | null = null;
         const observeDeliveryStageEvidence: DeliveryStageEvidenceObserver | undefined = innerObserver
           ? async (phase, outcome) => {
               const evidence = await innerObserver(phase, outcome);
-              if (phase === "before") {
-                preAttemptObserverEvidence = evidence;
-                return evidence;
-              }
-              // The adapter treats any SHA change as foreign candidate replacement.
-              // A successful owned S2 bind must not convert the handler outcome to waiting.
-              if (ownedCandidateMutationRebound && preAttemptObserverEvidence && !observerMismatch) {
-                return {
-                  ...preAttemptObserverEvidence,
-                  postconditionProven: true,
-                };
+              if (
+                phase === "after" &&
+                ownedCandidateMutationRebound &&
+                !observerMismatch &&
+                evidence.postconditionProven === true
+              ) {
+                ownedSuccessorEvidence = freezeDeliveryStageEvidence(evidence);
               }
               return evidence;
             }
@@ -3309,6 +3316,7 @@ export async function runAdvance(
         const dispatchOpts: AdvanceOpts = {
           ...opts,
           observeDeliveryStageEvidence,
+          stageOwnedSuccessorEvidence: () => ownedSuccessorEvidence,
         };
         out = await (deps.dispatch ?? dispatch)(
           cfg,

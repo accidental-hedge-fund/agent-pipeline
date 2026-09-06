@@ -33,3 +33,25 @@ The bind or reproduce of that Tester evidence SHALL complete before the consumer
 - **AND** no valid rebound implementation-role Tester evidence exists for the observed SHA
 - **THEN** the adapter SHALL still refuse before execution
 - **AND** RecoverySupervisor SHALL retain ownership
+
+### Requirement: Delivery-stage adapter SHALL accept a stage-owned successor Candidate without reporting S1 as S2 proof
+
+The delivery-stage adapter SHALL permit a handler outcome at `fix-1`, `fix-2`, or `pre-merge` when the post-attempt observer reports proven implementation-role evidence for S2 and the caller supplies that S2 snapshot as stage-owned successor evidence. The adapter SHALL record S2 as the completion Candidate. The adapter SHALL NOT represent the pre-attempt S1 binding as S2 proof. A Candidate SHA change without matching producer-completion evidence or matching stage-owned successor evidence SHALL still wait as Candidate-binding-changed.
+
+#### Scenario: stage-owned successor binding records S2 proof
+
+- **WHEN** the consumer stage is `fix-1`, `fix-2`, or `pre-merge`
+- **AND** the pre-attempt observer bound Candidate S1
+- **AND** the post-attempt observer reports proven implementation-role evidence for S2
+- **AND** the caller supplies that S2 snapshot as stage-owned successor evidence
+- **THEN** the adapter SHALL allow the handler outcome to stand
+- **AND** SHALL record S2 as the completion Candidate
+- **AND** SHALL NOT represent the pre-attempt S1 binding as S2 proof
+
+#### Scenario: Candidate SHA change without stage-owned successor evidence still waits
+
+- **WHEN** the post-attempt observer Candidate SHA differs from the pre-attempt SHA
+- **AND** no producer-completion evidence matches the post-attempt proof
+- **AND** no stage-owned successor evidence matches the post-attempt proof
+- **THEN** the adapter SHALL return waiting for Candidate-binding-changed
+- **AND** RecoverySupervisor SHALL retain ownership
