@@ -87,8 +87,14 @@ import {
   uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
 } from "../scripts/operation-reliability.ts";
-import { candidateProcessGuardEnv } from "../scripts/ship-end-candidate.ts";
-import { candidateReadyRecordPath } from "../scripts/candidate-engine-readiness.ts";
+import {
+  candidateProcessGuardEnv,
+  candidateProcessHandoffPath,
+} from "../scripts/ship-end-candidate.ts";
+import {
+  candidateReadyRecordPath,
+  READY_RECORD_SCHEMA,
+} from "../scripts/candidate-engine-readiness.ts";
 
 const MANIFEST_SHA = "a".repeat(64);
 const CANDIDATE = "b".repeat(40);
@@ -2424,7 +2430,10 @@ test("production dispatch adopts the ship parent lease and transfers it to the d
   );
   assert.equal(result.loop_run_id, "loop-nested-dispatch");
   assert.equal(childEnv?.PIPELINE_CANDIDATE_PROCESS_GUARD, "1");
-  assert.equal(JSON.parse(inherited.files.get(inherited.processLockPath)!).pid, 4242);
+  assert.equal(
+    JSON.parse(inherited.files.get(candidateProcessHandoffPath(inherited.processLockPath))!).pid,
+    4242,
+  );
 });
 
 test("production resume adopts the ship parent lease and transfers it to the detached pack loop (#1503)", async () => {
@@ -2448,7 +2457,10 @@ test("production resume adopts the ship parent lease and transfers it to the det
   );
   assert.equal(result.dispatch_state, "dispatched");
   assert.equal(captured.env?.PIPELINE_CANDIDATE_PROCESS_GUARD, "1");
-  assert.equal(JSON.parse(inherited.files.get(inherited.processLockPath)!).pid, 4242);
+  assert.equal(
+    JSON.parse(inherited.files.get(candidateProcessHandoffPath(inherited.processLockPath))!).pid,
+    4242,
+  );
 });
 
 test("crash after persist before spawn resumes the same bound run", async () => {
@@ -2722,12 +2734,22 @@ function inheritedCandidateFixture(
     pid: process.ppid,
     starttime: "parent-start",
   })}\n`;
-  const files = new Map<string, string>([[processLockPath, lockBody]]);
+  const lockfile = Buffer.from("candidate-lockfile");
+  const lockfileDigest = "d".repeat(64);
+  const files = new Map<string, string>([
+    [processLockPath, lockBody],
+    [readyRecordPath, `${JSON.stringify({
+      schema: READY_RECORD_SCHEMA,
+      engineRoot,
+      commitSha: CANDIDATE,
+      lockfileDigest,
+    })}\n`],
+  ]);
   const proof = {
     engineRoot,
     commitSha: CANDIDATE,
     readyRecordPath,
-    lockfileDigest: "d".repeat(64),
+    lockfileDigest,
     processLockPath,
     processLockDigest: crypto.createHash("sha256").update(lockBody).digest("hex"),
   };
@@ -2746,13 +2768,22 @@ function inheritedCandidateFixture(
     processLockPath,
     resolveCandidate: async () => ({ ok: true as const, engine }),
     resolveCandidateDeps: {
+      readFile: (p: string) => {
+        if (p === path.join(engineRoot, "core", "package-lock.json")) return lockfile;
+        throw new Error(`unexpected read ${p}`);
+      },
       readText: (p: string) => files.get(p) ?? null,
-      writeText: (p: string, body: string) => {
+      writeText: (p: string, body: string, flag: "wx" | "w") => {
+        if (flag === "wx" && files.has(p)) return false;
         files.set(p, body);
         return true;
       },
+      remove: (p: string) => {
+        files.delete(p);
+      },
+      digest: (body: Buffer) => body.equals(lockfile) ? lockfileDigest : "f".repeat(64),
       statePathTrusted: (p: string) =>
-        p === stateDir || p === processLockPath || p === readyRecordPath,
+        p === stateDir || files.has(p),
       processAlive: (pid: number, starttime: string | null) =>
         pid === process.ppid && starttime === "parent-start",
     } as never,
@@ -3112,6 +3143,42 @@ test("handoff SHA mismatch fails closed", async () => {
   );
   assert.equal(result.dispatch_state, "failed");
   assert.match(result.last_error ?? "", /handoff_mismatch|candidate_sha/);
+});
+
+test("handoff supervisor PID must equal the spawned detached child PID (#1503)", async () => {
+  const child = new EventEmitter() as EventEmitter & {
+    unref: () => void;
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+    pid: number;
+  };
+  child.unref = () => {};
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.pid = 77;
+  queueMicrotask(() => child.emit("spawn"));
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-supervisor-pid-mismatch",
+      candidateInvocation: testInvocation("loop-supervisor-pid-mismatch"),
+      candidateEnv: testCandidateEnv(),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      spawn: (() => child) as never,
+      env: { PATH: "/usr/bin" },
+      fileExists: () => true,
+      readHandoff: async () => validHandoff("loop-supervisor-pid-mismatch"),
+      readSupervisor: async () => validHandoff("loop-supervisor-pid-mismatch").supervisor,
+      realpath: (p: string) => p,
+      storeRunDir: "/state/runs/loop-supervisor-pid-mismatch",
+      sleep: async () => {},
+      now: () => new Date("2026-08-29T00:00:01.000Z"),
+    },
+  );
+  assert.equal(result.dispatch_state, "failed");
+  assert.match(result.last_error ?? "", /supervisor_pid_mismatch/);
 });
 
 test("malformed handoff stops a still-running child before return", async () => {

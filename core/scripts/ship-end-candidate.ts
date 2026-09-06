@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   CANDIDATE_CORE_LOCKFILE_REL,
+  READY_RECORD_SCHEMA,
   candidateReadyRecordPath,
   defaultPrepareCandidateEngineDeps,
   prepareCandidateEngine,
@@ -93,11 +94,112 @@ export function hasCandidateProcessGuardEnv(env: NodeJS.ProcessEnv | undefined):
 }
 
 export interface InheritedCandidateProcessLeaseDeps {
+  readFile(path: string): Buffer;
   readText(path: string): string | null;
   writeText(path: string, body: string, flag: "wx" | "w"): boolean;
+  remove(path: string): void;
+  digest(body: Buffer): string;
   statePathTrusted(path: string): boolean;
   processAlive(pid: number, starttime: string | null): boolean;
   parentPid?(): number;
+}
+
+interface CandidateProcessLockRecord {
+  schema: "pipeline-candidate-process-lock/v1";
+  engineRoot: string;
+  commitSha: string;
+  pid: number;
+  starttime: string | null;
+}
+
+interface CandidateProcessHandoffRecord {
+  schema: "pipeline-candidate-process-handoff/v1";
+  engineRoot: string;
+  commitSha: string;
+  parentLockDigest: string;
+  pid: number;
+  starttime: string | null;
+}
+
+export function candidateProcessHandoffPath(processLockPath: string): string {
+  return `${processLockPath}.handoff`;
+}
+
+function parseCandidateProcessLock(body: string): CandidateProcessLockRecord | null {
+  try {
+    const value = JSON.parse(body) as Partial<CandidateProcessLockRecord>;
+    if (
+      value.schema !== "pipeline-candidate-process-lock/v1" ||
+      typeof value.engineRoot !== "string" ||
+      typeof value.commitSha !== "string" ||
+      !Number.isInteger(value.pid) ||
+      (value.starttime !== null && typeof value.starttime !== "string")
+    ) return null;
+    return value as CandidateProcessLockRecord;
+  } catch {
+    return null;
+  }
+}
+
+function parseCandidateProcessHandoff(body: string): CandidateProcessHandoffRecord | null {
+  try {
+    const value = JSON.parse(body) as Partial<CandidateProcessHandoffRecord>;
+    if (
+      value.schema !== "pipeline-candidate-process-handoff/v1" ||
+      typeof value.engineRoot !== "string" ||
+      typeof value.commitSha !== "string" ||
+      !/^[0-9a-f]{64}$/.test(value.parentLockDigest ?? "") ||
+      !Number.isInteger(value.pid) ||
+      (value.starttime !== null && typeof value.starttime !== "string")
+    ) return null;
+    return value as CandidateProcessHandoffRecord;
+  } catch {
+    return null;
+  }
+}
+
+function processLeaseForRecord(
+  proof: CandidateProcessGuardProof,
+  body: string,
+  deps: InheritedCandidateProcessLeaseDeps,
+  releaseParent: boolean,
+): CandidateProcessLease {
+  const handoffPath = candidateProcessHandoffPath(proof.processLockPath);
+  return {
+    proof,
+    release() {
+      if (!releaseParent) return;
+      // A handoff is an immutable transfer marker. The original owner must
+      // leave both records for the detached supervisor's eventual reclaimer.
+      if (deps.readText(handoffPath) !== null) return;
+      if (
+        deps.statePathTrusted(proof.processLockPath) &&
+        deps.readText(proof.processLockPath) === body
+      ) deps.remove(proof.processLockPath);
+    },
+    transferTo(nextOwner) {
+      if (
+        !Number.isInteger(nextOwner.pid) ||
+        nextOwner.pid <= 0 ||
+        !deps.statePathTrusted(proof.processLockPath) ||
+        deps.readText(proof.processLockPath) !== body
+      ) return false;
+      const handoff = `${JSON.stringify({
+        schema: "pipeline-candidate-process-handoff/v1",
+        engineRoot: proof.engineRoot,
+        commitSha: proof.commitSha,
+        parentLockDigest: proof.processLockDigest,
+        pid: nextOwner.pid,
+        starttime: nextOwner.starttime ?? null,
+      })}\n`;
+      // Exclusive sidecar creation is the CAS-equivalent ownership handoff:
+      // the immutable parent record is never truncated or overwritten.
+      if (!deps.writeText(handoffPath, handoff, "wx")) {
+        return deps.statePathTrusted(handoffPath) && deps.readText(handoffPath) === handoff;
+      }
+      return deps.statePathTrusted(handoffPath) && deps.readText(handoffPath) === handoff;
+    },
+  };
 }
 
 function hasAnyCandidateProcessGuardEnv(env: NodeJS.ProcessEnv): boolean {
@@ -107,8 +209,7 @@ function hasAnyCandidateProcessGuardEnv(env: NodeJS.ProcessEnv): boolean {
 /**
  * Adopt the live parent candidate lease for one nested candidate start.
  * Release is a no-op while the parent owns the record. A successful detached
- * handoff rewrites it to the supervisor, so the parent's ownership-safe
- * release also becomes a no-op.
+ * handoff exclusively creates an immutable sidecar for the supervisor.
  */
 export function inheritCandidateProcessLease(
   engine: CandidateEngine,
@@ -150,27 +251,36 @@ export function inheritCandidateProcessLease(
     body == null ||
     createHash("sha256").update(body).digest("hex") !== processLockDigest
   ) return null;
-  let owner: {
-    schema?: unknown;
-    engineRoot?: unknown;
-    commitSha?: unknown;
-    pid?: unknown;
-    starttime?: unknown;
-  };
+  const owner = parseCandidateProcessLock(body);
+  if (!owner) return null;
   try {
-    owner = JSON.parse(body) as typeof owner;
+    const ready = JSON.parse(deps.readText(readyRecordPath) ?? "null") as {
+      schema?: unknown;
+      engineRoot?: unknown;
+      commitSha?: unknown;
+      lockfileDigest?: unknown;
+    } | null;
+    const currentLockfileDigest = deps.digest(
+      deps.readFile(path.join(engine.engineRoot, CANDIDATE_CORE_LOCKFILE_REL)),
+    );
+    if (
+      !ready ||
+      ready.schema !== READY_RECORD_SCHEMA ||
+      ready.engineRoot !== engine.engineRoot ||
+      ready.commitSha !== engine.commitSha ||
+      ready.lockfileDigest !== lockfileDigest ||
+      currentLockfileDigest !== lockfileDigest
+    ) return null;
   } catch {
     return null;
   }
   const parentPid = deps.parentPid?.() ?? process.ppid;
-  const starttime = typeof owner.starttime === "string" ? owner.starttime : null;
   if (
-    owner.schema !== "pipeline-candidate-process-lock/v1" ||
     owner.engineRoot !== engine.engineRoot ||
     owner.commitSha !== engine.commitSha ||
     owner.pid !== parentPid ||
-    !Number.isInteger(owner.pid) ||
-    !deps.processAlive(owner.pid as number, starttime)
+    !deps.processAlive(owner.pid, owner.starttime) ||
+    deps.readText(candidateProcessHandoffPath(processLockPath)) !== null
   ) return null;
   const proof: CandidateProcessGuardProof = {
     engineRoot: engine.engineRoot,
@@ -180,29 +290,7 @@ export function inheritCandidateProcessLease(
     processLockPath,
     processLockDigest,
   };
-  return {
-    proof,
-    release() {
-      // The parent owns this record until a detached supervisor takes it.
-    },
-    transferTo(nextOwner) {
-      if (
-        !Number.isInteger(nextOwner.pid) ||
-        nextOwner.pid <= 0 ||
-        !deps.statePathTrusted(processLockPath) ||
-        deps.readText(processLockPath) !== body
-      ) return false;
-      const next = `${JSON.stringify({
-        schema: "pipeline-candidate-process-lock/v1",
-        engineRoot: engine.engineRoot,
-        commitSha: engine.commitSha,
-        pid: nextOwner.pid,
-        starttime: nextOwner.starttime,
-      })}\n`;
-      if (!deps.writeText(processLockPath, next, "w")) return false;
-      return deps.statePathTrusted(processLockPath) && deps.readText(processLockPath) === next;
-    },
-  };
+  return processLeaseForRecord(proof, body, deps, false);
 }
 
 /** Prefer a valid inherited guard; any partial or invalid guard fails closed. */
@@ -531,6 +619,7 @@ export async function resolveAndPrepareCandidateEngine(
           .digest("hex")
           .slice(0, 32)}.lock`,
       );
+      const handoffPath = candidateProcessHandoffPath(lockPath);
       const d = deps as ResolveAndPrepareDeps;
       // The lock does not exist on the uncontended path, so it cannot be
       // trusted before exclusive creation. Trust the private parent first,
@@ -545,22 +634,42 @@ export async function resolveAndPrepareCandidateEngine(
           pid: holder.pid,
           starttime: holder.starttime,
         })}\n`;
-      let body = lockRecord(owner);
+      const orphanHandoff = d.readText(handoffPath);
+      if (orphanHandoff !== null && d.readText(lockPath) === null) {
+        if (
+          !d.statePathTrusted(handoffPath) ||
+          d.readText(handoffPath) !== orphanHandoff
+        ) return null;
+        d.remove(handoffPath);
+        if (d.readText(handoffPath) !== null) return null;
+      }
+      const body = lockRecord(owner);
       if (!d.writeText(lockPath, body, "wx")) {
         try {
-          const existing = JSON.parse(d.readText(lockPath) ?? "null") as {
-            pid?: unknown;
-            starttime?: unknown;
-          } | null;
-          if (
-            !existing ||
-            typeof existing.pid !== "number" ||
-            d.processAlive(
-              existing.pid,
-              typeof existing.starttime === "string" ? existing.starttime : null,
-            )
-          ) return null;
+          const existingBody = d.readText(lockPath);
+          if (existingBody == null || !d.statePathTrusted(lockPath)) return null;
+          const existing = parseCandidateProcessLock(existingBody);
+          if (!existing || existing.engineRoot !== engine.engineRoot) return null;
+          const handoffBody = d.readText(handoffPath);
+          if (handoffBody !== null) {
+            if (!d.statePathTrusted(handoffPath)) return null;
+            const handoff = parseCandidateProcessHandoff(handoffBody);
+            if (
+              !handoff ||
+              handoff.engineRoot !== existing.engineRoot ||
+              handoff.commitSha !== existing.commitSha ||
+              handoff.parentLockDigest !== createHash("sha256").update(existingBody).digest("hex")
+            ) return null;
+            if (d.processAlive(handoff.pid, handoff.starttime)) return null;
+            if (d.readText(handoffPath) !== handoffBody) return null;
+            d.remove(handoffPath);
+            if (d.readText(handoffPath) !== null) return null;
+          } else if (d.processAlive(existing.pid, existing.starttime)) {
+            return null;
+          }
+          if (d.readText(lockPath) !== existingBody) return null;
           d.remove(lockPath);
+          if (d.readText(lockPath) !== null) return null;
         } catch {
           return null;
         }
@@ -569,31 +678,20 @@ export async function resolveAndPrepareCandidateEngine(
       if (!d.statePathTrusted(lockPath) || d.readText(lockPath) !== body) return null;
       try {
         const lockfileDigest = d.digest(d.readFile(path.join(engine.engineRoot, CANDIDATE_CORE_LOCKFILE_REL)));
-        return {
-          proof: {
-            engineRoot: engine.engineRoot,
-            commitSha: engine.commitSha,
-            readyRecordPath: candidateReadyRecordPath(engine.engineRoot, engine.commitSha, stateDir),
-            lockfileDigest,
-            processLockPath: lockPath,
-            processLockDigest: createHash("sha256").update(body).digest("hex"),
-          },
-          release: () => {
-            if (d.statePathTrusted(lockPath) && d.readText(lockPath) === body) {
-              d.remove(lockPath);
-            }
-          },
-          transferTo: (nextOwner) => {
-            if (!d.statePathTrusted(lockPath) || d.readText(lockPath) !== body) return false;
-            const next = lockRecord(nextOwner);
-            if (!d.writeText(lockPath, next, "w")) return false;
-            if (!d.statePathTrusted(lockPath) || d.readText(lockPath) !== next) return false;
-            body = next;
-            return true;
-          },
-        };
+        return processLeaseForRecord({
+          engineRoot: engine.engineRoot,
+          commitSha: engine.commitSha,
+          readyRecordPath: candidateReadyRecordPath(engine.engineRoot, engine.commitSha, stateDir),
+          lockfileDigest,
+          processLockPath: lockPath,
+          processLockDigest: createHash("sha256").update(body).digest("hex"),
+        }, body, d, true);
       } catch {
-        if (d.statePathTrusted(lockPath) && d.readText(lockPath) === body) d.remove(lockPath);
+        if (
+          d.readText(handoffPath) === null &&
+          d.statePathTrusted(lockPath) &&
+          d.readText(lockPath) === body
+        ) d.remove(lockPath);
         return null;
       }
     },

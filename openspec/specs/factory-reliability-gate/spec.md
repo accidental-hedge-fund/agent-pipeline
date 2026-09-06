@@ -2500,7 +2500,10 @@ candidate's detached pack loop, the nested start SHALL adopt the live parent
 lease only when its guard, canonical root, exact SHA, readiness record, lock
 digest, and direct-parent process identity all match. It SHALL revalidate the
 candidate at the nested start boundary and transfer the lease record to the
-acknowledged detached supervisor. A failed or non-detached nested start SHALL
+acknowledged detached supervisor through an atomic, exclusively created
+handoff record while keeping the child-guard-bound parent lock immutable. The
+acknowledged supervisor PID SHALL equal the spawned child PID. A failed or
+non-detached nested start SHALL
 leave parent ownership intact. Partial, forged, stale, unreadable, wrong-root,
 wrong-SHA, or wrong-parent inherited evidence SHALL fail closed and SHALL NOT
 fall back to acquiring a fresh lease. An invocation without inherited guard
@@ -2512,6 +2515,7 @@ fields MAY acquire the ordinary fresh candidate lease.
 - **AND** prepare dispatches the same candidate's request-bound pack loop
 - **THEN** the nested launch SHALL start without contending with its own parent
 - **AND** the process lease SHALL be transferred to the acknowledged loop supervisor PID
+- **AND** the immutable parent-lock digest SHALL remain valid before and after transfer
 
 #### Scenario: Bound-loop resume uses the same handoff contract
 

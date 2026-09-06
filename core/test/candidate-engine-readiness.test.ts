@@ -22,6 +22,7 @@ import {
   CANDIDATE_ENGINE_CONSUMERS,
   assertCandidateEngineConsumerInventoryComplete,
   bindInheritedCandidateProcessLease,
+  candidateProcessHandoffPath,
   candidateProcessGuardEnv,
   candidateEngineConsumerInventoryGaps,
   candidateEngineRuntimeBindingGaps,
@@ -614,7 +615,8 @@ test("detached pack loop retains the candidate-root lease until the child exits 
   assert.equal(first.ok, true);
   const lockPath = candidateRootLockPath(repo);
   assert.equal(h.files.has(lockPath), true, "lease must remain after detached handoff");
-  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 4242);
+  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 111);
+  assert.equal(JSON.parse(h.files.get(candidateProcessHandoffPath(lockPath))!).pid, 4242);
 
   const resumePrepared = await sharedResolveAndPrepareCandidateEngine(
     { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.resume" },
@@ -684,15 +686,36 @@ test("nested candidate start inherits the live parent lease and transfers it to 
     candidateProcessGuardEnv(parentLease.proof),
     { ...h.deps, parentPid: () => 111 },
   );
+  let childGuardEnv: NodeJS.ProcessEnv | undefined;
   const started = await runCandidateEngineProcess({
     consumer: "factory-release.pack-loop.start",
     engine: inherited,
-    start: async () => ({ dispatch_state: "dispatched" as const, pid: 4242 }),
+    start: async (_engine, env) => {
+      childGuardEnv = env;
+      return { dispatch_state: "dispatched" as const, pid: 4242 };
+    },
     detachedSupervisor: (value) => ({ pid: value.pid, starttime: "child-st" }),
   });
   assert.equal(started.ok, true);
   const lockPath = candidateRootLockPath(repo);
-  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 4242);
+  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 111);
+  assert.equal(JSON.parse(h.files.get(candidateProcessHandoffPath(lockPath))!).pid, 4242);
+  assert.ok(childGuardEnv);
+  const afterTransferGuard = verifyCandidateProcessGuard(childGuardEnv, {
+    realpath: (p: string) => p === repo
+      ? repo
+      : p.endsWith("candidate-process-guard.mjs")
+        ? path.join(repo, CANDIDATE_PROCESS_GUARD_REL)
+        : p,
+    readFile: (p: string) => {
+      if (p === lockPath) return Buffer.from(h.files.get(p)!);
+      if (p === parentLease.proof.readyRecordPath) return Buffer.from(h.files.get(p)!);
+      if (p === lockfile) return LOCKFILE_V1;
+      throw new Error(`unexpected guard read ${p}`);
+    },
+    git: (_root: string, args: string[]) => args[0] === "status" ? "" : `${SHA}\n`,
+  });
+  assert.deepEqual(afterTransferGuard, { ok: true });
   parentLease.release();
   assert.equal(h.files.has(lockPath), true, "parent release must not remove the transferred lease");
 });
@@ -727,6 +750,36 @@ test("partial or wrong-parent nested guard fails closed without deleting the par
   });
   assert.equal(partialResult.ok, false);
 
+  const forgedDigest = bindInheritedCandidateProcessLease(
+    prepared.engine,
+    {
+      ...candidateProcessGuardEnv(parentLease.proof),
+      PIPELINE_CANDIDATE_PROCESS_LOCKFILE_DIGEST: "a".repeat(64),
+    },
+    { ...h.deps, parentPid: () => 111 },
+  );
+  const forgedDigestResult = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: forgedDigest,
+    start: async () => ++starts,
+  });
+  assert.equal(forgedDigestResult.ok, false);
+
+  const readyBody = h.files.get(parentLease.proof.readyRecordPath)!;
+  h.files.delete(parentLease.proof.readyRecordPath);
+  const unreadableReady = bindInheritedCandidateProcessLease(
+    prepared.engine,
+    candidateProcessGuardEnv(parentLease.proof),
+    { ...h.deps, parentPid: () => 111 },
+  );
+  const unreadableReadyResult = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.resume",
+    engine: unreadableReady,
+    start: async () => ++starts,
+  });
+  assert.equal(unreadableReadyResult.ok, false);
+  h.files.set(parentLease.proof.readyRecordPath, readyBody);
+
   const wrongParent = bindInheritedCandidateProcessLease(
     prepared.engine,
     candidateProcessGuardEnv(parentLease.proof),
@@ -740,6 +793,29 @@ test("partial or wrong-parent nested guard fails closed without deleting the par
   assert.equal(wrongParentResult.ok, false);
   assert.equal(starts, 0);
   assert.equal(JSON.parse(h.files.get(candidateRootLockPath(repo))!).pid, 111);
+});
+
+test("candidate lease handoff is exclusive and never overwrites an existing sidecar (#1503)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  const prepared = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const lease = prepared.engine.acquireProcessLock?.();
+  assert.ok(lease);
+  if (!lease) return;
+  const handoffPath = candidateProcessHandoffPath(lease.proof.processLockPath);
+  h.files.set(handoffPath, "foreign-handoff\n");
+  assert.equal(lease.transferTo?.({ pid: 4242, starttime: null }), false);
+  assert.equal(h.files.get(handoffPath), "foreign-handoff\n");
+  assert.equal(h.files.has(lease.proof.processLockPath), true);
 });
 
 test("candidate process lock serializes distinct SHAs on one canonical root (#1454)", async () => {

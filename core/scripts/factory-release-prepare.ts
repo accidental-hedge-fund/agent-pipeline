@@ -2646,13 +2646,17 @@ export async function defaultSpawnCandidateLoop(
         supervisor,
         realpath: deps.realpath,
       });
-      if (valid.ok) {
+      const supervisorPid =
+        typeof supervisor?.pid === "number" && Number.isInteger(supervisor.pid) && supervisor.pid > 0
+          ? supervisor.pid
+          : null;
+      if (valid.ok && supervisorPid === child.pid) {
         child.unref?.();
         return {
           dispatch_state: "dispatched",
-          pid: child.pid,
+          pid: supervisorPid,
           observation_deadline: deadline,
-          spawn_attempt: { pid: child.pid, at: isoNow(now()) },
+          spawn_attempt: { pid: supervisorPid, at: isoNow(now()) },
         };
       }
       await stopFailedPackLoopChild(child, exitCode !== undefined, sleep);
@@ -2662,7 +2666,7 @@ export async function defaultSpawnCandidateLoop(
         pid: child.pid,
         observation_deadline: deadline,
         last_error: formatPackLoopLastError({
-          errorCode: "handoff_mismatch",
+          errorCode: valid.ok ? "supervisor_pid_mismatch" : "handoff_mismatch",
           excerpt: excerpt.excerpt,
           evidencePath: excerpt.path,
           writeError: excerpt.writeError,
