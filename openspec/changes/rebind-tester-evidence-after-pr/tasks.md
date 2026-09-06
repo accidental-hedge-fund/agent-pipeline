@@ -55,3 +55,9 @@
 ## 9. Review 1 (post-attempt label/lifecycle) regressions
 
 - [x] 9.1 Post-attempt S1→S2 drift with a transition-recording consumer handler fail-closes without leaving `pipeline:` on the forward stage and without recording `stage_complete` as `advanced`
+
+## 10. Review 2 (owned mutation vs restoration) regressions
+
+- [x] 10.1 Successful `fix-1`, `fix-2`, and pre-merge autofix pushes rebind/reproduce the new head instead of `tester_rebind_pr_head_mismatch`
+- [x] 10.2 Unowned S1→S2 at `fix-1` (worktree remains S1) still fail-closes with `tester_rebind_pr_head_mismatch`
+- [x] 10.3 Compensating label restoration failure persists `tester_rebind_stage_label_unrestored` and does not record `stage_complete` as `advanced`

@@ -42,6 +42,7 @@ export const TESTER_REBIND_BLOCKER_CODES = [
   "tester_rebind_pr_head_unobservable",
   "tester_rebind_pr_head_mismatch",
   "tester_rebind_trusted_surface_unobservable",
+  "tester_rebind_stage_label_unrestored",
 ] as const;
 
 export type TesterRebindBlockerCode = (typeof TESTER_REBIND_BLOCKER_CODES)[number];
@@ -165,6 +166,11 @@ export function isConsumerImplementationStage(stage: string | null | undefined):
   if (!stage || !isDeliveryStage(stage)) return false;
   if (stage === "implementing") return false;
   return requiredEvidenceRoleForStage(stage) === "implementation";
+}
+
+/** Consumer stages that may push a new PR head during their attempt. */
+export function consumerStageMayPushPrHead(stage: string | null | undefined): boolean {
+  return stage === "fix-1" || stage === "fix-2" || stage === "pre-merge";
 }
 
 export function testerArtifactIdentity(candidateSha: string): string {

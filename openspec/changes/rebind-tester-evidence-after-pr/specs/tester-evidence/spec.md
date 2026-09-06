@@ -99,11 +99,32 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 - **WHEN** bind and the pre-attempt observer observed PR head S1
 - **AND** the consumer stage executes
 - **AND** the post-attempt observer's live PR read observes S2 where S1 ≠ S2
+- **AND** the S1→S2 movement is not a stage-owned push from that consumer's managed worktree
 - **THEN** the pipeline SHALL fail closed with typed blocker `tester_rebind_pr_head_mismatch`
 - **AND** SHALL NOT leave the outcome as generic Candidate-binding-changed waiting
-- **AND** SHALL NOT leave the pipeline stage label advanced past that consumer stage
+- **AND** SHALL restore the consumer stage label, or persist typed blocker `tester_rebind_stage_label_unrestored` if that restoration cannot be confirmed
 - **AND** SHALL NOT record `stage_complete` as `advanced` for that consumer stage
 - **AND** recovery SHALL NOT treat `unlink_engine_scratch`, `checkpoint_owned_harness_dirt`, or `publish_unpublished_stage_commit` as eligible for that diagnostic
+
+#### Scenario: stage-owned PR head mutation is rebound, not foreign drift
+
+- **WHEN** bind and the pre-attempt observer observed PR head S1
+- **AND** the consumer stage is `fix-1`, `fix-2`, or `pre-merge`
+- **AND** that stage pushes a new PR head S2 from the managed worktree
+- **AND** the post-attempt observer's live PR read observes S2 where S1 ≠ S2
+- **AND** the managed worktree HEAD equals S2
+- **THEN** the pipeline SHALL re-resolve trusted-surface and bind or reproduce Tester evidence for S2
+- **AND** SHALL NOT fail closed with `tester_rebind_pr_head_mismatch` solely because the stage produced S2
+- **AND** SHALL NOT restore the consumer stage label
+- **AND** SHALL allow the handler outcome to stand when S2 binding succeeds
+
+#### Scenario: failed restoration of the consumer stage label is a typed reconciliation blocker
+
+- **WHEN** post-attempt unowned PR-head movement requires restoring the consumer stage label
+- **AND** the compensating transition does not confirm the original consumer stage label
+- **THEN** the pipeline SHALL persist typed blocker `tester_rebind_stage_label_unrestored`
+- **AND** SHALL NOT silently discard the restoration failure
+- **AND** SHALL NOT record `stage_complete` as `advanced` for that consumer stage
 
 #### Scenario: disabled-gate exact-proof still fail-closes when PR head moved
 

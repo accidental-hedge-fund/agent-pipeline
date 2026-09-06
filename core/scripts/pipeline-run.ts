@@ -195,11 +195,14 @@ import {
   runDeliveryStageAdapter,
   readProducerCompletionEvidence,
   type DeliveryStage,
+  type DeliveryStageEvidence,
   type DeliveryStageEvidenceObserver,
 } from "./issue-stage-adapters.ts";
 import { diffFilePaths } from "./stages/review-parsing.ts";
 import { observeImplementDeliverablePaths } from "./unpublished-stage-commit.ts";
 import {
+  buildTesterRebindFailClosedDiagnostic,
+  consumerStageMayPushPrHead,
   isConsumerImplementationStage,
   observeTesterImplementationRole,
   rebindTesterEvidenceAfterPr,
@@ -1077,6 +1080,56 @@ function evidenceDigest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+const POST_ATTEMPT_LABEL_RESTORE_ATTEMPTS = 3;
+
+async function restoreConsumerStageAfterPostAttemptMismatch(input: {
+  cfg: PipelineConfig;
+  issueNumber: number;
+  consumerStage: Stage;
+  reason: string;
+  getIssueDetail: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+  ) => Promise<{ labels: string[] } | null>;
+  transition: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    from: Stage,
+    to: Stage,
+    summary: string,
+  ) => Promise<void>;
+}): Promise<{ ok: true; liveStage: Stage | null } | { ok: false; liveStage: Stage | null }> {
+  let liveStage: Stage | null = null;
+  for (let attempt = 0; attempt < POST_ATTEMPT_LABEL_RESTORE_ATTEMPTS; attempt++) {
+    const detail = await input.getIssueDetail(input.cfg, input.issueNumber).catch(() => null);
+    if (!detail) {
+      liveStage = null;
+      continue;
+    }
+    liveStage = pickStage(detail.labels);
+    if (!liveStage || liveStage === input.consumerStage) {
+      return { ok: true, liveStage };
+    }
+    try {
+      await input.transition(
+        input.cfg,
+        input.issueNumber,
+        liveStage,
+        input.consumerStage,
+        input.reason,
+      );
+    } catch {
+      // Retry after a fresh label read. Do not treat a throw as restored.
+    }
+  }
+  const detail = await input.getIssueDetail(input.cfg, input.issueNumber).catch(() => null);
+  liveStage = detail ? pickStage(detail.labels) : null;
+  if (detail && (!liveStage || liveStage === input.consumerStage)) {
+    return { ok: true, liveStage };
+  }
+  return { ok: false, liveStage };
+}
+
 /**
  * Candidate/artifact observer used on both sides of the delivery handler.
  * Every external read uses the run's injectable deps, so hermetic drives do
@@ -1101,7 +1154,10 @@ export function createDeliveryStageEvidenceObserver(
     /** Confirmed PR head the pre-observer bind used. Observer re-reads the live PR. */
     expectedPrHeadSha?: string | null | (() => string | null);
     /** Hook after the observer's live PR read for before and after (mismatch / rebind). */
-    onObservedPrHead?: (liveSha: string | null) => Promise<void>;
+    onObservedPrHead?: (
+      liveSha: string | null,
+      phase: "before" | "after",
+    ) => Promise<void>;
   } = {},
 ): DeliveryStageEvidenceObserver {
   return async (phase) => {
@@ -1163,7 +1219,7 @@ export function createDeliveryStageEvidenceObserver(
         }
       }
       if (deps.onObservedPrHead) {
-        await deps.onObservedPrHead(livePrSha);
+        await deps.onObservedPrHead(livePrSha, phase);
       }
       const expected = normalizeCandidateSha(
         typeof deps.expectedPrHeadSha === "function"
@@ -3012,9 +3068,13 @@ export async function runAdvance(
       let handoffPrHeadSha: string | null = null;
       let testerSubjectOmitted = false;
       let observerMismatch: Extract<RebindTesterEvidenceResult, { ok: false }> | null = null;
+      let ownedCandidateMutationRebound = false;
       let observerPrHeadBinding: {
         expectedPrHeadSha: () => string | null;
-        onObservedPrHead: (liveSha: string | null) => Promise<void>;
+        onObservedPrHead: (
+          liveSha: string | null,
+          phase: "before" | "after",
+        ) => Promise<void>;
       } | undefined;
       if (isConsumerImplementationStage(stage) && runDir && !opts.dryRun) {
         const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
@@ -3162,12 +3222,42 @@ export async function runAdvance(
           }
           observerPrHeadBinding = {
             expectedPrHeadSha: () => handoffPrHeadSha,
-            onObservedPrHead: async (liveSha) => {
+            onObservedPrHead: async (liveSha, phase) => {
               const expected = handoffPrHeadSha;
               if (!expected || liveSha === expected) return;
               const livePrNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
                 () => null,
               );
+              let ownedMutation = false;
+              if (phase === "after" && consumerStageMayPushPrHead(stage) && liveSha) {
+                const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
+                  () => null,
+                );
+                if (wt) {
+                  const gitFn: GitRunner = deps.gitInWorktree ?? gitInWorktree;
+                  const worktreeHead = normalizeCandidateSha(
+                    (await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim(),
+                  );
+                  ownedMutation = worktreeHead === liveSha;
+                }
+              }
+              if (ownedMutation) {
+                const nextTs = await ensureTrustedSurfaceDecision(stage);
+                const rebound = await rebindFn({
+                  ...rebindInput(),
+                  prNumber: livePrNumber,
+                  prHeadSha: liveSha,
+                  pushedHeadSha: liveSha,
+                  trustedSurface: nextTs,
+                });
+                if (!rebound.ok) {
+                  observerMismatch = rebound;
+                  return;
+                }
+                handoffPrHeadSha = rebound.candidateSha;
+                ownedCandidateMutationRebound = true;
+                return;
+              }
               const mismatch = await rebindFn({
                 ...rebindInput(),
                 prNumber: livePrNumber,
@@ -3187,18 +3277,38 @@ export async function runAdvance(
 
       let out: Outcome;
       try {
+        const innerObserver =
+          opts.observeDeliveryStageEvidence ??
+          (isDeliveryStage(stage)
+            ? createDeliveryStageEvidenceObserver(cfg, issueNumber, stage, !!opts.dryRun, {
+                ...deps,
+                runDir,
+                testerIo: deps.testerIo,
+                ...observerPrHeadBinding,
+              })
+            : undefined);
+        let preAttemptObserverEvidence: DeliveryStageEvidence | null = null;
+        const observeDeliveryStageEvidence: DeliveryStageEvidenceObserver | undefined = innerObserver
+          ? async (phase, outcome) => {
+              const evidence = await innerObserver(phase, outcome);
+              if (phase === "before") {
+                preAttemptObserverEvidence = evidence;
+                return evidence;
+              }
+              // The adapter treats any SHA change as foreign candidate replacement.
+              // A successful owned S2 bind must not convert the handler outcome to waiting.
+              if (ownedCandidateMutationRebound && preAttemptObserverEvidence && !observerMismatch) {
+                return {
+                  ...preAttemptObserverEvidence,
+                  postconditionProven: true,
+                };
+              }
+              return evidence;
+            }
+          : undefined;
         const dispatchOpts: AdvanceOpts = {
           ...opts,
-          observeDeliveryStageEvidence:
-            opts.observeDeliveryStageEvidence ??
-            (isDeliveryStage(stage)
-              ? createDeliveryStageEvidenceObserver(cfg, issueNumber, stage, !!opts.dryRun, {
-                  ...deps,
-                  runDir,
-                  testerIo: deps.testerIo,
-                  ...observerPrHeadBinding,
-                })
-              : undefined),
+          observeDeliveryStageEvidence,
         };
         out = await (deps.dispatch ?? dispatch)(
           cfg,
@@ -3247,24 +3357,43 @@ export async function runAdvance(
         throw err;
       }
 
-      // Post-attempt S1→S2 drift is fail-closed before lifecycle completion.
-      // Consumer handlers may already have swapped the pipeline label (e.g.
-      // design-gate → review-1). Compensate that transition and replace the
-      // in-memory outcome so stage_complete is not recorded as advanced.
+      // Post-attempt unowned S1→S2 drift is fail-closed before lifecycle
+      // completion. Consumer handlers may already have swapped the pipeline
+      // label (e.g. design-gate → review-1). Restore that label and replace
+      // the in-memory outcome so stage_complete is not recorded as advanced.
       if (observerMismatch) {
         if (!opts.dryRun) {
-          const liveStage = pickStage(
-            (await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber).catch(() => null))
-              ?.labels ?? [],
-          );
-          if (liveStage && liveStage !== stage) {
-            await (deps.transition ?? transition)(
-              cfg,
-              issueNumber,
-              liveStage,
-              stage,
+          const restored = await restoreConsumerStageAfterPostAttemptMismatch({
+            cfg,
+            issueNumber,
+            consumerStage: stage,
+            reason:
               `tester rebind: PR head moved after ${stage}; restoring consumer stage after failed post-attempt binding`,
-            ).catch(() => {});
+            getIssueDetail: async (c, n) =>
+              (await (deps.getIssueDetail ?? getIssueDetail)(c, n).catch(() => null)),
+            transition: deps.transition ?? transition,
+          });
+          if (!restored.ok) {
+            const live = restored.liveStage ?? "unknown";
+            const summary =
+              `tester rebind: PR head moved after ${stage} and restoring ${stage} failed; live stage remains ${live}`;
+            observerMismatch = {
+              ...observerMismatch,
+              code: "tester_rebind_stage_label_unrestored",
+              summary,
+              diagnostic: buildTesterRebindFailClosedDiagnostic({
+                stage,
+                code: "tester_rebind_stage_label_unrestored",
+                summary,
+                prHead: observerMismatch.candidateSha,
+                trustedSurfaceOutcome: currentTrustedSurface?.outcome ?? null,
+              }),
+              blocker: {
+                ...observerMismatch.blocker,
+                code: "tester_rebind_stage_label_unrestored",
+                summary,
+              },
+            };
           }
         }
         out = {

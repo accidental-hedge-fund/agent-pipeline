@@ -33,6 +33,7 @@ import {
   buildTesterRebindFailClosedDiagnostic,
   filterRecipesForTesterEvidenceOrdering,
   filterRecipesForWorkflowEngineDiagnostic,
+  consumerStageMayPushPrHead,
   isConsumerImplementationStage,
   isTesterEvidenceOrderingDiagnostic,
   isTesterRebindBlockerCode,
@@ -247,6 +248,11 @@ test("consumer implementation stages exclude producers and planning-role stages"
   assert.equal(isConsumerImplementationStage("plan-review"), false);
   assert.equal(isConsumerImplementationStage("pre-code-attestation"), false);
   assert.equal(requiredEvidenceRoleForStage("design-gate"), "implementation");
+  assert.equal(consumerStageMayPushPrHead("fix-1"), true);
+  assert.equal(consumerStageMayPushPrHead("fix-2"), true);
+  assert.equal(consumerStageMayPushPrHead("pre-merge"), true);
+  assert.equal(consumerStageMayPushPrHead("design-gate"), false);
+  assert.equal(consumerStageMayPushPrHead("review-1"), false);
 });
 
 test("1.1 subject-less Tester after test-gate-before-PR is rebound before design-gate observer", async () => {
@@ -721,6 +727,7 @@ async function driveDesignGateAdvance(opts: {
   prHeadSha?: string | null;
   prHeadSequence?: string[];
   worktreeHead?: string | null;
+  worktreeHeadAfter?: string | null;
   changedPaths?: string[];
   tester?: TesterEvidence | null;
   priorTester?: TesterEvidence | null;
@@ -730,6 +737,8 @@ async function driveDesignGateAdvance(opts: {
   invokeObserver?: boolean;
   /** Also invoke the post-attempt observer (S1-before / S2-after race). */
   invokeObserverAfter?: boolean;
+  /** Injected compensating transition throws (label restoration failure). */
+  compensationTransitionFails?: boolean;
   rebind?: AdvanceDeps["rebindTesterEvidenceAfterPr"];
   dispatch?: AdvanceDeps["dispatch"];
 }): Promise<{
@@ -780,6 +789,7 @@ async function driveDesignGateAdvance(opts: {
   const labels = [`pipeline:${startStage}`];
   let prHeadReads = 0;
   let dispatchCalls = 0;
+  let currentWorktreeHead = opts.worktreeHead ?? null;
   const pipelineCfg = {
     repo: "acme/widget",
     domain,
@@ -844,10 +854,14 @@ async function driveDesignGateAdvance(opts: {
       } as never;
     },
     getOnDiskForIssue: async () =>
-      opts.worktreeHead ? ({ path: "/wt/1468", slug: "1468-x" } as never) : null,
+      currentWorktreeHead ? ({ path: "/wt/1468", slug: "1468-x" } as never) : null,
     gitInWorktree: async (_cwd, args) => {
       if (args[0] === "rev-parse" && args.includes("HEAD")) {
-        return { stdout: `${opts.worktreeHead ?? ""}\n`, stderr: "", code: opts.worktreeHead ? 0 : 1 };
+        return {
+          stdout: `${currentWorktreeHead ?? ""}\n`,
+          stderr: "",
+          code: currentWorktreeHead ? 0 : 1,
+        };
       }
       if (args[0] === "diff") {
         return {
@@ -879,6 +893,9 @@ async function driveDesignGateAdvance(opts: {
     postComment: async () => {},
     postPrComment: async () => {},
     transition: async (_c, _n, from, to) => {
+      if (opts.compensationTransitionFails) {
+        throw new Error("github unavailable");
+      }
       const fromLabel = `pipeline:${from}`;
       const toLabel = `pipeline:${to}`;
       const idx = labels.findIndex((label) => label === fromLabel || label.startsWith("pipeline:"));
@@ -904,6 +921,9 @@ async function driveDesignGateAdvance(opts: {
             status: "waiting" as const,
             reason: "delivery-stage evidence binding refused before execution: required implementation evidence role, observed missing",
           };
+      if (opts.worktreeHeadAfter !== undefined) {
+        currentWorktreeHead = opts.worktreeHeadAfter;
+      }
       // Real consumer handlers transition the pipeline label during the attempt,
       // before the post-attempt observer runs.
       if (result.advanced) {
@@ -1111,6 +1131,41 @@ function boundPassed(over: Partial<TesterEvidence> = {}): TesterEvidence {
     },
     ...over,
   });
+}
+
+function boundPassedAt(sha: string): TesterEvidence {
+  return boundPassed({
+    candidate_sha: sha,
+    evidence_subject: {
+      schema_version: 1,
+      domain: "acme",
+      issue: 1468,
+      pr: 99,
+      run_id: "1468/test-run",
+      candidate_sha: sha,
+      diff_hash: null,
+      policy_hash: "e".repeat(64),
+      engine_fingerprint: ENGINE_FP,
+      verifier_fingerprint: VERIFIER_H,
+      required_evidence_set_revision: "f".repeat(64),
+    },
+  });
+}
+
+async function ownedAwareRebind(input: RebindTesterEvidenceAfterPrInput) {
+  const prHead = input.prHeadSha ?? null;
+  const pushed = input.pushedHeadSha ?? null;
+  if (pushed && prHead && pushed !== prHead) {
+    return rebindTesterEvidenceAfterPr(input);
+  }
+  const sha = prHead ?? SHA_S;
+  return {
+    ok: true as const,
+    action: "bind" as const,
+    candidateSha: sha,
+    evidence: boundPassedAt(sha),
+    suiteCommandInvoked: sha !== SHA_S,
+  };
 }
 
 test("disabled test gate does not fail-closed when no passed Tester record exists", async () => {
@@ -1560,4 +1615,166 @@ test("runAdvance does not leave the consumer stage advanced after post-attempt P
     "tester_rebind_pr_head_mismatch",
   );
   assert.ok(driven.setBlocked.some((row) => /disagrees with pushed head/.test(row.reason)));
+});
+
+test("runAdvance rebinds a successful fix-1 push instead of treating it as foreign PR drift", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "fix-1",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    worktreeHeadAfter: SHA_B,
+    tester: boundPassed(),
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    rebind: ownedAwareRebind,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "fix-1" as const,
+      to: "review-2" as const,
+      summary: "fix-1 pushed a new head",
+    }),
+  });
+  assert.ok(driven.dispatchCalls >= 1);
+  const lastRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
+  assert.equal(lastRebind?.prHeadSha, SHA_B);
+  assert.equal(lastRebind?.pushedHeadSha, SHA_B);
+  assert.equal(driven.pipelineStage, "review-2");
+  assert.equal(driven.setBlocked.length, 0);
+  assert.equal(
+    driven.stageCompleteEvents.some((event) => event.stage === "fix-1" && event.outcome === "advanced"),
+    true,
+  );
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    undefined,
+  );
+});
+
+test("runAdvance rebinds a successful fix-2 push instead of treating it as foreign PR drift", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "fix-2",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    worktreeHeadAfter: SHA_B,
+    tester: boundPassed(),
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    rebind: ownedAwareRebind,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "fix-2" as const,
+      to: "pre-merge" as const,
+      summary: "fix-2 pushed a new head",
+    }),
+  });
+  const lastRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
+  assert.equal(lastRebind?.prHeadSha, SHA_B);
+  assert.equal(lastRebind?.pushedHeadSha, SHA_B);
+  assert.equal(driven.pipelineStage, "pre-merge");
+  assert.equal(driven.setBlocked.length, 0);
+  assert.equal(
+    driven.stageCompleteEvents.some((event) => event.stage === "fix-2" && event.outcome === "advanced"),
+    true,
+  );
+});
+
+test("runAdvance rebinds a successful pre-merge autofix push instead of treating it as foreign PR drift", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "pre-merge",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    worktreeHeadAfter: SHA_B,
+    tester: boundPassed(),
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    rebind: ownedAwareRebind,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "pre-merge" as const,
+      to: "visual-gate" as const,
+      summary: "pre-merge autofix pushed a new head",
+    }),
+  });
+  const lastRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
+  assert.equal(lastRebind?.prHeadSha, SHA_B);
+  assert.equal(lastRebind?.pushedHeadSha, SHA_B);
+  assert.equal(driven.pipelineStage, "visual-gate");
+  assert.equal(driven.setBlocked.length, 0);
+  assert.equal(
+    driven.stageCompleteEvents.some(
+      (event) => event.stage === "pre-merge" && event.outcome === "advanced",
+    ),
+    true,
+  );
+});
+
+test("runAdvance still fail-closes unowned post-attempt drift at fix-1 when worktree stays at S1", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "fix-1",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    tester: boundPassed(),
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    rebind: ownedAwareRebind,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "fix-1" as const,
+      to: "review-2" as const,
+      summary: "fix-1 advanced while a foreign head landed",
+    }),
+  });
+  const lastRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
+  assert.equal(lastRebind?.prHeadSha, SHA_B);
+  assert.equal(lastRebind?.pushedHeadSha, SHA_S);
+  assert.equal(driven.pipelineStage, "fix-1");
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_mismatch",
+  );
+});
+
+test("runAdvance records a reconciliation blocker when post-attempt label restoration fails", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    tester: boundPassed(),
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    compensationTransitionFails: true,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "design-gate" as const,
+      to: "review-1" as const,
+      summary: "design-gate resolved; advanced to review",
+    }),
+  });
+  assert.equal(driven.pipelineStage, "review-1");
+  assert.equal(
+    driven.stageCompleteEvents.some((event) => event.outcome === "advanced"),
+    false,
+  );
+  assert.ok(
+    driven.stageCompleteEvents.some(
+      (event) => event.stage === "design-gate" && event.outcome === "blocked",
+    ),
+  );
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_stage_label_unrestored",
+  );
+  assert.ok(driven.setBlocked.some((row) => /restoring design-gate failed/.test(row.reason)));
 });
