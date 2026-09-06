@@ -369,6 +369,15 @@ test("1.3 missing PR head after push is a typed blocker, not generic observed mi
       code: string;
     };
     assert.equal(stored.code, "tester_rebind_pr_head_unobservable");
+    assert.equal(isTesterEvidenceOrderingDiagnostic(result.diagnostic), true);
+    const applicable = filterRecipesForWorkflowEngineDiagnostic(
+      DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes,
+      result.diagnostic,
+    );
+    for (const skipped of TESTER_EVIDENCE_ORDERING_INAPPLICABLE_RECIPES) {
+      assert.equal(applicable.includes(skipped), false, skipped);
+    }
+    assert.equal(applicable.includes(REBIND_TESTER_EVIDENCE_AFTER_PR), true);
   }
 });
 
@@ -390,6 +399,15 @@ test("1.3 unobservable trusted-surface after push is a typed blocker", async () 
   if (!result.ok) {
     assert.equal(result.code, "tester_rebind_trusted_surface_unobservable");
     assert.notEqual(result.summary, "required implementation evidence role, observed missing");
+    assert.equal(isTesterEvidenceOrderingDiagnostic(result.diagnostic), true);
+    const applicable = filterRecipesForWorkflowEngineDiagnostic(
+      DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes,
+      result.diagnostic,
+    );
+    for (const skipped of TESTER_EVIDENCE_ORDERING_INAPPLICABLE_RECIPES) {
+      assert.equal(applicable.includes(skipped), false, skipped);
+    }
+    assert.equal(applicable.includes(REBIND_TESTER_EVIDENCE_AFTER_PR), true);
   }
 });
 
@@ -1594,6 +1612,31 @@ test("equal-head linked-PR swap rebinds Tester evidence to the replacement PR", 
   assert.equal(driven.pipelineStage, "review-1");
   assert.equal(driven.observerBefore?.candidateSha, SHA_S);
   assert.equal(driven.observerBefore?.evidenceRole, "implementation");
+});
+
+test("equal-head PR swap at the delivery observer updates the expected PR", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prNumberSequence: [99, 99, 99, 100],
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    changedPaths: ["core/scripts/pipeline-run.ts"],
+    tester: boundPassed(),
+    testGateEnabled: false,
+    invokeObserver: true,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "design-gate" as const,
+      to: "review-1" as const,
+      summary: "design gate passed",
+    }),
+  });
+
+  assert.ok(driven.rebindCalls.some((call) => call.prNumber === 100));
+  assert.equal(driven.observerBefore?.candidateSha, SHA_S);
+  assert.equal(driven.observerBefore?.evidenceRole, "implementation");
+  assert.equal(driven.setBlocked.length, 0);
+  assert.equal(driven.pipelineStage, "review-1");
 });
 
 test("disabled-gate observer does not accept worktree S1 proof when live PR head is S2", async () => {

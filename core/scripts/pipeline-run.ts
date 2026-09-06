@@ -3317,6 +3317,7 @@ export async function runAdvance(
                 }
                 handoffPrHeadSha = rebound.candidateSha;
                 handoffPrNumber = livePrNumber;
+                lastPushedImplementationSha = rebound.candidateSha;
                 ownedCandidateMutationRebound = true;
                 return;
               }
@@ -3332,6 +3333,7 @@ export async function runAdvance(
                 return;
               }
               handoffPrHeadSha = mismatch.candidateSha;
+              handoffPrNumber = livePrNumber;
             },
           };
         }

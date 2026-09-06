@@ -202,6 +202,9 @@ export function isTesterEvidenceOrderingDiagnostic(diagnostic: unknown): boolean
   if (fields.kind !== TESTER_EVIDENCE_ORDERING_KIND) return false;
   if (fields.required_role !== "implementation") return false;
   if (fields.observed_role !== "missing") return false;
+  if (typeof fields.blocker_code === "string" && fields.blocker_code.startsWith("tester_rebind_")) {
+    return true;
+  }
   const ts = fields.trusted_surface_outcome;
   const subjectOmitted = fields.subject_omitted_because_unobservable === true;
   if (ts !== "passthrough" && ts !== "rebound" && !subjectOmitted) return false;

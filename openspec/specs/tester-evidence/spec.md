@@ -603,6 +603,18 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 - **THEN** the pipeline SHALL treat the `{PR number, head SHA}` binding as changed
 - **AND** SHALL rebind and reconfirm Tester evidence for P2/S before dispatch
 - **AND** implementation-role acquisition SHALL require both the evidence and its subject to name P2
+
+#### Scenario: Stage-owned successor remains the candidate for later consumers
+
+- **WHEN** a fix or pre-merge stage pushes successor S2 and its post-attempt rebind succeeds
+- **THEN** subsequent consumer stages in the same advance SHALL compare the linked PR against S2
+- **AND** SHALL NOT reuse the earlier implementation SHA S1 as the pushed-head expectation
+
+#### Scenario: Typed rebind blockers use only evidence-ordering recovery
+
+- **WHEN** PR-head or trusted-surface observation produces a typed `tester_rebind_*` blocker
+- **THEN** recovery SHALL classify it as Tester evidence ordering
+- **AND** SHALL mark scratch unlink, harness-dirt checkpoint, and unpublished-stage publish recipes inapplicable
 - **AND** SHALL NOT present S1 worktree HEAD or S1 Tester evidence as implementation-role proof for S2
 
 #### Scenario: PR head movement after execution is a typed mismatch, not a generic wait
