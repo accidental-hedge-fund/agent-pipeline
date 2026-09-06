@@ -117,6 +117,7 @@ type DriveOpts = {
   /** After the first managed-worktree fetch, PR HEAD becomes this SHA (H→J race). */
   prHeadAfterFetch?: string;
   priorArchiveTransition?: { from: string; to: string };
+  priorArchiveTransitionExclusive?: boolean;
 };
 
 type DriveResult = {
@@ -239,7 +240,12 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
     );
     fs.mkdirSync(priorDir, { recursive: true });
     fs.writeFileSync(
-      path.join(priorDir, "events.jsonl"),
+      path.join(
+        priorDir,
+        opts.priorArchiveTransitionExclusive
+          ? "pipeline-internal-candidate-transitions.jsonl"
+          : "events.jsonl",
+      ),
       JSON.stringify({
         schema_version: "1",
         type: "pipeline_internal_candidate_transition",
@@ -512,6 +518,19 @@ test("OpenSpec archive transition remains current across physical advance runs (
     commits: developerCommits(),
     reviewSha: SHA_S,
     priorArchiveTransition: { from: SHA_S, to: SHA_H },
+  });
+  assert.ok(r.dispatchStages.includes("visual-gate"));
+  assert.equal(r.transitions.some((t) => t.to === "review-1"), false);
+});
+
+test("OpenSpec archive transition remains current across exclusive-sink physical runs", async () => {
+  const r = await driveLaterStage({
+    startStage: "visual-gate",
+    prHead: SHA_H,
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+    priorArchiveTransition: { from: SHA_S, to: SHA_H },
+    priorArchiveTransitionExclusive: true,
   });
   assert.ok(r.dispatchStages.includes("visual-gate"));
   assert.equal(r.transitions.some((t) => t.to === "review-1"), false);

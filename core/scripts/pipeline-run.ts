@@ -85,6 +85,7 @@ import {
   finalizeRun,
   initRunDir,
   persistTrustedSurfaceDecision,
+  readInternalCandidateTransitions,
   readEvents,
   readTrustedSurfaceDecision,
   resolveRunStoreRepoDir,
@@ -2269,9 +2270,9 @@ export async function runAdvance(
       const events: unknown[] = [];
       for (const id of ids) {
         if (!id.startsWith(prefix)) continue;
-        events.push(
-          ...(await readEvents(runDirPath(runStoreRepoDir, id), runStoreDeps).catch(() => [])),
-        );
+        const priorDir = runDirPath(runStoreRepoDir, id);
+        events.push(...(await readInternalCandidateTransitions(priorDir, runStoreDeps)));
+        events.push(...(await readEvents(priorDir, runStoreDeps).catch(() => [])));
       }
       return events;
     }
@@ -3940,11 +3941,11 @@ export async function runAdvance(
           // so that notification gh calls (getPrForIssue/postPrComment) are captured (#257).
           if (runDir) {
             try {
-              await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, {
+              const finalization = await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, {
                 ...runStoreDeps,
                 evaluationPinSubject: readinessSubject ?? null,
               }, undefined, runCompleteStopReason);
-              terminalEvidenceDurable = true;
+              terminalEvidenceDurable = finalization.durable;
             } catch {
               terminalEvidenceDurable = false;
             }

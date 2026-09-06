@@ -622,6 +622,27 @@ test("handleRunSubcommand: detach pointer resolves a nested --repo-path to the r
   }
 });
 
+test("handleRunSubcommand: linked-worktree detach pointer uses the persistent primary run store", async () => {
+  const linkedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "linked-repo-"));
+  const primaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "primary-repo-"));
+  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "wrapper-"));
+  try {
+    await handleRunSubcommand("99", { detach: true }, {
+      cwd: () => linkedRoot,
+      findGitRoot: () => linkedRoot,
+      resolveRunStoreRepoDir: async () => primaryRoot,
+      spawnDetached: async () => ({ runDir: wrapperDir, pid: 42 }),
+    });
+    const pointer = JSON.parse(fs.readFileSync(path.join(wrapperDir, "run-store.json"), "utf8"));
+    assert.ok(String(pointer.run_store_dir).startsWith(path.join(primaryRoot, ".agent-pipeline")));
+    assert.ok(!String(pointer.run_store_dir).startsWith(linkedRoot));
+  } finally {
+    fs.rmSync(linkedRoot, { recursive: true, force: true });
+    fs.rmSync(primaryRoot, { recursive: true, force: true });
+    fs.rmSync(wrapperDir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 10. #485 regression: detached launch validates the repo BEFORE creating any
 //    artifact. Previously `findGitRoot(start) ?? start` silently fell back to

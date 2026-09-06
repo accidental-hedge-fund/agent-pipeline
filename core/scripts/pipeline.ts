@@ -8766,6 +8766,8 @@ export interface RunSubcommandDeps {
    * Injected so unit tests never start a real supervisor.
    */
   runSingleIssue?: typeof runSingleIssueCommand;
+  /** Persistent primary checkout that owns detached run-store pointers. */
+  resolveRunStoreRepoDir?: typeof resolveRunStoreRepoDir;
 }
 const defaultRunSubcommandDeps: RunSubcommandDeps = {
   spawnDetached,
@@ -8821,7 +8823,10 @@ export async function handleRunSubcommand(
     // desktop consumer could not find the structured event log without guessing —
     // reintroducing the competing artifact format the #155 contract avoids (#155).
     const runStoreRunId = runIdFor(number, new Date());
-    const runStoreDir = runDirPath(repoDir, runStoreRunId);
+    const persistentRepoDir = await (
+      deps.resolveRunStoreRepoDir ?? resolveRunStoreRepoDir
+    )(repoDir, gitInWorktree);
+    const runStoreDir = runDirPath(persistentRepoDir, runStoreRunId);
 
     // Forward all launch-shaping options so the inner pipeline process respects
     // the same profile / repo / model the caller specified (e.g. --profile claude).

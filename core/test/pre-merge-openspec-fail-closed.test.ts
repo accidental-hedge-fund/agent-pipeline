@@ -106,7 +106,9 @@ function appendOnlyRunStore(appended: string[]): RunStoreDeps {
   return {
     readFile: async () => "",
     writeFile: async () => {},
-    appendFile: async (_p, data) => { appended.push(data); },
+    appendFile: async (p, data) => {
+      if (p.endsWith("events.jsonl")) appended.push(data);
+    },
     rename: async () => {},
     mkdir: async () => {},
     readdir: async () => [],

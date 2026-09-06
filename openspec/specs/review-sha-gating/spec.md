@@ -263,7 +263,12 @@ pipeline SHALL durably record the exact prior and successor candidate SHAs as
 an owned internal transition. Later-stage currency reconciliation MAY use an
 exact chain of those records when GitHub's commit listing has not yet converged.
 Malformed records, non-archive causes, or chains that do not terminate at the
-live PR HEAD SHALL provide no reuse authority.
+live PR HEAD SHALL provide no reuse authority. The transition SHALL also be
+persisted in a local authority artifact that is independent of event-sink mode;
+an exclusive external sink SHALL NOT make the transition unavailable to a later
+physical run. Reconciliation SHALL confirm the live PR HEAD after currency
+resolution and SHALL NOT authorize a stale archive successor when a developer
+push has replaced it.
 
 #### Scenario: Archive push is visible before its commit list
 
@@ -364,6 +369,20 @@ Ready-to-deploy SHALL run this guard immediately before terminal finalization, i
 - **AND** a later supervisor dispatch starts a new physical run while GitHub's commit list still lags
 - **THEN** later-stage currency SHALL load the issue's durable prior-run transition evidence
 - **AND** SHALL treat H as current only when an exact validated transition chain reaches H
+
+#### Scenario: Exclusive event sink preserves archive currency
+
+- **WHEN** an archive transition is produced while the public event stream uses an exclusive sink
+- **AND** a later physical run must reconcile the archive successor
+- **THEN** the later run SHALL load the independently persisted local transition authority
+- **AND** SHALL NOT depend on a local `events.jsonl` copy
+
+#### Scenario: Developer push after archive observation invalidates reuse
+
+- **WHEN** reconciliation first observes archive successor A and the commit-list resolver reports unknown
+- **AND** a fresh PR HEAD confirmation observes developer head D
+- **THEN** the S-to-A archive transition SHALL NOT authorize D
+- **AND** the pipeline SHALL return the candidate to exact-SHA review
 
 #### Scenario: PR HEAD movement during epoch-restart bind restarts reconcile
 

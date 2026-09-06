@@ -1119,6 +1119,19 @@
       "migrated_outcome": "Cooling"
     },
     {
+      "site_id": "stages.pre-merge-openspec-archive:harness-failure#4",
+      "module": "scripts/stages/pre-merge-openspec-archive.ts",
+      "line": 1012,
+      "occurrence": 4,
+      "match": "OpenSpec archive was pushed, but its candidate-transition authority could not be",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "harness-failure",
+      "canonical_reason": "workflow-engine-defect",
+      "notes": "archive transition authority persistence failed; later-stage reuse must not proceed without a durable exact-SHA edge (#1478)",
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
+    },
+    {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#5",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
       "line": 836,

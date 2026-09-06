@@ -161,6 +161,42 @@ export function runDirPath(repoDir: string, runId: RunId): string {
   return path.join(runsDir(repoDir), runId);
 }
 
+export const INTERNAL_CANDIDATE_TRANSITIONS_FILE =
+  "pipeline-internal-candidate-transitions.jsonl" as const;
+
+/** Persist authority-bearing candidate transitions locally even when the
+ * public event stream is configured as sink-only. */
+export async function appendInternalCandidateTransition(
+  runDir: string,
+  transition: RunEvent,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<boolean> {
+  const target = path.join(runDir, INTERNAL_CANDIDATE_TRANSITIONS_FILE);
+  try {
+    await deps.mkdir(runDir, { recursive: true });
+    await deps.appendFile(target, `${JSON.stringify(transition)}\n`);
+    if (deps.fsyncFile) await deps.fsyncFile(target);
+    return true;
+  } catch (err) {
+    console.warn(
+      `[pipeline] run-store: internal candidate transition write failed: ${(err as Error).message}`,
+    );
+    return false;
+  }
+}
+
+export async function readInternalCandidateTransitions(
+  runDir: string,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<unknown[]> {
+  try {
+    const raw = await deps.readFile(path.join(runDir, INTERNAL_CANDIDATE_TRANSITIONS_FILE));
+    return raw.split("\n").filter(Boolean).map((line) => JSON.parse(line) as unknown);
+  } catch {
+    return [];
+  }
+}
+
 /** Root directory for the issue-level evidence-history artifacts (#377), a
  *  sibling of `runs/` under `.agent-pipeline/` — durable, reboot-safe storage,
  *  unlike the legacy `/tmp/pipeline-<repo>` state dir. */
@@ -2323,7 +2359,7 @@ export async function finalizeRun(
   deps: RunStoreDeps = defaultRunStoreDeps,
   ghMetrics?: GhMetricsSummary,
   stopReason?: RunCompleteStopReason,
-): Promise<void> {
+): Promise<{ durable: boolean; runComplete: boolean; summary: boolean; writeHealth: boolean }> {
   const now = nowIso();
   const startMs = Date.parse(startedAt);
   const elapsedMs = Number.isFinite(startMs) ? Date.parse(now) - startMs : 0;
@@ -2342,7 +2378,7 @@ export async function finalizeRun(
     elapsed_ms: elapsedMs,
     ...(stopReason ? { stop_reason: stopReason } : {}),
   };
-  await appendEvent(runDir, completeEvent, deps);
+  const runCompleteWritten = await appendEvent(runDir, completeEvent, deps);
 
   // Collect event-derived records to embed in summary.json. When the caller
   // supplies deps.summaryEvents (#343), use that in-memory accumulator so
@@ -2420,6 +2456,7 @@ export async function finalizeRun(
   // uses the commit-trailer format 155/..., which differs from the dir name 155-...).
   const fileRunId = path.basename(runDir);
   let logicalOperationId: string | undefined;
+  let summaryWritten = false;
   try {
     const rawMeta = await deps.readFile(path.join(runDir, "run.json"));
     const meta = JSON.parse(rawMeta) as { logical_operation_id?: unknown };
@@ -2505,6 +2542,7 @@ export async function finalizeRun(
     const tmp = `${summaryPath}.tmp`;
     await deps.writeFile(tmp, serialized);
     await deps.rename(tmp, summaryPath);
+    summaryWritten = true;
   } catch (err) {
     console.warn(
       `[pipeline] run-store: summary.json write failed (non-fatal): ${(err as Error).message}`,
@@ -2546,6 +2584,13 @@ export async function finalizeRun(
     })),
   };
   await appendIssueHistory(repoDirFromRunDir(runDir), issue, historyEntry, deps);
+  const writeHealthDurable = writeHealth.control_evidence_at_risk !== true;
+  return {
+    durable: runCompleteWritten && summaryWritten && writeHealthDurable,
+    runComplete: runCompleteWritten,
+    summary: summaryWritten,
+    writeHealth: writeHealthDurable,
+  };
 }
 
 // ---------------------------------------------------------------------------

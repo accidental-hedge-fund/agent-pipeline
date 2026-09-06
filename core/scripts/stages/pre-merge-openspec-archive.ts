@@ -28,7 +28,11 @@ import {
   buildTrustedOverrideComments,
   extractSpecDivergenceDirection,
 } from "../review-policy.ts";
-import { appendEvent, RUN_SCHEMA_VERSION } from "../run-store.ts";
+import {
+  appendEvent,
+  appendInternalCandidateTransition,
+  RUN_SCHEMA_VERSION,
+} from "../run-store.ts";
 import * as openspec from "../openspec.ts";
 import {
   computeBranchDeveloperCommits,
@@ -988,19 +992,28 @@ export async function maybeArchiveOpenspec(
     archivedHead.code === 0 &&
     /^[0-9a-f]{40}$/i.test(archivedHead.stdout.trim())
   ) {
-    await appendEvent(
+    const transition = {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "pipeline_internal_candidate_transition" as const,
+      at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+      cause: "openspec_archive" as const,
+      from_sha: reviewedHead.toLowerCase(),
+      to_sha: archivedHead.stdout.trim().toLowerCase(),
+      issue: issueNumber,
+    };
+    const transitionDurable = await appendInternalCandidateTransition(
       deps.runDir,
-      {
-        schema_version: RUN_SCHEMA_VERSION,
-        type: "pipeline_internal_candidate_transition",
-        at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
-        cause: "openspec_archive",
-        from_sha: reviewedHead.toLowerCase(),
-        to_sha: archivedHead.stdout.trim().toLowerCase(),
-        issue: issueNumber,
-      },
+      transition,
       deps.runStoreDeps,
-    ).catch(() => {});
+    );
+    if (!transitionDurable) {
+      const reason =
+        "OpenSpec archive was pushed, but its candidate-transition authority could not be persisted locally; refusing later-stage advancement";
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "harness-failure");
+      await recordDecision("fail", reason);
+      return preMergeBlocked(reason, "harness-failure");
+    }
+    await appendEvent(deps.runDir, transition, deps.runStoreDeps).catch(() => {});
   }
   console.log(`[pipeline] #${issueNumber}: OpenSpec change(s) archived; CI will re-run`);
   // Pass reason = verified archived ids only (#714 / #675).

@@ -146,6 +146,33 @@ test("reconcileLaterStageReviewCurrency: durable archive transition covers commi
   }
 });
 
+test("reconcileLaterStageReviewCurrency: stale archive head never authorizes a later developer push", async () => {
+  let reads = 0;
+  const result = await reconcileLaterStageReviewCurrency(
+    cfg(),
+    1478,
+    "ready-to-deploy",
+    detailWithReview(SHA_S),
+    {
+      ...actorDeps(),
+      getPrForIssue: async () => 99,
+      getPrDetail: async () => ({
+        number: 99,
+        head_sha: reads++ < 1 ? SHA_INTERNAL : SHA_H,
+      } as never),
+      resolveCurrency: async () => ({ status: "unknown" }),
+      internalCandidateTransitions: [{
+        type: "pipeline_internal_candidate_transition",
+        cause: "openspec_archive",
+        from_sha: SHA_S,
+        to_sha: SHA_INTERNAL,
+      }],
+    },
+  );
+  assert.equal(result.kind, "return-to-review");
+  if (result.kind === "return-to-review") assert.equal(result.headSha, SHA_H);
+});
+
 test("reconcileLaterStageReviewCurrency: exact SHA match stays current", async () => {
   let prDetailCalls = 0;
   const result = await reconcileLaterStageReviewCurrency(

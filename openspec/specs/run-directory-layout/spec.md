@@ -51,7 +51,9 @@ When `pipeline run <N> --detach` is used, the launcher SHALL pin a
 `--run-id`) so both share one run directory, and SHALL report that run-id/path to the caller.
 The pinned run-store directory SHALL be rooted at the **resolved repository root** — the git
 root of the resolved `--repo-path`, or of the current working directory — and SHALL NOT be
-derived from an unvalidated start directory; when no repository root can be resolved, the
+derived from an unvalidated start directory. When that root is a disposable linked worktree,
+the launcher SHALL resolve and publish the persistent primary-worktree run-store path used by
+the inner run. When no repository root can be resolved, the
 launcher SHALL refuse the launch rather than pin a run-store path (see the detached-launcher
 capability). The detached run's `events.jsonl` and `terminal.log` — not the wrapper's
 `pipeline.log`/`sentinel.json` — are the machine-readable Pipeline Desk contract.
@@ -78,6 +80,12 @@ capability). The detached run's `events.jsonl` and `terminal.log` — not the wr
 
 - **WHEN** `pipeline run <N> --detach --json-events` is invoked
 - **THEN** the inner detached run SHALL receive `--json-events`
+
+#### Scenario: Detached launch begins in a disposable linked worktree
+
+- **WHEN** a detached launch resolves its repository root to a registered linked worktree
+- **THEN** `run-store.json` and the reported structured paths SHALL point beneath the persistent primary worktree
+- **AND** the inner run SHALL write to those same paths after the linked worktree is removed
 
 #### Scenario: run store is pinned at the repository root, not the launch directory
 

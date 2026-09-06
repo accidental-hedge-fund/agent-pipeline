@@ -279,8 +279,32 @@ export async function reconcileLaterStageReviewCurrency(
     getPrCommits: getCommits,
   });
 
-  const observedHead =
-    currency.status === "superseded" ? currency.headSha : headSha;
+  // The currency resolver performs its own HEAD read. Re-read once more before
+  // applying a durable S→A pipeline transition: when its commit-list lookup is
+  // stale/unknown, the earlier `headSha` may already have been replaced by a
+  // developer push D. Only the newest observable head may be authorized by the
+  // exact transition edge. The delivery observer performs the final pre/post
+  // dispatch checks, closing movement after this reconciliation boundary.
+  let observedHead: string;
+  try {
+    observedHead = (await getDetailPr(cfg, prNumber)).head_sha;
+  } catch (err) {
+    return {
+      kind: "fail-closed",
+      reason: `later-stage review-currency: cannot confirm live PR HEAD: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (!observedHead) {
+    return {
+      kind: "fail-closed",
+      reason: "later-stage review-currency: live PR HEAD unreadable during confirmation; refusing to dispatch",
+    };
+  }
+  if (currency.status === "current" && observedHead !== headSha) {
+    currency = { status: "superseded", headSha: observedHead };
+  } else if (currency.status === "superseded" && currency.headSha !== observedHead) {
+    currency = { status: "superseded", headSha: observedHead };
+  }
 
   if (
     currency.status !== "current" &&

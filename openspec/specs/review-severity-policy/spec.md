@@ -203,12 +203,22 @@ NOT route the item to a fix round, even when its severity is `critical` or `high
 explicit `blocking: true` SHALL satisfy the severity side of the policy even below the configured
 threshold, while still honoring the confidence floor. The advisory record for a `blocking: false`
 finding SHALL state that it was marked non-blocking by the reviewer.
+When ensemble findings are deduplicated by stable key, explicit blocking intent
+SHALL be merged monotonically: if any grouped finding has `blocking: true`, the
+merged finding SHALL retain `blocking: true` even when another agent supplies
+the winning body or higher confidence.
 
 #### Scenario: High-severity non-blocking finding does not block
 
 - **WHEN** a `needs-attention` verdict contains a single finding with `severity: "high"` and
   `blocking: false`
 - **THEN** that finding SHALL be advisory and the item SHALL advance rather than route to a fix round
+
+#### Scenario: Ensemble dedupe retains an explicit blocker
+
+- **WHEN** two ensemble findings share a stable key and one is explicitly blocking
+- **AND** a higher-confidence duplicate is explicitly advisory
+- **THEN** the merged finding SHALL retain `blocking: true`
 
 #### Scenario: Critical non-blocking finding does not block
 

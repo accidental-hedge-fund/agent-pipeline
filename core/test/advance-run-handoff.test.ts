@@ -249,6 +249,31 @@ test("durable park releases its worktree only after run_complete and summary are
   }
 });
 
+test("park retains its worktree when terminal summary persistence fails", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-release-fail-"));
+  const domain = `advance-release-fail-${process.pid}-${Date.now()}`;
+  let releaseCalls = 0;
+  const { deps } = stubHandoffAdvance(repoDir, {
+    runStore: {
+      writeFile: async (target, data) => {
+        if (target.endsWith("summary.json.tmp")) throw new Error("ENOSPC: injected");
+        await fs.promises.writeFile(target, data, "utf8");
+      },
+    },
+    releaseParkedWorktree: async () => {
+      releaseCalls++;
+      return { action: "released", reason: "unexpected", branch: "pipeline/1049-x", worktree: "/wt" };
+    },
+  });
+  try {
+    await withoutHostPinAuthorityEnv(() => runAdvance(handoffCfg(repoDir, domain), ISSUE, {}, deps));
+    assert.equal(releaseCalls, 0);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(`/tmp/pipeline-${domain}`, { recursive: true, force: true });
+  }
+});
+
 function stubHandoffAdvance(
   repoDir: string,
   extra: Partial<AdvanceDeps> = {},
