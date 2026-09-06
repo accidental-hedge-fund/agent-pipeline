@@ -167,6 +167,12 @@ export function createRepairPipelineItemExecutor(
         `repair attempt ${input.attemptId} cannot verify an open same-repository linked PR delivery identity`;
       return { succeeded: false, evidence: error, error };
     }
+    if (delivery.headSha.toLowerCase() !== expected.toLowerCase()) {
+      const error =
+        `recovery candidate moved before repair mutation: claimed ${expected}, ` +
+        `linked PR is ${delivery.headSha}`;
+      return { succeeded: false, evidence: error, error };
+    }
 
     // Durable pre-invocation breadcrumb: a git ref in the managed worktree's
     // repository, keyed by this attempt id and pointing at the claimed head.
@@ -199,12 +205,6 @@ export function createRepairPipelineItemExecutor(
 
     let wt = await getWorktree(cfg, issueNumber);
     if (!wt) {
-      if (delivery.headSha.toLowerCase() !== expected.toLowerCase()) {
-        const error =
-          `recovery candidate moved before worktree rematerialization: claimed ${expected}, ` +
-          `linked PR is ${delivery.headSha}`;
-        return { succeeded: false, evidence: error, error };
-      }
       const materialized = await ensureWorktree(cfg, issueNumber, {
         recoveryTarget: {
           branch: delivery.branch,

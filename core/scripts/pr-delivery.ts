@@ -12,6 +12,37 @@ export interface PrDeliveryAuthority {
   repository: string;
 }
 
+export interface DeliveryHeadPreflightResult {
+  ok: boolean;
+  actualHead?: string;
+  reason?: string;
+}
+
+/** Prove a managed worktree is exactly at the freshly-authorized PR head. */
+export async function preflightDeliveryWorktreeHead(
+  worktreePath: string,
+  delivery: PrDeliveryAuthority,
+  git: (
+    cwd: string,
+    args: string[],
+    opts?: { ignoreFailure?: boolean },
+  ) => Promise<{ code: number; stdout: string; stderr: string }>,
+): Promise<DeliveryHeadPreflightResult> {
+  const result = await git(worktreePath, ["rev-parse", "HEAD"], { ignoreFailure: true });
+  const actualHead = result.stdout.trim().toLowerCase();
+  if (result.code !== 0 || !/^[0-9a-f]{40}$/.test(actualHead)) {
+    return { ok: false, reason: "cannot verify managed worktree HEAD" };
+  }
+  if (actualHead !== delivery.headSha.toLowerCase()) {
+    return {
+      ok: false,
+      actualHead,
+      reason: `managed worktree HEAD ${actualHead} does not match live PR head ${delivery.headSha}`,
+    };
+  }
+  return { ok: true, actualHead };
+}
+
 /** Accept only an open PR whose head is owned by the configured base repo. */
 export function prDeliveryAuthority(
   cfg: PipelineConfig,

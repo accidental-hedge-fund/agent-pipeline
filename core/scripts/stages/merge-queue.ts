@@ -39,7 +39,10 @@ import {
   type RunReleaseFn,
 } from "./merge-queue-release-when-complete.ts";
 import { performPreMergeAutoFix } from "./pre_merge.ts";
-import { resolveLinkedPrDelivery } from "../pr-delivery.ts";
+import {
+  preflightDeliveryWorktreeHead,
+  resolveLinkedPrDelivery,
+} from "../pr-delivery.ts";
 import { runRelease } from "./release.ts";
 import {
   applyReadmeLandingContractGate,
@@ -827,6 +830,15 @@ export async function runSharedMechanicalRepair(
       };
     }
     wt = { path: materialized.worktree.path, slug: materialized.worktree.slug };
+  }
+
+  const headPreflight = await preflightDeliveryWorktreeHead(wt.path, delivery, git);
+  if (!headPreflight.ok) {
+    return {
+      succeeded: false,
+      evidence: `managed worktree delivery preflight failed: ${headPreflight.reason}`,
+      error: headPreflight.reason ?? "unverified managed worktree head",
+    };
   }
 
   const runId = `merge-queue-repair-pr-${candidate.prNumber}`;

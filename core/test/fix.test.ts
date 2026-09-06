@@ -41,6 +41,7 @@ import {
 } from "../scripts/stages/fix.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { deliveryPushRefspec } from "../scripts/git-push-auth.ts";
+import { preflightDeliveryWorktreeHead } from "../scripts/pr-delivery.ts";
 
 const execFileAsync = promisify(execFile);
 import { formatReviewComment } from "../scripts/stages/review.ts";
@@ -841,6 +842,29 @@ test("resolveLinkedPrDelivery: closed or cross-repository PR heads fail closed",
     null,
     "a fork branch named main must never authorize a push to base origin/main",
   );
+});
+
+test("preflightDeliveryWorktreeHead requires the exact freshly-authorized PR head", async () => {
+  const delivery = {
+    branch: "fix/adopted",
+    headSha: SHA_HEAD,
+    prNumber: 1480,
+    repository: "acme/repo",
+  };
+  assert.deepEqual(
+    await preflightDeliveryWorktreeHead("/managed/wt", delivery, async (_cwd, args) => {
+      assert.deepEqual(args, ["rev-parse", "HEAD"]);
+      return { code: 0, stdout: `${SHA_HEAD}\n`, stderr: "" };
+    }),
+    { ok: true, actualHead: SHA_HEAD.toLowerCase() },
+  );
+  const stale = await preflightDeliveryWorktreeHead(
+    "/managed/wt",
+    delivery,
+    async () => ({ code: 0, stdout: `${SHA_REVIEWED}\n`, stderr: "" }),
+  );
+  assert.equal(stale.ok, false);
+  assert.match(stale.reason ?? "", /does not match live PR head/);
 });
 
 test("deliveryPushRefspec: adopted synthetic workspace pushes HEAD to the delivery branch", () => {

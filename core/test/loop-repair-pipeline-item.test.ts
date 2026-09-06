@@ -176,6 +176,34 @@ test("repair_pipeline_item rejects an unverified or fork delivery before worktre
   assert.equal(worktreeReads, 0);
 });
 
+test("repair_pipeline_item rejects a live PR head race before any worktree or breadcrumb mutation (#1478)", async () => {
+  let worktreeReads = 0;
+  let gitCalls = 0;
+  let repairCalls = 0;
+  const execute = createRepairPipelineItemExecutor(cfg(), {
+    resolveLinkedPrDelivery: async () => ({ ...TEST_DELIVERY, headSha: NEXT }),
+    getOnDiskForIssue: async () => {
+      worktreeReads += 1;
+      return { path: "/repo/.worktrees/42", slug: "repair" };
+    },
+    gitInWorktree: async () => {
+      gitCalls += 1;
+      return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+    },
+    performRepair: async () => {
+      repairCalls += 1;
+      return { status: "fix-committed", headSha: NEXT };
+    },
+  });
+
+  const result = await execute(input());
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /candidate moved before repair mutation/);
+  assert.equal(worktreeReads, 0);
+  assert.equal(gitCalls, 0);
+  assert.equal(repairCalls, 0);
+});
+
 test("repair_pipeline_item resolves every configured implementer through the same adapter contract", async () => {
   const adapters = ["claude", "codex", "grok", "extension-adapter"];
   const invoked: string[] = [];

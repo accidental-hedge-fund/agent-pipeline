@@ -806,8 +806,9 @@ test("runSharedMechanicalRepair uses injected shared repair path (no network)", 
       async ensureManagedWorktree() {
         throw new Error("should not rematerialize when worktree exists");
       },
-      async gitInWorktree() {
-        throw new Error("git should not run when repair is injected");
+      async gitInWorktree(_cwd, args) {
+        assert.deepEqual(args, ["rev-parse", "HEAD"]);
+        return { code: 0, stdout: `${"a".repeat(40)}\n`, stderr: "" };
       },
       async performRepair(
         _cfg,
@@ -869,6 +870,10 @@ test("runSharedMechanicalRepair rematerializes and repairs an adopted PR using e
           reason: "rematerialized",
         };
       },
+      gitInWorktree: async (_cwd, args) => {
+        assert.deepEqual(args, ["rev-parse", "HEAD"]);
+        return { code: 0, stdout: `${delivery.headSha}\n`, stderr: "" };
+      },
       performRepair: async (...args) => {
         repairDelivery = args.at(-1);
         return { status: "fix-committed", headSha: "b".repeat(40) };
@@ -885,6 +890,37 @@ test("runSharedMechanicalRepair rematerializes and repairs an adopted PR using e
     prNumber: delivery.prNumber,
   });
   assert.deepEqual(repairDelivery, delivery);
+});
+
+test("runSharedMechanicalRepair rejects a stale present worktree before repair (#1478)", async () => {
+  const cfg = { harnesses: { implementer: "claude" } } as unknown as PipelineConfig;
+  let repairCalls = 0;
+  const result = await runSharedMechanicalRepair(
+    { issueNumber: 42, prNumber: 7, title: "fix me" },
+    "surgical prompt body",
+    cfg,
+    {
+      resolveLinkedPrDelivery: async () => ({
+        branch: "fix/adopted",
+        headSha: "a".repeat(40),
+        prNumber: 7,
+        repository: "org/repo",
+      }),
+      getOnDiskForIssue: async () => ({ path: "/managed/wt", slug: "slug" }),
+      gitInWorktree: async () => ({
+        code: 0,
+        stdout: `${"b".repeat(40)}\n`,
+        stderr: "",
+      }),
+      performRepair: async () => {
+        repairCalls += 1;
+        return { status: "fix-committed", headSha: "c".repeat(40) };
+      },
+    },
+  );
+  assert.equal(result.succeeded, false);
+  assert.match(result.evidence, /does not match live PR head/);
+  assert.equal(repairCalls, 0);
 });
 
 // ---------------------------------------------------------------------------
