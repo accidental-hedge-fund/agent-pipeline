@@ -977,6 +977,31 @@ export async function maybeArchiveOpenspec(
     await recordDecision("fail", "push failed after archive");
     return preMergeBlocked("push failed after archive", "push-failed");
   }
+  // Durable owned-candidate carry-forward (#1478). GitHub's commit-list API can
+  // lag the just-completed push; later-stage currency must not misclassify this
+  // pipeline-authored archive as an unknown developer epoch during that window.
+  // Record only after the push succeeds and only with exact full SHAs.
+  const archivedHead = await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+  if (
+    deps.runDir &&
+    /^[0-9a-f]{40}$/i.test(reviewedHead) &&
+    archivedHead.code === 0 &&
+    /^[0-9a-f]{40}$/i.test(archivedHead.stdout.trim())
+  ) {
+    await appendEvent(
+      deps.runDir,
+      {
+        schema_version: RUN_SCHEMA_VERSION,
+        type: "pipeline_internal_candidate_transition",
+        at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+        cause: "openspec_archive",
+        from_sha: reviewedHead.toLowerCase(),
+        to_sha: archivedHead.stdout.trim().toLowerCase(),
+        issue: issueNumber,
+      },
+      deps.runStoreDeps,
+    ).catch(() => {});
+  }
   console.log(`[pipeline] #${issueNumber}: OpenSpec change(s) archived; CI will re-run`);
   // Pass reason = verified archived ids only (#714 / #675).
   await recordDecision("pass", archivedIds.join(", "));

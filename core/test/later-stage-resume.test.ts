@@ -110,6 +110,8 @@ type DriveOpts = {
   currencySequence?: Array<"current" | "superseded">;
   /** Managed-worktree HEAD at start. Omit for no on-disk worktree. */
   worktreeHead?: string;
+  /** Simulate exact linked-PR rematerialization after park cleanup. */
+  rematerializeMissingWorktree?: boolean;
   worktreeDirty?: boolean;
   worktreeNotAncestor?: boolean;
   /** After the first managed-worktree fetch, PR HEAD becomes this SHA (H→J race). */
@@ -264,9 +266,25 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
         }
       : {}),
     getOnDiskForIssue: async () =>
-      opts.worktreeHead ? { path: wtPath, slug: wtSlug } : null,
+      worktreeHead ? { path: wtPath, slug: wtSlug } : null,
+    rematerializeMissingWorktree: async () => {
+      if (!opts.rematerializeMissingWorktree) {
+        return {
+          result: "fail" as const,
+          worktree: null,
+          reason: "linked PR worktree cannot be rematerialized",
+          blockerKind: "worktree-missing" as const,
+        };
+      }
+      worktreeHead = currentPrHead;
+      return {
+        result: "pass" as const,
+        worktree: { path: wtPath, slug: wtSlug, branch: `pipeline/${ISSUE}-${wtSlug}` },
+        reason: "rematerialized from linked open PR",
+      };
+    },
     gitInWorktree: async (_cwd, args) => {
-      if (!opts.worktreeHead) return { stdout: "", stderr: "", code: 0 };
+      if (!worktreeHead) return { stdout: "", stderr: "", code: 0 };
       if (args[0] === "rev-parse" && args.includes("HEAD") && !args.includes("--verify")) {
         return { stdout: `${worktreeHead}\n`, stderr: "", code: 0 };
       }
@@ -620,7 +638,22 @@ test("epoch restart fails closed when stale worktree S cannot bind to H", async 
   assert.ok(r.logs.some((line) => /refusing to dispatch review/.test(line)));
 });
 
-test("epoch restart with no managed worktree does not dispatch review from repo_dir", async () => {
+test("epoch restart rematerializes a missing managed worktree at exact PR HEAD", async () => {
+  const r = await driveLaterStage({
+    startStage: "visual-gate",
+    prHead: SHA_H,
+    commits: developerCommits(),
+    reviewSha: SHA_S,
+    rematerializeMissingWorktree: true,
+  });
+  assert.ok(r.dispatchStages.includes("review-1"));
+  assert.equal(r.dispatchStages.includes("visual-gate"), false);
+  assert.equal(r.reviewDispatchedAtSha, SHA_H);
+  assert.equal(r.reviewDispatchedAtWorktreeHead, SHA_H);
+  assert.ok(r.transitions.some((t) => t.from === "visual-gate" && t.to === "review-1"));
+});
+
+test("epoch restart fails closed when a missing managed worktree cannot be rematerialized", async () => {
   const r = await driveLaterStage({
     startStage: "visual-gate",
     prHead: SHA_H,
@@ -632,7 +665,7 @@ test("epoch restart with no managed worktree does not dispatch review from repo_
   assert.equal(r.reviewDispatchedAtSha, null);
   assert.equal(r.reviewDispatchedAtWorktreeHead, null);
   assert.equal(r.transitions.length, 0, "must not reroute to review when bind cannot prove an H checkout");
-  assert.ok(r.logs.some((line) => /no managed worktree on disk/.test(line)));
+  assert.ok(r.logs.some((line) => /rematerialization failed/.test(line)));
 });
 
 test("epoch restart does not review new HEAD J from stale checkout H when HEAD moves during bind", async () => {

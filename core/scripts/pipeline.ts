@@ -419,6 +419,13 @@ export function pickOneItemChildAdvanceInputs(opts: AdvanceOpts): OneItemChildAd
   };
 }
 
+/** A numeric `--once` drive owns exactly one supervisor scheduling cycle. */
+export function oneItemDriveMaxCycles(
+  childAdvance: OneItemChildAdvanceInputs | undefined,
+): number | undefined {
+  return childAdvance?.once ? 1 : undefined;
+}
+
 // Package version, single-sourced from package.json so a version bump is reflected
 // automatically. The path is `../package.json` (core/package.json). The installer stages
 // `scripts/` beside that core manifest, so the same relative path resolves in both the
@@ -3484,12 +3491,14 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
   };
 
   try {
+    const maxCycles = oneItemDriveMaxCycles(input.childAdvance);
     const parentPidRaw = process.env.PIPELINE_LIVENESS_PARENT_PID;
     const parentPid = parentPidRaw ? Number.parseInt(parentPidRaw, 10) : Number.NaN;
     const result = await driveSupervisor(supervisorDeps, {
       runId,
       engine: input.engine as LoopEngineName,
       resume: !!input.resumeRunId || resumeExisting,
+      ...(maxCycles !== undefined ? { maxCycles } : {}),
       ...(Number.isInteger(parentPid) && parentPid > 0 ? { parentPid } : {}),
       onRunReady: input.onRunReady
         ? async (ctx) => {

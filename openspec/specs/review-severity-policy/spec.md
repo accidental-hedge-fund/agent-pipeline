@@ -199,9 +199,10 @@ A scoped override SHALL post an audited comment carrying a scope sentinel distin
 independent of its `severity` and `confidence` and independent of the active `review_policy`
 `block_threshold` / `min_confidence`. Such a finding SHALL NOT appear in the blocking set and SHALL
 NOT route the item to a fix round, even when its severity is `critical` or `high`. A finding whose
-`blocking` field is absent or `true` SHALL be classified exactly as before this change, by the
-severity threshold and confidence floor. The advisory record for the finding SHALL state that it
-was marked non-blocking by the reviewer.
+`blocking` field is absent SHALL be classified by the severity threshold and confidence floor. An
+explicit `blocking: true` SHALL satisfy the severity side of the policy even below the configured
+threshold, while still honoring the confidence floor. The advisory record for a `blocking: false`
+finding SHALL state that it was marked non-blocking by the reviewer.
 
 #### Scenario: High-severity non-blocking finding does not block
 
@@ -214,11 +215,18 @@ was marked non-blocking by the reviewer.
 - **WHEN** a verdict contains a finding with `severity: "critical"` and `blocking: false`
 - **THEN** that finding SHALL be advisory and SHALL NOT appear in the blocking set
 
-#### Scenario: Unmarked finding still blocks
+#### Scenario: Unmarked finding still follows the severity policy
 
-- **WHEN** a verdict contains a finding with `severity: "high"` and no `blocking` field (or
-  `blocking: true`), at or above the policy threshold and confidence floor
+- **WHEN** a verdict contains a finding with `severity: "high"` and no `blocking` field, at or
+  above the policy threshold and confidence floor
 - **THEN** that finding SHALL block exactly as before this change
+
+#### Scenario: Explicit medium blocker survives a high threshold
+
+- **WHEN** a verdict contains a `medium` finding with `blocking: true`, confidence at or above the
+  floor, and an effective `block_threshold` of `high`
+- **THEN** that finding SHALL remain in the blocking set
+- **AND** the displayed blocking count and fix-round remediation input SHALL include it
 
 #### Scenario: Non-blocking finding is itemized in the advance audit record
 

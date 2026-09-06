@@ -669,8 +669,9 @@ export function matchFindingScope(f: Pick<ReviewFinding, "category" | "file">, s
  *      (kind: "key") when its stable key appears in `overrides` AND it is a
  *      blocking candidate AND its key is NOT ambiguous (at most one distinct
  *      blocking payload for that key).
- *   3. Advisory / blocking: the remaining findings are classified by the severity
- *      threshold and confidence floor.
+ *   3. Advisory / blocking: an explicit `blocking: true` satisfies the severity
+ *      side of the policy; otherwise the severity threshold applies. The
+ *      confidence floor always applies.
  *
  * Override takes precedence over the severity/confidence test so an explicit
  * human disposition always wins.
@@ -737,7 +738,7 @@ export function partitionFindings(
   const blockingFingerprintsByKey = new Map<string, Set<string>>();
   for (const f of findings) {
     if (f.blocking === false) continue; // non-blocking marker: never a blocking candidate (#236)
-    const isAboveSeverity = severityRank(f.severity) >= threshold;
+    const isAboveSeverity = f.blocking === true || severityRank(f.severity) >= threshold;
     const isAboveConfidence = typeof f.confidence !== "number" || f.confidence >= policy.min_confidence;
     if (isAboveSeverity && isAboveConfidence) {
       const k = findingKey(f);
@@ -770,7 +771,7 @@ export function partitionFindings(
     // 2. Key override: only for blocking candidates, with ambiguity guard.
     const key = findingKey(f);
     const isBlockingCandidate =
-      severityRank(f.severity) >= threshold &&
+      (f.blocking === true || severityRank(f.severity) >= threshold) &&
       (typeof f.confidence !== "number" || f.confidence >= policy.min_confidence);
     const distinctBlockers = blockingFingerprintsByKey.get(key)?.size ?? 0;
     const isAmbiguous = distinctBlockers > 1;
@@ -802,7 +803,7 @@ export function partitionFindings(
     }
 
     // 3. Advisory / blocking classification.
-    const belowSeverity = severityRank(f.severity) < threshold;
+    const belowSeverity = f.blocking !== true && severityRank(f.severity) < threshold;
     const belowConfidence =
       typeof f.confidence === "number" && f.confidence < policy.min_confidence;
     if (belowSeverity || belowConfidence) {

@@ -2955,6 +2955,35 @@ test("#232 regression (a): low-risk review-1 + medium review-2 finding + risk_pr
   );
 });
 
+test("#1478: an explicitly blocking medium finding survives low-risk threshold scaling", async (t) => {
+  const explicit = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "explicit blocker",
+    findings: [{
+      severity: "medium",
+      title: "release correctness",
+      body: "b",
+      confidence: 0.9,
+      recommendation: "fix the release path",
+      blocking: true,
+    }],
+    next_steps: [],
+  });
+  const { deps, rec } = makeDeps([explicit]);
+  deps.getIssueDetail = async () => makeIssueWithR1Risk("low");
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(riskPropCfg, 1, 2, {}, 0, deps);
+  });
+  assert.equal(outcome.to, "fix-2");
+  assert.equal(outcome.summary, "1 blocking findings");
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+  const review = rec.comments.find((body) => body.startsWith("## Review 2"));
+  assert.ok(review);
+  assert.equal(extractBlockingKeysFromComment(review!).size, 1);
+  assert.match(review!, /fix the release path/);
+});
+
 // 4.4: (b) standard-risk review-1 + medium finding + flag on → still routes to fix-2
 test("#232 regression (b): standard-risk review-1 + medium finding + risk_proportional:true → routes to fix-2", async (t) => {
   const { deps, rec } = makeDeps([NA_MEDIUM]);

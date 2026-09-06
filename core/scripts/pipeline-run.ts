@@ -56,6 +56,7 @@ import {
   bindEpochRestartWorktreeToHead,
   isLaterStageForReviewCurrency,
   reconcileLaterStageReviewCurrency,
+  type EpochRestartWorktreeBindDeps,
   type LaterStageReviewCurrencyDeps,
 } from "./stages/later-stage-review-currency.ts";
 import { withLock, runStateDir, isLivePlanningActive, tryAcquireLivePlanningMarker } from "./lock.ts";
@@ -769,6 +770,8 @@ export interface AdvanceDeps {
   resolveReviewedShaCurrency?: LaterStageReviewCurrencyDeps["resolveCurrency"];
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   gitInWorktree?: typeof gitInWorktree;
+  /** Missing-worktree rematerialization seam for exact-candidate epoch restart. */
+  rematerializeMissingWorktree?: EpochRestartWorktreeBindDeps["rematerializeMissingWorktree"];
   postComment?: typeof postComment;
   postPrComment?: typeof postPrComment;
   addLabelToPr?: typeof addLabelToPr;
@@ -2729,6 +2732,9 @@ export async function runAdvance(
           getPrCommits: deps.getPrCommits ?? getPrCommits,
           getGhActor: deps.getGhActor ?? getGhActor,
           resolveCurrency: deps.resolveReviewedShaCurrency,
+          internalCandidateTransitions: runDir
+            ? await readEvents(runDir, runStoreDeps).catch(() => [])
+            : [],
         },
       );
       if (laterCurrency.kind === "current") return { kind: "current" };
@@ -2749,6 +2755,7 @@ export async function runAdvance(
             {
               getOnDiskForIssue: deps.getOnDiskForIssue ?? getOnDiskForIssue,
               gitInWorktree: deps.gitInWorktree ?? gitInWorktree,
+              rematerializeMissingWorktree: deps.rematerializeMissingWorktree,
               resolveOpenPrHead: async () => {
                 const live = await readLivePrHead();
                 return live || null;

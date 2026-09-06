@@ -689,6 +689,7 @@ test("maybeArchiveOpenspec: records a gate_result event when archived", async (t
     openspecIsActive: () => true,
     gitInWorktree: (() => {
       let addCalled = false;
+      let commitCalled = false;
       return (async (_p: string, args: string[]) => {
         if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
         if (args[0] === "add") { addCalled = true; return { stdout: "", stderr: "", code: 0 }; }
@@ -697,7 +698,17 @@ test("maybeArchiveOpenspec: records a gate_result event when archived", async (t
             ? { stdout: ` M openspec/specs/${CHANGE_ID}/spec.md`, stderr: "", code: 0 }
             : { stdout: "", stderr: "", code: 0 };
         }
-        if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
+        if (args[0] === "commit") {
+          commitCalled = true;
+          return { stdout: "", stderr: "", code: 0 };
+        }
+        if (args[0] === "rev-parse") {
+          return {
+            stdout: commitCalled ? `${"b".repeat(40)}\n` : `${"a".repeat(40)}\n`,
+            stderr: "",
+            code: 0,
+          };
+        }
         return { stdout: "", stderr: "", code: 0 };
       }) as AdvancePreMergeDeps["gitInWorktree"];
     })(),
@@ -723,6 +734,18 @@ test("maybeArchiveOpenspec: records a gate_result event when archived", async (t
   assert.equal(events.length, 1);
   assert.equal(events[0].result, "pass");
   assert.equal(events[0].reason, CHANGE_ID);
+  const transitions = appendedEvents(appended).filter(
+    (e) => e.type === "pipeline_internal_candidate_transition",
+  );
+  assert.deepEqual(transitions, [{
+    schema_version: 1,
+    type: "pipeline_internal_candidate_transition",
+    at: transitions[0]?.at,
+    cause: "openspec_archive",
+    from_sha: "a".repeat(40),
+    to_sha: "b".repeat(40),
+    issue: ISSUE,
+  }]);
 });
 
 test("maybeArchiveOpenspec: records a gate_result event when blocked (archive CLI failure)", async (t) => {
