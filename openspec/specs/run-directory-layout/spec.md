@@ -3,6 +3,28 @@
 ## Purpose
 TBD - created by archiving change desktop-run-artifact-contract. Update Purpose after archive.
 ## Requirements
+
+### Requirement: Run artifacts survive managed worktree cleanup
+
+When a pipeline command starts from a linked worktree, the system SHALL store
+its run directory beneath the repository's persistent primary registered
+worktree. The run directory SHALL remain writable while the managed linked
+worktree is removed and while terminal events, summaries, metrics, and
+write-health records are finalized.
+
+#### Scenario: Ready-to-deploy removes its linked worktree
+
+- **WHEN** a stateful advance reaches ready-to-deploy from a managed linked
+  worktree
+- **THEN** the linked worktree may be removed without removing the run directory
+- **AND** terminal finalization can append events and write the final summary,
+  metrics, and write-health records
+
+#### Scenario: Primary checkout discovery is unavailable
+
+- **WHEN** Git cannot enumerate registered worktrees
+- **THEN** the system falls back to the caller checkout for backward-compatible
+  run storage
 ### Requirement: Pipeline creates a stable, crash-safe run directory before the first stage
 The pipeline orchestrator SHALL create a run directory at `.agent-pipeline/runs/<run-id>/` before any stage handler is called for a dispatch cycle. The `<run-id>` SHALL be a deterministic, filesystem-safe string formed from the issue number and the UTC dispatch start timestamp including milliseconds (e.g. `<issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ>`). Millisecond precision is required so that two dispatches for the same issue starting in the same second produce distinct run directories. The run-id SHALL remain constant across all stages within a single dispatch cycle.
 
@@ -29,7 +51,9 @@ When `pipeline run <N> --detach` is used, the launcher SHALL pin a
 `--run-id`) so both share one run directory, and SHALL report that run-id/path to the caller.
 The pinned run-store directory SHALL be rooted at the **resolved repository root** — the git
 root of the resolved `--repo-path`, or of the current working directory — and SHALL NOT be
-derived from an unvalidated start directory; when no repository root can be resolved, the
+derived from an unvalidated start directory. When that root is a disposable linked worktree,
+the launcher SHALL resolve and publish the persistent primary-worktree run-store path used by
+the inner run. When no repository root can be resolved, the
 launcher SHALL refuse the launch rather than pin a run-store path (see the detached-launcher
 capability). The detached run's `events.jsonl` and `terminal.log` — not the wrapper's
 `pipeline.log`/`sentinel.json` — are the machine-readable Pipeline Desk contract.
@@ -56,6 +80,12 @@ capability). The detached run's `events.jsonl` and `terminal.log` — not the wr
 
 - **WHEN** `pipeline run <N> --detach --json-events` is invoked
 - **THEN** the inner detached run SHALL receive `--json-events`
+
+#### Scenario: Detached launch begins in a disposable linked worktree
+
+- **WHEN** a detached launch resolves its repository root to a registered linked worktree
+- **THEN** `run-store.json` and the reported structured paths SHALL point beneath the persistent primary worktree
+- **AND** the inner run SHALL write to those same paths after the linked worktree is removed
 
 #### Scenario: run store is pinned at the repository root, not the launch directory
 
@@ -240,4 +270,3 @@ because `engine.version` (or other pre-#763 engine identity) is present.
   but no `discovery_channel` field
 - **THEN** the run-level discovery channel SHALL be treated as missing-attribution
 - **AND** collectors SHALL NOT count that arrival as `live-run`
-

@@ -30,6 +30,27 @@ Item-local Cooling created by a Recovery Episode SHALL persist the candidate epo
 - **THEN** RecoverySupervisor SHALL persist a new Recovery Episode for that key
 - **AND** the prior episode's cursor SHALL NOT authorize treatment on the new key
 
+#### Scenario: Candidate movement supersedes an interrupted old-epoch claim
+
+- **WHEN** a non-candidate-changing recovery claim remains `started` for epoch E1
+- **AND** fresh observation proves that the candidate has moved to epoch E2
+- **THEN** RecoverySupervisor SHALL durably supersede the E1 claim without executing it
+- **AND** SHALL admit a fresh E2 Recovery Episode in the same cycle
+- **AND** E1 attempt bounds, class-budget projections, or Cooling SHALL NOT cool or exhaust E2
+- **AND** a candidate-changing repair claim that itself produced E2 SHALL instead remain resumable for postcondition reconciliation
+
+#### Scenario: Adopted PR identity is delivery authority during fix recovery
+
+- **WHEN** a managed recovery worktree uses a synthetic branch name that differs from its linked adopted PR head branch
+- **THEN** Pipeline SHALL bind the linked PR branch as delivery authority before invoking the fix harness
+- **AND** that authority SHALL identify an open, same-repository PR head using GitHub's repository-qualified head identity; a closed, unreadable, or cross-repository head SHALL fail closed before harness mutation
+- **AND** a harness-created follow-up commit, delegated-executor synchronization, timeout recovery, pre-merge autofix, merge-queue mechanical repair, RecoverySupervisor repair/replay, and final push SHALL retain that delivery authority rather than targeting the synthetic branch
+- **AND** a pipeline-owned push from the synthetic workspace SHALL use an explicit local-HEAD-to-delivery-branch refspec
+- **AND** when the worktree HEAD exactly equals the live linked PR HEAD after an external fix, the linked PR HEAD SHALL prove the external commit is delivered
+- **AND** the synthetic managed branch SHALL NOT cause Pipeline to amend or push-rewrite that commit
+- **AND** an absent workspace at a fix or later stage SHALL be rematerialized on a stable synthetic managed branch at the verified linked PR head without requiring the delivery branch to use a `pipeline/*` name
+- **AND** an unreadable or moved linked PR HEAD SHALL fail closed
+
 #### Scenario: Prose variation does not reset the cursor
 
 - **WHEN** two observations differ only in incidental formatting or comment prose and normalize to the same evidence identity

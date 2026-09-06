@@ -292,6 +292,7 @@ export function mergeEnsembleVerdicts(
     winnerAgentIndex: number;
     maxSevRank: number;
     maxConfidence: number;
+    explicitBlocking: boolean;
   };
   const groups = new Map<string, Group>();
   const keyOrder: string[] = [];
@@ -316,6 +317,7 @@ export function mergeEnsembleVerdicts(
           winnerAgentIndex: agentIndex,
           maxSevRank: sevRank,
           maxConfidence: conf ?? Number.NEGATIVE_INFINITY,
+          explicitBlocking: f.blocking === true,
         });
         keyOrder.push(key);
         continue;
@@ -345,6 +347,7 @@ export function mergeEnsembleVerdicts(
       if (conf !== undefined) {
         existing.maxConfidence = Math.max(existing.maxConfidence, conf);
       }
+      existing.explicitBlocking ||= f.blocking === true;
       // Canonical severity/confidence always reflect maxes even if body fields
       // came from an earlier agent that had lower confidence later raised.
       const sev = (["low", "medium", "high", "critical"] as const)[
@@ -359,6 +362,7 @@ export function mergeEnsembleVerdicts(
               ? existing.winner.confidence
               : 0)
             : existing.maxConfidence,
+        ...(existing.explicitBlocking ? { blocking: true } : {}),
       };
     }
   }

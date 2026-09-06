@@ -4,11 +4,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   bindEpochRestartWorktreeToHead,
+  hasPipelineInternalCandidateTransition,
   isLaterStageForReviewCurrency,
   reconcileLaterStageReviewCurrency,
 } from "../scripts/stages/later-stage-review-currency.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
-import { worktreePath } from "../scripts/worktree.ts";
+import { ensureManagedWorktree, worktreePath } from "../scripts/worktree.ts";
 
 const SHA_S = "a".repeat(40);
 const SHA_H = "b".repeat(40);
@@ -104,6 +105,72 @@ test("reconcileLaterStageReviewCurrency: pipeline-internal-only stays current", 
     assert.equal(result.headSha, SHA_INTERNAL);
     assert.match(result.reason, /pipeline-internal/);
   }
+});
+
+test("pipeline-owned transition chain is exact and ignores malformed or wrong-cause events", () => {
+  const events = [
+    { type: "pipeline_internal_candidate_transition", cause: "openspec_archive", from_sha: SHA_S, to_sha: SHA_INTERNAL },
+    { type: "pipeline_internal_candidate_transition", cause: "openspec_archive", from_sha: SHA_INTERNAL, to_sha: SHA_H },
+    { type: "pipeline_internal_candidate_transition", cause: "developer", from_sha: SHA_S, to_sha: SHA_J },
+    { type: "pipeline_internal_candidate_transition", cause: "openspec_archive", from_sha: "bad", to_sha: SHA_J },
+  ];
+  assert.equal(hasPipelineInternalCandidateTransition(events, SHA_S, SHA_H), true);
+  assert.equal(hasPipelineInternalCandidateTransition(events, SHA_S, SHA_J), false);
+  assert.equal(hasPipelineInternalCandidateTransition(events, SHA_H, SHA_S), false);
+});
+
+test("reconcileLaterStageReviewCurrency: durable archive transition covers commit-list lag", async () => {
+  const result = await reconcileLaterStageReviewCurrency(
+    cfg(),
+    1478,
+    "ready-to-deploy",
+    detailWithReview(SHA_S),
+    {
+      ...actorDeps(),
+      getPrForIssue: async () => 99,
+      getPrDetail: async () => ({ number: 99, head_sha: SHA_INTERNAL } as never),
+      resolveCurrency: async () => ({ status: "unknown" }),
+      internalCandidateTransitions: [{
+        type: "pipeline_internal_candidate_transition",
+        cause: "openspec_archive",
+        from_sha: SHA_S,
+        to_sha: SHA_INTERNAL,
+      }],
+    },
+  );
+  assert.equal(result.kind, "current");
+  if (result.kind === "current") {
+    assert.equal(result.reviewedSha, SHA_S);
+    assert.equal(result.headSha, SHA_INTERNAL);
+    assert.match(result.reason, /pipeline-internal/);
+  }
+});
+
+test("reconcileLaterStageReviewCurrency: stale archive head never authorizes a later developer push", async () => {
+  let reads = 0;
+  const result = await reconcileLaterStageReviewCurrency(
+    cfg(),
+    1478,
+    "ready-to-deploy",
+    detailWithReview(SHA_S),
+    {
+      ...actorDeps(),
+      getPrForIssue: async () => 99,
+      getPrDetail: async () => ({
+        number: 99,
+        head_sha: reads++ < 1 ? SHA_INTERNAL : SHA_H,
+      } as never),
+      resolveCurrency: async () => ({ status: "unknown" }),
+      internalCandidateTransitions: [{
+        type: "pipeline_internal_candidate_transition",
+        cause: "openspec_archive",
+        from_sha: SHA_S,
+        to_sha: SHA_INTERNAL,
+      }],
+    },
+  );
+  assert.equal(result.kind, "return-to-review");
+  if (result.kind === "return-to-review") assert.equal(result.headSha, SHA_H);
 });
 
 test("reconcileLaterStageReviewCurrency: exact SHA match stays current", async () => {
@@ -451,15 +518,79 @@ function gitCallsRecorder() {
   };
 }
 
-test("bindEpochRestartWorktreeToHead: missing worktree fails closed without git", async () => {
+test("bindEpochRestartWorktreeToHead: failed missing-worktree rematerialization fails closed", async () => {
   const rec = gitCallsRecorder();
   const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
     getOnDiskForIssue: async () => null,
     gitInWorktree: rec.git,
+    rematerializeMissingWorktree: async () => ({
+      result: "fail",
+      worktree: null,
+      reason: "no recoverable remote",
+      blockerKind: "worktree-missing",
+    }),
   });
   assert.equal(result.kind, "fail-closed");
-  assert.match(result.reason, /no managed worktree on disk/);
+  assert.match(result.reason, /rematerialization failed.*no recoverable remote/);
   assert.equal(rec.calls.length, 0);
+});
+
+test("bindEpochRestartWorktreeToHead: rematerializes the exact PR head after park cleanup", async () => {
+  const rec = gitCallsRecorder();
+  rec.setHead(SHA_H);
+  let rematerialized = 0;
+  const result = await bindEpochRestartWorktreeToHead(bindCfg(), BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => null,
+    gitInWorktree: rec.git,
+    resolveOpenPrHead: async () => SHA_H,
+    rematerializeMissingWorktree: async (config, issue) => {
+      rematerialized++;
+      assert.equal(config.base_branch, "main");
+      assert.equal(issue, BIND_ISSUE);
+      return {
+        result: "pass",
+        worktree: { path: managedWtPath(), slug: BIND_SLUG, branch: `issue/${BIND_ISSUE}-${BIND_SLUG}` },
+        reason: "rematerialized from open PR head",
+      };
+    },
+  });
+  assert.equal(rematerialized, 1);
+  assert.equal(result.kind, "bound");
+  if (result.kind === "bound") assert.equal(result.worktreeHead, SHA_H);
+  assert.equal(rec.calls.some((args) => args[0] === "reset"), false);
+});
+
+test("bindEpochRestartWorktreeToHead: rematerializes an adopted PR after park cleanup (#1478)", async () => {
+  const rec = gitCallsRecorder();
+  rec.setHead(SHA_H);
+  const adoptedSlug = "adopted-pr-1480";
+  const cfg = bindCfg();
+  const adoptedPath = worktreePath(cfg, BIND_ISSUE, adoptedSlug);
+  let createdSlug = "";
+  const result = await bindEpochRestartWorktreeToHead(cfg, BIND_ISSUE, SHA_H, {
+    getOnDiskForIssue: async () => null,
+    gitInWorktree: rec.git,
+    resolveOpenPrHead: async () => SHA_H,
+    rematerializeMissingWorktree: async (config, issue) =>
+      ensureManagedWorktree(config, issue, {
+        recoveryTarget: {
+          branch: "fix/release-convergence-durable",
+          headSha: SHA_H,
+          prNumber: 1480,
+        },
+        getOnDiskForIssue: async () => null,
+        gitCmd: async () => ({ stdout: "", stderr: "", code: 0 }),
+        resolveOpenPrHeadForBranch: async () => null,
+        createWorktree: async (_cfg, _issue, slug) => {
+          createdSlug = slug;
+          return { path: adoptedPath, branch: `pipeline/${BIND_ISSUE}-${slug}` };
+        },
+        gitInWorktree: async () => ({ stdout: `${SHA_H}\n`, stderr: "", code: 0 }),
+      }),
+  });
+  assert.equal(createdSlug, adoptedSlug);
+  assert.equal(result.kind, "bound");
+  if (result.kind === "bound") assert.equal(result.worktreeHead, SHA_H);
 });
 
 test("bindEpochRestartWorktreeToHead: live PR HEAD J during bind does not move worktree to H", async () => {

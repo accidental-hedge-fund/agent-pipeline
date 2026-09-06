@@ -51,11 +51,15 @@ import {
 } from "./worktree-dirt.ts";
 import {
   boundExcerpt,
+  buildToolchainFingerprint,
   buildTesterEvidence,
   DEFAULT_TESTER_EVIDENCE_CONFIG,
   normalizeCandidateSha,
   normalizeTesterProducerObservation,
+  readTesterEvidence,
   runAllowlistedExtractors,
+  stableStringify,
+  worktreeIdFromPath,
   writeTesterEvidence,
   type TesterCommandStatus,
   type TesterOverallStatus,
@@ -198,6 +202,65 @@ export interface TestGateDeps {
     evidence: TesterEvidence,
     opts?: { maxArtifactChars?: number; runStoreDeps?: RunStoreDeps },
   ) => Promise<WriteTesterEvidenceResult>;
+  /** Find a prior exact-candidate suite record. Production scans sibling runs. */
+  findReusableTesterEvidence?: (
+    runDir: string,
+    issueNumber: number,
+    expected: TesterEvidence,
+  ) => Promise<TesterEvidence | null>;
+  resolvePinnedEngineIdentity?: typeof resolvePinnedEngineIdentity;
+}
+
+/**
+ * A suite result is reusable only when every execution-affecting identity is
+ * unchanged. Delivery-local fields (run/worktree/PR) are intentionally not
+ * execution inputs and are rebound when the record is adopted.
+ */
+export function isReusablePassedTesterEvidence(
+  prior: TesterEvidence,
+  expected: TesterEvidence,
+): boolean {
+  if (prior.issue !== expected.issue) return false;
+  if (!normalizeCandidateSha(prior.candidate_sha) ||
+      normalizeCandidateSha(prior.candidate_sha) !== normalizeCandidateSha(expected.candidate_sha)) return false;
+  if (prior.overall_status !== "passed" || prior.commands.length === 0) return false;
+  if (prior.commands.some((row) => row.status !== "passed" || row.exit_code !== 0)) return false;
+  if (prior.config_digest !== expected.config_digest) return false;
+  if (stableStringify(prior.toolchain_fingerprint) !== stableStringify(expected.toolchain_fingerprint)) return false;
+  if (prior.producer.engine_version !== expected.producer.engine_version) return false;
+  const a = prior.evidence_subject;
+  const b = expected.evidence_subject;
+  if (!a || !b) return false;
+  return a.domain === b.domain &&
+    a.issue === b.issue &&
+    a.candidate_sha === b.candidate_sha &&
+    a.diff_hash === b.diff_hash &&
+    a.policy_hash === b.policy_hash &&
+    a.engine_fingerprint === b.engine_fingerprint &&
+    a.verifier_fingerprint === b.verifier_fingerprint &&
+    a.required_evidence_set_revision === b.required_evidence_set_revision;
+}
+
+async function findReusableTesterEvidence(
+  runDir: string,
+  issueNumber: number,
+  expected: TesterEvidence,
+): Promise<TesterEvidence | null> {
+  const runsRoot = path.dirname(runDir);
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(runsRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === path.basename(runDir) ||
+        !entry.name.startsWith(`${issueNumber}-`)) continue;
+    const read = await readTesterEvidence(path.join(runsRoot, entry.name));
+    if (read.status !== "ok" || read.evidence.run_id !== entry.name) continue;
+    if (isReusablePassedTesterEvidence(read.evidence, expected)) return read.evidence;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +425,7 @@ export async function runTestGate(
       // fingerprint prefers trusted-surface effective hash when the run has a
       // decision. Blocked decisions omit subject emission (fail closed) but
       // MUST still persist the suite record after a successful command (#1226).
-      const engineId = resolvePinnedEngineIdentity();
+      const engineId = (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)();
       const engineFp = engineId
         ? buildEngineFingerprint({
             version: engineId.version,
@@ -721,6 +784,109 @@ export async function runTestGate(
           enabled: true,
         },
       );
+    }
+  }
+
+  // A fresh nested advance must not re-run an unchanged, expensive suite merely
+  // because it minted a new physical run id. Reuse is fail-closed across the
+  // exact commit, effective gate config, toolchain, engine, verifier surface,
+  // and required evidence-set revision. The prior artifact is schema-validated
+  // by readTesterEvidence before this predicate sees it.
+  if (runDir) {
+    let candidateSha: string | null = null;
+    try {
+      candidateSha = normalizeCandidateSha(await gitHeadFn(wtPath));
+    } catch {
+      candidateSha = null;
+    }
+    const engineId = (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)();
+    if (candidateSha && engineId) {
+      const engineFp = buildEngineFingerprint({
+        version: engineId.version,
+        templates_fingerprint: engineId.templates_fingerprint,
+        ...(engineId.commit_sha ? { commit_sha: engineId.commit_sha } : {}),
+      });
+      let trustedSurface: { outcome: string; effective_verifier_hash: string | null } | null = null;
+      try {
+        const { readTrustedSurfaceDecision, defaultRunStoreDeps } = await import("./run-store.ts");
+        trustedSurface = await readTrustedSurfaceDecision(
+          runDir,
+          runStoreDeps ?? defaultRunStoreDeps,
+        );
+      } catch {
+        trustedSurface = null;
+      }
+      const verifierFp = resolveVerifierFingerprint({
+        engineFingerprint: engineFp,
+        trustedSurface,
+      });
+      if (verifierFp) {
+        const instant = gateStartedAt.toISOString().replace(/\.\d+Z$/, "Z");
+        const expected = buildTesterEvidence({
+          candidateSha,
+          runId: path.basename(runDir),
+          issue: issueNumber,
+          wtPath,
+          enabled: true,
+          commandIdentity: label,
+          timeoutSec: cfg.test_gate.timeout,
+          maxOutputChars,
+          startedAt: instant,
+          endedAt: instant,
+          durationMs: 0,
+          overallStatus: "passed",
+          lastCommand: {
+            identity: label,
+            exitCode: 0,
+            durationMs: 0,
+            status: "passed",
+            output: "",
+          },
+          toolchain: buildToolchainFingerprint(),
+          domain: (cfg.domain || cfg.repo || "").trim() || undefined,
+          engineVersion: engineId.version,
+          engineFingerprint: engineFp,
+          verifierFingerprint: verifierFp,
+          requiredEvidenceSetRevision: buildRequiredEvidenceSetRevisionFromGates({
+            testGateEnabled: cfg.test_gate?.enabled,
+            evalGateEnabled: cfg.eval_gate?.enabled,
+            visualGateEnabled: cfg.visual_gate?.enabled,
+            shipcheckGateEnabled: cfg.shipcheck_gate?.enabled,
+          }),
+        });
+        const reusable = await (
+          deps.findReusableTesterEvidence ?? findReusableTesterEvidence
+        )(runDir, issueNumber, expected).catch(() => null);
+        if (reusable) {
+          const adopted: TesterEvidence = {
+            ...reusable,
+            run_id: path.basename(runDir),
+            worktree_id: worktreeIdFromPath(wtPath),
+            evidence_subject: reusable.evidence_subject
+              ? { ...reusable.evidence_subject, run_id: path.basename(runDir) }
+              : undefined,
+          };
+          const write = await (deps.writeTesterEvidence ?? writeTesterEvidence)(
+            runDir,
+            adopted,
+            { maxArtifactChars, runStoreDeps },
+          );
+          if (write.ok) {
+            console.log(
+              `[pipeline] #${issueNumber}: reusing exact-candidate test gate evidence ` +
+                `from run ${reusable.run_id} (${candidateSha.slice(0, 12)})`,
+            );
+            return {
+              skipped: false,
+              passed: true,
+              attempts: 0,
+              recorded_required_exit_0: false,
+              required_command_exit_code: 0,
+              persist: { ok: true, candidate_sha: candidateSha },
+            };
+          }
+        }
+      }
     }
   }
 

@@ -77,9 +77,25 @@ function makeDeps(opts: {
   ceilingAction: "park" | "demote_and_advance";
   runDeltaReview?: RunDeltaReviewFn;
   getCommitDeltaDiff?: () => Promise<string>;
+  priorCeilingSha?: string;
+  postCeilingDeltaSha?: string;
 }): { deps: ShaGateDeps; rec: Rec; cfg: PipelineConfig } {
   const rec: Rec = { comments: [], transitions: [], blocked: [], createIssueCalls: [], addIssueCommentCalls: [] };
   const comments = fourPriorDeltaComments(opts.finalBlocking);
+  if (opts.priorCeilingSha) {
+    comments.push({
+      author: TEST_ACTOR,
+      body:
+        "## Pipeline: Pre-merge delta round ceiling reached — human decision required\n" +
+        `<!-- reviewed-sha: ${opts.priorCeilingSha} -->`,
+    });
+  }
+  if (opts.postCeilingDeltaSha) {
+    comments.push({
+      author: TEST_ACTOR,
+      body: deltaComment(opts.postCeilingDeltaSha, computeDiffHash(diffFor(4)), opts.finalBlocking),
+    });
+  }
   const cfg = {
     review_policy: {
       block_threshold: "low", min_confidence: 0,
@@ -170,7 +186,13 @@ test("enforceReviewShaGate: ceiling_action demote_and_advance demotes below-high
   assert.equal(rec.blocked.length, 0);
   assert.equal(rec.createIssueCalls.length, 1, "a single tracked follow-up issue is filed");
   assert.match(rec.createIssueCalls[0].title, /Pre-merge delta review ceiling/);
-  assert.ok(rec.comments.some((c) => /demoted and deferred/.test(c)));
+  const demotion = rec.comments.find((c) => /demoted and deferred/.test(c));
+  assert.ok(demotion);
+  assert.match(
+    demotion,
+    new RegExp(`<!-- reviewed-sha: ${SHA_HEAD} -->`),
+    "the demoted ceiling must bind the candidate it exhausted so exactly one successor can reset it",
+  );
   assert.ok(rec.comments.some((c) => /Finding override/.test(c)), "an audited override comment must be recorded for the demoted finding");
 });
 
@@ -212,6 +234,52 @@ test("enforceReviewShaGate: below the cap, the existing delta-review path is unc
     await enforceReviewShaGate(cfg, 483, 99, deps);
   });
   assert.equal(reviewerCalls, 1, "below the cap, the delta reviewer runs exactly as before");
+});
+
+test("enforceReviewShaGate: a fixed successor gets reviewed after a superseded ceiling", async (t) => {
+  let reviewerCalls = 0;
+  const { deps, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING],
+    maxDeltaRounds: 4,
+    ceilingAction: "park",
+    priorCeilingSha: SHA_4,
+    runDeltaReview: async () => {
+      reviewerCalls += 1;
+      return { verdict: "approve", findings: [], summary: "fixed" } as DeltaReviewResult;
+    },
+    getCommitDeltaDiff: async () => diffFor(5),
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfg, 483, 99, deps);
+  });
+  assert.equal(reviewerCalls, 1, "stale exhausted history must not park the successor without review");
+});
+
+test("enforceReviewShaGate: H1 ceiling then H2 delta then H3 fix routes to bounded full review", async (t) => {
+  let reviewerCalls = 0;
+  const { deps, rec, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING],
+    maxDeltaRounds: 4,
+    ceilingAction: "park",
+    priorCeilingSha: SHA_3,
+    postCeilingDeltaSha: SHA_4,
+    runDeltaReview: async () => {
+      reviewerCalls += 1;
+      return { verdict: "approve", findings: [], summary: "must not run" } as DeltaReviewResult;
+    },
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 483, 99, deps);
+  });
+  assert.equal(reviewerCalls, 0, "H3 must not receive another unbounded delta review");
+  assert.deepEqual(out, {
+    advanced: true,
+    from: "pre-merge",
+    to: "review-2",
+    summary: "delta-review budget exhausted; superseding fix requires a fresh full review",
+  });
+  assert.deepEqual(rec.transitions.at(-1), { from: "pre-merge", to: "review-2" });
 });
 
 test("enforceReviewShaGate: hitting the delta-round ceiling never consumes max_adversarial_rounds budget", async (t) => {

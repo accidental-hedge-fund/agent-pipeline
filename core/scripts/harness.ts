@@ -144,6 +144,36 @@ export function papercutIdentityEnv(
   return env;
 }
 
+/** Factory/release controller authority must never leak into an agent harness.
+ * Agents may run the repository's own tests, whose behavior must not depend on
+ * the outer ship/FRG topology. Ordinary credentials and build inputs remain. */
+export function harnessChildOmittedEnvNames(): readonly string[] {
+  return Object.freeze([
+    "AGENT_PIPELINE_FACTORY_CONTROL",
+    "AGENT_PIPELINE_PRODUCTION_PIN",
+    "REPO_DIR",
+    "PIPELINE_CANDIDATE_ENGINE_ROOT",
+    "PIPELINE_PACK_LOOP_CANDIDATE_SHA",
+    "PIPELINE_STARTING_LOCK_PID",
+    "ALLOW_MERGE",
+    "PIPELINE_CANDIDATE_PROCESS_GUARD",
+    "PIPELINE_CANDIDATE_PROCESS_ROOT",
+    "PIPELINE_CANDIDATE_PROCESS_SHA",
+    "PIPELINE_CANDIDATE_PROCESS_READY_RECORD",
+    "PIPELINE_CANDIDATE_PROCESS_LOCKFILE_DIGEST",
+    "PIPELINE_CANDIDATE_PROCESS_LOCK",
+    "PIPELINE_CANDIDATE_PROCESS_LOCK_DIGEST",
+  ]);
+}
+
+export function harnessChildEnvOverlay(
+  additions: NodeJS.ProcessEnv | undefined,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...(additions ?? {}) };
+  for (const name of harnessChildOmittedEnvNames()) env[name] = undefined;
+  return env;
+}
+
 /** Run-store context for recording a `harness_timeout` event at cap-fire time
  *  (#398). Optional: bare `runCapped` callers (`testgate.ts`, `eval.ts`) pass
  *  none, and no event is recorded for them. */
@@ -711,7 +741,7 @@ export async function invoke(
             stage: opts.accounting.stage,
           }
         : undefined,
-      env: opts.env,
+      env: harnessChildEnvOverlay(opts.env),
       // The cost/usage-bearing envelope line always arrives last, so telemetry
       // capture keeps the tail of the stream rather than the head (#429).
       captureMode,

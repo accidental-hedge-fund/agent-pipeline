@@ -115,6 +115,58 @@ test("maybeArchiveOpenspec: worktree behind origin/<branch> is fast-forwarded be
   assert.equal((out as { status: string })?.status, "waiting", "sync + archive must proceed to waiting");
 });
 
+test("maybeArchiveOpenspec: adopted PR archive sync and push use the exact delivery branch (#1478)", async (t) => {
+  const deliveryBranch = "fix/adopted-delivery";
+  const gitCalls: string[][] = [];
+  let archived = false;
+  const gitInWorktree = (async (_p: string, args: string[]) => {
+    gitCalls.push([...args]);
+    if (args[0] === "status") {
+      return { stdout: archived ? " M openspec/specs/x/spec.md" : "", stderr: "", code: 0 };
+    }
+    if (args[0] === "fetch") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "rev-parse") {
+      if (args[1] === "HEAD") return { stdout: REVIEWED_HEAD, stderr: "", code: 0 };
+      if (args[1] === `origin/${deliveryBranch}`) return { stdout: REVIEWED_HEAD, stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as AdvancePreMergeDeps["gitInWorktree"];
+  const deps = baseDeps(gitInWorktree);
+  let active = true;
+  deps.listChangeDirs = () => active ? [CHANGE_ID] : [];
+  deps.changeDirExists = (_worktreePath, changeId) => active && changeId === CHANGE_ID;
+  deps.resolveLinkedPrDelivery = async () => ({
+    prNumber: 1480,
+    branch: deliveryBranch,
+    headSha: REVIEWED_HEAD,
+  });
+  deps.openspecArchive = (async (_worktreePath, changeId) => {
+    assert.equal(changeId, CHANGE_ID);
+    archived = true;
+    active = false;
+    return { success: true, unavailable: false, output: "" };
+  }) as AdvancePreMergeDeps["openspecArchive"];
+
+  let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps, undefined, 1480);
+  });
+
+  assert.equal((out as { status: string })?.status, "waiting", JSON.stringify(out));
+  assert.ok(gitCalls.some((a) =>
+    a[0] === "fetch" && a[2] === `${deliveryBranch}:refs/remotes/origin/${deliveryBranch}`
+  ));
+  const push = gitCalls.find((a) => a[0] === "push");
+  assert.deepEqual(push, [
+    "push",
+    `--force-with-lease=refs/heads/${deliveryBranch}:${REVIEWED_HEAD}`,
+    "origin",
+    `HEAD:${deliveryBranch}`,
+  ]);
+  assert.ok(!gitCalls.some((a) => a.includes(`origin/${BRANCH}`)), "stale synthetic remote must not authorize the archive");
+});
+
 test("maybeArchiveOpenspec: true divergence from origin/<branch> blocks with a SHA diagnostic, never forces (#579)", async (t) => {
   const gitCalls: string[][] = [];
   const archiveCalls: string[] = [];

@@ -792,14 +792,23 @@ test("runSharedMechanicalRepair uses injected shared repair path (no network)", 
     "surgical prompt body",
     cfg,
     {
+      async resolveLinkedPrDelivery() {
+        return {
+          branch: "fix/adopted",
+          headSha: "a".repeat(40),
+          prNumber: 7,
+          repository: "org/repo",
+        };
+      },
       async getOnDiskForIssue() {
         return { path: "/managed/wt", slug: "slug" };
       },
       async ensureManagedWorktree() {
         throw new Error("should not rematerialize when worktree exists");
       },
-      async gitInWorktree() {
-        throw new Error("git should not run when repair is injected");
+      async gitInWorktree(_cwd, args) {
+        assert.deepEqual(args, ["rev-parse", "HEAD"]);
+        return { code: 0, stdout: `${"a".repeat(40)}\n`, stderr: "" };
       },
       async performRepair(
         _cfg,
@@ -808,11 +817,18 @@ test("runSharedMechanicalRepair uses injected shared repair path (no network)", 
         findingsText,
         _title,
         wt,
+        ...rest
       ) {
         repairCalls += 1;
         assert.equal(issueNumber, 42);
         assert.equal(findingsText, "surgical prompt body");
         assert.equal(wt.path, "/managed/wt");
+        assert.deepEqual(rest.at(-1), {
+          branch: "fix/adopted",
+          headSha: "a".repeat(40),
+          prNumber: 7,
+          repository: "org/repo",
+        });
         return { status: "fix-committed", headSha: "abc123def" };
       },
       async invoke() {
@@ -823,6 +839,88 @@ test("runSharedMechanicalRepair uses injected shared repair path (no network)", 
   assert.equal(repairCalls, 1);
   assert.equal(result.succeeded, true);
   assert.equal(result.headSha, "abc123def");
+});
+
+test("runSharedMechanicalRepair rematerializes and repairs an adopted PR using exact delivery identity (#1478)", async () => {
+  const cfg = { harnesses: { implementer: "claude" } } as unknown as PipelineConfig;
+  const delivery = {
+    branch: "fix/adopted",
+    headSha: "a".repeat(40),
+    prNumber: 7,
+    repository: "org/repo",
+  };
+  let recoveryTarget: unknown;
+  let repairDelivery: unknown;
+  const result = await runSharedMechanicalRepair(
+    { issueNumber: 42, prNumber: 7, title: "fix me" },
+    "surgical prompt body",
+    cfg,
+    {
+      resolveLinkedPrDelivery: async () => delivery,
+      getOnDiskForIssue: async () => null,
+      ensureManagedWorktree: async (_cfg, _issue, deps) => {
+        recoveryTarget = deps?.recoveryTarget;
+        return {
+          result: "pass",
+          worktree: {
+            path: "/managed/wt",
+            slug: "adopted-pr-7",
+            branch: "pipeline/42-adopted-pr-7",
+          },
+          reason: "rematerialized",
+        };
+      },
+      gitInWorktree: async (_cwd, args) => {
+        assert.deepEqual(args, ["rev-parse", "HEAD"]);
+        return { code: 0, stdout: `${delivery.headSha}\n`, stderr: "" };
+      },
+      performRepair: async (...args) => {
+        repairDelivery = args.at(-1);
+        return { status: "fix-committed", headSha: "b".repeat(40) };
+      },
+      invoke: async () => {
+        throw new Error("injected repair owns invocation");
+      },
+    },
+  );
+  assert.equal(result.succeeded, true);
+  assert.deepEqual(recoveryTarget, {
+    branch: delivery.branch,
+    headSha: delivery.headSha,
+    prNumber: delivery.prNumber,
+  });
+  assert.deepEqual(repairDelivery, delivery);
+});
+
+test("runSharedMechanicalRepair rejects a stale present worktree before repair (#1478)", async () => {
+  const cfg = { harnesses: { implementer: "claude" } } as unknown as PipelineConfig;
+  let repairCalls = 0;
+  const result = await runSharedMechanicalRepair(
+    { issueNumber: 42, prNumber: 7, title: "fix me" },
+    "surgical prompt body",
+    cfg,
+    {
+      resolveLinkedPrDelivery: async () => ({
+        branch: "fix/adopted",
+        headSha: "a".repeat(40),
+        prNumber: 7,
+        repository: "org/repo",
+      }),
+      getOnDiskForIssue: async () => ({ path: "/managed/wt", slug: "slug" }),
+      gitInWorktree: async () => ({
+        code: 0,
+        stdout: `${"b".repeat(40)}\n`,
+        stderr: "",
+      }),
+      performRepair: async () => {
+        repairCalls += 1;
+        return { status: "fix-committed", headSha: "c".repeat(40) };
+      },
+    },
+  );
+  assert.equal(result.succeeded, false);
+  assert.match(result.evidence, /does not match live PR head/);
+  assert.equal(repairCalls, 0);
 });
 
 // ---------------------------------------------------------------------------

@@ -4,8 +4,8 @@
 // reconcile PR HEAD against the latest review SHA using the shared currency
 // surface. A non-pipeline-internal HEAD starts a new candidate epoch and
 // returns the issue to review-1 after the managed worktree is bound to that
-// HEAD (or fail-closed if it cannot be, including when no managed worktree
-// exists). Pipeline-internal-only movement stays current. Unreadable PR/HEAD
+// HEAD (rematerializing an absent managed worktree from the linked PR, or
+// failing closed if that cannot be done). Pipeline-internal-only movement stays current. Unreadable PR/HEAD
 // fails closed. This is not a second SHA-gate product.
 
 import * as path from "node:path";
@@ -26,6 +26,7 @@ import {
 import type { PipelineConfig } from "../types.ts";
 import {
   branchName,
+  ensureManagedWorktree,
   getOnDiskForIssue,
   gitInWorktree,
   worktreePath,
@@ -76,6 +77,47 @@ export interface LaterStageReviewCurrencyDeps {
   getGhActor?: typeof getGhActor;
   extractReviewedSha?: typeof extractReviewedSha;
   resolveCurrency?: typeof resolveReviewedShaCurrency;
+  /** Durable pipeline-authored candidate transitions from the active run. */
+  internalCandidateTransitions?: readonly unknown[];
+}
+
+/**
+ * Prove an exact from→to chain using only pipeline-owned transition events.
+ * Unknown/malformed events are ignored; cycles are bounded by the event count.
+ */
+export function hasPipelineInternalCandidateTransition(
+  events: readonly unknown[],
+  fromSha: string,
+  toSha: string,
+): boolean {
+  const from = normalizeFullSha(fromSha);
+  const to = normalizeFullSha(toSha);
+  if (!from || !to) return false;
+  const edges = new Map<string, Set<string>>();
+  for (const raw of events) {
+    if (!raw || typeof raw !== "object") continue;
+    const event = raw as Record<string, unknown>;
+    if (event.type !== "pipeline_internal_candidate_transition") continue;
+    if (event.cause !== "openspec_archive") continue;
+    const a = normalizeFullSha(typeof event.from_sha === "string" ? event.from_sha : "");
+    const b = normalizeFullSha(typeof event.to_sha === "string" ? event.to_sha : "");
+    if (!a || !b || a === b) continue;
+    if (!edges.has(a)) edges.set(a, new Set());
+    edges.get(a)!.add(b);
+  }
+  const seen = new Set<string>([from]);
+  const pending = [from];
+  while (pending.length > 0 && seen.size <= events.length + 1) {
+    const current = pending.shift()!;
+    for (const next of edges.get(current) ?? []) {
+      if (next === to) return true;
+      if (!seen.has(next)) {
+        seen.add(next);
+        pending.push(next);
+      }
+    }
+  }
+  return false;
 }
 
 function mapReconcileToLaterStageAction(input: {
@@ -232,13 +274,48 @@ export async function reconcileLaterStageReviewCurrency(
   // Always re-read via the shared resolver, including after an initial exact-SHA
   // match. A developer push between the first HEAD read and later-stage dispatch
   // must not reuse the first observation as current.
-  const currency = await resolveCurrency(cfg, prNumber, reviewedSha, {
+  let currency = await resolveCurrency(cfg, prNumber, reviewedSha, {
     getPrDetail: getDetailPr,
     getPrCommits: getCommits,
   });
 
-  const observedHead =
-    currency.status === "superseded" ? currency.headSha : headSha;
+  // The currency resolver performs its own HEAD read. Re-read once more before
+  // applying a durable S→A pipeline transition: when its commit-list lookup is
+  // stale/unknown, the earlier `headSha` may already have been replaced by a
+  // developer push D. Only the newest observable head may be authorized by the
+  // exact transition edge. The delivery observer performs the final pre/post
+  // dispatch checks, closing movement after this reconciliation boundary.
+  let observedHead: string;
+  try {
+    observedHead = (await getDetailPr(cfg, prNumber)).head_sha;
+  } catch (err) {
+    return {
+      kind: "fail-closed",
+      reason: `later-stage review-currency: cannot confirm live PR HEAD: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (!observedHead) {
+    return {
+      kind: "fail-closed",
+      reason: "later-stage review-currency: live PR HEAD unreadable during confirmation; refusing to dispatch",
+    };
+  }
+  if (currency.status === "current" && observedHead !== headSha) {
+    currency = { status: "superseded", headSha: observedHead };
+  } else if (currency.status === "superseded" && currency.headSha !== observedHead) {
+    currency = { status: "superseded", headSha: observedHead };
+  }
+
+  if (
+    currency.status !== "current" &&
+    hasPipelineInternalCandidateTransition(
+      deps.internalCandidateTransitions ?? [],
+      reviewedSha,
+      observedHead,
+    )
+  ) {
+    currency = { status: "current" };
+  }
 
   return mapReconcileToLaterStageAction({
     cfg,
@@ -265,11 +342,13 @@ export interface EpochRestartWorktreeBindDeps {
   gitInWorktree?: typeof gitInWorktree;
   /** Live open-PR HEAD reader. When omitted, bind verifies the supplied target only. */
   resolveOpenPrHead?: () => Promise<string | null>;
+  rematerializeMissingWorktree?: typeof ensureManagedWorktree;
 }
 
 /**
- * Bind a present managed worktree to the new candidate HEAD before epoch-restarted
- * review. Missing worktrees fail closed so review cannot fall back to `cfg.repo_dir`.
+ * Bind a managed worktree to the new candidate HEAD before epoch-restarted
+ * review. Missing worktrees are rematerialized from the linked open PR and
+ * configured integration base, or fail closed so review cannot fall back to `cfg.repo_dir`.
  * Present HEAD mismatch uses the verified-head ancestor recipe (ff-only, then
  * reset --hard) scoped to the managed worktree path, or fails closed so review/test
  * never run on S. A live PR HEAD that moved past the bind target returns
@@ -303,11 +382,23 @@ export async function bindEpochRestartWorktreeToHead(
     };
   }
   if (!wt) {
-    return {
-      kind: "fail-closed",
-      reason:
-        "later-stage epoch restart: no managed worktree on disk; refusing to dispatch review from the integration checkout",
-    };
+    const rematerialize = deps.rematerializeMissingWorktree ?? ensureManagedWorktree;
+    let remat: Awaited<ReturnType<typeof ensureManagedWorktree>>;
+    try {
+      remat = await rematerialize(cfg, issueNumber);
+    } catch (err) {
+      return {
+        kind: "fail-closed",
+        reason: `later-stage epoch restart: managed worktree rematerialization failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    if (remat.result === "fail") {
+      return {
+        kind: "fail-closed",
+        reason: `later-stage epoch restart: managed worktree rematerialization failed: ${remat.reason}`,
+      };
+    }
+    wt = { path: remat.worktree.path, slug: remat.worktree.slug };
   }
 
   const expectedPath = worktreePath(

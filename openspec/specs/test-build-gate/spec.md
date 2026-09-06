@@ -5,6 +5,30 @@ The test/build gate runs the target repo's own test/build command in the worktre
 
 ## Requirements
 
+### Requirement: Exact immutable candidate evidence is reusable across runs
+
+The gate SHALL reuse a prior passed Tester evidence record for the same issue
+and candidate commit instead of executing the suite again only when the prior
+record is schema-valid and its effective command/config digest, allowlisted
+toolchain fingerprint, pinned engine identity, verifier surface, and required
+evidence-set revision all match the current gate. Before reuse, the current
+worktree SHALL pass the same product-dirt check required before execution. A
+changed or unavailable execution identity SHALL cause the command to run.
+
+#### Scenario: Fresh physical run evaluates an unchanged candidate
+
+- **WHEN** a fresh pipeline run reaches the test gate for a commit with matching
+  passed evidence under every execution identity
+- **THEN** the prior evidence is rebound to the fresh run identity
+- **AND** the test command is not executed again
+
+#### Scenario: Verifier or environment identity changed
+
+- **WHEN** candidate SHA matches but the gate config, toolchain, engine,
+  verifier surface, or required evidence set differs
+- **THEN** the prior evidence is not reusable
+- **AND** the test command executes normally
+
 ### Requirement: Disabled gate is skipped
 When `cfg.test_gate.enabled` is `false`, the gate SHALL return a skipped result immediately without detecting or running any command.
 
@@ -455,9 +479,9 @@ The test/build gate SHALL spawn the repo test/build command in a child environme
 - **THEN** timeout kill, process-group kill, and capture (including tooling-error vs clean-exit distinction) SHALL behave as already specified
 - **AND** isolation of the omitted names SHALL NOT change those mechanics
 
-### Requirement: Test-gate env isolation SHALL NOT rewrite the pipeline controller or harness environment
+### Requirement: Factory-authority env isolation SHALL preserve the controller and cover harness children
 
-The test/build gate's env isolation SHALL apply only to the spawned repo test/build command. The pipeline controller process environment SHALL remain unchanged. Harness children (implement, review, and fix) SHALL keep the existing `runCapped` contract: when no env overlay is supplied, spawn carries no `env` key and the child inherits the parent environment; when an additive overlay is supplied (papercut identity), those keys still merge on top of the parent environment.
+The pipeline controller process environment SHALL remain unchanged. Harness children (implement, review, and fix) SHALL omit the same factory topology, candidate-process lease data, and merge authority as repo test/build children because a harness may itself execute repository tests. Harness-specific additive identity such as papercut run/stage fields SHALL remain available.
 
 #### Scenario: controller keeps factory and merge variables
 
@@ -465,11 +489,12 @@ The test/build gate's env isolation SHALL apply only to the spawned repo test/bu
 - **AND** the test/build gate spawns a repo test/build command
 - **THEN** those names SHALL remain set on the controller process after the spawn
 
-#### Scenario: harness spawn without an env overlay still inherits the parent environment
+#### Scenario: harness-spawned repository CI cannot observe outer ship authority
 
-- **WHEN** a harness invocation supplies no env overlay
-- **THEN** spawn SHALL carry no `env` key
-- **AND** the harness child SHALL inherit the parent environment, including any factory topology or `ALLOW_MERGE` values present on the parent
+- **WHEN** a review, implementation, or fix harness is spawned by a ship/FRG controller
+- **AND** the harness runs repository CI
+- **THEN** the harness child SHALL NOT contain factory topology, candidate-process lease, or merge-authority names
+- **AND** ordinary credentials/build inputs and explicitly supplied pipeline run identity SHALL remain available
 
 ### Requirement: Injectable spawn tests SHALL prove omitted names are absent and an unrelated variable is preserved
 

@@ -199,9 +199,14 @@ A scoped override SHALL post an audited comment carrying a scope sentinel distin
 independent of its `severity` and `confidence` and independent of the active `review_policy`
 `block_threshold` / `min_confidence`. Such a finding SHALL NOT appear in the blocking set and SHALL
 NOT route the item to a fix round, even when its severity is `critical` or `high`. A finding whose
-`blocking` field is absent or `true` SHALL be classified exactly as before this change, by the
-severity threshold and confidence floor. The advisory record for the finding SHALL state that it
-was marked non-blocking by the reviewer.
+`blocking` field is absent SHALL be classified by the severity threshold and confidence floor. An
+explicit `blocking: true` SHALL satisfy the severity side of the policy even below the configured
+threshold, while still honoring the confidence floor. The advisory record for a `blocking: false`
+finding SHALL state that it was marked non-blocking by the reviewer.
+When ensemble findings are deduplicated by stable key, explicit blocking intent
+SHALL be merged monotonically: if any grouped finding has `blocking: true`, the
+merged finding SHALL retain `blocking: true` even when another agent supplies
+the winning body or higher confidence.
 
 #### Scenario: High-severity non-blocking finding does not block
 
@@ -209,16 +214,29 @@ was marked non-blocking by the reviewer.
   `blocking: false`
 - **THEN** that finding SHALL be advisory and the item SHALL advance rather than route to a fix round
 
+#### Scenario: Ensemble dedupe retains an explicit blocker
+
+- **WHEN** two ensemble findings share a stable key and one is explicitly blocking
+- **AND** a higher-confidence duplicate is explicitly advisory
+- **THEN** the merged finding SHALL retain `blocking: true`
+
 #### Scenario: Critical non-blocking finding does not block
 
 - **WHEN** a verdict contains a finding with `severity: "critical"` and `blocking: false`
 - **THEN** that finding SHALL be advisory and SHALL NOT appear in the blocking set
 
-#### Scenario: Unmarked finding still blocks
+#### Scenario: Unmarked finding still follows the severity policy
 
-- **WHEN** a verdict contains a finding with `severity: "high"` and no `blocking` field (or
-  `blocking: true`), at or above the policy threshold and confidence floor
+- **WHEN** a verdict contains a finding with `severity: "high"` and no `blocking` field, at or
+  above the policy threshold and confidence floor
 - **THEN** that finding SHALL block exactly as before this change
+
+#### Scenario: Explicit medium blocker survives a high threshold
+
+- **WHEN** a verdict contains a `medium` finding with `blocking: true`, confidence at or above the
+  floor, and an effective `block_threshold` of `high`
+- **THEN** that finding SHALL remain in the blocking set
+- **AND** the displayed blocking count and fix-round remediation input SHALL include it
 
 #### Scenario: Non-blocking finding is itemized in the advance audit record
 

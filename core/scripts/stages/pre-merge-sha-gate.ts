@@ -69,6 +69,8 @@ import {
 import {
   buildPriorRoundDigest,
   countDeltaRounds,
+  hasSupersededDeltaCeiling,
+  hasSupersededPostCeilingDelta,
   detectSuspectedChurn,
   priorAdvisoryFindings,
   priorAdvisorySurfaceFiles,
@@ -1076,10 +1078,30 @@ export async function enforceReviewShaGate(
       // reviewer, purely from the durable delta-review comment thread, so this
       // check never depends on run-local state.
       const deltaRoundCount = countDeltaRounds(detail.comments, {
-        actor, trustedOverrideActors: cfg.trusted_override_actors,
+        actor,
+        trustedOverrideActors: cfg.trusted_override_actors,
       });
       const deltaRoundCap = cfg.review_policy.max_delta_rounds;
-      if (deltaRoundCap > 0 && deltaRoundCount >= deltaRoundCap) {
+      const staleCeilingReset = hasSupersededDeltaCeiling(detail.comments, {
+        actor,
+        trustedOverrideActors: cfg.trusted_override_actors,
+        candidateSha: head,
+      });
+      const spentResetWasSuperseded = hasSupersededPostCeilingDelta(detail.comments, {
+        actor,
+        trustedOverrideActors: cfg.trusted_override_actors,
+        candidateSha: head,
+      });
+      if (deltaRoundCap > 0 && deltaRoundCount >= deltaRoundCap && spentResetWasSuperseded) {
+        await transitionFn(cfg, issueNumber, "pre-merge", "review-2");
+        return {
+          advanced: true,
+          from: "pre-merge",
+          to: "review-2",
+          summary: "delta-review budget exhausted; superseding fix requires a fresh full review",
+        };
+      }
+      if (deltaRoundCap > 0 && deltaRoundCount >= deltaRoundCap && !staleCeilingReset) {
         if (deps.runDir) {
           const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
           await appendEvent(deps.runDir, {
@@ -1126,7 +1148,14 @@ export async function enforceReviewShaGate(
         if (!shouldDemote) {
           await postCommentFn(
             cfg, issueNumber,
-            deltaRoundCeilingComment(cfg, deltaRoundCount, deltaRoundCap, cfg.review_policy.ceiling_action, outstanding),
+            deltaRoundCeilingComment(
+              cfg,
+              deltaRoundCount,
+              deltaRoundCap,
+              cfg.review_policy.ceiling_action,
+              outstanding,
+              head,
+            ),
           );
           // Round-ceiling exhaustion is engine-owned review recovery (#814 / #760):
           // unresolved findings remain blocking under review-findings; they do not
@@ -1159,7 +1188,14 @@ export async function enforceReviewShaGate(
 
         await postCommentFn(
           cfg, issueNumber,
-          deltaRoundCeilingDemotionComment(cfg, deltaRoundCount, deltaRoundCap, belowHigh, followupNumber),
+          deltaRoundCeilingDemotionComment(
+            cfg,
+            deltaRoundCount,
+            deltaRoundCap,
+            belowHigh,
+            followupNumber,
+            head,
+          ),
         );
 
         const ceilingTimestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");

@@ -9,6 +9,8 @@ import {
   DIGEST_MAX_CHARS,
   DIGEST_MAX_ENTRIES_PER_ROUND,
   DIGEST_MAX_ROUNDS,
+  hasSupersededDeltaCeiling,
+  hasSupersededPostCeilingDelta,
   matchSettledAlternative,
   matchSettledFinding,
   renderPriorRoundDigest,
@@ -1065,6 +1067,54 @@ test("countDeltaRounds: pure — same inputs return the same value twice, no I/O
   ];
   const opts = { actor: "pipeline-bot" };
   assert.equal(countDeltaRounds(comments, opts), countDeltaRounds(comments, opts));
+});
+
+test("hasSupersededDeltaCeiling: a fixed successor can escape a stale exhausted ceiling", () => {
+  const oldHead = "a".repeat(40);
+  const newHead = "b".repeat(40);
+  const comments = Array.from({ length: 4 }, () => ({
+    author: "pipeline-bot",
+    body: `${DELTA_REVIEW_MARKER_PREFIX} — needs-attention\n<!-- reviewed-sha: ${oldHead} -->`,
+  }));
+  comments.push({
+    author: "pipeline-bot",
+    body: `## Pipeline: Pre-merge delta round ceiling reached — human decision required\n<!-- reviewed-sha: ${oldHead} -->`,
+  });
+  assert.equal(countDeltaRounds(comments, { actor: "pipeline-bot" }), 4);
+  assert.equal(hasSupersededDeltaCeiling(comments, { actor: "pipeline-bot", candidateSha: oldHead }), false);
+  assert.equal(hasSupersededDeltaCeiling(comments, { actor: "pipeline-bot", candidateSha: newHead }), true);
+  comments.push({
+    author: "pipeline-bot",
+    body: `${DELTA_REVIEW_MARKER_PREFIX} — needs-attention\n<!-- reviewed-sha: ${newHead} -->`,
+  });
+  assert.equal(
+    hasSupersededDeltaCeiling(comments, { actor: "pipeline-bot", candidateSha: "c".repeat(40) }),
+    false,
+    "H1 ceiling → H2 review cannot grant another reset to H3",
+  );
+  assert.equal(
+    hasSupersededPostCeilingDelta(comments, {
+      actor: "pipeline-bot",
+      candidateSha: "c".repeat(40),
+    }),
+    true,
+    "H3 must leave the exhausted delta path for a bounded full review",
+  );
+});
+
+test("hasSupersededDeltaCeiling: demoted ceilings also bind and reset for one successor", () => {
+  const oldHead = "a".repeat(40);
+  const newHead = "b".repeat(40);
+  const comments = [{
+    author: "pipeline-bot",
+    body:
+      "## Pipeline: Pre-merge delta round ceiling — findings demoted and deferred\n" +
+      `<!-- reviewed-sha: ${oldHead} -->`,
+  }];
+  assert.equal(
+    hasSupersededDeltaCeiling(comments, { actor: "pipeline-bot", candidateSha: newHead }),
+    true,
+  );
 });
 
 // ---------------------------------------------------------------------------

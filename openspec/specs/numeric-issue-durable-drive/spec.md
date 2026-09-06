@@ -5,6 +5,22 @@ Makes mutating default numeric issue drive a compatibility alias for the canonic
 
 ## Requirements
 
+### Requirement: Numeric once is bounded at the owning lifecycle
+
+A mutating numeric invocation with `--once` SHALL drive at most one supervisor
+scheduling cycle and then return without recording a terminal stop solely for
+that pause. The nested advance SHALL also receive `--once`. The owning
+supervisor SHALL NOT immediately redispatch the same still-pending item in a
+second cycle during the same invocation.
+
+#### Scenario: One stage leaves the item pending
+
+- **WHEN** `pipeline <N> --once` advances one stage and the durable item remains
+  schedulable
+- **THEN** the child exits after that stage
+- **AND** the supervisor releases its lock and returns after its first cycle
+- **AND** a later invocation may resume the durable run
+
 ### Requirement: Mutating numeric invocation SHALL alias to the one-item durable supervisor
 
 Every mutating `pipeline <N>` invocation SHALL be a compatibility alias for the canonical one-item durable supervisor used by `pipeline single <N>`. Invocation syntax SHALL NOT change lifecycle ownership. Mutating numeric invocation and `pipeline single <N>` SHALL create or attach to the same durable run model: the same supervisor, recovery policy, attempt ledger, and terminal event contract. Mutating numeric invocation SHALL NOT call raw stage advancement as its top-level lifecycle owner. Numeric, single, and loop SHALL still never merge or deploy.

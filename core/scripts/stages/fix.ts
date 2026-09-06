@@ -11,6 +11,7 @@ import {
   findLatestCommentMatching,
   getGhActor,
   getIssueDetail,
+  getPrDetail,
   getPrForIssue,
   postComment,
   setBlocked,
@@ -121,11 +122,14 @@ import {
 } from "../transient-wrappers.ts";
 import {
   DEFAULT_GIT_PUSH_AUTH,
+  deliveryPushArgs,
   formatPushAuthFailure,
   gitExecForwardingEnv,
   prepareWorktreePushAuthEnv,
   runConfiguredGitPush,
 } from "../git-push-auth.ts";
+import { preflightDeliveryWorktreeHead, resolveLinkedPrDelivery } from "../pr-delivery.ts";
+export { resolveLinkedPrDelivery } from "../pr-delivery.ts";
 
 export interface AdvanceFixOpts {
   dryRun?: boolean;
@@ -198,14 +202,9 @@ export interface AdvanceFixDeps {
    * used. Tests inject fakes so no real git/build subprocess is invoked.
    */
   buildSideEffects?: BuildSideEffectsDeps;
-  /**
-   * Verifies that `sha` is already present on `origin/<branch>` (#349 review-1
-   * finding 1). Used to confirm an external-commit advance decision was truly
-   * applied outside the fix harness (pushed to the remote by a human) rather
-   * than being a local-only leftover commit from a prior fix-harness run that
-   * was blocked before it could push. Defaults to `isCommitOnRemote`. Tests
-   * inject a fake so no real git fetch/subprocess runs.
-   */
+  /** Legacy/injected remote verification seam. Production verifies the linked
+   * PR's actual head, because an adopted PR branch need not equal the managed
+   * worktree's synthetic branch name. */
   verifyCommitOnRemote?: (wtPath: string, branch: string, sha: string) => Promise<boolean>;
   /**
    * Injectable per-attempt fix-harness invoker for the crash-retry loop
@@ -283,6 +282,8 @@ export interface AdvanceFixDeps {
    * Tests inject fakes so afterRound never hits the GitHub API.
    */
   getPrForIssue?: typeof getPrForIssue;
+  /** Linked PR detail for exact external-commit verification. */
+  getPrDetail?: typeof getPrDetail;
   /**
    * Shared unpublished-commit publish executor. Tests inject fakes.
    */
@@ -480,6 +481,26 @@ export function decideExternalCommitAdvance(
 }
 
 /**
+ * Recognize an externally delivered fix before spawning the implementer.
+ * The worktree head must be the exact freshly resolved linked-PR head; merely
+ * moving past the reviewed SHA locally is insufficient because it may be an
+ * unpublished leftover from an earlier failed fix attempt.
+ */
+export function decidePreHarnessExternalAdvance(
+  comments: { author: string; body: string }[],
+  actor: string | null,
+  round: 1 | 2,
+  worktreeHead: string,
+  deliveryHead: string,
+): (ExternalCommitAdvanceDecision & { advance: true }) | null {
+  const decision = decideExternalCommitAdvance(comments, actor, round, worktreeHead);
+  if (!decision.advance) return null;
+  return worktreeHead.trim().toLowerCase() === deliveryHead.trim().toLowerCase()
+    ? decision
+    : null;
+}
+
+/**
  * Whether HEAD moving past the reviewed SHA (#349) was proven to have been
  * applied outside the fix harness, and so may skip the harness-prescribed
  * commit-subject check (`enforceExternalCommitGate`) rather than the normal
@@ -519,6 +540,28 @@ export async function isCommitOnRemote(wtPath: string, branch: string, sha: stri
     { ignoreFailure: true },
   );
   return check.code === 0;
+}
+
+/**
+ * Proves that an externally-applied fix is the exact current head of the PR
+ * linked to this issue. The linked PR is the delivery authority; the local
+ * managed branch name is only workspace identity and can differ for adopted
+ * PRs. An unreadable/missing/moved PR fails closed.
+ */
+export async function isCommitOnLinkedPr(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  sha: string,
+  deps: { getPrForIssue?: typeof getPrForIssue; getPrDetail?: typeof getPrDetail } = {},
+): Promise<boolean> {
+  try {
+    const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber);
+    if (prNumber == null) return false;
+    const pr = await (deps.getPrDetail ?? getPrDetail)(cfg, prNumber);
+    return Boolean(sha.trim()) && (pr.head_sha ?? "").trim().toLowerCase() === sha.trim().toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -567,15 +610,34 @@ export async function advanceFix(
 
   const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
   const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
   let wt = await getOnDiskFn(cfg, issueNumber);
   if (!wt) {
     // Rematerialize once before parking (#769) — park-release may have deleted
-    // a clean tree while the PR branch remains recoverable.
-    const remat = await ensureFn(cfg, issueNumber, {
-      getOnDiskForIssue: getOnDiskFn,
-      runDir: opts.runDir,
-      runStoreDeps: opts.runStoreDeps,
+    // a clean tree while the PR branch remains recoverable. Adopted PRs live
+    // on a distinct delivery branch; resolve that exact identity first and
+    // fail closed rather than deriving a synthetic branch from the issue title.
+    const recoveryIdentity = await resolveLinkedPrDelivery(cfg, issueNumber, {
+      getPrForIssue: deps.getPrForIssue,
+      getPrDetail: deps.getPrDetail,
     });
+    const remat = recoveryIdentity
+      ? await ensureFn(cfg, issueNumber, {
+          getOnDiskForIssue: getOnDiskFn,
+          runDir: opts.runDir,
+          runStoreDeps: opts.runStoreDeps,
+          recoveryTarget: {
+            branch: recoveryIdentity.branch,
+            headSha: recoveryIdentity.headSha,
+            prNumber: recoveryIdentity.prNumber,
+          },
+        })
+      : {
+          result: "fail" as const,
+          worktree: null,
+          reason: "linked open PR is unavailable for exact recovery",
+          blockerKind: "worktree-missing" as const,
+        };
     if (remat.result === "fail") {
       if (isOccupiedWorktreeFault(remat)) {
         return { advanced: false, status: "waiting", reason: remat.reason };
@@ -585,14 +647,14 @@ export async function advanceFix(
       // Separate calls keep explicit BlockerKind string literals visible to the
       // blocked-recipes exhaustiveness scan (nested ternaries confuse its paren walk).
       if (remat.blockerKind === "worktree-capacity") {
-        await setBlocked(cfg, issueNumber, reason, stage, "worktree-capacity");
+        await setBlockedFn(cfg, issueNumber, reason, stage, "worktree-capacity");
         return { advanced: false, status: "blocked", reason, blockerKind: "worktree-capacity" };
       }
       if (remat.blockerKind === "worktree-creation-failed") {
-        await setBlocked(cfg, issueNumber, reason, stage, "worktree-creation-failed");
+        await setBlockedFn(cfg, issueNumber, reason, stage, "worktree-creation-failed");
         return { advanced: false, status: "blocked", reason, blockerKind: "worktree-creation-failed" };
       }
-      await setBlocked(cfg, issueNumber, reason, stage, "worktree-missing");
+      await setBlockedFn(cfg, issueNumber, reason, stage, "worktree-missing");
       return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
     }
     wt = { path: remat.worktree.path, slug: remat.worktree.slug };
@@ -601,7 +663,6 @@ export async function advanceFix(
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const getGhActorFn = deps.getGhActor ?? getGhActor;
   const postCommentFn = deps.postComment ?? postComment;
-  const setBlockedFn = deps.setBlocked ?? setBlocked;
   const transitionFn = deps.transition ?? transition;
   const detail = await getIssueDetailFn(cfg, issueNumber);
 
@@ -758,7 +819,40 @@ export async function advanceFix(
   // Prompt assembly needs headBefore for reviewedSha, so capture head for the
   // prompt via a short pre-round read; the shared helper re-captures for the
   // commit-range (reattach may not change HEAD content).
-  const preRoundHead = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
+  // A managed worktree's local branch is workspace identity, not necessarily
+  // the delivery identity. Bind the linked PR branch before invoking the
+  // harness so commits, delegated-executor sync, timeout recovery, and the
+  // final push all target the adopted PR rather than an orphan synthetic ref.
+  const linkedDelivery = await resolveLinkedPrDelivery(cfg, issueNumber, {
+    getPrForIssue: deps.getPrForIssue,
+    getPrDetail: deps.getPrDetail,
+  });
+  if (!linkedDelivery) {
+    const reason = `${stage}: open same-repository linked PR delivery identity is unavailable`;
+    await setBlockedFn(cfg, issueNumber, reason, stage, "worktree-missing");
+    return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
+  }
+  const deliveryGit = deps.gitInWorktree ?? gitInWorktree;
+  const deliveryPreflight = await preflightDeliveryWorktreeHead(
+    wt.path,
+    linkedDelivery,
+    deliveryGit,
+  );
+  if (!deliveryPreflight.ok) {
+    const reason = `${stage}: adopted PR worktree preflight failed: ${deliveryPreflight.reason}`;
+    await setBlockedFn(cfg, issueNumber, reason, stage, "head-drift");
+    return { advanced: false, status: "blocked", reason, blockerKind: "head-drift" };
+  }
+  const preRoundHead = deliveryPreflight.actualHead!;
+  const managedBranch = branchName(issueNumber, wt.slug);
+  const deliveryBranch = linkedDelivery.branch;
+  const preHarnessExternalAdvance = decidePreHarnessExternalAdvance(
+    detail.comments,
+    fixActor,
+    round,
+    preRoundHead,
+    linkedDelivery.headSha,
+  );
 
   // Use branch-diff to identify the OpenSpec change this branch introduced rather
   // than changes[0], which may be an unrelated pre-existing change in the worktree.
@@ -782,6 +876,7 @@ export async function advanceFix(
     // at this point equals the reviewed SHA (no commits have happened yet).
     // A does-not-reproduce declaration must exactly match this value.
     reviewedSha: preRoundHead,
+    deliveryBranch,
   });
   const model = opts.model ?? cfg.models.fix;
   // External stage executor delegation (#314): fix-1/fix-2 are
@@ -866,6 +961,29 @@ export async function advanceFix(
     shouldAttemptSalvage: ({ confirmedNoNewCommit, invokeResult }) =>
       !invokeResult.result.success || confirmedNoNewCommit,
     invoke: async () => {
+      if (preHarnessExternalAdvance) {
+        // The exact current PR head already contains commits past the triggering
+        // review. Skip the implementer, then let the existing external-commit
+        // path run every normal commit/spec/build/test gate before transition.
+        const result: HarnessResult = {
+          success: true,
+          stdout: "",
+          stderr: "",
+          exit_code: 0,
+          duration: 0,
+          timed_out: false,
+        };
+        return {
+          result,
+          retryResult: {
+            attempts: [],
+            finalResult: result,
+            budgetExhausted: false,
+            certainty: "known_complete",
+            observation: "verified-complete",
+          },
+        };
+      }
       // Crash-retry loop (#486): a fix-harness invocation that exits non-zero or
       // times out is retried in place, up to cfg.auto_recovery_max_retries
       // additional times, within the remaining fix_timeout budget — never
@@ -929,7 +1047,7 @@ export async function advanceFix(
       // below, so the executor's real result and the pipeline's inspection can
       // never diverge.
       if (result.executor_name) {
-        await syncWorktreeToDelegatedExecutorResult(wt.path, branchName(issueNumber, wt.slug));
+        await syncWorktreeToDelegatedExecutorResult(wt.path, deliveryBranch);
       }
       return { result, retryResult };
     },
@@ -992,7 +1110,7 @@ export async function advanceFix(
       const timeoutPark = resolveTimeoutParkForUnpublishedCommit(
         {
           issueNumber,
-          headBranch: branchName(issueNumber, wt.slug),
+          headBranch: deliveryBranch,
           porcelain: statusR.code === 0 ? statusR.stdout : "",
           extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
           commitsAheadOfBase: true,
@@ -1105,6 +1223,7 @@ export async function advanceFix(
   // (fix already applied externally); carries the decided target stage through
   // to the final transition once the normal gates below have validated it.
   let externalAdvance: ExternalCommitAdvanceDecision & { advance: true } | null = null;
+  let externalDeliveryBranch: string | null = linkedDelivery?.branch ?? null;
   // Which commit-message gate to run when externalAdvance is set (#349 review-1
   // finding 1): "external" only once verifyCommitOnRemote proves the commit(s)
   // already reached origin outside the fix harness; otherwise "harness" keeps
@@ -1173,12 +1292,21 @@ export async function advanceFix(
         // #349 review-2: rewrite headBefore and fall through normal gates.
         headBefore = externalDecision.reviewSha;
         externalAdvance = externalDecision;
-        const verifyOnRemote = deps.verifyCommitOnRemote ?? isCommitOnRemote;
-        const verifiedOnRemote = await verifyOnRemote(
-          wt.path,
-          branchName(issueNumber, wt.slug),
-          headAfter,
-        );
+        let verifiedOnRemote: boolean;
+        if (deps.verifyCommitOnRemote) {
+          verifiedOnRemote = await deps.verifyCommitOnRemote(
+              wt.path,
+              deliveryBranch,
+              headAfter,
+            );
+        } else {
+          const delivery = await resolveLinkedPrDelivery(cfg, issueNumber, {
+            getPrForIssue: deps.getPrForIssue,
+            getPrDetail: deps.getPrDetail,
+          });
+          verifiedOnRemote = delivery?.headSha === headAfter.toLowerCase();
+          if (verifiedOnRemote) externalDeliveryBranch = delivery!.branch;
+        }
         commitGateMode = resolveFixCommitGateMode(externalDecision, verifiedOnRemote);
       } else {
         // #473: human-decision park before DNR so mixed rounds never advance.
@@ -1615,7 +1743,7 @@ export async function advanceFix(
     });
   }
 
-  const branch = branchName(issueNumber, wt.slug);
+  const branch = externalDeliveryBranch ?? deliveryBranch;
   // #760: transient-retryable push with currency re-sync (no force-push).
   // Authoritative delivery uses configured git.push_auth (#980).
   const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
@@ -1628,7 +1756,20 @@ export async function advanceFix(
   let skipAncestorPush = false;
   if (externalAdvance) {
     const resolvePr = deps.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadForBranch;
-    const ancestorDecision = await decideAncestorPushAfterNoop(branch, {
+    if (externalDeliveryBranch) {
+      const live = await resolvePr(cfg, externalDeliveryBranch).catch(() => null);
+      if (!live || live.headSha.toLowerCase() !== localHead.toLowerCase()) {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason:
+            `${stage}: linked adopted PR head moved or became unreadable after external-fix verification; ` +
+            "RecoverySupervisor must rebind the replacement candidate before delivery",
+        };
+      }
+      skipAncestorPush = true;
+    }
+    const ancestorDecision = skipAncestorPush ? null : await decideAncestorPushAfterNoop(branch, {
       localHead: localHead || "HEAD",
       git: async (args) => gitWt(wt.path, args, { ignoreFailure: true }),
       resolveOpenPrHead: async () => {
@@ -1636,7 +1777,7 @@ export async function advanceFix(
         return pr?.headSha ?? null;
       },
     });
-    if (ancestorDecision.action === "skip") {
+    if (ancestorDecision?.action === "skip") {
       skipAncestorPush = true;
     }
   }
@@ -1650,10 +1791,24 @@ export async function advanceFix(
         // Currency-check uses fetch/rev-parse; push uses configured auth via the
         // same injectable gitInWorktree seam unit tests already fake (#980).
         if (args[0] === "push") {
+          const ancestry = await gitWt(
+            wt.path,
+            ["merge-base", "--is-ancestor", linkedDelivery.headSha, localHead],
+            { ignoreFailure: true },
+          );
+          if (ancestry.code !== 0) {
+            return {
+              code: 1,
+              stdout: "",
+              stderr:
+                `delivery ancestry check failed: authorized PR head ${linkedDelivery.headSha} ` +
+                `is not an ancestor of local repair ${localHead}`,
+            };
+          }
           const res = await runConfiguredGitPush({
             cwd: wt.path,
             auth: pushAuth,
-            args: ["push", "origin", branch],
+            args: deliveryPushArgs(managedBranch, branch, linkedDelivery.headSha),
             deps: {
               gitConfigGet: async (cwd, key) => {
                 const r = await gitWt(cwd, ["config", "--get", key], {

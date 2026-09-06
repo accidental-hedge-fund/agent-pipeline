@@ -138,6 +138,78 @@ test("ensureManagedWorktree: missing + open PR head → create + HEAD match → 
   assert.equal(events[0].result, "pass");
 });
 
+test("ensureManagedWorktree: retained linked-PR branch survives a later issue-title rename (#1478)", async () => {
+  let titleRead = false;
+  let createdSlug = "";
+  const out = await ensureManagedWorktree(cfg, ISSUE, {
+    recoveryTarget: { branch: BRANCH, headSha: TIP_SHA },
+    getOnDiskForIssue: async () => null,
+    getIssueTitle: async () => {
+      titleRead = true;
+      return "Completely Renamed Issue";
+    },
+    gitCmd: async () => ({ stdout: `${TIP_SHA}\trefs/heads/${BRANCH}\n`, stderr: "", code: 0 }),
+    resolveOpenPrHeadForBranch: async (_cfg, branch) => {
+      assert.equal(branch, BRANCH);
+      return { prNumber: PR, headSha: TIP_SHA };
+    },
+    createWorktree: async (_cfg, _issue, slug) => {
+      createdSlug = slug;
+      return { path: WT_PATH, branch: BRANCH };
+    },
+    gitInWorktree: async () => ({ stdout: `${TIP_SHA}\n`, stderr: "", code: 0 }),
+  });
+  assert.equal(out.result, "pass");
+  assert.equal(titleRead, false, "exact PR recovery must not derive identity from mutable title");
+  assert.equal(createdSlug, SLUG);
+});
+
+test("ensureManagedWorktree: adopted PR rematerializes a synthetic managed branch at the exact linked head", async () => {
+  const deliveryBranch = "fix/release-convergence-durable";
+  let recoveryStart: unknown;
+  let createdSlug = "";
+  const out = await ensureManagedWorktree(cfg, ISSUE, {
+    recoveryTarget: { branch: deliveryBranch, headSha: TIP_SHA, prNumber: PR },
+    getOnDiskForIssue: async () => null,
+    gitCmd: async () => ({ stdout: "", stderr: "", code: 0 }),
+    resolveOpenPrHeadForBranch: async () => null,
+    createWorktree: async (_cfg, _issue, slug, deps) => {
+      createdSlug = slug;
+      recoveryStart = deps?.recoveryStart;
+      return { path: WT_PATH, branch: `pipeline/${ISSUE}-${slug}` };
+    },
+    gitInWorktree: async () => ({ stdout: `${TIP_SHA}\n`, stderr: "", code: 0 }),
+  });
+  assert.equal(out.result, "pass");
+  assert.equal(createdSlug, `adopted-pr-${PR}`);
+  assert.deepEqual(recoveryStart, {
+    deliveryBranch,
+    headSha: TIP_SHA,
+    prNumber: PR,
+  });
+  assert.equal(out.worktree?.branch, `pipeline/${ISSUE}-adopted-pr-${PR}`);
+});
+
+test("ensureManagedWorktree: adopted PR recovery without prNumber fails closed", async () => {
+  let createCalls = 0;
+  const out = await ensureManagedWorktree(cfg, ISSUE, {
+    recoveryTarget: { branch: "fix/release-convergence-durable", headSha: TIP_SHA },
+    getOnDiskForIssue: async () => null,
+    getIssueTitle: async () => {
+      throw new Error("must not derive identity from the issue title");
+    },
+    gitCmd: async () => ({ stdout: "", stderr: "", code: 0 }),
+    createWorktree: async () => {
+      createCalls += 1;
+      return { path: WT_PATH, branch: BRANCH };
+    },
+  });
+  assert.equal(out.result, "fail");
+  assert.equal(out.blockerKind, "worktree-missing");
+  assert.match(out.reason, /linked PR recovery identity is invalid/);
+  assert.equal(createCalls, 0);
+});
+
 test("ensureManagedWorktree: stale metadata without on-disk path → rematerialize", async () => {
   // getOnDiskForIssue returns null even if "manager" might remember something.
   let createCalls = 0;
@@ -775,6 +847,16 @@ test("source wiring: pre_merge autofix/archive and fix rematerialize before bare
     preMerge,
     /status:\s*"rematerialize-failed"/,
     "production autofix must return typed rematerialize-failed (not bare error)",
+  );
+  assert.match(
+    preMerge,
+    /recoveryTarget:\s*\{[\s\S]*?branch:\s*delivery\.branch[\s\S]*?headSha:\s*delivery\.headSha[\s\S]*?prNumber:\s*delivery\.prNumber/,
+    "pre-merge autofix rematerialization must retain the adopted PR identity",
+  );
+  assert.match(
+    preMerge,
+    /deliveryPushArgs\(managedBranch, deliveryBranch, delivery\.headSha\)/,
+    "pre-merge autofix delivery must CAS-push to the adopted PR branch",
   );
   assert.match(
     preMerge,

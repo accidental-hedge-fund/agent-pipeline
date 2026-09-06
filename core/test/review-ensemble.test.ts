@@ -302,6 +302,32 @@ test("mergeEnsembleVerdicts: max confidence wins at same severity", () => {
   assert.equal(merged.findings[0]!.confidence, 0.9);
 });
 
+test("mergeEnsembleVerdicts: dedupe preserves any explicit blocking intent", () => {
+  const blocker = finding({
+    severity: "medium",
+    title: "explicit blocker",
+    file: "f.ts",
+    line_start: 1,
+    confidence: 0.7,
+    blocking: true,
+  });
+  const advisory = finding({
+    severity: "medium",
+    title: "higher confidence advisory",
+    file: "f.ts",
+    line_start: 2,
+    confidence: 0.95,
+    blocking: false,
+  });
+  assert.equal(findingKey(blocker), findingKey(advisory));
+  const merged = mergeEnsembleVerdicts([
+    { agentIndex: 0, verdict: verdict("needs-attention", [blocker]) },
+    { agentIndex: 1, verdict: verdict("needs-attention", [advisory]) },
+  ]);
+  assert.equal(merged.findings[0]!.body, advisory.body);
+  assert.equal(merged.findings[0]!.blocking, true);
+});
+
 test("mergeEnsembleVerdicts: config-order tie-break is deterministic", () => {
   const a = finding({
     severity: "high",

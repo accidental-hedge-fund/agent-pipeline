@@ -589,6 +589,7 @@ export function deltaRoundCeilingComment(
   cap: number,
   ceilingAction: "park" | "demote_and_advance",
   blockingFindings: DeltaCeilingFinding[],
+  candidateSha?: string,
 ): string {
   const lines = [
     "## Pipeline: Pre-merge delta round ceiling reached — human decision required",
@@ -609,6 +610,7 @@ export function deltaRoundCeilingComment(
     "### To resume",
     `- Accept a finding: \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes.`,
     `- Or fix the finding(s) by hand.`,
+    ...(candidateSha ? ["", `<!-- reviewed-sha: ${candidateSha} -->`] : []),
     "",
     cfgFooter(cfg),
   );
@@ -629,6 +631,7 @@ export function deltaRoundCeilingDemotionComment(
   cap: number,
   demotedFindings: DeltaCeilingFinding[],
   followupNumber: number,
+  candidateSha?: string,
 ): string {
   const lines = [
     "## Pipeline: Pre-merge delta round ceiling — findings demoted and deferred",
@@ -650,6 +653,7 @@ export function deltaRoundCeilingDemotionComment(
     `See #${followupNumber} for the complete deferred finding list.`,
     "",
     "⚠️ The demoted findings were **not fixed** — review them before merging this PR.",
+    ...(candidateSha ? ["", `<!-- reviewed-sha: ${candidateSha} -->`] : []),
     "",
     cfgFooter(cfg),
     "",

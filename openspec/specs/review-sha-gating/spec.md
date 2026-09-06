@@ -256,7 +256,27 @@ When the pipeline decides whether a leftover `pipeline:blocked` label is stale b
 
 The pipeline SHALL, before dispatching `visual-gate`, `eval-gate`, `shipcheck-gate`, or `ready-to-deploy`, reconcile the linked PR HEAD against the latest authoritative review evidence using the same non-pipeline-internal supersession classification that the pre-merge review-SHA gate uses. The pipeline SHALL obtain that classification from the existing review-currency reconcile surface. It SHALL NOT invent a later-stage-local reuse rule. Pre-merge SHALL keep its existing in-stage SHA gate, including pipeline-internal reuse and delta review while the issue remains at `pre-merge`.
 
-The latest authoritative review evidence SHALL be the most recent review or delta-review `reviewed-sha` (artifact first, individual sentinel fallback) that the SHA gate already trusts. The pipeline SHALL resolve the authenticated pipeline actor and SHALL pass only comments authored by that actor to reviewed-SHA extraction. When the actor cannot be determined, the pipeline SHALL fail closed: it SHALL NOT dispatch the later stage. When that SHA is current under exact match or pipeline-internal-only commits, the pipeline SHALL dispatch the later stage. Exact-SHA current SHALL be the shared currency resolver's final observed HEAD, not a first HEAD read that skipped reconcile. When that SHA is superseded by at least one non-pipeline-internal commit, or when HEAD is readable, differs from the reviewed SHA, and currency cannot prove pipeline-internal-only reuse, the pipeline SHALL treat the movement as a new candidate epoch: it SHALL invalidate candidate-bound review, test, and readiness evidence for the prior SHA as authority for the new HEAD; clear a leftover `pipeline:blocked` label; bind a present managed worktree to the new HEAD (or fail closed when no managed worktree is on disk, rather than reviewing from `cfg.repo_dir`); re-read the authoritative PR HEAD after bind and restart reconciliation when that HEAD has moved; transition in the same advance to the first enabled exact-SHA review stage (`review-1`, otherwise `review-2`); durably record the epoch restart with the old and new SHAs and stages; and require a review bound to the new HEAD before any later-stage handler or ready-to-deploy finalize runs. Review SHALL fail closed unless its CWD HEAD is readable as a full SHA and exactly equals the captured PR SHA. If neither exact-SHA review stage is enabled, the pipeline SHALL fail closed. When the linked PR or HEAD cannot be read, the pipeline SHALL fail closed: it SHALL NOT dispatch the later stage and SHALL NOT reach `pipeline:ready-to-deploy`.
+The latest authoritative review evidence SHALL be the most recent review or delta-review `reviewed-sha` (artifact first, individual sentinel fallback) that the SHA gate already trusts. The pipeline SHALL resolve the authenticated pipeline actor and SHALL pass only comments authored by that actor to reviewed-SHA extraction. When the actor cannot be determined, the pipeline SHALL fail closed: it SHALL NOT dispatch the later stage. When that SHA is current under exact match or pipeline-internal-only commits, the pipeline SHALL dispatch the later stage. Exact-SHA current SHALL be the shared currency resolver's final observed HEAD, not a first HEAD read that skipped reconcile. When that SHA is superseded by at least one non-pipeline-internal commit, or when HEAD is readable, differs from the reviewed SHA, and currency cannot prove pipeline-internal-only reuse, the pipeline SHALL treat the movement as a new candidate epoch: it SHALL invalidate candidate-bound review, test, and readiness evidence for the prior SHA as authority for the new HEAD; clear a leftover `pipeline:blocked` label; bind a present managed worktree to the new HEAD or rematerialize an absent one from the linked open PR using the configured integration base, verifying exact HEAD and failing closed if that cannot be done rather than reviewing from `cfg.repo_dir`; re-read the authoritative PR HEAD after bind and restart reconciliation when that HEAD has moved; transition in the same advance to the first enabled exact-SHA review stage (`review-1`, otherwise `review-2`); durably record the epoch restart with the old and new SHAs and stages; and require a review bound to the new HEAD before any later-stage handler or ready-to-deploy finalize runs. Review SHALL fail closed unless its CWD HEAD is readable as a full SHA and exactly equals the captured PR SHA. If neither exact-SHA review stage is enabled, the pipeline SHALL fail closed. When the linked PR or HEAD cannot be read, the pipeline SHALL fail closed: it SHALL NOT dispatch the later stage and SHALL NOT reach `pipeline:ready-to-deploy`.
+
+After successfully pushing a pipeline-authored OpenSpec archive commit, the
+pipeline SHALL durably record the exact prior and successor candidate SHAs as
+an owned internal transition. Later-stage currency reconciliation MAY use an
+exact chain of those records when GitHub's commit listing has not yet converged.
+Malformed records, non-archive causes, or chains that do not terminate at the
+live PR HEAD SHALL provide no reuse authority. The transition SHALL also be
+persisted in a local authority artifact that is independent of event-sink mode;
+an exclusive external sink SHALL NOT make the transition unavailable to a later
+physical run. Reconciliation SHALL confirm the live PR HEAD after currency
+resolution and SHALL NOT authorize a stale archive successor when a developer
+push has replaced it.
+
+#### Scenario: Archive push is visible before its commit list
+
+- **WHEN** the live PR HEAD is the exact successor in a durably recorded
+  OpenSpec archive transition from the reviewed SHA
+- **AND** the shared commit-list resolver temporarily reports unknown
+- **THEN** later-stage review currency remains current
+- **AND** the completed review is not restarted solely because of API lag
 
 This guard SHALL apply to ordinary advance, nested whole-item advance, `pipeline single`, and durable loop item recovery. A leftover `pipeline:blocked` label SHALL NOT be required for the guard to run.
 
@@ -328,13 +348,41 @@ Ready-to-deploy SHALL run this guard immediately before terminal finalization, i
 - **AND** SHALL record `reviewed-sha` H
 - **AND** SHALL NOT reuse the S verdict as approval for H
 
-#### Scenario: Missing managed worktree fails closed before epoch-restarted review
+#### Scenario: Missing managed worktree is rematerialized before epoch-restarted review
 
 - **WHEN** later-stage dispatch would return the issue to `review-1` because HEAD H superseded review SHA S
 - **AND** no managed worktree is on disk
-- **THEN** the pipeline SHALL fail closed
+- **THEN** the pipeline SHALL rematerialize the managed worktree from the linked open PR using the configured integration base
+- **AND** SHALL verify the rematerialized worktree at exact HEAD H
 - **AND** SHALL NOT dispatch review from `cfg.repo_dir`
-- **AND** SHALL NOT transition to `review-1`
+- **AND** SHALL fail closed without transitioning to `review-1` when rematerialization or exact-HEAD verification fails
+
+#### Scenario: Linked PR identity survives issue-title changes
+
+- **WHEN** an issue title changed after its pipeline branch and PR were created
+- **AND** later-stage recovery must rematerialize an absent worktree
+- **THEN** recovery SHALL use the linked PR's exact branch and HEAD rather than deriving a new slug from the current issue title
+
+#### Scenario: Archive currency survives a new physical advance run
+
+- **WHEN** OpenSpec archival records an exact pipeline-owned S-to-H transition in one physical advance run
+- **AND** a later supervisor dispatch starts a new physical run while GitHub's commit list still lags
+- **THEN** later-stage currency SHALL load the issue's durable prior-run transition evidence
+- **AND** SHALL treat H as current only when an exact validated transition chain reaches H
+
+#### Scenario: Exclusive event sink preserves archive currency
+
+- **WHEN** an archive transition is produced while the public event stream uses an exclusive sink
+- **AND** a later physical run must reconcile the archive successor
+- **THEN** the later run SHALL load the independently persisted local transition authority
+- **AND** SHALL NOT depend on a local `events.jsonl` copy
+
+#### Scenario: Developer push after archive observation invalidates reuse
+
+- **WHEN** reconciliation first observes archive successor A and the commit-list resolver reports unknown
+- **AND** a fresh PR HEAD confirmation observes developer head D
+- **THEN** the S-to-A archive transition SHALL NOT authorize D
+- **AND** the pipeline SHALL return the candidate to exact-SHA review
 
 #### Scenario: PR HEAD movement during epoch-restart bind restarts reconcile
 

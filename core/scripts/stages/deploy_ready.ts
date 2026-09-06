@@ -44,6 +44,8 @@ import {
 
 /** Injectable seams for {@link finalize} unit tests (#759 / #1243 / #1274). */
 export interface FinalizeDeps {
+  /** runAdvance defers cleanup until run_complete/summary are durable. */
+  deferWorktreeRemoval?: boolean;
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   removeManagedWorktreeSafely?: typeof removeManagedWorktreeSafely;
   safeRemoveDeps?: SafeRemoveDeps;
@@ -301,7 +303,7 @@ export async function finalize(
   // uncommitted operator work is not destroyed. After a proven squash merge,
   // mint bound proof and pass it into the shared wrapper (#1274) — never
   // force:true (that would discard dirty work).
-  const wt = await getOnDiskFn(cfg, issueNumber);
+  const wt = deps.deferWorktreeRemoval ? null : await getOnDiskFn(cfg, issueNumber);
   if (wt) {
     let verifiedMergeProof: VerifiedMergeProof | undefined;
     if (prNumber) {

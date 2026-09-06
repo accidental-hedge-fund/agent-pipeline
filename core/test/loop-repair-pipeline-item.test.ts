@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createRepairPipelineItemExecutor } from "../scripts/loop/repair-pipeline-item.ts";
+import {
+  createRepairPipelineItemExecutor,
+  type RepairPipelineItemDeps,
+} from "../scripts/loop/repair-pipeline-item.ts";
 import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 
@@ -38,9 +41,23 @@ function input() {
   };
 }
 
+const TEST_DELIVERY = {
+  branch: "fix/adopted-repair",
+  headSha: HEAD,
+  prNumber: 7,
+  repository: "owner/repo",
+};
+
+function createTestExecutor(deps: RepairPipelineItemDeps) {
+  return createRepairPipelineItemExecutor(cfg(), {
+    resolveLinkedPrDelivery: async () => TEST_DELIVERY,
+    ...deps,
+  });
+}
+
 test("repair_pipeline_item uses the configured repair transaction and only succeeds after push", async () => {
   const calls: string[] = [];
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "update-ref") {
@@ -76,13 +93,14 @@ test("repair_pipeline_item uses the configured repair transaction and only succe
         timed_out: false,
       };
     },
-    performRepair: async (resolvedCfg, issueNumber, runId, findings, title, _wt, _git, invokeFn) => {
+    performRepair: async (resolvedCfg, issueNumber, runId, findings, title, _wt, _git, invokeFn, ...rest) => {
       assert.equal(resolvedCfg.harnesses.implementer, "any-registered-adapter");
       assert.equal(issueNumber, 42);
       assert.equal(runId, "loop-1");
       assert.equal(title, "Repair archive");
       assert.match(findings, /openspec-archive-apply-conflict/);
       await invokeFn(resolvedCfg.harnesses.implementer, "/repo/.worktrees/42", "repair", {});
+      assert.deepEqual(rest.at(-1), TEST_DELIVERY);
       calls.push("repair");
       return { status: "fix-committed", headSha: NEXT };
     },
@@ -99,6 +117,93 @@ test("repair_pipeline_item uses the configured repair transaction and only succe
   assert.match(result.evidence, new RegExp(`${HEAD}.*${NEXT}`));
 });
 
+test("repair_pipeline_item rematerializes an adopted PR at its exact delivery head (#1478)", async () => {
+  let recoveryTarget: unknown;
+  const execute = createTestExecutor({
+    getOnDiskForIssue: async () => null,
+    ensureManagedWorktree: async (_cfg, _issue, deps) => {
+      recoveryTarget = deps?.recoveryTarget;
+      return {
+        result: "pass",
+        worktree: {
+          path: "/repo/.worktrees/42",
+          slug: "adopted-pr-7",
+          branch: "pipeline/42-adopted-pr-7",
+        },
+        reason: "rematerialized",
+      };
+    },
+    gitInWorktree: async (_dir, args) => {
+      if (args[0] === "rev-parse") return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "Repair archive",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: ["pipeline:pre-merge"],
+    }),
+    performRepair: async (...args) => {
+      assert.deepEqual(args.at(-1), TEST_DELIVERY);
+      return { status: "fix-committed", headSha: NEXT };
+    },
+    clearBlocked: async () => {},
+  });
+  const result = await execute(input());
+  assert.equal(result.succeeded, true);
+  assert.deepEqual(recoveryTarget, {
+    branch: TEST_DELIVERY.branch,
+    headSha: TEST_DELIVERY.headSha,
+    prNumber: TEST_DELIVERY.prNumber,
+  });
+});
+
+test("repair_pipeline_item rejects an unverified or fork delivery before worktree mutation (#1478)", async () => {
+  let worktreeReads = 0;
+  const execute = createRepairPipelineItemExecutor(cfg(), {
+    resolveLinkedPrDelivery: async () => null,
+    getOnDiskForIssue: async () => {
+      worktreeReads += 1;
+      return null;
+    },
+  });
+  const result = await execute(input());
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /open same-repository linked PR/);
+  assert.equal(worktreeReads, 0);
+});
+
+test("repair_pipeline_item rejects a live PR head race before any worktree or breadcrumb mutation (#1478)", async () => {
+  let worktreeReads = 0;
+  let gitCalls = 0;
+  let repairCalls = 0;
+  const execute = createRepairPipelineItemExecutor(cfg(), {
+    resolveLinkedPrDelivery: async () => ({ ...TEST_DELIVERY, headSha: NEXT }),
+    getOnDiskForIssue: async () => {
+      worktreeReads += 1;
+      return { path: "/repo/.worktrees/42", slug: "repair" };
+    },
+    gitInWorktree: async () => {
+      gitCalls += 1;
+      return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+    },
+    performRepair: async () => {
+      repairCalls += 1;
+      return { status: "fix-committed", headSha: NEXT };
+    },
+  });
+
+  const result = await execute(input());
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /candidate moved before repair mutation/);
+  assert.equal(worktreeReads, 0);
+  assert.equal(gitCalls, 0);
+  assert.equal(repairCalls, 0);
+});
+
 test("repair_pipeline_item resolves every configured implementer through the same adapter contract", async () => {
   const adapters = ["claude", "codex", "grok", "extension-adapter"];
   const invoked: string[] = [];
@@ -107,6 +212,7 @@ test("repair_pipeline_item resolves every configured implementer through the sam
     const configured = cfg();
     configured.harnesses = { ...configured.harnesses, implementer: adapter };
     const execute = createRepairPipelineItemExecutor(configured, {
+      resolveLinkedPrDelivery: async () => TEST_DELIVERY,
       getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
       gitInWorktree: async () => ({ code: 0, stdout: `${HEAD}\n`, stderr: "" }),
       getIssueDetail: async () => ({
@@ -138,7 +244,7 @@ test("repair_pipeline_item resolves every configured implementer through the sam
 
 test("repair_pipeline_item refuses stale candidate identity before model execution", async () => {
   let repaired = false;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => ({
       code: 0,
@@ -160,7 +266,7 @@ test("repair_pipeline_item refuses stale candidate identity before model executi
 test("repair_pipeline_item reconciles its already-pushed commit after a crash without replaying the model", async () => {
   let repaired = false;
   let cleared = false;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => ({
       code: 0,
@@ -193,7 +299,7 @@ test("repair_pipeline_item pushes its clean marked commit after a crash before p
   let cleared = false;
   let pushed = false;
   let remoteReads = 0;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "push") pushed = true;
@@ -242,7 +348,7 @@ test("repair_pipeline_item pushes its clean marked commit after a crash before p
 
 test("repair_pipeline_item charges a clean model no-op as failure instead of claiming repair", async () => {
   let cleared = false;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async () => ({ code: 0, stdout: `${HEAD}\n`, stderr: "" }),
     getIssueDetail: async () => ({
@@ -274,7 +380,7 @@ test("repair_pipeline_item charges a clean model no-op as failure instead of cla
 });
 
 test("repair_pipeline_item #1060: harness error with diagnostic is category harness-error with tail", async () => {
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async () => ({ code: 0, stdout: `${HEAD}\n`, stderr: "" }),
     getIssueDetail: async () => ({
@@ -305,7 +411,7 @@ test("repair_pipeline_item #1060: harness error with diagnostic is category harn
 });
 
 test("repair_pipeline_item #1060: bare error with residual porcelain is dirt-blocked with path summary", async () => {
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "rev-parse" && args[1] === "HEAD") {
@@ -341,7 +447,7 @@ test("repair_pipeline_item #1060: bare error with residual porcelain is dirt-blo
 });
 
 test("repair_pipeline_item #1060: no diagnostic and clean tree is category no-diagnostic", async () => {
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "status") return { code: 0, stdout: "", stderr: "" };
@@ -371,7 +477,7 @@ test("repair_pipeline_item hard-syncs a present-but-stale worktree when the remo
   let fetched = false;
   let repaired = false;
   let ancestryChecked = false;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "log") return { code: 0, stdout: "feat: human push landed upstream\n", stderr: "" };
@@ -427,7 +533,7 @@ test("repair_pipeline_item hard-syncs a present-but-stale worktree when the remo
 test("repair_pipeline_item still fails candidate-moved when the remote head differs from the claim", async () => {
   let destructive = false;
   let repaired = false;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "fetch" || args[0] === "reset") destructive = true;
@@ -457,7 +563,7 @@ test("repair_pipeline_item still fails candidate-moved when the remote head diff
 test("repair_pipeline_item fails closed instead of syncing over a dirty stale worktree", async () => {
   let destructive = false;
   let repaired = false;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "fetch" || args[0] === "reset") destructive = true;
@@ -481,7 +587,7 @@ test("repair_pipeline_item fails closed instead of syncing over a dirty stale wo
 test("repair_pipeline_item treats a case-differing worktree head as the claimed head", async () => {
   const reconciliationOps: string[] = [];
   let repaired = false;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (["log", "ls-remote", "fetch", "reset", "status"].includes(args[0])) {
@@ -519,7 +625,7 @@ test("repair_pipeline_item reconciles an interrupted unmarked commit by stamping
   let repaired = false;
   let cleared = false;
   let breadcrumbChecked = false;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "rev-parse" && args[1] === "--verify") {
@@ -588,7 +694,7 @@ test("repair_pipeline_item refuses to adopt an unmarked commit without this atte
   let pushed = false;
   let repaired = false;
   let cleared = false;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "rev-parse" && args[1] === "--verify") {
@@ -643,7 +749,7 @@ test("repair_pipeline_item refuses to hard-sync away local-only commits in a div
   const DIVERGED = "d".repeat(40);
   let reset = false;
   let repaired = false;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "log") return { code: 0, stdout: "feat: local work not on the claim\n", stderr: "" };
@@ -680,7 +786,7 @@ test("repair_pipeline_item refuses to hard-sync away local-only commits in a div
 
 test("repair_pipeline_item succeeds with a warning when label clear keeps failing on the already-on-remote path", async () => {
   let clearAttempts = 0;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => ({
       code: 0,
@@ -714,7 +820,7 @@ test("repair_pipeline_item succeeds with a warning when label clear keeps failin
   let clearAttempts = 0;
   let pushed = false;
   let remoteReads = 0;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "push") pushed = true;
@@ -756,7 +862,7 @@ test("repair_pipeline_item succeeds with a warning when label clear keeps failin
 
 test("repair_pipeline_item returns success with a recorded warning when label clear fails after a verified push", async () => {
   let clearAttempts = 0;
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async () => ({ code: 0, stdout: `${HEAD}\n`, stderr: "" }),
     getIssueDetail: async () => ({
@@ -791,7 +897,7 @@ for (const fixture of [
 ] as const) {
   test(`repair_pipeline_item refuses substantive model work for a ${fixture.name}`, async () => {
     let repaired = false;
-    const execute = createRepairPipelineItemExecutor(cfg(), {
+    const execute = createTestExecutor({
       getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
       gitInWorktree: async () => ({ code: 0, stdout: `${HEAD}\n`, stderr: "" }),
       getIssueDetail: async () => ({
@@ -837,7 +943,7 @@ test("repair_pipeline_item #629: substantive path uses performPreMergeAutoFix (s
 
 test("repair_pipeline_item #629: refuses unmarked human commits (ownership proof)", async () => {
   // Unpushed commit on claimed head without breadcrumb → refuse.
-  const execute = createRepairPipelineItemExecutor(cfg(), {
+  const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
       if (args[0] === "rev-parse" && args[1] === "HEAD") {

@@ -9,6 +9,7 @@ import {
   HEALTHY_WRITE_HEALTH,
   UNREADABLE_WRITE_HEALTH,
   appendEvent,
+  appendInternalCandidateTransition,
   appendIssueHistory,
   emitPapercut,
   emitStageAccounting,
@@ -25,13 +26,16 @@ import {
   listRunIds,
   parseWriteHealthText,
   persistPublicEntrypointAdmission,
+  primaryWorktreeFromPorcelain,
   publicEntrypointRunIdFor,
   resolvePublicAdmissionPersistRoot,
   resolvePublicAdmissionClaimRoot,
   readEvents,
+  readInternalCandidateTransitions,
   readWriteHealth,
   recordWriteHealthFailure,
   resolveRunEngineIdentity,
+  resolveRunStoreRepoDir,
   runDirPath,
   runIdFor,
   trainRunIdFor,
@@ -110,6 +114,42 @@ test("runDirPath: resolves to <repoDir>/.agent-pipeline/runs/<runId>", () => {
   assert.equal(
     runDirPath(REPO_DIR, id),
     path.join(REPO_DIR, ".agent-pipeline", "runs", id),
+  );
+});
+
+test("run-store root: linked worktree resolves to persistent primary checkout", async () => {
+  const linked = "/repo/.claude/worktrees/fix+x";
+  const primary = "/repo";
+  const porcelain = [
+    `worktree ${primary}`,
+    "HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "branch refs/heads/main",
+    "",
+    `worktree ${linked}`,
+    "HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "branch refs/heads/fix/x",
+    "",
+  ].join("\n");
+  assert.equal(primaryWorktreeFromPorcelain(porcelain), primary);
+  const resolved = await resolveRunStoreRepoDir(
+    linked,
+    async (_cwd, args) => {
+      assert.deepEqual(args, ["worktree", "list", "--porcelain"]);
+      return { stdout: porcelain, stderr: "", code: 0 };
+    },
+  );
+  assert.equal(resolved, primary);
+  assert.equal(runDirPath(resolved, "155-test"), "/repo/.agent-pipeline/runs/155-test");
+});
+
+test("run-store root: git discovery failure retains caller checkout", async () => {
+  const linked = "/repo/.claude/worktrees/fix+x";
+  assert.equal(
+    await resolveRunStoreRepoDir(
+      linked,
+      async () => ({ stdout: "", stderr: "not a repository", code: 128 }),
+    ),
+    linked,
   );
 });
 
@@ -1367,6 +1407,24 @@ test("appendEvent: exclusive mode delivers to the sink and does NOT write events
   assert.equal(delivered.length, 1);
   assert.equal(files.has(EVENTS_JSONL), false, "events.jsonl must not be created in exclusive mode");
   assert.equal(appends.has(EVENTS_JSONL), false, "events.jsonl must not be appended to in exclusive mode");
+});
+
+test("internal candidate transition remains locally durable in exclusive sink mode", async () => {
+  const { deps } = memRunStore();
+  deps.eventSink = () => {};
+  deps.eventSinkMode = "exclusive";
+  const transition = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "pipeline_internal_candidate_transition" as const,
+    at: STARTED_AT_ISO,
+    cause: "openspec_archive" as const,
+    from_sha: "a".repeat(40),
+    to_sha: "b".repeat(40),
+    issue: ISSUE,
+  };
+  assert.equal(await appendInternalCandidateTransition(RUN_DIR, transition, deps), true);
+  await appendEvent(RUN_DIR, transition, deps);
+  assert.deepEqual(await readInternalCandidateTransitions(RUN_DIR, deps), [transition]);
 });
 
 test("appendEvent: sink mode is ignored when no eventSink is configured (local write proceeds)", async () => {
@@ -2852,7 +2910,9 @@ test("finalizeRun: a summary.json write failure is non-fatal even with delta-rou
       return deps.writeFile(p, "");
     },
   };
-  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, failingDeps); // must not throw
+  const result = await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, failingDeps); // must not throw
+  assert.equal(result.summary, false);
+  assert.equal(result.durable, false);
 });
 
 // ---------------------------------------------------------------------------

@@ -67,6 +67,7 @@ import {
 import { blockItem, completeRecoveryAttempt, eligibleIndependentItems, fingerprintEvidence, hasContinuableIndependentSibling, persistOwnedCooling, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
 import {
   buildCoolingRecord,
+  attemptBelongsToCandidateEpoch,
   coolingDeadline,
   coolingIsActive,
   coolingIsStaleForNewCandidateEpoch,
@@ -840,11 +841,12 @@ async function supersedeStartedRecoveryAttempts(
   token: string,
   itemId: string,
   reason: string,
+  select: (attempt: LoopRecoveryAttempt) => boolean = () => true,
 ): Promise<LoopLedger> {
   const ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId, token));
   const time = deps.store.now().toISOString();
   const superseded = ledger.recovery_attempts
-    .filter((attempt) => attempt.item_id === itemId && attempt.outcome === "started")
+    .filter((attempt) => attempt.item_id === itemId && attempt.outcome === "started" && select(attempt))
     .map((attempt) => attempt.attempt_id);
   if (superseded.length === 0) return ledger;
 
@@ -1034,12 +1036,46 @@ async function executeBlockedRecovery(
   }
 
   const currentEpoch = observedCandidateEpoch(item);
-  const matchingAttempts = ledger.recovery_attempts.filter(
+  let matchingAttempts = ledger.recovery_attempts.filter(
     (attempt) =>
       attempt.item_id === itemId &&
       attempt.class === item.blocked_theme &&
       attempt.evidence_fingerprint === item.evidence_fingerprint,
   );
+  const staleStarted = matchingAttempts.filter(
+    (attempt) =>
+      attempt.outcome === "started" &&
+      attempt.action !== "repair_pipeline_item" &&
+      Boolean(currentEpoch) &&
+      !attemptBelongsToCandidateEpoch(attempt, currentEpoch),
+  );
+  if (staleStarted.length > 0) {
+    const staleIds = new Set(staleStarted.map((attempt) => attempt.attempt_id));
+    for (const stale of staleStarted) {
+      const claimedHead =
+        /(?:^|\|)head=([^|]+)(?:\||$)/i.exec(stale.candidate_identity)?.[1]?.toLowerCase() ?? "none";
+      await appendEvent(deps.store, runId, token, "loop_recovery_attempt_stale", {
+        attempt_id: stale.attempt_id,
+        item_id: itemId,
+        claimed_head: claimedHead,
+        current_head: item.last_verified_identity?.head_sha.trim().toLowerCase() || currentEpoch,
+      });
+    }
+    ledger = await supersedeStartedRecoveryAttempts(
+      deps,
+      runId,
+      token,
+      itemId,
+      `fresh candidate epoch ${currentEpoch} supersedes recovery claimed for an earlier candidate`,
+      (attempt) => staleIds.has(attempt.attempt_id),
+    );
+    matchingAttempts = ledger.recovery_attempts.filter(
+      (attempt) =>
+        attempt.item_id === itemId &&
+        attempt.class === item.blocked_theme &&
+        attempt.evidence_fingerprint === item.evidence_fingerprint,
+    );
+  }
   let attempt = [...matchingAttempts].reverse().find((candidate) => candidate.outcome === "started");
   let claimedNow = false;
   if (!attempt) {

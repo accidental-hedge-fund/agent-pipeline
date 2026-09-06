@@ -740,6 +740,21 @@ test("fix prompt: round 1 = standard, round 2 = adversarial", () => {
   assert.match(r2, /FINDINGS-X/);
 });
 
+test("fix prompt: adopted PR delivery branch overrides the synthetic workspace branch (#1478)", () => {
+  const out = buildFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 1478,
+    title: "t",
+    reviewFindings: "f",
+    fixRound: 2,
+    pipelineRunId: "1478/run",
+    deliveryBranch: "fix/release-convergence-durable",
+  });
+  assert.match(out, /authoritative remote branch is `fix\/release-convergence-durable`/);
+  assert.match(out, /git push origin HEAD:fix\/release-convergence-durable/);
+  assert.match(out, /Do not pull, rebase from, or push the local branch's same-named remote/);
+});
+
 test("fix prompt: spec-revision instruction + consistency framing only when OpenSpec context is present (#106)", () => {
   const withSpec = buildFixPrompt({
     cfg: dummyConfig(),

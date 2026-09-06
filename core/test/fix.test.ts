@@ -15,6 +15,7 @@ import {
   computeEffectiveBlockingSet,
   decideDoesNotReproduceAdvance,
   decideExternalCommitAdvance,
+  decidePreHarnessExternalAdvance,
   decideHumanDecisionPark,
   enforceFixOpenspecConsistency,
   enforceFixCommitGate,
@@ -29,6 +30,8 @@ import {
   FIX_RETRY_MIN_BUDGET_SEC,
   invokeFixHarnessWithRetry,
   isCommitOnRemote,
+  isCommitOnLinkedPr,
+  resolveLinkedPrDelivery,
   parseDoesNotReproduceDeclarations,
   parseFindingSummaries,
   parseHumanDecisionDeclarations,
@@ -38,6 +41,8 @@ import {
   type AdvanceFixDeps,
 } from "../scripts/stages/fix.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
+import { deliveryPushArgs, deliveryPushRefspec } from "../scripts/git-push-auth.ts";
+import { preflightDeliveryWorktreeHead } from "../scripts/pr-delivery.ts";
 
 const execFileAsync = promisify(execFile);
 import { formatReviewComment } from "../scripts/stages/review.ts";
@@ -667,6 +672,33 @@ test("decideExternalCommitAdvance: actor unresolved (null) → fails closed, doe
   assert.equal(decision.reviewSha, null);
 });
 
+test("decidePreHarnessExternalAdvance: exact linked-PR delivery skips an unnecessary fix harness", () => {
+  const decision = decidePreHarnessExternalAdvance(
+    [reviewComment(2, SHA_REVIEWED)],
+    ACTOR,
+    2,
+    SHA_HEAD,
+    SHA_HEAD.toUpperCase(),
+  );
+  assert.ok(decision?.advance);
+  assert.equal(decision?.to, "pre-merge");
+});
+
+test("decidePreHarnessExternalAdvance: local-only or stale delivery heads fail closed", () => {
+  assert.equal(
+    decidePreHarnessExternalAdvance(
+      [reviewComment(2, SHA_REVIEWED)], ACTOR, 2, SHA_HEAD, SHA_REVIEWED,
+    ),
+    null,
+  );
+  assert.equal(
+    decidePreHarnessExternalAdvance(
+      [reviewComment(2, SHA_HEAD)], ACTOR, 2, SHA_HEAD, SHA_HEAD,
+    ),
+    null,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // resolveFixCommitGateMode + isCommitOnRemote (#349 pre-merge review-1 finding 1):
 // the external-commit subject exemption must only apply once the commit is
@@ -757,6 +789,241 @@ test("isCommitOnRemote: fetch failure with stale tracking ref containing the sha
   } finally {
     await cleanup();
   }
+});
+
+test("isCommitOnLinkedPr: adopted PR head proves an external commit despite a different managed branch", async () => {
+  assert.equal(
+    await isCommitOnLinkedPr({} as PipelineConfig, 1478, SHA_HEAD, {
+      getPrForIssue: async () => 1480,
+      getPrDetail: async () => ({ head_ref: "fix/release-convergence-durable", head_sha: SHA_HEAD }) as any,
+    }),
+    true,
+  );
+});
+
+test("isCommitOnLinkedPr: missing, moved, or unreadable linked PR fails closed", async () => {
+  const cfg = {} as PipelineConfig;
+  assert.equal(await isCommitOnLinkedPr(cfg, 1478, SHA_HEAD, { getPrForIssue: async () => null }), false);
+  assert.equal(
+    await isCommitOnLinkedPr(cfg, 1478, SHA_HEAD, {
+      getPrForIssue: async () => 1480,
+      getPrDetail: async () => ({ head_ref: "fix/release-convergence-durable", head_sha: SHA_REVIEWED }) as any,
+    }),
+    false,
+  );
+  assert.equal(
+    await isCommitOnLinkedPr(cfg, 1478, SHA_HEAD, {
+      getPrForIssue: async () => { throw new Error("offline"); },
+    }),
+    false,
+  );
+});
+
+test("resolveLinkedPrDelivery: returns the adopted delivery branch and exact live head", async () => {
+  assert.deepEqual(
+    await resolveLinkedPrDelivery({ repo: "acme/repo" } as PipelineConfig, 1478, {
+      getPrForIssue: async () => 1480,
+      getPrDetail: async () => ({
+        number: 1480,
+        state: "open",
+        head_ref: "fix/release-convergence-durable",
+        head_sha: SHA_HEAD,
+        head_repo_full_name: "acme/repo",
+        is_cross_repository: false,
+      }) as any,
+    }),
+    {
+      branch: "fix/release-convergence-durable",
+      headSha: SHA_HEAD,
+      prNumber: 1480,
+      repository: "acme/repo",
+    },
+  );
+});
+
+test("resolveLinkedPrDelivery: closed or cross-repository PR heads fail closed", async () => {
+  const cfg = { repo: "acme/repo" } as PipelineConfig;
+  const base = {
+    number: 1480,
+    head_ref: "main",
+    head_sha: SHA_HEAD,
+    head_repo_full_name: "acme/repo",
+    is_cross_repository: false,
+  };
+  assert.equal(
+    await resolveLinkedPrDelivery(cfg, 1478, {
+      getPrForIssue: async () => 1480,
+      getPrDetail: async () => ({ ...base, state: "closed" }) as any,
+    }),
+    null,
+  );
+  assert.equal(
+    await resolveLinkedPrDelivery(cfg, 1478, {
+      getPrForIssue: async () => 1480,
+      getPrDetail: async () => ({
+        ...base,
+        state: "open",
+        head_repo_full_name: "attacker/fork",
+        is_cross_repository: true,
+      }) as any,
+    }),
+    null,
+    "a fork branch named main must never authorize a push to base origin/main",
+  );
+});
+
+test("preflightDeliveryWorktreeHead requires the exact freshly-authorized PR head", async () => {
+  const delivery = {
+    branch: "fix/adopted",
+    headSha: SHA_HEAD,
+    prNumber: 1480,
+    repository: "acme/repo",
+  };
+  assert.deepEqual(
+    await preflightDeliveryWorktreeHead("/managed/wt", delivery, async (_cwd, args) => {
+      assert.deepEqual(args, ["rev-parse", "HEAD"]);
+      return { code: 0, stdout: `${SHA_HEAD}\n`, stderr: "" };
+    }),
+    { ok: true, actualHead: SHA_HEAD.toLowerCase() },
+  );
+  const stale = await preflightDeliveryWorktreeHead(
+    "/managed/wt",
+    delivery,
+    async () => ({ code: 0, stdout: `${SHA_REVIEWED}\n`, stderr: "" }),
+  );
+  assert.equal(stale.ok, false);
+  assert.match(stale.reason ?? "", /does not match live PR head/);
+});
+
+test("deliveryPushRefspec: adopted synthetic workspace pushes HEAD to the delivery branch", () => {
+  assert.equal(
+    deliveryPushRefspec("pipeline/1478-adopted-pr-1480", "fix/release-convergence-durable"),
+    "HEAD:fix/release-convergence-durable",
+  );
+  assert.equal(deliveryPushRefspec("pipeline/1478-x", "pipeline/1478-x"), "pipeline/1478-x");
+});
+
+test("deliveryPushArgs: adopted repair is CAS-bound to the authorized remote head", () => {
+  assert.deepEqual(
+    deliveryPushArgs("pipeline/1478-adopted", "fix/adopted", SHA_HEAD),
+    [
+      "push",
+      `--force-with-lease=refs/heads/fix/adopted:${SHA_HEAD}`,
+      "origin",
+      "HEAD:fix/adopted",
+    ],
+  );
+});
+
+test("adopted synthetic workspace: harness commit reaches the delivery branch only via HEAD:<delivery> (#1478)", async () => {
+  const { cloneDir, cleanup } = await makeRemoteAndClone();
+  const delivery = "fix/release-convergence-durable";
+  const synthetic = "pipeline/1478-adopted-pr-1480";
+  try {
+    await execFileAsync("git", ["checkout", "-b", delivery], { cwd: cloneDir });
+    await execFileAsync("git", ["push", "-u", "origin", delivery], { cwd: cloneDir });
+    await execFileAsync("git", ["checkout", "-b", synthetic], { cwd: cloneDir });
+    await execFileAsync("git", ["branch", "-D", delivery], { cwd: cloneDir });
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "fix: harness commit on synthetic branch"], {
+      cwd: cloneDir,
+    });
+    const { stdout: localHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const sha = localHead.trim();
+
+    await assert.rejects(
+      () => execFileAsync("git", ["push", "origin", delivery], { cwd: cloneDir }),
+      /src refspec|does not match/i,
+    );
+    await execFileAsync("git", ["push", "origin", deliveryPushRefspec(synthetic, delivery)], { cwd: cloneDir });
+    const { stdout: remoteHead } = await execFileAsync(
+      "git",
+      ["ls-remote", "origin", `refs/heads/${delivery}`],
+      { cwd: cloneDir },
+    );
+    assert.equal(remoteHead.trim().split(/\s+/)[0], sha);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("adopted repair CAS refuses to resurrect a candidate force-reset during the harness (#1478)", async () => {
+  const { cloneDir, cleanup } = await makeRemoteAndClone();
+  const delivery = "fix/cas-race";
+  const synthetic = "pipeline/1478-cas-race";
+  try {
+    await execFileAsync("git", ["checkout", "-b", delivery], { cwd: cloneDir });
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "feat: authorized candidate"], { cwd: cloneDir });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const authorized = stdout.trim();
+    await execFileAsync("git", ["push", "origin", delivery], { cwd: cloneDir });
+    await execFileAsync("git", ["checkout", "-b", synthetic], { cwd: cloneDir });
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "fix: stale repair"], { cwd: cloneDir });
+
+    // Concurrent actor force-resets the PR branch to the authorized head's
+    // parent. A normal push of the repair would be a fast-forward and would
+    // incorrectly resurrect the superseded candidate.
+    await execFileAsync(
+      "git",
+      ["push", "--force", "origin", `${authorized}^:refs/heads/${delivery}`],
+      { cwd: cloneDir },
+    );
+    await assert.rejects(
+      () => execFileAsync("git", deliveryPushArgs(synthetic, delivery, authorized), { cwd: cloneDir }),
+      /stale info|rejected/i,
+    );
+    const { stdout: remoteHead } = await execFileAsync(
+      "git",
+      ["ls-remote", "origin", `refs/heads/${delivery}`],
+      { cwd: cloneDir },
+    );
+    const { stdout: expectedReset } = await execFileAsync("git", ["rev-parse", `${authorized}^`], { cwd: cloneDir });
+    assert.equal(remoteHead.trim().split(/\s+/)[0], expectedReset.trim());
+  } finally {
+    await cleanup();
+  }
+});
+
+test("advanceFix source pin: adopted delivery identity is bound before the harness and retained when the harness commits (#1478)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const resolveIdx = src.indexOf("const linkedDelivery = await resolveLinkedPrDelivery(");
+  const unavailableIdx = src.indexOf("if (!linkedDelivery) {", resolveIdx);
+  const preflightIdx = src.indexOf("await preflightDeliveryWorktreeHead(", unavailableIdx);
+  const promptIdx = src.indexOf("const prompt = buildFixPrompt(", resolveIdx);
+  const roundIdx = src.indexOf("const roundResult = await runHarnessRound", promptIdx);
+  assert.ok(resolveIdx !== -1 && unavailableIdx !== -1 && preflightIdx !== -1 && promptIdx !== -1 && roundIdx !== -1);
+  assert.ok(
+    resolveIdx < unavailableIdx && unavailableIdx < preflightIdx && preflightIdx < promptIdx && promptIdx < roundIdx,
+    "missing delivery or a stale managed worktree must fail closed before invoking the harness",
+  );
+  assert.match(src.slice(unavailableIdx, preflightIdx), /status: "blocked"/);
+  assert.match(src.slice(preflightIdx, promptIdx), /blockerKind: "head-drift"/);
+  assert.match(src.slice(promptIdx, roundIdx), /deliveryBranch,/);
+  const externalBypassIdx = src.indexOf("if (preHarnessExternalAdvance) {", roundIdx);
+  const harnessInvokeIdx = src.indexOf("const retryResult = await invokeFixHarnessWithRetry(", roundIdx);
+  assert.ok(
+    externalBypassIdx !== -1 && harnessInvokeIdx !== -1 && externalBypassIdx < harnessInvokeIdx,
+    "an exact externally delivered fix must bypass the implementer before its invocation",
+  );
+  assert.match(src, /syncWorktreeToDelegatedExecutorResult\(wt\.path, deliveryBranch\)/);
+  assert.match(src, /headBranch: deliveryBranch/);
+  assert.match(src, /let externalDeliveryBranch: string \| null = linkedDelivery\?\.branch \?\? null/);
+  assert.match(src, /const branch = externalDeliveryBranch \?\? deliveryBranch/);
+  assert.match(
+    src,
+    /deliveryPushArgs\(managedBranch, branch, linkedDelivery\.headSha\)/,
+    "pipeline-owned final push must use a lease bound to the adopted PR head",
+  );
+  const ancestryIdx = src.indexOf('["merge-base", "--is-ancestor", linkedDelivery.headSha, localHead]');
+  const pushIdx = src.indexOf("await runConfiguredGitPush(", ancestryIdx);
+  assert.ok(
+    ancestryIdx !== -1 && pushIdx !== -1 && ancestryIdx < pushIdx,
+    "the authorized PR head must be an ancestor of the local repair before any final push",
+  );
+  const rematIdx = src.indexOf("if (!wt) {");
+  const ensureIdx = src.indexOf("await ensureFn(", rematIdx);
+  assert.ok(rematIdx !== -1 && ensureIdx !== -1);
+  assert.match(src.slice(rematIdx, ensureIdx), /recoveryIdentity = await resolveLinkedPrDelivery/);
+  assert.match(src.slice(ensureIdx, ensureIdx + 500), /recoveryTarget:/);
 });
 
 // ---------------------------------------------------------------------------
@@ -2472,6 +2739,72 @@ function makeAckFixDeps(comments: { author: string; body: string; createdAt: str
   return { deps, rec };
 }
 
+test("advanceFix: park-released adopted PR rematerializes with exact recoveryTarget (#1478)", async (t) => {
+  let captured: { branch: string; headSha: string; prNumber?: number } | undefined;
+  const { deps } = makeAckFixDeps([
+    { author: "pipeline-bot", body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
+    { author: "alice", body: "please also change X", createdAt: "2026-01-02T00:00:00Z" },
+  ]);
+  deps.getOnDiskForIssue = async () => null;
+  deps.getPrForIssue = async () => 1480;
+  deps.getPrDetail = async () =>
+    ({
+      number: 1480,
+      state: "open",
+      head_ref: "fix/release-convergence-durable",
+      head_sha: SHA_HEAD,
+      head_repo_full_name: "acme/x",
+      is_cross_repository: false,
+    }) as Awaited<
+      ReturnType<NonNullable<AdvanceFixDeps["getPrDetail"]>>
+    >;
+  deps.ensureManagedWorktree = async (_cfg, _issue, ensureDeps) => {
+    captured = ensureDeps?.recoveryTarget;
+    return {
+      result: "pass",
+      worktree: {
+        path: "/tmp/wt",
+        slug: "adopted-pr-1480",
+        branch: "pipeline/1478-adopted-pr-1480",
+      },
+      reason: "recreated from adopted PR head",
+    };
+  };
+  await quietFix(t, async () => {
+    await advanceFix(ACK_CFG, 1099, 1, {}, deps);
+  });
+  assert.deepEqual(captured, {
+    branch: "fix/release-convergence-durable",
+    headSha: SHA_HEAD,
+    prNumber: 1480,
+  });
+});
+
+test("advanceFix: missing linked PR identity fails closed before title-derived rematerialize (#1478)", async (t) => {
+  let ensureCalls = 0;
+  const { deps, rec } = makeAckFixDeps([]);
+  deps.getOnDiskForIssue = async () => null;
+  deps.getPrForIssue = async () => null;
+  deps.ensureManagedWorktree = async () => {
+    ensureCalls += 1;
+    return {
+      result: "fail",
+      worktree: null,
+      reason: "must not derive identity from the issue title",
+      blockerKind: "worktree-missing",
+    };
+  };
+  let outcome: Awaited<ReturnType<typeof advanceFix>> | undefined;
+  await quietFix(t, async () => {
+    outcome = await advanceFix(ACK_CFG, 1099, 1, {}, deps);
+  });
+  assert.equal(ensureCalls, 0);
+  assert.equal(outcome?.advanced, false);
+  assert.equal(outcome && "blockerKind" in outcome ? outcome.blockerKind : undefined, "worktree-missing");
+  assert.equal(rec.blocked[0]?.kind, "worktree-missing");
+  assert.match(rec.blocked[0]?.reason ?? "", /linked open PR is unavailable for exact recovery/);
+});
+
 test("advanceFix: please-also from a non-pipeline author setBlocked needs-human (#1099)", async (t) => {
   const { deps, rec } = makeAckFixDeps([
     { author: "pipeline-bot", body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
@@ -2501,4 +2834,3 @@ test("advanceFix: ambiguous trusted unmarked note recovers to planning, not need
   assert.deepEqual(rec.transitions, ["planning"]);
   assert.equal(rec.blocked.some((b) => b.kind === "needs-human"), false);
 });
-

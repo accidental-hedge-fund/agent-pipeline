@@ -1034,11 +1034,29 @@ test("partition: unmarked finding (blocking absent) still blocks at high severit
   assert.equal(p.advisory.length, 0);
 });
 
-test("partition: blocking:true at high severity still blocks (explicit true = normal classification) (#236)", () => {
+test("partition: blocking:true at high severity still blocks (#236)", () => {
   const f = finding({ severity: "high", confidence: 0.95, blocking: true });
   const p = partitionFindings([f], DEFAULT_POLICY);
-  assert.equal(p.blocking.length, 1, "blocking:true must classify normally — high severity must block");
+  assert.equal(p.blocking.length, 1, "blocking:true must remain blocking");
   assert.equal(p.advisory.length, 0);
+});
+
+test("partition: blocking:true medium survives a high severity threshold (#1478)", () => {
+  const f = finding({ severity: "medium", confidence: 0.95, blocking: true });
+  const highOnly = { ...DEFAULT_POLICY, block_threshold: "high" as const };
+  const p = partitionFindings([f], highOnly);
+  assert.deepEqual(p.blocking, [f]);
+  assert.equal(p.advisory.length, 0);
+});
+
+test("partition: explicit blocking still honors the confidence floor (#1478)", () => {
+  const f = finding({ severity: "medium", confidence: 0.2, blocking: true });
+  const highOnly = { ...DEFAULT_POLICY, block_threshold: "high" as const, min_confidence: 0.7 };
+  const p = partitionFindings([f], highOnly);
+  assert.equal(p.blocking.length, 0);
+  assert.equal(p.advisory.length, 1);
+  assert.match(p.advisory[0]!.reason, /confidence/);
+  assert.doesNotMatch(p.advisory[0]!.reason, /severity/);
 });
 
 test("partition: blocking:false sharing a key with a real blocker does NOT make the key ambiguous (#236)", () => {

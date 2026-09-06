@@ -258,6 +258,23 @@ Automatic park-release and ready-to-deploy removal SHALL consume this classifica
 
 The shared automatic-removal path used at `pipeline:ready-to-deploy` and by park-release SHALL accept bound merge-result proof (same issue number, same PR number, same base branch, same proven `merge_result_oid` contained in `origin/<base>`, and current worktree HEAD equal to the HEAD bound at merge/proof time). When that proof is present, the HEAD still matches, and the managed worktree is clean, the path SHALL remove the worktree even if local-only verification reports squash-merge unreachability. The path SHALL still evaluate the shared dirty/local-only ladder once. It SHALL NOT pass operator `--force` solely to bypass unverifiable state, because `--force` also discards dirty work. When bound proof matches, park-release SHALL skip remote-tip and open-PR recoverability probes.
 
+Automatic ready-to-deploy and durable-park removal SHALL occur only after the owning physical advance has durably committed its `run_complete`, write-health, and `summary.json` artifacts. A crash before terminal finalization SHALL leave the managed worktree recoverable.
+Finalization returning normally is not sufficient proof: the release decision
+SHALL use explicit write results and SHALL retain the worktree when the terminal
+event, summary, or write-health state reports a persistence failure.
+
+#### Scenario: Terminal evidence precedes automatic cleanup
+
+- **WHEN** an advance reaches ready-to-deploy or a durable park
+- **THEN** the owning run SHALL finalize its terminal artifacts before invoking automatic worktree release
+- **AND** a failure or crash before finalization SHALL NOT remove the worktree
+
+#### Scenario: Non-throwing terminal write failure retains the worktree
+
+- **WHEN** finalization catches and reports a failed `run_complete`, `summary.json`, or write-health write
+- **THEN** automatic park or ready-to-deploy cleanup SHALL NOT run
+- **AND** the worktree SHALL remain available for recovery
+
 #### Scenario: Deploy-ready removal releases a clean tree after proven squash merge
 
 - **WHEN** `pipeline:ready-to-deploy` removal runs for issue N

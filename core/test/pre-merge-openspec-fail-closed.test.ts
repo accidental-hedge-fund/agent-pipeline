@@ -106,7 +106,9 @@ function appendOnlyRunStore(appended: string[]): RunStoreDeps {
   return {
     readFile: async () => "",
     writeFile: async () => {},
-    appendFile: async (_p, data) => { appended.push(data); },
+    appendFile: async (p, data) => {
+      if (p.endsWith("events.jsonl")) appended.push(data);
+    },
     rename: async () => {},
     mkdir: async () => {},
     readdir: async () => [],
@@ -491,7 +493,16 @@ test("advance(): #464 shape — worktree misreports OpenSpec inactive but the PR
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR,
     getIssueDetail: (async () => ({ comments: [{ body: reviewComment, author: "test-actor" }] })) as AdvancePreMergeDeps["getIssueDetail"],
-    getPrDetail: (async () => ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" })) as AdvancePreMergeDeps["getPrDetail"],
+    getPrDetail: (async () => ({
+      number: PR,
+      state: "open",
+      head_ref: "b",
+      head_sha: SHA_HEAD,
+      head_repo_full_name: cfg.repo,
+      is_cross_repository: false,
+      mergeable: true,
+      mergeable_state: "CLEAN",
+    })) as AdvancePreMergeDeps["getPrDetail"],
     getPrCommits: async () => [],
     getPrChecks: (async () => [{ name: "ci", bucket: "pass" }]) as AdvancePreMergeDeps["getPrChecks"],
     // Worktree present but reports OpenSpec inactive (the exact class of bug D1
@@ -526,6 +537,56 @@ test("advance(): #464 shape — worktree misreports OpenSpec inactive but the PR
   assert.match(blockedCalls[0].reason, /finding-level-reversal-matching/);
 });
 
+test("advance(): archive re-resolves live delivery and refuses a PR head replaced after entry-gate review", async (t) => {
+  const REVIEWED_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const REPLACED_HEAD = "dddddddddddddddddddddddddddddddddddddddd";
+  const reviewComment = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${REVIEWED_HEAD} -->`;
+  const blockedCalls: Array<{ reason: string; label: string }> = [];
+  let gitCalled = false;
+
+  const deps: AdvancePreMergeDeps = {
+    getPrForIssue: async () => PR,
+    getIssueDetail: (async () => ({ comments: [{ body: reviewComment, author: "test-actor" }] })) as AdvancePreMergeDeps["getIssueDetail"],
+    getPrDetail: (async () => ({
+      number: PR,
+      state: "open",
+      head_ref: "b",
+      head_sha: REVIEWED_HEAD,
+      head_repo_full_name: cfg.repo,
+      is_cross_repository: false,
+      mergeable: true,
+      mergeable_state: "CLEAN",
+    })) as AdvancePreMergeDeps["getPrDetail"],
+    getPrCommits: async () => [],
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    resolveLinkedPrDelivery: async () => ({
+      branch: "replacement",
+      headSha: REPLACED_HEAD,
+      prNumber: PR,
+      repository: cfg.repo,
+    }),
+    gitInWorktree: (async () => {
+      gitCalled = true;
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    setBlocked: (async (_cfg, _n, reason, _stage, label) => {
+      blockedCalls.push({ reason, label });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    getGhActor: async () => "test-actor",
+  };
+
+  let out: Awaited<ReturnType<typeof advance>> | undefined;
+  await quiet(t, async () => {
+    out = await advance(cfg, ISSUE, {}, deps);
+  });
+
+  assert.equal(out!.status, "blocked");
+  assert.equal(out!.blockerKind, "head-drift");
+  assert.equal(blockedCalls[0]?.label, "head-drift");
+  assert.equal(gitCalled, false, "stale authority must be rejected before archive git mutation");
+});
+
 test("advance(): openspec.enabled off → head-side guard is skipped even though the PR's file list still shows an active change", async (t) => {
   const SHA_HEAD = "cccccccccccccccccccccccccccccccccccccccc";
   const reviewComment = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
@@ -538,7 +599,16 @@ test("advance(): openspec.enabled off → head-side guard is skipped even though
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR,
     getIssueDetail: (async () => ({ comments: [{ body: reviewComment, author: "test-actor" }] })) as AdvancePreMergeDeps["getIssueDetail"],
-    getPrDetail: (async () => ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" })) as AdvancePreMergeDeps["getPrDetail"],
+    getPrDetail: (async () => ({
+      number: PR,
+      state: "open",
+      head_ref: "b",
+      head_sha: SHA_HEAD,
+      head_repo_full_name: cfg.repo,
+      is_cross_repository: false,
+      mergeable: true,
+      mergeable_state: "CLEAN",
+    })) as AdvancePreMergeDeps["getPrDetail"],
     getPrCommits: async () => [],
     getPrChecks: (async () => [{ name: "ci", bucket: "pass" }]) as AdvancePreMergeDeps["getPrChecks"],
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
@@ -599,9 +669,24 @@ test("advance(): override-resumed pre-merge (blocking delta-review key overridde
         { body: overrideComment, author: "test-actor" },
       ],
     })) as AdvancePreMergeDeps["getIssueDetail"],
-    getPrDetail: (async () => ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" })) as AdvancePreMergeDeps["getPrDetail"],
+    getPrDetail: (async () => ({
+      number: PR,
+      state: "open",
+      head_ref: "b",
+      head_sha: SHA_HEAD,
+      head_repo_full_name: cfg.repo,
+      is_cross_repository: false,
+      mergeable: true,
+      mergeable_state: "CLEAN",
+    })) as AdvancePreMergeDeps["getPrDetail"],
     getPrCommits: async () => [],
     getPrChecks: (async () => [{ name: "ci", bucket: "pass" }]) as AdvancePreMergeDeps["getPrChecks"],
+    resolveLinkedPrDelivery: async () => ({
+      branch: "b",
+      headSha: SHA_HEAD,
+      prNumber: PR,
+      repository: cfg.repo,
+    }),
     // Shared active-change set comes from PR tip (#714); must not hit network.
     getPrDiff: async () => `diff --git a/${CHANGE_PATH} b/${CHANGE_PATH}\n`,
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
@@ -689,6 +774,7 @@ test("maybeArchiveOpenspec: records a gate_result event when archived", async (t
     openspecIsActive: () => true,
     gitInWorktree: (() => {
       let addCalled = false;
+      let commitCalled = false;
       return (async (_p: string, args: string[]) => {
         if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
         if (args[0] === "add") { addCalled = true; return { stdout: "", stderr: "", code: 0 }; }
@@ -697,7 +783,17 @@ test("maybeArchiveOpenspec: records a gate_result event when archived", async (t
             ? { stdout: ` M openspec/specs/${CHANGE_ID}/spec.md`, stderr: "", code: 0 }
             : { stdout: "", stderr: "", code: 0 };
         }
-        if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
+        if (args[0] === "commit") {
+          commitCalled = true;
+          return { stdout: "", stderr: "", code: 0 };
+        }
+        if (args[0] === "rev-parse") {
+          return {
+            stdout: commitCalled ? `${"b".repeat(40)}\n` : `${"a".repeat(40)}\n`,
+            stderr: "",
+            code: 0,
+          };
+        }
         return { stdout: "", stderr: "", code: 0 };
       }) as AdvancePreMergeDeps["gitInWorktree"];
     })(),
@@ -723,6 +819,18 @@ test("maybeArchiveOpenspec: records a gate_result event when archived", async (t
   assert.equal(events.length, 1);
   assert.equal(events[0].result, "pass");
   assert.equal(events[0].reason, CHANGE_ID);
+  const transitions = appendedEvents(appended).filter(
+    (e) => e.type === "pipeline_internal_candidate_transition",
+  );
+  assert.deepEqual(transitions, [{
+    schema_version: 1,
+    type: "pipeline_internal_candidate_transition",
+    at: transitions[0]?.at,
+    cause: "openspec_archive",
+    from_sha: "a".repeat(40),
+    to_sha: "b".repeat(40),
+    issue: ISSUE,
+  }]);
 });
 
 test("maybeArchiveOpenspec: records a gate_result event when blocked (archive CLI failure)", async (t) => {

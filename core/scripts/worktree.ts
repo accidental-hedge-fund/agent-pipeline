@@ -482,6 +482,9 @@ export async function branchExists(
 }
 
 export interface CreateWorktreeDeps {
+  /** Recovery-only source for a synthetic managed workspace created at the
+   * exact linked PR delivery head. The local branch remains pipeline-owned. */
+  recoveryStart?: { deliveryBranch: string; headSha: string; prNumber?: number };
   listActive?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
   existsSync?: (p: string) => boolean;
   removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, resolvedPath?: string) => Promise<void>;
@@ -1079,7 +1082,35 @@ export async function createWorktree(
         ? lsRemote.stdout.trim().split(/\s+/)[0]!
         : null;
     let startPoint = `origin/${cfg.base_branch}`;
-    if (remoteTip) {
+    if (deps.recoveryStart) {
+      const expected = deps.recoveryStart.headSha.trim().toLowerCase();
+      const refspec = deps.recoveryStart.prNumber
+        ? `pull/${deps.recoveryStart.prNumber}/head`
+        : `refs/heads/${deps.recoveryStart.deliveryBranch}`;
+      const fetchedRecovery = await gitFn(
+        cfg,
+        cfg.repo_dir,
+        ["fetch", "origin", refspec],
+        { ignoreFailure: true },
+      );
+      if (fetchedRecovery.code !== 0) {
+        throw new Error(
+          `git fetch origin ${refspec} failed (cannot recreate adopted PR workspace): ${fetchedRecovery.stderr.trim()}`,
+        );
+      }
+      const fetchedHead = await gitFn(
+        cfg,
+        cfg.repo_dir,
+        ["rev-parse", "FETCH_HEAD"],
+        { ignoreFailure: true },
+      );
+      if (fetchedHead.code !== 0 || fetchedHead.stdout.trim().toLowerCase() !== expected) {
+        throw new Error(
+          `fetched adopted PR head ${fetchedHead.stdout.trim() || "missing"} does not match expected ${expected}`,
+        );
+      }
+      startPoint = expected;
+    } else if (remoteTip) {
       // Populate the remote-tracking ref so worktree add can start from the
       // verified ls-remote tip. Fetch MUST succeed and origin/<branch> MUST
       // resolve to that tip — a failed fetch must not fall through to a
@@ -1497,6 +1528,9 @@ export type EnsureManagedWorktreeResult =
 
 /** Injectable deps for {@link ensureManagedWorktree}. No real network/git in tests. */
 export interface EnsureManagedWorktreeDeps {
+  /** Exact linked-PR identity retained by a recovery caller. Avoids deriving
+   * a different branch when the issue title changed after PR creation. */
+  recoveryTarget?: { branch: string; headSha: string; prNumber?: number };
   getOnDiskForIssue?: (
     cfg: PipelineConfig,
     issueNumber: number,
@@ -1750,18 +1784,42 @@ export async function ensureManagedWorktree(
     };
   }
 
-  let title: string;
-  try {
-    title = await getTitleFn(cfg, issueNumber);
-  } catch (err) {
-    const reason = boundRematerializeReason(
-      `cannot resolve issue title for rematerialize: ${(err as Error).message ?? String(err)}`,
-    );
-    await recordRematerializeGate(deps, "fail", reason);
-    return { result: "fail", worktree: null, reason, blockerKind: "worktree-missing" };
+  let slug: string;
+  let branch: string;
+  const recoveryTarget = deps.recoveryTarget;
+  if (recoveryTarget) {
+    const prefix = `pipeline/${issueNumber}-`;
+    const targetSha = recoveryTarget.headSha.trim().toLowerCase();
+    const adopted = !recoveryTarget.branch.startsWith(prefix);
+    if (
+      !recoveryTarget.branch.trim() ||
+      !/^[0-9a-f]{40}$/.test(targetSha) ||
+      (adopted && (!Number.isInteger(recoveryTarget.prNumber) || (recoveryTarget.prNumber ?? 0) <= 0))
+    ) {
+      const reason = boundRematerializeReason(
+        `linked PR recovery identity is invalid for issue #${issueNumber}`,
+      );
+      await recordRematerializeGate(deps, "fail", reason);
+      return { result: "fail", worktree: null, reason, blockerKind: "worktree-missing" };
+    }
+    slug = adopted
+      ? `adopted-pr-${recoveryTarget.prNumber}`
+      : recoveryTarget.branch.slice(prefix.length);
+    branch = branchName(issueNumber, slug);
+  } else {
+    let title: string;
+    try {
+      title = await getTitleFn(cfg, issueNumber);
+    } catch (err) {
+      const reason = boundRematerializeReason(
+        `cannot resolve issue title for rematerialize: ${(err as Error).message ?? String(err)}`,
+      );
+      await recordRematerializeGate(deps, "fail", reason);
+      return { result: "fail", worktree: null, reason, blockerKind: "worktree-missing" };
+    }
+    slug = slugify(title) || `issue-${issueNumber}`;
+    branch = branchName(issueNumber, slug);
   }
-  const slug = slugify(title) || `issue-${issueNumber}`;
-  const branch = branchName(issueNumber, slug);
 
   // Recoverability pre-check: do not create from base alone when rematerializing.
   const lsRemote = await gitFn(
@@ -1781,7 +1839,8 @@ export async function ensureManagedWorktree(
   } catch {
     prHead = null;
   }
-  const prSha = prHead && prHead.headSha.length > 0 ? prHead.headSha : null;
+  const prSha = recoveryTarget?.headSha ??
+    (prHead && prHead.headSha.length > 0 ? prHead.headSha : null);
 
   if (!remoteTip && !prSha) {
     const reason = boundRematerializeReason(
@@ -1798,6 +1857,15 @@ export async function ensureManagedWorktree(
   try {
     created = await createFn(cfg, issueNumber, slug, {
       ...deps.createWorktreeDeps,
+      ...(recoveryTarget
+        ? {
+            recoveryStart: {
+              deliveryBranch: recoveryTarget.branch,
+              headSha: recoveryTarget.headSha,
+              ...(recoveryTarget.prNumber ? { prNumber: recoveryTarget.prNumber } : {}),
+            },
+          }
+        : {}),
       gitCmd: deps.createWorktreeDeps?.gitCmd ?? gitFn,
       resolveOpenPrHeadForBranch:
         deps.createWorktreeDeps?.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadFn,

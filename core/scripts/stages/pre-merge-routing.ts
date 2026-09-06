@@ -49,6 +49,10 @@ import {
 } from "../pipeline-commits.ts";
 import { runCiDocsStaleHeal } from "../ci-docs-stale-heal.ts";
 import type { CheckRun, Outcome, PipelineConfig, Stage } from "../types.ts";
+import {
+  preflightDeliveryWorktreeHead,
+  resolveLinkedPrDelivery,
+} from "../pr-delivery.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import { readEvents } from "../run-store.ts";
 import type { RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
@@ -178,6 +182,8 @@ export interface AdvancePreMergeOpts {
  */
 export interface AdvancePreMergeDeps extends ShaGateDeps {
   getPrForIssue?: typeof getPrForIssue;
+  /** Fresh same-repository PR authority resolved immediately before autofix mutation. */
+  resolveLinkedPrDelivery?: typeof resolveLinkedPrDelivery;
   getPrChecks?: typeof getPrChecks;
   getForIssue?: typeof getForIssue;
   setBlocked?: typeof setBlocked;
@@ -548,17 +554,43 @@ export async function advance(
     const getForIssueForAutoFix = deps.getForIssue ?? getOnDiskForIssue;
     const salvageFnForAutoFix = deps.trySalvageUncommittedWork ?? trySalvageUncommittedWork;
     const ensureWtForAutoFix = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+    const resolveDeliveryForAutoFix =
+      deps.resolveLinkedPrDelivery ?? resolveLinkedPrDelivery;
     const preAutoFixFn: ShaGateDeps["attemptPreMergeAutoFix"] =
       deps.attemptPreMergeAutoFix ??
       (cfg.harnesses?.implementer
         ? async (blockingFindings, issueTitle, findingsText, claimAttempt) => {
+            const delivery = await resolveDeliveryForAutoFix(cfg, issueNumber, {
+              getPrForIssue: async () => prNumber,
+            });
+            if (!delivery || delivery.prNumber !== prNumber) {
+              return {
+                status: "rematerialize-failed",
+                blockerKind: "worktree-missing",
+                diagnostic:
+                  "pre-merge autofix refused: open same-repository PR delivery identity is unavailable",
+              };
+            }
+            if (delivery.headSha !== stackEntryHeadSha.toLowerCase()) {
+              return {
+                status: "rematerialize-failed",
+                blockerKind: "worktree-missing",
+                diagnostic:
+                  `pre-merge autofix refused: reviewed head ${stackEntryHeadSha} ` +
+                  `does not match live PR head ${delivery.headSha}`,
+              };
+            }
             let wt = await getForIssueForAutoFix(cfg, issueNumber);
             if (!wt) {
               const remat = await ensureWtForAutoFix(cfg, issueNumber, {
                 getOnDiskForIssue: getForIssueForAutoFix,
-                getIssueTitle: async () => issueTitle,
                 runDir: opts.runDir,
                 runStoreDeps: opts.runStoreDeps,
+                recoveryTarget: {
+                  branch: delivery.branch,
+                  headSha: delivery.headSha,
+                  prNumber: delivery.prNumber,
+                },
               });
               if (remat.result === "fail") {
                 return {
@@ -569,6 +601,18 @@ export async function advance(
                 };
               }
               wt = { path: remat.worktree.path, slug: remat.worktree.slug };
+            }
+            const headPreflight = await preflightDeliveryWorktreeHead(
+              wt.path,
+              delivery,
+              gitFnForAutoFix,
+            );
+            if (!headPreflight.ok) {
+              return {
+                status: "rematerialize-failed",
+                blockerKind: "worktree-missing",
+                diagnostic: `pre-merge autofix refused: ${headPreflight.reason}`,
+              };
             }
             // `claimAttempt` charges the durable one-attempt marker inside
             // performPreMergeAutoFix only after the clean-tree preflight, so a
@@ -585,6 +629,12 @@ export async function advance(
               salvageFnForAutoFix,
               {},
               claimAttempt,
+              undefined,
+              {
+                branch: delivery.branch,
+                headSha: delivery.headSha,
+                prNumber: delivery.prNumber,
+              },
             );
           }
         : undefined);
@@ -615,11 +665,29 @@ export async function advance(
     }
 
     // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
+    const resolveArchiveDelivery = deps.resolveLinkedPrDelivery ?? resolveLinkedPrDelivery;
     const archiveOutcome = await maybeArchiveOpenspec(
       cfg,
       issueNumber,
       pipelineRunId,
-      { ...deps, runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+      {
+        ...deps,
+        runDir: opts.runDir,
+        runStoreDeps: opts.runStoreDeps,
+        // Re-resolve live linked-PR authority at the archive mutation boundary.
+        // It must still be the exact PR/head validated by this tick's entry
+        // gates; closure/relink/head movement restarts instead of mutating a
+        // stale delivery branch. maybeArchiveOpenspec retains the final CAS.
+        resolveLinkedPrDelivery: async (deliveryCfg, deliveryIssue) => {
+          const liveDelivery = await resolveArchiveDelivery(deliveryCfg, deliveryIssue);
+          if (
+            !liveDelivery ||
+            liveDelivery.prNumber !== prNumber ||
+            liveDelivery.headSha.toLowerCase() !== prDetail.head_sha.toLowerCase()
+          ) return null;
+          return liveDelivery;
+        },
+      },
       opts.stateDir,
       prNumber,
     );

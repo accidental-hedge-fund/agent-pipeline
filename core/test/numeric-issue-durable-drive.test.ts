@@ -22,6 +22,7 @@ import {
   dispatchItemChildArgs,
   handleRunSubcommand,
   NESTED_ADVANCE_CHILD_SCRIPT,
+  oneItemDriveMaxCycles,
   pickOneItemChildAdvanceInputs,
   pinAdvanceRunIdentity,
   realDispatchItem,
@@ -625,6 +626,16 @@ test("pipeline <N> --once still enters the supervisor and forwards once as a chi
     console.log = originalLog;
     process.exitCode = priorExit;
   }
+});
+
+test("numeric --once caps the owning supervisor to one scheduling cycle", () => {
+  assert.equal(oneItemDriveMaxCycles({ once: true }), 1);
+  assert.equal(oneItemDriveMaxCycles({ once: false }), undefined);
+  assert.equal(oneItemDriveMaxCycles(undefined), undefined);
+  assert.match(
+    PIPELINE_SRC,
+    /maxCycles = oneItemDriveMaxCycles\(input\.childAdvance\)/,
+  );
 });
 
 test("dispatchItemChildArgs omits --once unless one-item childAdvance.once is set", () => {

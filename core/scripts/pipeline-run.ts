@@ -38,6 +38,7 @@ import {
 } from "./engine-attribution.ts";
 import {
   getOnDiskForIssue,
+  ensureManagedWorktree,
   gitInWorktree,
   gitProveMergeResultDeps,
   branchName,
@@ -56,6 +57,7 @@ import {
   bindEpochRestartWorktreeToHead,
   isLaterStageForReviewCurrency,
   reconcileLaterStageReviewCurrency,
+  type EpochRestartWorktreeBindDeps,
   type LaterStageReviewCurrencyDeps,
 } from "./stages/later-stage-review-currency.ts";
 import { withLock, runStateDir, isLivePlanningActive, tryAcquireLivePlanningMarker } from "./lock.ts";
@@ -83,8 +85,10 @@ import {
   finalizeRun,
   initRunDir,
   persistTrustedSurfaceDecision,
+  readInternalCandidateTransitions,
   readEvents,
   readTrustedSurfaceDecision,
+  resolveRunStoreRepoDir,
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
@@ -768,6 +772,8 @@ export interface AdvanceDeps {
   resolveReviewedShaCurrency?: LaterStageReviewCurrencyDeps["resolveCurrency"];
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   gitInWorktree?: typeof gitInWorktree;
+  /** Missing-worktree rematerialization seam for exact-candidate epoch restart. */
+  rematerializeMissingWorktree?: EpochRestartWorktreeBindDeps["rematerializeMissingWorktree"];
   postComment?: typeof postComment;
   postPrComment?: typeof postPrComment;
   addLabelToPr?: typeof addLabelToPr;
@@ -814,6 +820,8 @@ export interface AdvanceDeps {
    * failures without touching the real FS or spawning an event-sink command.
    */
   runStore?: Partial<RunStoreDeps>;
+  /** Persistent checkout that owns run artifacts; defaults to Git primary worktree. */
+  resolveRunStoreRepoDir?: typeof resolveRunStoreRepoDir;
 }
 
 /**
@@ -1684,6 +1692,7 @@ export async function runAdvance(
     // 'starting' and 'run id' lines below. Skipped under --dry-run.
     // runStoreDeps is mutated after the tee starts so --json-events events bypass it.
     let runDir: string | undefined;
+    let runStoreRepoDir = cfg.repo_dir;
     /** Open planning-leverage phase instances keyed by delivery phase (#702). */
     const openPhaseInstances = new Map<string, { phase_instance_id: string; started_at: string }>();
     /**
@@ -1721,7 +1730,11 @@ export async function runAdvance(
       // Use the run id pinned by a detached launcher when present, so the detached
       // caller and the inner run share one `.agent-pipeline/runs/<run-id>` (#155).
       const runId = opts.runId ?? runIdFor(issueNumber, runStartedAt);
-      runDir = runDirPath(cfg.repo_dir, runId);
+      runStoreRepoDir = await (deps.resolveRunStoreRepoDir ?? resolveRunStoreRepoDir)(
+        cfg.repo_dir,
+        deps.gitInWorktree ?? gitInWorktree,
+      );
+      runDir = runDirPath(runStoreRepoDir, runId);
       // stdoutWrite for initRunDir uses the original stdout (before tee starts);
       // this ensures run_start appears on stdout without going to terminal.log.
       if (opts.jsonEvents) {
@@ -2204,11 +2217,11 @@ export async function runAdvance(
       const candidates: DurablePinCandidate[] = [];
       if (runDir) {
         const currentId = path.basename(runDir);
-        const ids = await listRunIds(cfg.repo_dir, runStoreDeps).catch(() => [] as string[]);
+        const ids = await listRunIds(runStoreRepoDir, runStoreDeps).catch(() => [] as string[]);
         const prefix = `${issueNumber}-`;
         for (const id of ids) {
           if (!id.startsWith(prefix) || id === currentId) continue;
-          const priorDir = runDirPath(cfg.repo_dir, id);
+          const priorDir = runDirPath(runStoreRepoDir, id);
           const prior = await readTrustedSurfaceDecision(priorDir, runStoreDeps);
           const events = await readEvents(priorDir, runStoreDeps).catch(() => []);
           candidates.push(
@@ -2245,6 +2258,23 @@ export async function runAdvance(
         preMergeCandidateSha,
         reviewedSha,
       });
+    }
+
+    /** Pipeline-owned candidate transitions remain authoritative across the
+     * supervisor's physical advance runs for this issue. The exact-SHA guard
+     * validates event shape/cause before using any edge. */
+    async function loadDurableInternalCandidateTransitions(): Promise<unknown[]> {
+      if (!runDir) return [];
+      const ids = await listRunIds(runStoreRepoDir, runStoreDeps).catch(() => [] as string[]);
+      const prefix = `${issueNumber}-`;
+      const events: unknown[] = [];
+      for (const id of ids) {
+        if (!id.startsWith(prefix)) continue;
+        const priorDir = runDirPath(runStoreRepoDir, id);
+        events.push(...(await readInternalCandidateTransitions(priorDir, runStoreDeps)));
+        events.push(...(await readEvents(priorDir, runStoreDeps).catch(() => [])));
+      }
+      return events;
     }
 
     async function ensureTrustedSurfaceDecision(
@@ -2691,6 +2721,13 @@ export async function runAdvance(
     // can exhaust MAX_ITERATIONS on the advance that labels the issue R2D, leaving
     // PR tagging / Pipeline Complete unrun unless we defer-finalize after the loop.
     let deployReadyFinalized = false;
+    // Worktree release is intentionally delayed until finalizeRun has committed
+    // run_complete, write-health, and summary evidence.
+    let deferredParkOutcome: Outcome | null = null;
+    let terminalEvidenceDurable = false;
+    const deferParkRelease = (out: Outcome): void => {
+      if (isDurableParkOutcome(out)) deferredParkOutcome = out;
+    };
     // #1462: later-stage review-currency fail-closed must not fall through to
     // deferred ready-to-deploy finalize when resume started at that label.
     let laterStageCurrencyFailedClosed = false;
@@ -2721,6 +2758,7 @@ export async function runAdvance(
           getPrCommits: deps.getPrCommits ?? getPrCommits,
           getGhActor: deps.getGhActor ?? getGhActor,
           resolveCurrency: deps.resolveReviewedShaCurrency,
+          internalCandidateTransitions: await loadDurableInternalCandidateTransitions(),
         },
       );
       if (laterCurrency.kind === "current") return { kind: "current" };
@@ -2741,6 +2779,27 @@ export async function runAdvance(
             {
               getOnDiskForIssue: deps.getOnDiskForIssue ?? getOnDiskForIssue,
               gitInWorktree: deps.gitInWorktree ?? gitInWorktree,
+              rematerializeMissingWorktree:
+                deps.rematerializeMissingWorktree ??
+                (async (config, item) => {
+                  const prNumber = await getPr(config, item);
+                  if (prNumber == null) {
+                    return {
+                      result: "fail" as const,
+                      worktree: null,
+                      reason: "linked open PR is unavailable for exact recovery",
+                      blockerKind: "worktree-missing" as const,
+                    };
+                  }
+                  const live = await getDetailPr(config, prNumber);
+                  return ensureManagedWorktree(config, item, {
+                    recoveryTarget: {
+                      branch: live.head_ref,
+                      headSha: live.head_sha ?? "",
+                      prNumber,
+                    },
+                  });
+                }),
               resolveOpenPrHead: async () => {
                 const live = await readLivePrHead();
                 return live || null;
@@ -2854,6 +2913,7 @@ export async function runAdvance(
           addLabelToPr: deps.addLabelToPr,
           postComment: deps.postComment,
           postPrComment: deps.postPrComment,
+          deferWorktreeRemoval: true,
         });
       } catch (err) {
         if (runDir) {
@@ -2865,6 +2925,7 @@ export async function runAdvance(
         await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: evidenceOutcome(out), commits: [] }, runStoreDeps).catch(() => {});
       }
       deployReadyFinalized = true;
+      deferParkRelease(out);
       printOutcome(issueNumber, "ready-to-deploy", out, tlog);
       return out;
     }
@@ -2942,13 +3003,7 @@ export async function runAdvance(
         );
         if (ceiling) console.log(ceiling.body);
         // Already parked: free capacity when the managed worktree is safe (#718).
-        await maybeReleaseWorktreeOnPark(
-          cfg,
-          issueNumber,
-          { advanced: false, status: "finalized", reason: "needs-human" },
-          !!opts.dryRun,
-          deps,
-        );
+        deferParkRelease({ advanced: false, status: "finalized", reason: "needs-human" });
         break;
       }
 
@@ -2993,13 +3048,7 @@ export async function runAdvance(
           `[pipeline] #${issueNumber}: follow the "### How to unblock" steps in the comment above to resume.`,
         );
         // Already blocked: free capacity when the managed worktree is safe (#718).
-        await maybeReleaseWorktreeOnPark(
-          cfg,
-          issueNumber,
-          { advanced: false, status: "blocked", reason: "already blocked" },
-          !!opts.dryRun,
-          deps,
-        );
+        deferParkRelease({ advanced: false, status: "blocked", reason: "already blocked" });
         break;
       }
 
@@ -3157,11 +3206,11 @@ export async function runAdvance(
             const sha = normalizeCandidateSha(candidateSha);
             if (!sha) return null;
             const currentId = path.basename(runDir);
-            const ids = await listRunIds(cfg.repo_dir, runStoreDeps).catch(() => [] as string[]);
+            const ids = await listRunIds(runStoreRepoDir, runStoreDeps).catch(() => [] as string[]);
             const prefix = `${issueNumber}-`;
             for (const id of ids) {
               if (!id.startsWith(prefix) || id === currentId) continue;
-              const priorDir = runDirPath(cfg.repo_dir, id);
+              const priorDir = runDirPath(runStoreRepoDir, id);
               const priorRead = await readTesterEvidence(priorDir, deps.testerIo);
               const matched = shaMatchedPassedTesterEvidence(
                 priorRead.status === "ok" ? priorRead.evidence : null,
@@ -3740,7 +3789,7 @@ export async function runAdvance(
         // Durable park sink (#718): free a safe managed worktree so capacity is
         // not stranded while this issue waits. Mid-process auto-loop continues
         // above never reach this path.
-        await maybeReleaseWorktreeOnPark(cfg, issueNumber, out, !!opts.dryRun, deps);
+        deferParkRelease(out);
         if (out.status === "error") {
           process.exitCode = 1;
         }
@@ -3802,13 +3851,7 @@ export async function runAdvance(
             runStoreDeps,
           ).catch(() => {});
         }
-        await maybeReleaseWorktreeOnPark(
-          cfg,
-          issueNumber,
-          exhaustedOutcome,
-          !!opts.dryRun,
-          deps,
-        );
+        deferParkRelease(exhaustedOutcome);
       }
     }
     } finally {
@@ -3898,10 +3941,15 @@ export async function runAdvance(
           // Metrics are NOT passed here — gh_metrics_summary is emitted after notification
           // so that notification gh calls (getPrForIssue/postPrComment) are captured (#257).
           if (runDir) {
-            await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, {
-              ...runStoreDeps,
-              evaluationPinSubject: readinessSubject ?? null,
-            }, undefined, runCompleteStopReason).catch(() => {});
+            try {
+              const finalization = await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, {
+                ...runStoreDeps,
+                evaluationPinSubject: readinessSubject ?? null,
+              }, undefined, runCompleteStopReason);
+              terminalEvidenceDurable = finalization.durable;
+            } catch {
+              terminalEvidenceDurable = false;
+            }
           }
           // Opt-in papercut auto-file (#421): best-effort, gated on resolved
           // config, wrapped so a failure here can never alter the run's outcome.
@@ -3940,6 +3988,15 @@ export async function runAdvance(
         // a notification failure does not suppress the summary (#257 finding 2).
         if (runDir) {
           await emitGhMetrics(runDir, ghCollector.summary(), runStoreDeps).catch(() => {});
+        }
+        if (deferredParkOutcome && terminalEvidenceDurable) {
+          await maybeReleaseWorktreeOnPark(
+            cfg,
+            issueNumber,
+            deferredParkOutcome,
+            !!opts.dryRun,
+            deps,
+          );
         }
       }
     }

@@ -159,6 +159,7 @@ import {
   persistPublicEntrypointAdmission,
   persistTrustedSurfaceDecision,
   readTrustedSurfaceDecision,
+  resolveRunStoreRepoDir,
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
@@ -416,6 +417,13 @@ export function pickOneItemChildAdvanceInputs(opts: AdvanceOpts): OneItemChildAd
     profile: opts.profile,
     candidateShaOverride: opts.candidateShaOverride,
   };
+}
+
+/** A numeric `--once` drive owns exactly one supervisor scheduling cycle. */
+export function oneItemDriveMaxCycles(
+  childAdvance: OneItemChildAdvanceInputs | undefined,
+): number | undefined {
+  return childAdvance?.once ? 1 : undefined;
 }
 
 // Package version, single-sourced from package.json so a version bump is reflected
@@ -1639,6 +1647,8 @@ export interface RealDispatchItemDeps {
    * (#1327). Multi-item callers omit this so `--once` stays off the child argv.
    */
   childAdvance?: OneItemChildAdvanceInputs;
+  /** Persistent run-store owner shared with the nested advance child. */
+  resolveRunStoreRepoDir?: typeof resolveRunStoreRepoDir;
 }
 
 export function realDispatchItem(
@@ -1682,6 +1692,10 @@ export function realDispatchItem(
 
   return async (request, hooks): Promise<LoopExecutionResponse> => {
     const issueNumber = Number(request.item_id);
+    const runStoreRepoDir = await (deps.resolveRunStoreRepoDir ?? resolveRunStoreRepoDir)(
+      cfg.repo_dir,
+      gitInWorktree,
+    );
     // Pin before spawn so the child uses the same `.agent-pipeline/runs/<run-id>/`
     // (detached-launch pattern). Start linkage + live events_path are published
     // only after the pinned run store is confirmed initialized — never on bare
@@ -1693,10 +1707,10 @@ export function realDispatchItem(
         ? childAdvance?.runId
           ? {
               pipeline_run_id: childAdvance.runId,
-              run_dir: runDirPath(cfg.repo_dir, childAdvance.runId),
-              events_path: path.join(runDirPath(cfg.repo_dir, childAdvance.runId), "events.jsonl"),
+              run_dir: runDirPath(runStoreRepoDir, childAdvance.runId),
+              events_path: path.join(runDirPath(runStoreRepoDir, childAdvance.runId), "events.jsonl"),
             }
-          : pinAdvanceRunIdentity(cfg.repo_dir, issueNumber, nowFn())
+          : pinAdvanceRunIdentity(runStoreRepoDir, issueNumber, nowFn())
         : null;
 
     let startLinkage: Promise<void> = Promise.resolve();
@@ -2057,6 +2071,7 @@ export interface RealExecuteRecoveryDeps {
     input: ComputeTrustedSurfaceFromObjectSourceInput,
   ) => ReturnType<typeof computeTrustedSurfaceFromObjectSource>;
   persistTrustedSurfaceDecision?: typeof persistTrustedSurfaceDecision;
+  resolveRunStoreRepoDir?: typeof resolveRunStoreRepoDir;
   /** Blocked-run engine identity from run.json (not the currently installed engine). */
   resolveRunEngineIdentity?: typeof resolveRunEngineIdentity;
 }
@@ -2801,7 +2816,13 @@ export function realExecuteRecovery(
           ? await getDetailPr(cfg, prNumber).catch(() => null)
           : null;
         const runId = input.evidence?.pipeline_run_id?.trim() ?? "";
-        const runDir = runId ? runDirPath(cfg.repo_dir, runId) : "";
+        const runStoreRepoDir = runId
+          ? await (deps.resolveRunStoreRepoDir ?? resolveRunStoreRepoDir)(
+              cfg.repo_dir,
+              gitInWt,
+            )
+          : cfg.repo_dir;
+        const runDir = runId ? runDirPath(runStoreRepoDir, runId) : "";
         const readTs = deps.readTrustedSurfaceDecision ?? readTrustedSurfaceDecision;
         let trustedSurface = runDir ? await readTs(runDir).catch(() => null) : null;
         let pushedHeadSha: string | null = null;
@@ -3476,12 +3497,14 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
   };
 
   try {
+    const maxCycles = oneItemDriveMaxCycles(input.childAdvance);
     const parentPidRaw = process.env.PIPELINE_LIVENESS_PARENT_PID;
     const parentPid = parentPidRaw ? Number.parseInt(parentPidRaw, 10) : Number.NaN;
     const result = await driveSupervisor(supervisorDeps, {
       runId,
       engine: input.engine as LoopEngineName,
       resume: !!input.resumeRunId || resumeExisting,
+      ...(maxCycles !== undefined ? { maxCycles } : {}),
       ...(Number.isInteger(parentPid) && parentPid > 0 ? { parentPid } : {}),
       onRunReady: input.onRunReady
         ? async (ctx) => {
@@ -8743,6 +8766,8 @@ export interface RunSubcommandDeps {
    * Injected so unit tests never start a real supervisor.
    */
   runSingleIssue?: typeof runSingleIssueCommand;
+  /** Persistent primary checkout that owns detached run-store pointers. */
+  resolveRunStoreRepoDir?: typeof resolveRunStoreRepoDir;
 }
 const defaultRunSubcommandDeps: RunSubcommandDeps = {
   spawnDetached,
@@ -8798,7 +8823,10 @@ export async function handleRunSubcommand(
     // desktop consumer could not find the structured event log without guessing —
     // reintroducing the competing artifact format the #155 contract avoids (#155).
     const runStoreRunId = runIdFor(number, new Date());
-    const runStoreDir = runDirPath(repoDir, runStoreRunId);
+    const persistentRepoDir = await (
+      deps.resolveRunStoreRepoDir ?? resolveRunStoreRepoDir
+    )(repoDir, gitInWorktree);
+    const runStoreDir = runDirPath(persistentRepoDir, runStoreRunId);
 
     // Forward all launch-shaping options so the inner pipeline process respects
     // the same profile / repo / model the caller specified (e.g. --profile claude).
