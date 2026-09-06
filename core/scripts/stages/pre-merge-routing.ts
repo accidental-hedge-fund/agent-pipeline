@@ -674,14 +674,19 @@ export async function advance(
         ...deps,
         runDir: opts.runDir,
         runStoreDeps: opts.runStoreDeps,
-        // Bind archive delivery to the same per-tick PR snapshot already used
-        // by the SHA gate; maybeArchiveOpenspec remains directly testable with
-        // legacy synthetic fixtures when this production seam is absent.
-        resolveLinkedPrDelivery: (deliveryCfg, deliveryIssue) =>
-          resolveArchiveDelivery(deliveryCfg, deliveryIssue, {
-            getPrForIssue: async () => prNumber,
-            getPrDetail: async () => prDetail,
-          }),
+        // Re-resolve live linked-PR authority at the archive mutation boundary.
+        // It must still be the exact PR/head validated by this tick's entry
+        // gates; closure/relink/head movement restarts instead of mutating a
+        // stale delivery branch. maybeArchiveOpenspec retains the final CAS.
+        resolveLinkedPrDelivery: async (deliveryCfg, deliveryIssue) => {
+          const liveDelivery = await resolveArchiveDelivery(deliveryCfg, deliveryIssue);
+          if (
+            !liveDelivery ||
+            liveDelivery.prNumber !== prNumber ||
+            liveDelivery.headSha.toLowerCase() !== prDetail.head_sha.toLowerCase()
+          ) return null;
+          return liveDelivery;
+        },
       },
       opts.stateDir,
       prNumber,

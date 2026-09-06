@@ -537,6 +537,56 @@ test("advance(): #464 shape — worktree misreports OpenSpec inactive but the PR
   assert.match(blockedCalls[0].reason, /finding-level-reversal-matching/);
 });
 
+test("advance(): archive re-resolves live delivery and refuses a PR head replaced after entry-gate review", async (t) => {
+  const REVIEWED_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const REPLACED_HEAD = "dddddddddddddddddddddddddddddddddddddddd";
+  const reviewComment = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${REVIEWED_HEAD} -->`;
+  const blockedCalls: Array<{ reason: string; label: string }> = [];
+  let gitCalled = false;
+
+  const deps: AdvancePreMergeDeps = {
+    getPrForIssue: async () => PR,
+    getIssueDetail: (async () => ({ comments: [{ body: reviewComment, author: "test-actor" }] })) as AdvancePreMergeDeps["getIssueDetail"],
+    getPrDetail: (async () => ({
+      number: PR,
+      state: "open",
+      head_ref: "b",
+      head_sha: REVIEWED_HEAD,
+      head_repo_full_name: cfg.repo,
+      is_cross_repository: false,
+      mergeable: true,
+      mergeable_state: "CLEAN",
+    })) as AdvancePreMergeDeps["getPrDetail"],
+    getPrCommits: async () => [],
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    resolveLinkedPrDelivery: async () => ({
+      branch: "replacement",
+      headSha: REPLACED_HEAD,
+      prNumber: PR,
+      repository: cfg.repo,
+    }),
+    gitInWorktree: (async () => {
+      gitCalled = true;
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    setBlocked: (async (_cfg, _n, reason, _stage, label) => {
+      blockedCalls.push({ reason, label });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    getGhActor: async () => "test-actor",
+  };
+
+  let out: Awaited<ReturnType<typeof advance>> | undefined;
+  await quiet(t, async () => {
+    out = await advance(cfg, ISSUE, {}, deps);
+  });
+
+  assert.equal(out!.status, "blocked");
+  assert.equal(out!.blockerKind, "head-drift");
+  assert.equal(blockedCalls[0]?.label, "head-drift");
+  assert.equal(gitCalled, false, "stale authority must be rejected before archive git mutation");
+});
+
 test("advance(): openspec.enabled off → head-side guard is skipped even though the PR's file list still shows an active change", async (t) => {
   const SHA_HEAD = "cccccccccccccccccccccccccccccccccccccccc";
   const reviewComment = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
@@ -631,6 +681,12 @@ test("advance(): override-resumed pre-merge (blocking delta-review key overridde
     })) as AdvancePreMergeDeps["getPrDetail"],
     getPrCommits: async () => [],
     getPrChecks: (async () => [{ name: "ci", bucket: "pass" }]) as AdvancePreMergeDeps["getPrChecks"],
+    resolveLinkedPrDelivery: async () => ({
+      branch: "b",
+      headSha: SHA_HEAD,
+      prNumber: PR,
+      repository: cfg.repo,
+    }),
     // Shared active-change set comes from PR tip (#714); must not hit network.
     getPrDiff: async () => `diff --git a/${CHANGE_PATH} b/${CHANGE_PATH}\n`,
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],

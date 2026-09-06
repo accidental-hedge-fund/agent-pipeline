@@ -256,7 +256,7 @@ Both park and demote ceiling artifacts SHALL bind the candidate SHA and particip
 
 When an item is in a fix stage and the managed worktree already equals the exact freshly resolved linked-PR head beyond the triggering review SHA, the pipeline SHALL skip the implementer invocation and validate that external repair through the normal commit, specification, build, test, and transition gates. A local-only or stale head SHALL NOT receive this bypass.
 
-Pre-merge OpenSpec archive sync, rematerialization, and publication SHALL use the freshly resolved linked-PR delivery branch and head rather than the managed synthetic branch. Archive publication SHALL be compare-and-swap bound to that authorized head.
+Pre-merge OpenSpec archive sync, rematerialization, and publication SHALL re-resolve the live linked-PR delivery branch and head at the mutation boundary rather than use an earlier snapshot or the managed synthetic branch. That live identity SHALL still match the exact PR and candidate head validated by the current pre-merge tick, and archive publication SHALL be compare-and-swap bound to that authorized head.
 
 #### Scenario: At the cap the reviewer is not invoked again
 
