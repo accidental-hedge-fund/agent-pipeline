@@ -855,8 +855,8 @@ test("source wiring: pre_merge autofix/archive and fix rematerialize before bare
   );
   assert.match(
     preMerge,
-    /deliveryPushRefspec\(managedBranch, deliveryBranch\)/,
-    "pre-merge autofix delivery must not push the synthetic workspace branch",
+    /deliveryPushArgs\(managedBranch, deliveryBranch, delivery\.headSha\)/,
+    "pre-merge autofix delivery must CAS-push to the adopted PR branch",
   );
   assert.match(
     preMerge,

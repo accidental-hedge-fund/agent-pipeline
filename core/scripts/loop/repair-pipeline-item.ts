@@ -23,12 +23,13 @@ import { withTrailers } from "../traceability.ts";
 import type { StageDiagnostic } from "../stage-diagnostic.ts";
 import { LABEL_PREFIX, type PipelineConfig } from "../types.ts";
 import {
+  branchName,
   ensureManagedWorktree,
   getOnDiskForIssue,
   gitInWorktree,
 } from "../worktree.ts";
 import { appendEvent, defaultRunStoreDeps, runDirPath } from "../run-store.ts";
-import { DEFAULT_GIT_PUSH_AUTH, gitExecForwardingEnv, runConfiguredGitPush } from "../git-push-auth.ts";
+import { DEFAULT_GIT_PUSH_AUTH, deliveryPushArgs, gitExecForwardingEnv, runConfiguredGitPush } from "../git-push-auth.ts";
 import { classifyPorcelainForScratchRecover } from "../worktree-dirt.ts";
 
 /** #1060: closed set of non-commit repair failure categories. */
@@ -409,7 +410,7 @@ export function createRepairPipelineItemExecutor(
         const push = await runConfiguredGitPush({
           cwd: wt.path,
           auth: pushAuth,
-          args: ["push", "origin", `HEAD:refs/heads/${branch}`],
+          args: deliveryPushArgs(branchName(issueNumber, wt.slug), branch, expected),
           deps: {
             gitConfigGet: async (cwd, key) => {
               const r = await git(cwd, ["config", "--get", key], { ignoreFailure: true });

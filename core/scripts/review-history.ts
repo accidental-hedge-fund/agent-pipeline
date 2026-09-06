@@ -554,6 +554,12 @@ export function hasSupersededDeltaCeiling(
     .filter((c) => c.body.startsWith("## Pipeline: Pre-merge delta round ceiling reached"))
     .at(-1);
   if (!ceiling) return false;
+  const ceilingIndex = trustedComments.lastIndexOf(ceiling);
+  if (
+    trustedComments
+      .slice(ceilingIndex + 1)
+      .some((c) => c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX))
+  ) return false;
   const bound = [...ceiling.body.matchAll(/<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->/gi)]
     .at(-1)?.[1];
   if (bound) return bound.toLowerCase() !== opts.candidateSha.toLowerCase();

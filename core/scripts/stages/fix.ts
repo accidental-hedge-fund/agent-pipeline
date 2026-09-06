@@ -122,6 +122,7 @@ import {
 } from "../transient-wrappers.ts";
 import {
   DEFAULT_GIT_PUSH_AUTH,
+  deliveryPushArgs,
   deliveryPushRefspec,
   formatPushAuthFailure,
   gitExecForwardingEnv,
@@ -1728,7 +1729,9 @@ export async function advanceFix(
           const res = await runConfiguredGitPush({
             cwd: wt.path,
             auth: pushAuth,
-            args: ["push", "origin", deliveryPushRefspec(managedBranch, branch)],
+            args: linkedDelivery
+              ? deliveryPushArgs(managedBranch, branch, linkedDelivery.headSha)
+              : ["push", "origin", deliveryPushRefspec(managedBranch, branch)],
             deps: {
               gitConfigGet: async (cwd, key) => {
                 const r = await gitWt(cwd, ["config", "--get", key], {

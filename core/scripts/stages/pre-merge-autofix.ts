@@ -30,6 +30,7 @@ import type { PipelineConfig, ReviewFinding } from "../types.ts";
 import {
   DEFAULT_GIT_PUSH_AUTH,
   deliveryPushRefspec,
+  deliveryPushArgs,
   gitExecForwardingEnv,
   runConfiguredGitPush,
 } from "../git-push-auth.ts";
@@ -767,7 +768,9 @@ export async function performPreMergeAutoFix(
       const pushRes = await runConfiguredGitPush({
         cwd: wt.path,
         auth: pushAuth,
-        args: ["push", "origin", deliveryPushRefspec(managedBranch, deliveryBranch)],
+        args: delivery
+          ? deliveryPushArgs(managedBranch, deliveryBranch, delivery.headSha)
+          : ["push", "origin", deliveryPushRefspec(managedBranch, deliveryBranch)],
         deps: {
           gitConfigGet: async (cwd, key) => {
             const r = await gitFn(cwd, ["config", "--get", key], { ignoreFailure: true });

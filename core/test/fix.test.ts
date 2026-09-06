@@ -40,7 +40,7 @@ import {
   type AdvanceFixDeps,
 } from "../scripts/stages/fix.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
-import { deliveryPushRefspec } from "../scripts/git-push-auth.ts";
+import { deliveryPushArgs, deliveryPushRefspec } from "../scripts/git-push-auth.ts";
 import { preflightDeliveryWorktreeHead } from "../scripts/pr-delivery.ts";
 
 const execFileAsync = promisify(execFile);
@@ -875,6 +875,18 @@ test("deliveryPushRefspec: adopted synthetic workspace pushes HEAD to the delive
   assert.equal(deliveryPushRefspec("pipeline/1478-x", "pipeline/1478-x"), "pipeline/1478-x");
 });
 
+test("deliveryPushArgs: adopted repair is CAS-bound to the authorized remote head", () => {
+  assert.deepEqual(
+    deliveryPushArgs("pipeline/1478-adopted", "fix/adopted", SHA_HEAD),
+    [
+      "push",
+      `--force-with-lease=refs/heads/fix/adopted:${SHA_HEAD}`,
+      "origin",
+      "HEAD:fix/adopted",
+    ],
+  );
+});
+
 test("adopted synthetic workspace: harness commit reaches the delivery branch only via HEAD:<delivery> (#1478)", async () => {
   const { cloneDir, cleanup } = await makeRemoteAndClone();
   const delivery = "fix/release-convergence-durable";
@@ -906,6 +918,43 @@ test("adopted synthetic workspace: harness commit reaches the delivery branch on
   }
 });
 
+test("adopted repair CAS refuses to resurrect a candidate force-reset during the harness (#1478)", async () => {
+  const { cloneDir, cleanup } = await makeRemoteAndClone();
+  const delivery = "fix/cas-race";
+  const synthetic = "pipeline/1478-cas-race";
+  try {
+    await execFileAsync("git", ["checkout", "-b", delivery], { cwd: cloneDir });
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "feat: authorized candidate"], { cwd: cloneDir });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const authorized = stdout.trim();
+    await execFileAsync("git", ["push", "origin", delivery], { cwd: cloneDir });
+    await execFileAsync("git", ["checkout", "-b", synthetic], { cwd: cloneDir });
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "fix: stale repair"], { cwd: cloneDir });
+
+    // Concurrent actor force-resets the PR branch to the authorized head's
+    // parent. A normal push of the repair would be a fast-forward and would
+    // incorrectly resurrect the superseded candidate.
+    await execFileAsync(
+      "git",
+      ["push", "--force", "origin", `${authorized}^:refs/heads/${delivery}`],
+      { cwd: cloneDir },
+    );
+    await assert.rejects(
+      () => execFileAsync("git", deliveryPushArgs(synthetic, delivery, authorized), { cwd: cloneDir }),
+      /stale info|rejected/i,
+    );
+    const { stdout: remoteHead } = await execFileAsync(
+      "git",
+      ["ls-remote", "origin", `refs/heads/${delivery}`],
+      { cwd: cloneDir },
+    );
+    const { stdout: expectedReset } = await execFileAsync("git", ["rev-parse", `${authorized}^`], { cwd: cloneDir });
+    assert.equal(remoteHead.trim().split(/\s+/)[0], expectedReset.trim());
+  } finally {
+    await cleanup();
+  }
+});
+
 test("advanceFix source pin: adopted delivery identity is bound before the harness and retained when the harness commits (#1478)", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
   const resolveIdx = src.indexOf("const linkedDelivery = await resolveLinkedPrDelivery(");
@@ -920,8 +969,8 @@ test("advanceFix source pin: adopted delivery identity is bound before the harne
   assert.match(src, /const branch = externalDeliveryBranch \?\? deliveryBranch/);
   assert.match(
     src,
-    /args:\s*\["push",\s*"origin",\s*deliveryPushRefspec\(managedBranch,\s*branch\)\]/,
-    "pipeline-owned final push must use HEAD:<delivery> when the local branch is synthetic",
+    /deliveryPushArgs\(managedBranch, branch, linkedDelivery\.headSha\)/,
+    "pipeline-owned final push must use a lease bound to the adopted PR head",
   );
   const rematIdx = src.indexOf("if (!wt) {");
   const ensureIdx = src.indexOf("await ensureFn(", rematIdx);

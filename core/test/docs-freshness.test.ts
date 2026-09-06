@@ -970,7 +970,7 @@ test("bite: removing pre-PR docs enforcement would allow createPr on red docs", 
   );
   const fixDocsIdx = fixSrc.indexOf("docsEnforce(");
   // The push after gates uses an explicit delivery refspec — require docs before first push.
-  const fixPushIdx = fixSrc.indexOf('["push", "origin", deliveryPushRefspec(managedBranch, branch)]');
+  const fixPushIdx = fixSrc.indexOf("deliveryPushArgs(managedBranch, branch, linkedDelivery.headSha)");
   assert.ok(fixDocsIdx > 0, "fix.ts must call docsEnforce on the post-gate path");
   assert.ok(fixPushIdx > fixDocsIdx, "docsEnforce must appear before push in fix.ts");
 

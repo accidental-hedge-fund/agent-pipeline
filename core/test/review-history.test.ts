@@ -1082,6 +1082,15 @@ test("hasSupersededDeltaCeiling: a fixed successor can escape a stale exhausted 
   assert.equal(countDeltaRounds(comments, { actor: "pipeline-bot" }), 4);
   assert.equal(hasSupersededDeltaCeiling(comments, { actor: "pipeline-bot", candidateSha: oldHead }), false);
   assert.equal(hasSupersededDeltaCeiling(comments, { actor: "pipeline-bot", candidateSha: newHead }), true);
+  comments.push({
+    author: "pipeline-bot",
+    body: `${DELTA_REVIEW_MARKER_PREFIX} — needs-attention\n<!-- reviewed-sha: ${newHead} -->`,
+  });
+  assert.equal(
+    hasSupersededDeltaCeiling(comments, { actor: "pipeline-bot", candidateSha: "c".repeat(40) }),
+    false,
+    "H1 ceiling → H2 review cannot grant another reset to H3",
+  );
 });
 
 // ---------------------------------------------------------------------------

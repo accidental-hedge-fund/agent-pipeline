@@ -1470,10 +1470,12 @@ test("performPreMergeAutoFix: adopted PR prompt and pipeline push retain deliver
   assert.match(prompt, /git push origin HEAD:fix\/release-convergence-durable/);
   assert.ok(
     calls.some((args) =>
-      args[0] === "push" && args[1] === "origin" &&
-      args[2] === "HEAD:fix/release-convergence-durable"
+      args[0] === "push" &&
+      args[1] === "--force-with-lease=refs/heads/fix/release-convergence-durable:sha1" &&
+      args[2] === "origin" &&
+      args[3] === "HEAD:fix/release-convergence-durable"
     ),
-    "pre-merge autofix must push local HEAD to the adopted PR delivery branch",
+    "pre-merge autofix must CAS-push local HEAD to the adopted PR delivery branch",
   );
 });
 

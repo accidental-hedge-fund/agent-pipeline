@@ -43,6 +43,20 @@ export function deliveryPushRefspec(localBranch: string, deliveryBranch: string)
   return localBranch === deliveryBranch ? deliveryBranch : `HEAD:${deliveryBranch}`;
 }
 
+/** Build a push argv whose remote update is CAS-bound to the authorized PR head. */
+export function deliveryPushArgs(
+  localBranch: string,
+  deliveryBranch: string,
+  expectedRemoteHead: string,
+): string[] {
+  return [
+    "push",
+    `--force-with-lease=refs/heads/${deliveryBranch}:${expectedRemoteHead}`,
+    "origin",
+    deliveryPushRefspec(localBranch, deliveryBranch),
+  ];
+}
+
 const HTTPS_TOKEN_PREFIX = "https-token:";
 
 /** Known GitHub workflow-scope refusal text fragments (case-insensitive match). */
