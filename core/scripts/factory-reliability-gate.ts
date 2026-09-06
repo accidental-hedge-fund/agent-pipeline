@@ -5127,7 +5127,16 @@ export async function runFactoryGate(
       executed_matrix_rows: opts.executed_matrix_rows,
     };
   }
-  const collectorInFlightShip = opts.inFlightShip === true;
+  // Prepare scores the pack in-process with `inFlightShip: true`, but the
+  // production attestor re-enters through the public `factory-gate --from-run`
+  // command. Once attachShipPathFromRunBinding has loaded the closed unsigned
+  // checkpoint, that binding is authoritative proof that this is the same
+  // in-flight ship score. Preserve prepare's collection semantics so the
+  // attestor does not drop pre-candidate host operations on replay (#1499).
+  // An unbound standalone factory-gate remains strict.
+  const collectorInFlightShip =
+    opts.inFlightShip === true ||
+    Boolean(opts.fromRun && computeInput.factory_release_binding != null);
   if (collectorInFlightShip) {
     computeInput = {
       ...computeInput,

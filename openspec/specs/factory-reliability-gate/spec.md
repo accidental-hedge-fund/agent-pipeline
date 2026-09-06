@@ -2433,6 +2433,20 @@ The HMAC-covered binding SHALL exactly match request fingerprint, target version
 
 Before HMAC, the attestor SHALL require every collected scored candidate identity (`pack_provenance.candidate_git_sha` and Layer-A `pack_provenance.probes[].candidate_git_sha` when present) to exactly equal `factory_release_binding.candidate_git_sha`. A mismatch SHALL fail closed and SHALL NOT persist evidence.
 
+The closed `factory_release_binding` loaded by credentialed `factory-gate --from-run` SHALL identify the score as the same in-flight ship operation scored by unsigned `factory-release prepare`. Unique-operation collection in that attestor replay SHALL therefore preserve prepare's in-flight treatment of host artifacts that predate final candidate or release binding. A standalone `factory-gate` score without a closed ship-path binding SHALL remain strict and SHALL NOT admit those unbound artifacts.
+
+#### Scenario: Attestor replay preserves prepare operation coverage
+
+- **WHEN** unsigned prepare accepts an admitted host operation under in-flight ship rules
+- **AND** credentialed `factory-gate --from-run` loads the closed `factory_release_binding` for that checkpoint
+- **THEN** the attestor SHALL collect that operation with the same in-flight binding rules
+- **AND** SHALL NOT report the operation missing solely because the public attestor command did not receive an internal `inFlightShip` option
+
+#### Scenario: Unbound standalone score remains strict
+
+- **WHEN** standalone `factory-gate` has no closed ship-path `factory_release_binding`
+- **THEN** unbound host operations SHALL remain excluded from candidate/release coverage
+
 Standalone unbound `--from-run` (no unsigned checkpoint / no version index / no request SHA) MAY omit the binding and MAY mint a fresh `run_id`. That standalone path SHALL NOT be the ship handoff.
 
 This requirement does not collapse production `A` and `B` into one `run_id`. It does not authorize `--skip-frg`. It does not change Layer A packed-candidate identity (#1298).
