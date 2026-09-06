@@ -3039,6 +3039,14 @@ interface IssueTimelinePage {
   }[];
 }
 
+interface IssueClosingPrPage {
+  pageInfo: {
+    hasPreviousPage: boolean;
+    startCursor: string | null;
+  };
+  nodes: IssueTimelinePr[];
+}
+
 function isSameRepoTimelinePr(pr: IssueTimelinePr | null | undefined): pr is IssueTimelinePr & { number: number } {
   return Boolean(
     pr &&
@@ -3046,6 +3054,32 @@ function isSameRepoTimelinePr(pr: IssueTimelinePr | null | undefined): pr is Iss
     typeof pr.number === "number" &&
     !pr.isCrossRepository,
   );
+}
+
+function isSameRepoClosingPr(
+  pr: IssueTimelinePr | null | undefined,
+): pr is IssueTimelinePr & { number: number } {
+  return Boolean(
+    pr &&
+    typeof pr.number === "number" &&
+    pr.isCrossRepository === false,
+  );
+}
+
+function appendClosingPrPage(
+  closing: IssueClosingPrPage,
+  out: number[],
+  seen: Set<number>,
+): number {
+  let appended = 0;
+  for (let i = closing.nodes.length - 1; i >= 0; i--) {
+    const pr = closing.nodes[i]!;
+    if (!isSameRepoClosingPr(pr) || seen.has(pr.number)) continue;
+    seen.add(pr.number);
+    out.push(pr.number);
+    appended++;
+  }
+  return appended;
 }
 
 /** Pipeline squash identity for any-state lookup: head `pipeline/<N>-*` or
@@ -3107,19 +3141,25 @@ const ISSUE_TIMELINE_QUERY =
   "{issue(number:$num){timelineItems(last:50,before:$before,itemTypes:[CONNECTED_EVENT,CROSS_REFERENCED_EVENT])" +
   "{pageInfo{hasPreviousPage startCursor}nodes{__typename " +
   `... on ConnectedEvent{subject{__typename ... on PullRequest{${ISSUE_TIMELINE_PR_FIELDS}}}} ` +
-  `... on CrossReferencedEvent{willCloseTarget source{__typename ... on PullRequest{${ISSUE_TIMELINE_PR_FIELDS}}}}}}}}}`;
+  `... on CrossReferencedEvent{willCloseTarget source{__typename ... on PullRequest{${ISSUE_TIMELINE_PR_FIELDS}}}}}} ` +
+  `closedByPullRequestsReferences(last:50){pageInfo{hasPreviousPage startCursor}nodes{${ISSUE_TIMELINE_PR_FIELDS}}}}}}`;
+
+const ISSUE_CLOSING_PRS_QUERY =
+  "query($owner:String!,$repo:String!,$num:Int!,$before:String){repository(owner:$owner,name:$repo)" +
+  `{issue(number:$num){closedByPullRequestsReferences(last:50,before:$before)` +
+  `{pageInfo{hasPreviousPage startCursor}nodes{${ISSUE_TIMELINE_PR_FIELDS}}}}}}`;
 
 /** Same issue-scoped resolution as {@link getPrForIssue} but across every PR
  *  state (open, closed, merged) — used by reconciliation (#511), ship train
  *  observation, and train merge-wave. An open-only lookup would miss a
  *  since-merged PR (`pr_state: "merged"`).
  *
- *  Resolves via the issue's own `CONNECTED_EVENT`/`CROSS_REFERENCED_EVENT`
- *  timeline (paginated backward through history) rather than a repository-wide
- *  `gh pr list` scan: the timeline is scoped to this one issue, so it cannot
- *  lose a historical merged PR to an unrelated bounded-size repo-wide list
- *  (#511 review-2 finding — a fixed `-L 100` repo-wide scan silently drops
- *  older PRs once a repo has passed 100 total PRs).
+ *  Resolves from the issue's authoritative `closedByPullRequestsReferences`
+ *  connection plus its own `CONNECTED_EVENT`/`CROSS_REFERENCED_EVENT` timeline,
+ *  paginating both backward through history rather than using a repository-wide
+ *  `gh pr list` scan. The closing connection covers merged recovery PRs whose
+ *  post-merge timeline event reports `willCloseTarget=false` (#1478/#1479),
+ *  while the timeline preserves explicit manual links and pipeline identities.
  *
  *  Match identities (#1269): `ConnectedEvent`, closing `willCloseTarget`,
  *  same-repo head `pipeline/<N>-*`, or title parenthetical `(#N)`. Fork PRs
@@ -3154,6 +3194,7 @@ async function paginateIssueTimelinePrs(
   let before: string | null = null;
   const out: number[] = [];
   const seen = new Set<number>();
+  let closingBefore: string | null | undefined;
   for (let page = 0; page < ISSUE_TIMELINE_PR_PAGE_CAP; page++) {
     const args = [
       "api",
@@ -3170,20 +3211,81 @@ async function paginateIssueTimelinePrs(
     if (before) args.push("-F", `before=${before}`);
     const stdout = await run(args);
     const data = JSON.parse(stdout) as {
-      data: { repository: { issue: { timelineItems: IssueTimelinePage } | null } };
+      data: {
+        repository: {
+          issue: {
+            timelineItems: IssueTimelinePage;
+            closedByPullRequestsReferences?: IssueClosingPrPage;
+          } | null;
+        };
+      };
     };
-    const timelineItems = data.data.repository.issue?.timelineItems;
+    const issue = data.data.repository.issue;
+    const timelineItems = issue?.timelineItems;
     if (!timelineItems) return { numbers: out, truncated: false };
+    if (page === 0) {
+      const closing = issue?.closedByPullRequestsReferences;
+      if (closing) {
+        const appended = appendClosingPrPage(closing, out, seen);
+        if (opts.stopOnFirst && appended > 0) return { numbers: out, truncated: false };
+        closingBefore = closing.pageInfo.hasPreviousPage
+          ? closing.pageInfo.startCursor
+          : null;
+      } else {
+        closingBefore = null;
+      }
+    }
     for (const n of listPrsFromTimelinePage(timelineItems.nodes, issueNumber)) {
       if (seen.has(n)) continue;
       seen.add(n);
       out.push(n);
       if (opts.stopOnFirst) return { numbers: out, truncated: false };
     }
-    if (!timelineItems.pageInfo.hasPreviousPage) return { numbers: out, truncated: false };
+    if (!timelineItems.pageInfo.hasPreviousPage) {
+      before = null;
+      break;
+    }
     before = timelineItems.pageInfo.startCursor;
   }
-  return { numbers: out, truncated: true };
+
+  let closingTruncated = false;
+  for (let page = 1; closingBefore; page++) {
+    if (page >= ISSUE_TIMELINE_PR_PAGE_CAP) {
+      closingTruncated = true;
+      break;
+    }
+    const args = [
+      "api",
+      "graphql",
+      "-f",
+      `query=${ISSUE_CLOSING_PRS_QUERY}`,
+      "-F",
+      `owner=${owner}`,
+      "-F",
+      `repo=${repo}`,
+      "-F",
+      `num=${issueNumber}`,
+      "-F",
+      `before=${closingBefore}`,
+    ];
+    const stdout = await run(args);
+    const data = JSON.parse(stdout) as {
+      data: {
+        repository: {
+          issue: { closedByPullRequestsReferences?: IssueClosingPrPage } | null;
+        };
+      };
+    };
+    const closing = data.data.repository.issue?.closedByPullRequestsReferences;
+    if (!closing) break;
+    const appended = appendClosingPrPage(closing, out, seen);
+    if (opts.stopOnFirst && appended > 0) return { numbers: out, truncated: false };
+    closingBefore = closing.pageInfo.hasPreviousPage
+      ? closing.pageInfo.startCursor
+      : null;
+  }
+  const timelineTruncated = before !== null;
+  return { numbers: out, truncated: timelineTruncated || closingTruncated };
 }
 
 export async function getPrForIssueAnyState(
