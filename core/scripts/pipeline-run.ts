@@ -1163,6 +1163,8 @@ export function createDeliveryStageEvidenceObserver(
   > & {
     /** Confirmed PR head the pre-observer bind used. Observer re-reads the live PR. */
     expectedPrHeadSha?: string | null | (() => string | null);
+    /** PR identity paired with expectedPrHeadSha; both must remain current. */
+    expectedPrNumber?: number | null | (() => number | null);
     /** Hook after one coupled linked-PR identity/head read for before and after. */
     onObservedPrHead?: (
       livePr: { prNumber: number | null; headSha: string | null },
@@ -1242,7 +1244,17 @@ export function createDeliveryStageEvidenceObserver(
           ? deps.expectedPrHeadSha()
           : deps.expectedPrHeadSha,
       );
-      if (!expected || !livePrSha || livePrSha !== expected) {
+      const expectedPrNumber = deps.expectedPrNumber == null
+        ? livePr.prNumber
+        : typeof deps.expectedPrNumber === "function"
+          ? deps.expectedPrNumber()
+          : deps.expectedPrNumber;
+      if (
+        !expected ||
+        !livePrSha ||
+        livePrSha !== expected ||
+        livePr.prNumber !== expectedPrNumber
+      ) {
         return {
           candidateSha: livePrSha ?? "",
           candidateEpoch: livePrSha ?? "",
@@ -1273,6 +1285,7 @@ export function createDeliveryStageEvidenceObserver(
       const tester = observeTesterImplementationRole(
         read.status === "ok" ? read.evidence : null,
         candidateSha,
+        livePr?.prNumber,
       );
       if (tester) {
         return {
@@ -3083,11 +3096,13 @@ export async function runAdvance(
       // they enter runAdvance. Always invoke the helper: missing records
       // reproduce, and a missing/unobservable PR fails closed.
       let handoffPrHeadSha: string | null = null;
+      let handoffPrNumber: number | null = null;
       let testerSubjectOmitted = false;
       let observerMismatch: Extract<RebindTesterEvidenceResult, { ok: false }> | null = null;
       let ownedCandidateMutationRebound = false;
       let observerPrHeadBinding: {
         expectedPrHeadSha: () => string | null;
+        expectedPrNumber: () => number | null;
         onObservedPrHead: (
           livePr: { prNumber: number | null; headSha: string | null },
           phase: "before" | "after",
@@ -3222,7 +3237,11 @@ export async function runAdvance(
             ? await (deps.getPrDetail ?? getPrDetail)(cfg, confirmPrNumber).catch(() => null)
             : null;
           const confirmSha = normalizeCandidateSha(confirmDetail?.head_sha);
-          if (!confirmSha || confirmSha !== rebind.candidateSha) {
+          if (
+            confirmPrNumber !== prNumber ||
+            !confirmSha ||
+            confirmSha !== rebind.candidateSha
+          ) {
             const mismatch = await rebindFn({
               ...rebindInput(),
               prNumber: confirmPrNumber,
@@ -3233,17 +3252,23 @@ export async function runAdvance(
             if (!mismatch.ok) {
               return await failClosedRebind(mismatch);
             }
+            handoffPrNumber = confirmPrNumber;
             handoffPrHeadSha = mismatch.candidateSha;
           } else {
+            handoffPrNumber = confirmPrNumber;
             handoffPrHeadSha = confirmSha;
           }
           observerPrHeadBinding = {
             expectedPrHeadSha: () => handoffPrHeadSha,
+            expectedPrNumber: () => handoffPrNumber,
             onObservedPrHead: async (livePr, phase) => {
               const liveSha = livePr.headSha;
               const livePrNumber = livePr.prNumber;
               const expected = handoffPrHeadSha;
-              if (!expected || liveSha === expected) return;
+              if (
+                !expected ||
+                (liveSha === expected && livePrNumber === handoffPrNumber)
+              ) return;
               let ownedMutation = false;
               if (phase === "after" && consumerStageMayPushPrHead(stage) && liveSha) {
                 const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
@@ -3291,6 +3316,7 @@ export async function runAdvance(
                   return;
                 }
                 handoffPrHeadSha = rebound.candidateSha;
+                handoffPrNumber = livePrNumber;
                 ownedCandidateMutationRebound = true;
                 return;
               }

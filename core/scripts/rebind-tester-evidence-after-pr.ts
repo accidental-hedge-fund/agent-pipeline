@@ -232,6 +232,7 @@ export function filterRecipesForWorkflowEngineDiagnostic<T extends string>(
 export function observeTesterImplementationRole(
   evidence: TesterEvidence | null | undefined,
   candidateSha: string,
+  expectedPrNumber?: number | null,
 ): TesterImplementationRoleObservation | null {
   if (!evidence) return null;
   const sha = normalizeCandidateSha(candidateSha);
@@ -240,6 +241,10 @@ export function observeTesterImplementationRole(
   const subject = parseEvidenceSubjectDetailed(evidence.evidence_subject);
   if (subject.status !== "ok") return null;
   if (!candidateShaMatches(subject.subject.candidate_sha, sha)) return null;
+  if (
+    expectedPrNumber !== undefined &&
+    (evidence.pr !== expectedPrNumber || subject.subject.pr !== expectedPrNumber)
+  ) return null;
   return {
     evidenceRole: "implementation",
     artifactIdentity: testerArtifactIdentity(sha),

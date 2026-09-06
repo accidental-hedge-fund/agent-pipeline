@@ -725,6 +725,7 @@ const ENGINE = {
 
 async function driveDesignGateAdvance(opts: {
   prNumber: number | null;
+  prNumberSequence?: Array<number | null>;
   prHeadSha?: string | null;
   prHeadSequence?: string[];
   worktreeHead?: string | null;
@@ -795,6 +796,7 @@ async function driveDesignGateAdvance(opts: {
   const startStage = opts.startStage ?? "design-gate";
   const labels = [`pipeline:${startStage}`];
   let prHeadReads = 0;
+  let prNumberReads = 0;
   let dispatchCalls = 0;
   let currentWorktreeHead = opts.worktreeHead ?? null;
   const pipelineCfg = {
@@ -851,7 +853,11 @@ async function driveDesignGateAdvance(opts: {
       ],
     })) as AdvanceDeps["getIssueDetail"],
     getGhActor: async () => "pipeline-bot",
-    getPrForIssue: async () => opts.prNumber,
+    getPrForIssue: async () => {
+      const sequence = opts.prNumberSequence;
+      if (!sequence?.length) return opts.prNumber;
+      return sequence[Math.min(prNumberReads++, sequence.length - 1)] ?? null;
+    },
     getPrDetail: async (_cfg, requestedPrNumber) => {
       if (!requestedPrNumber) return null;
       const sequenced = opts.prHeadSequence?.[prHeadReads++];
@@ -1559,6 +1565,35 @@ test("disabled-gate runAdvance fail-closes when PR head moves before observer", 
       ?.detail?.evidence_ordering?.blocker_code,
     "tester_rebind_pr_head_mismatch",
   );
+});
+
+test("equal-head linked-PR swap rebinds Tester evidence to the replacement PR", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prNumberSequence: [99, 99, 100],
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    changedPaths: ["core/scripts/pipeline-run.ts"],
+    tester: boundPassed(),
+    testGateEnabled: false,
+    invokeObserver: true,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "design-gate" as const,
+      to: "review-1" as const,
+      summary: "design gate passed",
+    }),
+  });
+
+  assert.ok(driven.rebindCalls.length >= 2);
+  assert.equal(driven.rebindCalls[0]?.prNumber, 99);
+  assert.equal(driven.rebindCalls[1]?.prNumber, 100);
+  assert.equal(driven.rebindCalls[1]?.prHeadSha, SHA_S);
+  assert.equal(driven.dispatchCalls, 1);
+  assert.equal(driven.setBlocked.length, 0);
+  assert.equal(driven.pipelineStage, "review-1");
+  assert.equal(driven.observerBefore?.candidateSha, SHA_S);
+  assert.equal(driven.observerBefore?.evidenceRole, "implementation");
 });
 
 test("disabled-gate observer does not accept worktree S1 proof when live PR head is S2", async () => {

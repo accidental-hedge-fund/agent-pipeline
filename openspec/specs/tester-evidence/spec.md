@@ -595,6 +595,14 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 - **AND** the consumer observer's live PR read observes S2 where S1 ≠ S2
 - **THEN** the pipeline SHALL fail closed with typed blocker `tester_rebind_pr_head_mismatch`
 - **OR** SHALL rebind or reproduce for S2 before treating the observation as proven
+
+#### Scenario: Linked PR identity changes while the head SHA stays equal
+
+- **WHEN** Tester evidence is bound to linked PR P1 at head S
+- **AND** a confirmation or delivery-stage observer resolves linked PR P2 at the same head S where P1 differs from P2
+- **THEN** the pipeline SHALL treat the `{PR number, head SHA}` binding as changed
+- **AND** SHALL rebind and reconfirm Tester evidence for P2/S before dispatch
+- **AND** implementation-role acquisition SHALL require both the evidence and its subject to name P2
 - **AND** SHALL NOT present S1 worktree HEAD or S1 Tester evidence as implementation-role proof for S2
 
 #### Scenario: PR head movement after execution is a typed mismatch, not a generic wait
