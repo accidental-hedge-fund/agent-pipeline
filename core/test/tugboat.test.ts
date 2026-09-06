@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { isThinPlaybookLauncher } from "../scripts/ship-end-identity.ts";
 import {
@@ -2692,24 +2692,296 @@ function spawnDetachViaBarrier(opts: {
   });
 }
 
-function reapDetachFixture(dir: string, stateRoot: string, version: string): void {
-  killPids(pidsWithCmdlineNeedle(dir));
-  killPids(pidsWithCmdlineNeedle(`--milestone v${version}`));
+const DETACH_FIXTURE_CLEANUP_DEADLINE_MS = 2_000;
+const NAIVE_RM_BITE_DEADLINE_MS = 1_000;
+
+/** /proc/<pid>/stat field 3 after last ')'. Z is not mutating. Missing stat is gone. */
+function procLiveness(pid: number): "live" | "zombie" | "gone" {
   try {
-    const shipDir = path.join(stateRoot, `ship-v${version}`);
-    const pidFile = path.join(shipDir, "playbook.pid");
-    if (fs.existsSync(pidFile)) {
-      const p = Number(fs.readFileSync(pidFile, "utf8").trim());
-      if (Number.isFinite(p) && p > 0) {
-        try {
-          process.kill(p, "SIGTERM");
-        } catch {
-          /* gone */
-        }
+    const s = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const i = s.lastIndexOf(")");
+    if (i < 0) return "gone";
+    const state = s.slice(i + 2).trim().split(/\s+/)[0];
+    if (!state) return "gone";
+    if (state === "Z") return "zombie";
+    return "live";
+  } catch {
+    return "gone";
+  }
+}
+
+function procGroup(pid: number): number | undefined {
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const i = s.lastIndexOf(")");
+    if (i < 0) return undefined;
+    const group = Number(s.slice(i + 2).trim().split(/\s+/)[2]);
+    return Number.isSafeInteger(group) && group > 0 ? group : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readProcArgv(pid: number): string[] {
+  try {
+    return fs
+      .readFileSync(`/proc/${pid}/cmdline`)
+      .toString("utf8")
+      .split("\0")
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function isStillMutatingUnlinkError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ENOTEMPTY" || code === "EBUSY";
+}
+
+function argvOwnsFixture(argv: string[], dir: string, version: string): boolean {
+  if (argv.some((arg) => arg.includes(dir))) return true;
+  for (let i = 0; i < argv.length - 1; i += 1) {
+    if (argv[i] === "--milestone" && argv[i + 1] === `v${version}`) return true;
+  }
+  return false;
+}
+
+function ownedPlaybookPid(
+  dir: string,
+  stateRoot: string,
+  version: string,
+): number | undefined {
+  try {
+    const pidFile = path.join(stateRoot, `ship-v${version}`, "playbook.pid");
+    if (!fs.existsSync(pidFile)) return undefined;
+    const p = Number(fs.readFileSync(pidFile, "utf8").trim());
+    if (!Number.isFinite(p) || p <= 0) return undefined;
+    if (argvOwnsFixture(readProcArgv(p), dir, version)) {
+      return p;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function liveOwnedDetachFixturePids(
+  dir: string,
+  stateRoot: string,
+  version: string,
+  ownedGroups: ReadonlySet<number> = new Set(),
+): Array<{ pid: number; source: string; argv: string[] }> {
+  const seen = new Set<number>();
+  const out: Array<{ pid: number; source: string; argv: string[] }> = [];
+  const take = (
+    source: string,
+    procs: Array<{ pid: number; argv: string[] }>,
+  ): void => {
+    for (const p of procs) {
+      if (seen.has(p.pid)) continue;
+      if (procLiveness(p.pid) !== "live") continue;
+      seen.add(p.pid);
+      out.push({ pid: p.pid, source, argv: p.argv });
+    }
+  };
+  take("cmdline:dir", procsWithNeedle(dir));
+  take(
+    "cmdline:milestone",
+    procsWithNeedle(version).filter((proc) =>
+      argvOwnsFixture(proc.argv, dir, version),
+    ),
+  );
+  const playbookPid = ownedPlaybookPid(dir, stateRoot, version);
+  if (
+    playbookPid !== undefined &&
+    !seen.has(playbookPid) &&
+    procLiveness(playbookPid) === "live"
+  ) {
+    seen.add(playbookPid);
+    out.push({
+      pid: playbookPid,
+      source: "playbook.pid",
+      argv: readProcArgv(playbookPid),
+    });
+  }
+  for (const ent of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(ent)) continue;
+    const pid = Number(ent);
+    const group = procGroup(pid);
+    if (
+      group === undefined ||
+      !ownedGroups.has(group) ||
+      seen.has(pid) ||
+      procLiveness(pid) !== "live"
+    ) {
+      continue;
+    }
+    seen.add(pid);
+    out.push({
+      pid,
+      source: `process-group:${group}`,
+      argv: readProcArgv(pid),
+    });
+  }
+  return out;
+}
+
+function formatOwnedPids(
+  pids: Array<{ pid: number; source: string; argv: string[] }>,
+): string {
+  if (pids.length === 0) return "(none)";
+  return pids
+    .map((p) => `pid=${p.pid} source=${p.source} argv=${JSON.stringify(p.argv)}`)
+    .join("; ");
+}
+
+function killOwnedDetachFixturePids(
+  dir: string,
+  stateRoot: string,
+  version: string,
+): Set<number> {
+  const directOwners = [
+    ...procsWithNeedle(dir),
+    ...procsWithNeedle(version).filter((proc) =>
+      argvOwnsFixture(proc.argv, dir, version),
+    ),
+  ];
+  const playbookPid = ownedPlaybookPid(dir, stateRoot, version);
+  if (playbookPid !== undefined) {
+    directOwners.push({ pid: playbookPid, argv: readProcArgv(playbookPid) });
+  }
+  const groups = new Set<number>();
+  for (const owner of directOwners) {
+    const group = procGroup(owner.pid);
+    if (group === owner.pid) groups.add(group);
+  }
+  for (const group of groups) {
+    if (
+      procGroup(group) !== group ||
+      !argvOwnsFixture(readProcArgv(group), dir, version)
+    ) {
+      continue;
+    }
+    try {
+      process.kill(-group, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+  }
+  for (const pid of new Set(directOwners.map((owner) => owner.pid))) {
+    if (!argvOwnsFixture(readProcArgv(pid), dir, version)) continue;
+    killPids([pid]);
+  }
+  return groups;
+}
+
+function closeFixtureChildStdio(
+  children?: Array<ChildProcess | undefined | null>,
+): void {
+  if (!children) return;
+  for (const child of children) {
+    if (!child) continue;
+    for (const stream of [child.stdout, child.stderr]) {
+      if (!stream) continue;
+      try {
+        stream.removeAllListeners("data");
+      } catch {
+        /* already gone */
+      }
+      try {
+        if (typeof stream.unpipe === "function") stream.unpipe();
+      } catch {
+        /* already gone */
+      }
+      try {
+        stream.destroy();
+      } catch {
+        /* already gone */
       }
     }
-  } catch {
-    /* ignore */
+  }
+}
+
+function listTreeLimited(dir: string): string {
+  try {
+    if (!fs.existsSync(dir)) return "(missing)";
+    const ents = fs.readdirSync(dir, { recursive: true }).slice(0, 40);
+    return ents.map(String).join(",");
+  } catch (err) {
+    return `(list failed: ${(err as Error).message})`;
+  }
+}
+
+function describePidAndTree(pid: number | undefined, dir: string): string {
+  if (pid === undefined) {
+    return `writer pid missing; tree=${listTreeLimited(dir)}`;
+  }
+  return `writer pid=${pid} liveness=${procLiveness(pid)} argv=${JSON.stringify(readProcArgv(pid))} tree=${listTreeLimited(dir)}`;
+}
+
+/** Kill owned pids, await non-zombie death, close optional stdio, then delete dir. */
+async function reapDetachFixture(opts: {
+  dir: string;
+  stateRoot: string;
+  version: string;
+  children?: Array<ChildProcess | undefined | null>;
+}): Promise<void> {
+  const { dir, stateRoot, version, children } = opts;
+  const deadline = Date.now() + DETACH_FIXTURE_CLEANUP_DEADLINE_MS;
+  const remainingMs = (): number => Math.max(0, deadline - Date.now());
+
+  const ownedGroups = killOwnedDetachFixturePids(dir, stateRoot, version);
+  closeFixtureChildStdio(children);
+
+  if (liveOwnedDetachFixturePids(dir, stateRoot, version, ownedGroups).length > 0) {
+    try {
+      await waitUntil(
+        () =>
+          liveOwnedDetachFixturePids(dir, stateRoot, version, ownedGroups)
+            .length === 0,
+        remainingMs(),
+        "fixture-owned processes to exit",
+      );
+    } catch (err) {
+      throw new Error(
+        `timeout waiting for fixture-owned processes to exit; live owned pids: ${formatOwnedPids(liveOwnedDetachFixturePids(dir, stateRoot, version, ownedGroups))}`,
+        { cause: err },
+      );
+    }
+  }
+
+  let lastUnlinkErr: unknown;
+  const tryDelete = (): boolean => {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return true;
+    } catch (err) {
+      if (!isStillMutatingUnlinkError(err)) throw err;
+      lastUnlinkErr = err;
+      for (const group of killOwnedDetachFixturePids(dir, stateRoot, version)) {
+        ownedGroups.add(group);
+      }
+      return false;
+    }
+  };
+
+  if (tryDelete()) return;
+
+  try {
+    await waitUntil(tryDelete, remainingMs(), "fixture temp-tree delete after reap");
+  } catch (err) {
+    const remaining = liveOwnedDetachFixturePids(
+      dir,
+      stateRoot,
+      version,
+      ownedGroups,
+    );
+    const code = (lastUnlinkErr as NodeJS.ErrnoException | undefined)?.code;
+    throw new Error(
+      `fixture temp-tree delete still mutating at deadline; live owned pids: ${formatOwnedPids(remaining)}; last unlink: ${code ?? lastUnlinkErr ?? err}`,
+      { cause: lastUnlinkErr ?? err },
+    );
   }
 }
 
@@ -2773,10 +3045,8 @@ test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () =
       statuses: [a.status, b.status],
     });
   } finally {
-    // Reap before rmSync. Collecting only after asserts leaked sleep 3600
-    // stubs whose argv still matched train --merge for the old milestone.
-    reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Reap leftover sleep 3600 stubs whose argv still matches this milestone.
+    await reapDetachFixture({ dir, stateRoot, version });
   }
 });
 
@@ -2804,7 +3074,7 @@ test("detach race fixture stays enabled (not skipped or flaky)", () => {
   assert.match(src, /assertSingleDetachAdmission/);
 });
 
-test("admission lock leftover file is not a live ship", () => {
+test("admission lock leftover file is not a live ship", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-stale-lock-"));
   const stateRoot = path.join(dir, "state");
   const repo = path.join(dir, "repo");
@@ -2838,8 +3108,7 @@ test("admission lock leftover file is not a live ship", () => {
     assert.doesNotMatch(out, /already running.*not detaching a second copy/);
     assert.doesNotMatch(out, /admission lock|lock file/i);
   } finally {
-    reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    await reapDetachFixture({ dir, stateRoot, version });
   }
 });
 
@@ -2994,8 +3263,7 @@ test("failed wait-for-live reaps delayed child so a later detach is the only shi
       `later detach must leave a live owning tugboat for v${version}`,
     );
   } finally {
-    reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    await reapDetachFixture({ dir, stateRoot, version });
   }
 });
 
@@ -3008,6 +3276,7 @@ test("SIGTERM during wait-for-live reaps the unconfirmed child before unlock", a
   const marker = `TERM_REAP_MARKER=${version}`;
   const delayChild = path.join(dir, "delay-child.sh");
   const patched = path.join(dir, "patched.sh");
+  let child: ChildProcess | undefined;
   try {
     fs.mkdirSync(repo, { recursive: true });
     writeLongLivedPipelineStub(fakePipeline);
@@ -3045,19 +3314,20 @@ test("SIGTERM during wait-for-live reaps the unconfirmed child before unlock", a
       PIPELINE_SUPERVISOR_STATE: stateRoot,
     });
 
-    const child = spawn("bash", [patched, "--milestone", `v${version}`, "--detach"], {
+    child = spawn("bash", [patched, "--milestone", `v${version}`, "--detach"], {
       env: baseEnv,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const spawned = child;
     let out = "";
-    child.stdout.on("data", (b) => {
+    spawned.stdout.on("data", (b) => {
       out += String(b);
     });
-    child.stderr.on("data", (b) => {
+    spawned.stderr.on("data", (b) => {
       out += String(b);
     });
     const finished = new Promise<{ status: number | null; out: string }>((resolve) => {
-      child.on("close", (code) => resolve({ status: code, out }));
+      spawned.on("close", (code) => resolve({ status: code, out }));
     });
 
     await waitUntil(() => fs.existsSync(pidFile), 10_000, "unconfirmed child pid file");
@@ -3123,9 +3393,130 @@ test("SIGTERM during wait-for-live reaps the unconfirmed child before unlock", a
         .join("\n")}`,
     );
   } finally {
-    reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    await reapDetachFixture({ dir, stateRoot, version, children: [child] });
   }
+});
+
+test("SIGTERM wait-for-live fixture stays enabled (not skipped or flaky)", () => {
+  const src = fs.readFileSync(path.join(here, "tugboat.test.ts"), "utf8");
+  const needle =
+    'test("SIGTERM during wait-for-live reaps the unconfirmed child before unlock"';
+  const idx = src.indexOf(needle);
+  assert.ok(idx >= 0, "SIGTERM wait-for-live fixture must remain in tugboat.test.ts");
+  const head = src.slice(Math.max(0, idx - 80), idx + needle.length);
+  assert.doesNotMatch(head, /test\.skip|describe\.skip|\.todo\(|flaky/i);
+  assert.match(src, /async function reapDetachFixture\(/);
+  assert.doesNotMatch(
+    src,
+    /await reapDetachFixture\([\s\S]{0,240}\);\s*fs\.rmSync/,
+    "lifecycle fixtures must not kill-then-immediate-rmSync after the shared seam",
+  );
+});
+
+test("naive rmSync of a mutating tree throws ENOTEMPTY; reapDetachFixture reaps then deletes", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-enotempty-"));
+  const stateRoot = path.join(dir, "state");
+  const version = `9.99.${process.pid}.${Date.now()}.enotempty`;
+  const readyFile = path.join(dir, "writer.ready");
+  const writerPath = path.join(dir, "writer.mjs");
+  let writer: ChildProcess | undefined;
+  let writerPid: number | undefined;
+  try {
+    fs.writeFileSync(
+      writerPath,
+      [
+        'import * as fs from "node:fs";',
+        'import * as path from "node:path";',
+        'import { fileURLToPath } from "node:url";',
+        "const root = path.dirname(fileURLToPath(import.meta.url));",
+        'const ready = path.join(root, "writer.ready");',
+        'const nest = path.join(root, "nest", "deep", "x");',
+        'fs.mkdirSync(nest, { recursive: true });',
+        'fs.mkdirSync(path.join(root, "hold"), { recursive: true });',
+        'fs.openSync(path.join(root, "hold"), "r");',
+        "for (let i = 0; i < 40; i++) {",
+        '  const p = path.join(root, "init", `n${i}`, "a", "b");',
+        "  fs.mkdirSync(p, { recursive: true });",
+        '  fs.writeFileSync(path.join(p, "f"), "x");',
+        "}",
+        'fs.writeFileSync(ready, "ready\\n");',
+        "let n = 0;",
+        "for (;;) {",
+        "  try {",
+        "    fs.mkdirSync(nest, { recursive: true });",
+        "    fs.writeFileSync(path.join(nest, `f-${n++}`), \"x\");",
+        "    if (n % 8 === 0) {",
+        '      const extra = path.join(root, "w", `b${n}`, "c");',
+        "      fs.mkdirSync(extra, { recursive: true });",
+        '      fs.writeFileSync(path.join(extra, "f"), "x");',
+        "    }",
+        "  } catch {",
+        "    /* tree may be mid-delete */",
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    writer = spawn(process.execPath, [writerPath], { stdio: "ignore" });
+    writerPid = writer.pid;
+    assert.ok(writerPid && writerPid > 0, "writer pid missing");
+    await waitUntil(() => fs.existsSync(readyFile), 2_000, "writer-ready handshake");
+
+    let naiveErr: unknown;
+    const biteStart = Date.now();
+    while (Date.now() - biteStart < NAIVE_RM_BITE_DEADLINE_MS) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch (err) {
+        if (isStillMutatingUnlinkError(err)) {
+          naiveErr = err;
+          break;
+        }
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    assert.ok(
+      naiveErr,
+      `naive rmSync never threw ENOTEMPTY/EBUSY within ${NAIVE_RM_BITE_DEADLINE_MS}ms; ${describePidAndTree(writerPid, dir)}`,
+    );
+  } finally {
+    await reapDetachFixture({
+      dir,
+      stateRoot,
+      version,
+      children: [writer],
+    });
+  }
+  assert.equal(fs.existsSync(dir), false, "shared seam must delete the temp tree");
+  if (writerPid !== undefined) {
+    assert.notEqual(
+      procLiveness(writerPid),
+      "live",
+      `writer pid ${writerPid} still live after seam; argv=${JSON.stringify(readProcArgv(writerPid))}`,
+    );
+  }
+});
+
+test("reapDetachFixture does not signal a reused playbook.pid", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-pid-reuse-"));
+  const stateRoot = path.join(dir, "state");
+  const version = `9.99.${process.pid}.${Date.now()}.reuse`;
+  const shipDir = path.join(stateRoot, `ship-v${version}`);
+  fs.mkdirSync(shipDir, { recursive: true });
+  fs.writeFileSync(path.join(shipDir, "playbook.pid"), `${process.pid}\n`);
+  await reapDetachFixture({
+    dir,
+    stateRoot,
+    version,
+    children: [undefined],
+  });
+  assert.equal(
+    procLiveness(process.pid),
+    "live",
+    "cleanup must not SIGTERM a reused playbook.pid whose argv does not match the fixture",
+  );
+  assert.equal(fs.existsSync(dir), false);
 });
 
 test("wait-for-live expiry reaps a re-parented descendant before unlock", async () => {
@@ -3313,12 +3704,11 @@ test("wait-for-live expiry reaps a re-parented descendant before unlock", async 
       `later detach must leave a live owning tugboat for v${version}`,
     );
   } finally {
-    reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    await reapDetachFixture({ dir, stateRoot, version });
   }
 });
 
-test("failed wait-for-live releases admission for a later detach", () => {
+test("failed wait-for-live releases admission for a later detach", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-fail-wait-"));
   const stateRoot = path.join(dir, "state");
   const repo = path.join(dir, "repo");
@@ -3402,12 +3792,11 @@ test("failed wait-for-live releases admission for a later detach", () => {
     assert.equal(r.status, 0, `later detach status=${r.status} out=${out}`);
     assert.match(out, /detached tugboat ship/);
   } finally {
-    reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    await reapDetachFixture({ dir, stateRoot, version });
   }
 });
 
-test("sequential second detach uses live-ship probe after first is live", () => {
+test("sequential second detach uses live-ship probe after first is live", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-seq-detach-"));
   const stateRoot = path.join(dir, "state");
   const repo = path.join(dir, "repo");
@@ -3447,8 +3836,7 @@ test("sequential second detach uses live-ship probe after first is live", () => 
     assert.doesNotMatch(secondOut, /detached tugboat ship/);
     assert.doesNotMatch(secondOut, /admission lock|lock file|detach\.gate/i);
   } finally {
-    reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    await reapDetachFixture({ dir, stateRoot, version });
   }
 });
 
@@ -6902,4 +7290,3 @@ test("Tugboat factory-release request dest is $RUN_DIR, not REPO_DIR (#1259)", (
     "the test bites when dest is $REPO_DIR/.agent-pipeline/...",
   );
 });
-
