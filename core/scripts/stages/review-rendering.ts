@@ -631,6 +631,7 @@ export function deltaRoundCeilingDemotionComment(
   cap: number,
   demotedFindings: DeltaCeilingFinding[],
   followupNumber: number,
+  candidateSha?: string,
 ): string {
   const lines = [
     "## Pipeline: Pre-merge delta round ceiling — findings demoted and deferred",
@@ -652,6 +653,7 @@ export function deltaRoundCeilingDemotionComment(
     `See #${followupNumber} for the complete deferred finding list.`,
     "",
     "⚠️ The demoted findings were **not fixed** — review them before merging this PR.",
+    ...(candidateSha ? ["", `<!-- reviewed-sha: ${candidateSha} -->`] : []),
     "",
     cfgFooter(cfg),
     "",

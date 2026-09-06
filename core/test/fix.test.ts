@@ -958,10 +958,17 @@ test("adopted repair CAS refuses to resurrect a candidate force-reset during the
 test("advanceFix source pin: adopted delivery identity is bound before the harness and retained when the harness commits (#1478)", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
   const resolveIdx = src.indexOf("const linkedDelivery = await resolveLinkedPrDelivery(");
+  const unavailableIdx = src.indexOf("if (!linkedDelivery) {", resolveIdx);
+  const preflightIdx = src.indexOf("await preflightDeliveryWorktreeHead(", unavailableIdx);
   const promptIdx = src.indexOf("const prompt = buildFixPrompt(", resolveIdx);
   const roundIdx = src.indexOf("const roundResult = await runHarnessRound", promptIdx);
-  assert.ok(resolveIdx !== -1 && promptIdx !== -1 && roundIdx !== -1);
-  assert.ok(resolveIdx < promptIdx && promptIdx < roundIdx, "delivery authority must be fixed before invoking the harness");
+  assert.ok(resolveIdx !== -1 && unavailableIdx !== -1 && preflightIdx !== -1 && promptIdx !== -1 && roundIdx !== -1);
+  assert.ok(
+    resolveIdx < unavailableIdx && unavailableIdx < preflightIdx && preflightIdx < promptIdx && promptIdx < roundIdx,
+    "missing delivery or a stale managed worktree must fail closed before invoking the harness",
+  );
+  assert.match(src.slice(unavailableIdx, preflightIdx), /status: "blocked"/);
+  assert.match(src.slice(preflightIdx, promptIdx), /blockerKind: "head-drift"/);
   assert.match(src.slice(promptIdx, roundIdx), /deliveryBranch,/);
   assert.match(src, /syncWorktreeToDelegatedExecutorResult\(wt\.path, deliveryBranch\)/);
   assert.match(src, /headBranch: deliveryBranch/);
@@ -971,6 +978,12 @@ test("advanceFix source pin: adopted delivery identity is bound before the harne
     src,
     /deliveryPushArgs\(managedBranch, branch, linkedDelivery\.headSha\)/,
     "pipeline-owned final push must use a lease bound to the adopted PR head",
+  );
+  const ancestryIdx = src.indexOf('["merge-base", "--is-ancestor", linkedDelivery.headSha, localHead]');
+  const pushIdx = src.indexOf("await runConfiguredGitPush(", ancestryIdx);
+  assert.ok(
+    ancestryIdx !== -1 && pushIdx !== -1 && ancestryIdx < pushIdx,
+    "the authorized PR head must be an ancestor of the local repair before any final push",
   );
   const rematIdx = src.indexOf("if (!wt) {");
   const ensureIdx = src.indexOf("await ensureFn(", rematIdx);

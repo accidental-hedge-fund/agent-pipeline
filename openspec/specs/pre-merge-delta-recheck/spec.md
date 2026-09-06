@@ -252,6 +252,7 @@ Before invoking the reviewer for a pre-merge delta round, `enforceReviewShaGate`
 - Under either setting, an outstanding blocking delta finding of severity `high` or `critical` SHALL hard-park the item at `needs-human`, mirroring the review-2 ceiling behavior.
 
 The comment the pipeline posts at the ceiling SHALL name the observed round count, the configured cap, and the applied `ceiling_action`. When the count is below the cap, behavior SHALL be unchanged from before this requirement.
+Both park and demote ceiling artifacts SHALL bind the candidate SHA and participate in the same one-successor reset rule.
 
 #### Scenario: At the cap the reviewer is not invoked again
 

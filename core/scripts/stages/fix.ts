@@ -123,13 +123,12 @@ import {
 import {
   DEFAULT_GIT_PUSH_AUTH,
   deliveryPushArgs,
-  deliveryPushRefspec,
   formatPushAuthFailure,
   gitExecForwardingEnv,
   prepareWorktreePushAuthEnv,
   runConfiguredGitPush,
 } from "../git-push-auth.ts";
-import { resolveLinkedPrDelivery } from "../pr-delivery.ts";
+import { preflightDeliveryWorktreeHead, resolveLinkedPrDelivery } from "../pr-delivery.ts";
 export { resolveLinkedPrDelivery } from "../pr-delivery.ts";
 
 export interface AdvanceFixOpts {
@@ -800,7 +799,6 @@ export async function advanceFix(
   // Prompt assembly needs headBefore for reviewedSha, so capture head for the
   // prompt via a short pre-round read; the shared helper re-captures for the
   // commit-range (reattach may not change HEAD content).
-  const preRoundHead = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
   // A managed worktree's local branch is workspace identity, not necessarily
   // the delivery identity. Bind the linked PR branch before invoking the
   // harness so commits, delegated-executor sync, timeout recovery, and the
@@ -809,8 +807,25 @@ export async function advanceFix(
     getPrForIssue: deps.getPrForIssue,
     getPrDetail: deps.getPrDetail,
   });
+  if (!linkedDelivery) {
+    const reason = `${stage}: open same-repository linked PR delivery identity is unavailable`;
+    await setBlockedFn(cfg, issueNumber, reason, stage, "worktree-missing");
+    return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
+  }
+  const deliveryGit = deps.gitInWorktree ?? gitInWorktree;
+  const deliveryPreflight = await preflightDeliveryWorktreeHead(
+    wt.path,
+    linkedDelivery,
+    deliveryGit,
+  );
+  if (!deliveryPreflight.ok) {
+    const reason = `${stage}: adopted PR worktree preflight failed: ${deliveryPreflight.reason}`;
+    await setBlockedFn(cfg, issueNumber, reason, stage, "head-drift");
+    return { advanced: false, status: "blocked", reason, blockerKind: "head-drift" };
+  }
+  const preRoundHead = deliveryPreflight.actualHead!;
   const managedBranch = branchName(issueNumber, wt.slug);
-  const deliveryBranch = linkedDelivery?.branch ?? managedBranch;
+  const deliveryBranch = linkedDelivery.branch;
 
   // Use branch-diff to identify the OpenSpec change this branch introduced rather
   // than changes[0], which may be an unrelated pre-existing change in the worktree.
@@ -1726,12 +1741,24 @@ export async function advanceFix(
         // Currency-check uses fetch/rev-parse; push uses configured auth via the
         // same injectable gitInWorktree seam unit tests already fake (#980).
         if (args[0] === "push") {
+          const ancestry = await gitWt(
+            wt.path,
+            ["merge-base", "--is-ancestor", linkedDelivery.headSha, localHead],
+            { ignoreFailure: true },
+          );
+          if (ancestry.code !== 0) {
+            return {
+              code: 1,
+              stdout: "",
+              stderr:
+                `delivery ancestry check failed: authorized PR head ${linkedDelivery.headSha} ` +
+                `is not an ancestor of local repair ${localHead}`,
+            };
+          }
           const res = await runConfiguredGitPush({
             cwd: wt.path,
             auth: pushAuth,
-            args: linkedDelivery
-              ? deliveryPushArgs(managedBranch, branch, linkedDelivery.headSha)
-              : ["push", "origin", deliveryPushRefspec(managedBranch, branch)],
+            args: deliveryPushArgs(managedBranch, branch, linkedDelivery.headSha),
             deps: {
               gitConfigGet: async (cwd, key) => {
                 const r = await gitWt(cwd, ["config", "--get", key], {

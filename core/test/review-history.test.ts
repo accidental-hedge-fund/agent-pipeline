@@ -1102,6 +1102,21 @@ test("hasSupersededDeltaCeiling: a fixed successor can escape a stale exhausted 
   );
 });
 
+test("hasSupersededDeltaCeiling: demoted ceilings also bind and reset for one successor", () => {
+  const oldHead = "a".repeat(40);
+  const newHead = "b".repeat(40);
+  const comments = [{
+    author: "pipeline-bot",
+    body:
+      "## Pipeline: Pre-merge delta round ceiling — findings demoted and deferred\n" +
+      `<!-- reviewed-sha: ${oldHead} -->`,
+  }];
+  assert.equal(
+    hasSupersededDeltaCeiling(comments, { actor: "pipeline-bot", candidateSha: newHead }),
+    true,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Override-settled trade-offs rendered as binding constraints (#483)
 // ---------------------------------------------------------------------------

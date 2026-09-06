@@ -1188,7 +1188,14 @@ export async function enforceReviewShaGate(
 
         await postCommentFn(
           cfg, issueNumber,
-          deltaRoundCeilingDemotionComment(cfg, deltaRoundCount, deltaRoundCap, belowHigh, followupNumber),
+          deltaRoundCeilingDemotionComment(
+            cfg,
+            deltaRoundCount,
+            deltaRoundCap,
+            belowHigh,
+            followupNumber,
+            head,
+          ),
         );
 
         const ceilingTimestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");

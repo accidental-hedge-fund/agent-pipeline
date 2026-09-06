@@ -541,6 +541,11 @@ export function deltaReviewTargetsCandidate(body: string, candidateSha: string):
   return matches.at(-1)?.[1]?.toLowerCase() === candidateSha.toLowerCase();
 }
 
+function isDeltaCeilingComment(body: string): boolean {
+  return body.startsWith("## Pipeline: Pre-merge delta round ceiling reached") ||
+    body.startsWith("## Pipeline: Pre-merge delta round ceiling — findings demoted and deferred");
+}
+
 /** Whether the latest durable delta ceiling belongs to a superseded candidate. */
 export function hasSupersededDeltaCeiling(
   comments: { author: string | null; body: string }[],
@@ -551,7 +556,7 @@ export function hasSupersededDeltaCeiling(
   trusted.add(opts.actor);
   const trustedComments = comments.filter((c) => c.author !== null && trusted.has(c.author));
   const ceiling = trustedComments
-    .filter((c) => c.body.startsWith("## Pipeline: Pre-merge delta round ceiling reached"))
+    .filter((c) => isDeltaCeilingComment(c.body))
     .at(-1);
   if (!ceiling) return false;
   const ceilingIndex = trustedComments.lastIndexOf(ceiling);
@@ -581,7 +586,7 @@ export function hasSupersededPostCeilingDelta(
   trusted.add(opts.actor);
   const trustedComments = comments.filter((c) => c.author !== null && trusted.has(c.author));
   const ceilingIndex = trustedComments.findLastIndex((c) =>
-    c.body.startsWith("## Pipeline: Pre-merge delta round ceiling reached")
+    isDeltaCeilingComment(c.body)
   );
   if (ceilingIndex < 0) return false;
   const postCeilingDelta = trustedComments

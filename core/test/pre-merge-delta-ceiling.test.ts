@@ -186,7 +186,13 @@ test("enforceReviewShaGate: ceiling_action demote_and_advance demotes below-high
   assert.equal(rec.blocked.length, 0);
   assert.equal(rec.createIssueCalls.length, 1, "a single tracked follow-up issue is filed");
   assert.match(rec.createIssueCalls[0].title, /Pre-merge delta review ceiling/);
-  assert.ok(rec.comments.some((c) => /demoted and deferred/.test(c)));
+  const demotion = rec.comments.find((c) => /demoted and deferred/.test(c));
+  assert.ok(demotion);
+  assert.match(
+    demotion,
+    new RegExp(`<!-- reviewed-sha: ${SHA_HEAD} -->`),
+    "the demoted ceiling must bind the candidate it exhausted so exactly one successor can reset it",
+  );
   assert.ok(rec.comments.some((c) => /Finding override/.test(c)), "an audited override comment must be recorded for the demoted finding");
 });
 

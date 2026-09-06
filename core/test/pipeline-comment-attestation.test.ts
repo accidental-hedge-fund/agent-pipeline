@@ -269,7 +269,7 @@ const KIND_RENDERERS: Record<string, () => string> = {
   "review-ceiling": () => reviewCeilingComment(advanceCfg, 1, "codex", CEILING_PARTITION, 3, []),
   "review-ceiling-demotion": () => reviewCeilingDemotionComment(advanceCfg, 1, "codex", CEILING_PARTITION, 3, [], 999),
   "delta-round-ceiling": () => deltaRoundCeilingComment(advanceCfg, 4, 4, "park", DELTA_CEILING_FINDINGS),
-  "delta-round-ceiling-demotion": () => deltaRoundCeilingDemotionComment(advanceCfg, 4, 4, DELTA_CEILING_FINDINGS, 999),
+  "delta-round-ceiling-demotion": () => deltaRoundCeilingDemotionComment(advanceCfg, 4, 4, DELTA_CEILING_FINDINGS, 999, "a".repeat(40)),
   "new-human-input-warning": () =>
     buildNewHumanInputWarningComment([{ author: "human1", createdAt: ts(0) }], "review-1"),
   "pipeline-complete": () => buildPipelineCompleteComment(advanceCfg, 471, "Some issue", "PR #1", 0),

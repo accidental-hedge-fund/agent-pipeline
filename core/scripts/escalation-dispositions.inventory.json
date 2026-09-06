@@ -378,6 +378,32 @@
       "migrated_outcome": "Cooling"
     },
     {
+      "site_id": "stages.fix:worktree-missing#1",
+      "module": "scripts/stages/fix.ts",
+      "line": 812,
+      "occurrence": 1,
+      "match": "${stage}: open same-repository linked PR delivery identity is unavailable",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "worktree-missing",
+      "canonical_reason": "workflow-state",
+      "notes": "fix harness cannot run without a freshly resolved open same-repository delivery identity (#1478)",
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
+    },
+    {
+      "site_id": "stages.fix:head-drift#0",
+      "module": "scripts/stages/fix.ts",
+      "line": 823,
+      "occurrence": 0,
+      "match": "${stage}: adopted PR worktree preflight failed: ${deliveryPreflight.reason}",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "head-drift",
+      "canonical_reason": "workflow-state",
+      "notes": "fix harness cannot mutate a managed worktree that differs from the freshly authorized PR head (#1478)",
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
+    },
+    {
       "site_id": "stages.fix:needs-human#0",
       "module": "scripts/stages/fix.ts",
       "line": 844,
