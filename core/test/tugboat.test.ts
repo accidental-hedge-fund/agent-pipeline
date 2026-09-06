@@ -2783,7 +2783,22 @@ function liveOwnedDetachFixturePids(
   stateRoot: string,
   version: string,
   ownedGroups: ReadonlyMap<number, string> = new Map(),
+  deps: {
+    listProcPids?: () => number[];
+    groupOf?: (pid: number) => number | undefined;
+    startTimeOf?: (pid: number) => string | undefined;
+    livenessOf?: (pid: number) => "live" | "zombie" | "gone";
+    argvOf?: (pid: number) => string[];
+  } = {},
 ): Array<{ pid: number; source: string; argv: string[] }> {
+  const listProcPids = deps.listProcPids ?? (() =>
+    fs.readdirSync("/proc")
+      .filter((ent) => /^\d+$/.test(ent))
+      .map(Number));
+  const groupOf = deps.groupOf ?? procGroup;
+  const startTimeOf = deps.startTimeOf ?? procStartTime;
+  const livenessOf = deps.livenessOf ?? procLiveness;
+  const argvOf = deps.argvOf ?? readProcArgv;
   const seen = new Set<number>();
   const out: Array<{ pid: number; source: string; argv: string[] }> = [];
   const take = (
@@ -2792,7 +2807,7 @@ function liveOwnedDetachFixturePids(
   ): void => {
     for (const p of procs) {
       if (seen.has(p.pid)) continue;
-      if (procLiveness(p.pid) !== "live") continue;
+      if (livenessOf(p.pid) !== "live") continue;
       seen.add(p.pid);
       out.push({ pid: p.pid, source, argv: p.argv });
     }
@@ -2808,30 +2823,37 @@ function liveOwnedDetachFixturePids(
   if (
     playbookPid !== undefined &&
     !seen.has(playbookPid) &&
-    procLiveness(playbookPid) === "live"
+    livenessOf(playbookPid) === "live"
   ) {
     seen.add(playbookPid);
     out.push({
       pid: playbookPid,
       source: "playbook.pid",
-      argv: readProcArgv(playbookPid),
+      argv: argvOf(playbookPid),
     });
   }
-  for (const ent of fs.readdirSync("/proc")) {
-    if (!/^\d+$/.test(ent)) continue;
-    const pid = Number(ent);
-    const group = procGroup(pid);
-    const ownedGroupStart =
-      group === undefined ? undefined : ownedGroups.get(group);
-    const currentLeaderStart =
-      group === undefined ? undefined : procStartTime(group);
+  for (const [group, ownedGroupStart] of ownedGroups) {
+    const currentLeaderStart = startTimeOf(group);
+    if (
+      currentLeaderStart !== undefined &&
+      (groupOf(group) !== group || currentLeaderStart !== ownedGroupStart)
+    ) {
+      seen.add(group);
+      out.push({
+        pid: group,
+        source: `process-group:${group}:leader-identity-mismatch`,
+        argv: argvOf(group),
+      });
+    }
+  }
+  for (const pid of listProcPids()) {
+    const group = groupOf(pid);
+    const ownedGroupStart = group === undefined ? undefined : ownedGroups.get(group);
     if (
       group === undefined ||
       ownedGroupStart === undefined ||
-      (currentLeaderStart !== undefined &&
-        currentLeaderStart !== ownedGroupStart) ||
       seen.has(pid) ||
-      procLiveness(pid) !== "live"
+      livenessOf(pid) !== "live"
     ) {
       continue;
     }
@@ -2839,7 +2861,7 @@ function liveOwnedDetachFixturePids(
     out.push({
       pid,
       source: `process-group:${group}`,
-      argv: readProcArgv(pid),
+      argv: argvOf(pid),
     });
   }
   return out;
@@ -3651,6 +3673,38 @@ test("fixture group tracking retains a live descendant after its leader exits", 
     );
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("group leader identity mismatch fails closed without dropping retained descendants", () => {
+  const ownedGroups = new Map([[700, "original-start"]]);
+  const remaining = liveOwnedDetachFixturePids(
+    "/tmp/nonexistent-fixture-identity-mismatch",
+    "/tmp/nonexistent-state-identity-mismatch",
+    "9.99.identity-mismatch",
+    ownedGroups,
+    {
+      listProcPids: () => [700, 701],
+      groupOf: (pid) => pid === 701 ? 700 : 999,
+      startTimeOf: (pid) => pid === 700 ? "replacement-start" : "child-start",
+      livenessOf: () => "live",
+      argvOf: (pid) => pid === 700 ? ["unrelated"] : ["sleep", "3600"],
+    },
+  );
+
+  assert.ok(
+    remaining.some(
+      (proc) =>
+        proc.pid === 700 &&
+        proc.source === "process-group:700:leader-identity-mismatch",
+    ),
+    `replacement identity must remain a fail-closed blocker: ${formatOwnedPids(remaining)}`,
+  );
+  assert.ok(
+    remaining.some(
+      (proc) => proc.pid === 701 && proc.source === "process-group:700",
+    ),
+    `retained unmarked descendant must not be dropped: ${formatOwnedPids(remaining)}`,
+  );
 });
 
 test("reapDetachFixture captures a leader-gone group from its marked non-leader", async () => {

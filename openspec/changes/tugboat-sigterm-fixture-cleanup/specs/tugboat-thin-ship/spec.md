@@ -59,6 +59,7 @@ Tugboat lifecycle fixture cleanup SHALL terminate only fixture-owned processes: 
 - **THEN** cleanup SHALL continue to treat the descendant as fixture-owned
 - **AND** SHALL NOT declare cleanup complete solely because the original leader no longer exists in `/proc`
 - **AND** a different live process that reuses the leader pid SHALL NOT validate the captured group identity
+- **AND** a mismatched replacement identity SHALL block cleanup while retained members of the original group remain observable
 - **AND** cleanup SHALL capture a detached group from an argv-verified non-leader when the original group leader has already exited, while excluding the test worker's own group
 
 #### Scenario: ENOTEMPTY is not swallowed

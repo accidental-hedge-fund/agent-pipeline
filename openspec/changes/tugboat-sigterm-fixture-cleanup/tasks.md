@@ -30,3 +30,4 @@
 - [x] 5.2 Make the mutating writer delay SIGTERM exit and require the cleanup seam to observe owned-process exit before every delete retry and again after a successful delete.
 - [x] 5.3 Capture a detached process group from a verified non-leader after the leader exits, and prove cleanup reaps both the marked member and its unmarked `sleep` descendant.
 - [x] 5.4 Route the leader-gone regression's assertion-failure cleanup through the same bounded reaping seam instead of manual signal-then-delete.
+- [x] 5.5 Treat a replaced group-leader PID as a fail-closed ambiguity without dropping retained unmarked descendants.
