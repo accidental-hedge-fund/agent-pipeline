@@ -599,10 +599,20 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 #### Scenario: Linked PR identity changes while the head SHA stays equal
 
 - **WHEN** Tester evidence is bound to linked PR P1 at head S
-- **AND** a confirmation or delivery-stage observer resolves linked PR P2 at the same head S where P1 differs from P2
+- **AND** a confirmation or pre-attempt delivery-stage observer resolves linked PR P2 at the same head S where P1 differs from P2
 - **THEN** the pipeline SHALL treat the `{PR number, head SHA}` binding as changed
 - **AND** SHALL rebind and reconfirm Tester evidence for P2/S before dispatch
 - **AND** implementation-role acquisition SHALL require both the evidence and its subject to name P2
+
+#### Scenario: Equal-head linked PR change after execution invalidates completion
+
+- **WHEN** the pre-attempt delivery-stage observer proves Tester evidence bound to P1/S
+- **AND** the consumer stage executes and advances its pipeline label
+- **AND** the post-attempt observer resolves linked PR P2 at the same head S where P1 differs from P2
+- **THEN** the pipeline SHALL rebind Tester evidence to P2/S but SHALL NOT retain the completed consumer outcome
+- **AND** SHALL restore the consumer stage label so the stage executes against P2
+- **AND** SHALL persist a typed `tester_rebind_pr_head_mismatch` blocker for that invalidated attempt
+- **AND** SHALL NOT record `stage_complete` as `advanced` for that attempt
 
 #### Scenario: Stage-owned successor remains the candidate for later consumers
 

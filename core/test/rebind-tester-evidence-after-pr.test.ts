@@ -1614,7 +1614,7 @@ test("equal-head linked-PR swap rebinds Tester evidence to the replacement PR", 
   assert.equal(driven.observerBefore?.evidenceRole, "implementation");
 });
 
-test("equal-head PR swap at the delivery observer updates the expected PR", async () => {
+test("equal-head PR swap before delivery execution updates the expected PR", async () => {
   const driven = await driveDesignGateAdvance({
     prNumber: 99,
     prNumberSequence: [99, 99, 99, 100],
@@ -1637,6 +1637,48 @@ test("equal-head PR swap at the delivery observer updates the expected PR", asyn
   assert.equal(driven.observerBefore?.evidenceRole, "implementation");
   assert.equal(driven.setBlocked.length, 0);
   assert.equal(driven.pipelineStage, "review-1");
+});
+
+test("equal-head PR swap after delivery execution restores the consumer stage", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prNumberSequence: [99, 99, 99, 99, 100],
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    changedPaths: ["core/scripts/pipeline-run.ts"],
+    tester: boundPassed(),
+    testGateEnabled: false,
+    invokeObserver: true,
+    invokeObserverAfter: true,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "design-gate" as const,
+      to: "review-1" as const,
+      summary: "design gate passed against PR #99",
+    }),
+  });
+
+  assert.ok(driven.rebindCalls.some((call) => call.prNumber === 100));
+  assert.equal(driven.observerBefore?.candidateSha, SHA_S);
+  assert.equal(driven.observerBefore?.evidenceRole, "implementation");
+  assert.equal(driven.observerAfter?.candidateSha, SHA_S);
+  assert.equal(driven.observerAfter?.evidenceRole, null);
+  assert.equal(driven.pipelineStage, "design-gate");
+  assert.equal(
+    driven.stageCompleteEvents.some((event) => event.outcome === "advanced"),
+    false,
+  );
+  assert.ok(
+    driven.stageCompleteEvents.some(
+      (event) => event.stage === "design-gate" && event.outcome === "blocked",
+    ),
+  );
+  assert.ok(driven.setBlocked.some((row) => /linked PR changed after design-gate/.test(row.reason)));
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_mismatch",
+  );
 });
 
 test("disabled-gate observer does not accept worktree S1 proof when live PR head is S2", async () => {

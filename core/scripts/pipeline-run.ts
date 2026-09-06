@@ -3265,6 +3265,42 @@ export async function runAdvance(
               const liveSha = livePr.headSha;
               const livePrNumber = livePr.prNumber;
               const expected = handoffPrHeadSha;
+              const expectedPrNumber = handoffPrNumber;
+              const postAttemptPrIdentityChanged =
+                phase === "after" && livePrNumber !== expectedPrNumber;
+              const rejectPostAttemptPrIdentityChange = (
+                rebound: Extract<RebindTesterEvidenceResult, { ok: true }>,
+              ): boolean => {
+                if (!postAttemptPrIdentityChanged) return false;
+                const summary =
+                  `tester rebind: linked PR changed after ${stage} from ` +
+                  `${expectedPrNumber === null ? "unbound" : `#${expectedPrNumber}`} to ` +
+                  `${livePrNumber === null ? "unbound" : `#${livePrNumber}`}; ` +
+                  "restoring consumer stage so it executes against the replacement PR";
+                observerMismatch = {
+                  ok: false,
+                  code: "tester_rebind_pr_head_mismatch",
+                  summary,
+                  candidateSha: rebound.candidateSha,
+                  evidence: rebound.evidence,
+                  diagnostic: buildTesterRebindFailClosedDiagnostic({
+                    stage,
+                    code: "tester_rebind_pr_head_mismatch",
+                    summary,
+                    prHead: rebound.candidateSha,
+                    trustedSurfaceOutcome: currentTrustedSurface?.outcome ?? null,
+                  }),
+                  blocker: {
+                    schema_version: 1,
+                    kind: "tester_rebind_blocker",
+                    code: "tester_rebind_pr_head_mismatch",
+                    candidate_sha: rebound.candidateSha,
+                    pr: livePrNumber,
+                    summary,
+                  },
+                };
+                return true;
+              };
               if (
                 !expected ||
                 (liveSha === expected && livePrNumber === handoffPrNumber)
@@ -3295,6 +3331,7 @@ export async function runAdvance(
                   observerMismatch = rebound;
                   return;
                 }
+                if (rejectPostAttemptPrIdentityChange(rebound)) return;
                 const postRebindDetail = livePrNumber
                   ? await (deps.getPrDetail ?? getPrDetail)(cfg, livePrNumber).catch(() => null)
                   : null;
@@ -3332,6 +3369,7 @@ export async function runAdvance(
                 observerMismatch = mismatch;
                 return;
               }
+              if (rejectPostAttemptPrIdentityChange(mismatch)) return;
               handoffPrHeadSha = mismatch.candidateSha;
               handoffPrNumber = livePrNumber;
             },
