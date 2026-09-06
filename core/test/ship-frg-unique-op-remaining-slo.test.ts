@@ -399,6 +399,82 @@ test("persist into factory-control generic store is observed by in-flight ship s
   assert.ok(observed.includes("merge-queue"));
 });
 
+test("ship-path attestor binding preserves in-flight operation collection (#1499)", async () => {
+  const files = new Map<string, string>();
+  writeUnboundPrefixRun(files, GENERIC, "1446-2026-09-04T23-26-39-000Z");
+  const candidateSha = "c".repeat(40);
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/candidate-worktree",
+      fromRun: "loop-pack-only",
+      loadContract: async () =>
+        ({
+          schema: "pipeline/loop-contract@1",
+          run_id: "loop-pack-only",
+          selector: { type: "label", value: "factory-gate" },
+          items: [
+            { id: "1", depends_on: [], external_depends_on: [] },
+            { id: "2", depends_on: [], external_depends_on: [] },
+          ],
+        }) as never,
+      loadLedger: async () =>
+        ({
+          schema: "pipeline/loop-ledger@1",
+          run_id: "loop-pack-only",
+          items: {
+            "1": { state: "ready", history: [], recovery_attempts: [] },
+            "2": { state: "ready", history: [], recovery_attempts: [] },
+          },
+        }) as never,
+      env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/frg" },
+      presentAttestorCredential: {
+        readFile: () => Buffer.from("unit-test-attestor-key"),
+      },
+      resolveShipPathFromRun: async () => ({
+        kind: "bound",
+        binding: { candidate_git_sha: candidateSha } as never,
+        unsigned_frg_run_id: "frg-unsigned-1499",
+      }),
+      resolveUniqueOperationRunsRoots: () => [STATE_HOME, GENERIC],
+      scenarioOverrides: frgRequiredObservationOverrides("pass"),
+      compositionOverrides: frgRequiredCompositionOverrides("pass"),
+      unique_operation_manifest: {
+        ...passingUniqueOperationManifest({
+          release_identity: "1.29.1",
+          candidate_sha: candidateSha,
+        }),
+        in_flight_ship: true,
+      },
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  assert.ok(
+    result.evidence.operation_reliability!.entrypoint_coverage.observed.includes("drive"),
+    "credentialed ship-path replay must retain the same unbound-in-flight drive proof as prepare",
+  );
+  assert.ok(result.evidence.integrity.attestation?.mac, "KEY_FILE path must sign the replay");
+});
+
+test("standalone factory-gate without a ship binding remains strict (#1499)", async () => {
+  const files = new Map<string, string>();
+  writeUnboundPrefixRun(files, GENERIC, "1446-2026-09-04T23-26-39-000Z");
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/candidate-worktree",
+      resolveUniqueOperationRunsRoots: () => [STATE_HOME, GENERIC],
+      scoreInput: scoreInput("c".repeat(40)),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    memFs(files),
+  );
+  assert.ok(result.evidence.operation_reliability!.entrypoint_coverage.missing.includes("drive"));
+});
+
 test("candidate-worktree-only persist is not unique-operation coverage (#1446)", async () => {
   const files = new Map<string, string>();
   const startedAt = new Date("2026-09-04T23:26:39.000Z");

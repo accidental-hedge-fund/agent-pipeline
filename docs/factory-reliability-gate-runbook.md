@@ -174,6 +174,13 @@ equal the train minted id.
 When Factory Reliability Gate unique-operation scoring runs as a phase of an
 admitted in-flight `ship` (`opts.inFlightShip === true`):
 
+The closed `factory_release_binding` loaded by credentialed
+`factory-gate --from-run` is the public attestor's equivalent in-flight signal.
+Its operation collection MUST use the same rules as prepare's in-process score;
+otherwise the attestor replay would drop pre-candidate host operations that the
+unsigned checkpoint accepted. A standalone score without that binding remains
+strict.
+
 - Missing-field host artifacts that lack `candidate_sha` (and, when absent,
   release identity) are kept as entrypoint coverage. Other-candidate SHAs and
   present mismatched release identities still drop. Standalone `factory-gate`
