@@ -235,9 +235,10 @@ function processLeaseForRecord(
   deps: InheritedCandidateProcessLeaseDeps,
   releaseParent: boolean,
   claim?: CandidateProcessClaim,
+  allowTransfer = true,
 ): CandidateProcessLease {
   const handoffPath = candidateProcessHandoffPath(proof.processLockPath);
-  return {
+  const lease: CandidateProcessLease = {
     proof,
     release() {
       claim?.release();
@@ -250,7 +251,9 @@ function processLeaseForRecord(
         deps.readText(proof.processLockPath) === body
       ) deps.remove(proof.processLockPath);
     },
-    transferTo(nextOwner) {
+  };
+  if (allowTransfer) {
+    lease.transferTo = (nextOwner) => {
       if (
         !Number.isInteger(nextOwner.pid) ||
         nextOwner.pid <= 0 ||
@@ -276,8 +279,9 @@ function processLeaseForRecord(
       const transferred = deps.statePathTrusted(handoffPath) && deps.readText(handoffPath) === handoff;
       if (transferred) claim?.release();
       return transferred;
-    },
-  };
+    };
+  }
+  return lease;
 }
 
 function hasAnyCandidateProcessGuardEnv(env: NodeJS.ProcessEnv): boolean {
@@ -414,6 +418,7 @@ const EXPECTED_CANDIDATE_ENGINE_CONSUMERS = [
   "factory-release.pack-loop.start",
   "factory-release.pack-loop.resume",
   "factory-gate.hybrid-v2",
+  "ship.frg-prepare-observe",
   "ship.stage-adapter",
 ] as const;
 export type CandidateEngineConsumer = (typeof EXPECTED_CANDIDATE_ENGINE_CONSUMERS)[number];
@@ -743,7 +748,11 @@ export async function resolveAndPrepareCandidateEngine(
             const existingBody = d.readText(lockPath);
             if (existingBody == null || !d.statePathTrusted(lockPath)) return null;
             const existing = parseCandidateProcessLock(existingBody);
-            if (!existing || existing.engineRoot !== engine.engineRoot) return null;
+            if (
+              !existing ||
+              existing.engineRoot !== engine.engineRoot ||
+              existing.commitSha !== engine.commitSha
+            ) return null;
             const handoffBody = d.readText(handoffPath);
             if (handoffBody !== null) {
               if (!d.statePathTrusted(handoffPath)) return null;
@@ -754,7 +763,36 @@ export async function resolveAndPrepareCandidateEngine(
                 handoff.commitSha !== existing.commitSha ||
                 handoff.parentLockDigest !== createHash("sha256").update(existingBody).digest("hex")
               ) return null;
-              if (d.processAlive(handoff.pid, handoff.starttime)) return null;
+              if (d.processAlive(handoff.pid, handoff.starttime)) {
+                // The immutable root owner remains the only process allowed to
+                // start observation ticks while its detached supervisor holds
+                // the handoff. The observer cannot transfer or release either
+                // record, and its guarded child still cannot start a nested
+                // candidate process while the live handoff exists.
+                if (
+                  opts.consumer !== "ship.frg-prepare-observe" ||
+                  existing.starttime === null ||
+                  existing.starttime === "" ||
+                  owner.starttime === null ||
+                  owner.starttime === "" ||
+                  existing.pid !== owner.pid ||
+                  existing.starttime !== owner.starttime ||
+                  !d.processAlive(owner.pid, owner.starttime) ||
+                  d.readText(lockPath) !== existingBody ||
+                  d.readText(handoffPath) !== handoffBody
+                ) return null;
+                const lockfileDigest = d.digest(
+                  d.readFile(path.join(engine.engineRoot, CANDIDATE_CORE_LOCKFILE_REL)),
+                );
+                return processLeaseForRecord({
+                  engineRoot: engine.engineRoot,
+                  commitSha: engine.commitSha,
+                  readyRecordPath: candidateReadyRecordPath(engine.engineRoot, engine.commitSha, stateDir),
+                  lockfileDigest,
+                  processLockPath: lockPath,
+                  processLockDigest: createHash("sha256").update(existingBody).digest("hex"),
+                }, existingBody, d, false, undefined, false);
+              }
               if (d.readText(handoffPath) !== handoffBody) return null;
               d.remove(handoffPath);
               if (d.readText(handoffPath) !== null) return null;

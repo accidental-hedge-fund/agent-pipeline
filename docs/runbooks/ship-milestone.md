@@ -216,6 +216,14 @@ owner reclamation. Transfer happens before the detached child is unref'd; a
 failed transfer stops and reaps that child. The inner start does not acquire a
 second lease for the same root, release the parent's lease on failure, or fall
 back to a fresh lease when inherited guard fields are partial or invalid.
+While that supervisor remains live, only the same immutable ship coordinator
+with the exact nonempty PID start identity may use the dedicated
+`ship.frg-prepare-observe` route to start later `factory-release prepare`
+observation ticks under the unchanged parent proof. That route rejects every
+other leaf. Its owner-only observation lease cannot transfer or remove the
+parent lock or handoff, and its guarded child cannot start another nested
+candidate process. Release, finish, tag, other consumers, PID-only identities,
+and other processes remain blocked.
 Fail-closed recovery is candidate-local (`npm ci` in that candidate `core/`).
 It is not a global package reinstall. Identity-only resolution does not
 authorize ship-end spawn. Tugboat and in-engine `pipeline ship` share that

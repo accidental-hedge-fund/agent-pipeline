@@ -2151,24 +2151,38 @@ test("production ship adapter wires multi-item advanceWave, not N×single (revie
 });
 
 const PIN_SHA = "9".repeat(40);
-const candidateEngine: import("../scripts/ship-end-candidate.ts").CandidateEngine = {
-  engineRoot: "/cand",
-  launcherPath: "/cand/scripts/pipeline-launcher.mjs",
-  commitSha: head,
-  consumer: "ship.stage-adapter",
-  acquireProcessLock: () => ({
-    proof: {
-      engineRoot: "/cand",
-      commitSha: head,
-      readyRecordPath: "/state/ready.json",
-      lockfileDigest: "d".repeat(64),
-      processLockPath: "/state/process.lock",
-      processLockDigest: "f".repeat(64),
-    },
-    release() {},
-  }),
-  revalidateBeforeSpawn: () => ({ ok: true, engine: candidateEngine }),
-};
+type CandidateEngineConsumer = import("../scripts/ship-end-candidate.ts").CandidateEngineConsumer;
+
+function candidateEngineFor(
+  consumer: CandidateEngineConsumer,
+  acquireProcessLock?: import("../scripts/ship-end-candidate.ts").CandidateEngine["acquireProcessLock"],
+): import("../scripts/ship-end-candidate.ts").CandidateEngine {
+  const engine: import("../scripts/ship-end-candidate.ts").CandidateEngine = {
+    engineRoot: "/cand",
+    launcherPath: "/cand/scripts/pipeline-launcher.mjs",
+    commitSha: head,
+    consumer,
+    acquireProcessLock: acquireProcessLock ?? (() => ({
+      proof: {
+        engineRoot: "/cand",
+        commitSha: head,
+        readyRecordPath: "/state/ready.json",
+        lockfileDigest: "d".repeat(64),
+        processLockPath: "/state/process.lock",
+        processLockDigest: "f".repeat(64),
+      },
+      release() {},
+    })),
+    revalidateBeforeSpawn: () => ({ ok: true, engine }),
+  };
+  return engine;
+}
+
+const candidateEngine = candidateEngineFor("ship.stage-adapter");
+const resolveTestCandidate = async (_sha: string, consumer: CandidateEngineConsumer) => ({
+  ok: true as const,
+  engine: candidateEngineFor(consumer),
+});
 
 function memoryShipStore(): ShipStateStore & { status: ShipStatus | null; events: ShipPhaseEvent[] } {
   let status: ShipStatus | null = null;
@@ -2214,7 +2228,7 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
     env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     nodeBin: "/usr/bin/node",
     factoryReleaseRequestPath: "/abs/req.json",
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv, env) => {
       spawned.push(argv);
       // Prepare must stay uncredentialed (#1133). The attestor child inherits KEY.
@@ -2365,10 +2379,10 @@ test("no leaf spawn until resolve-and-prepare returns a ready root (#1344)", asy
     env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     nodeBin: "/usr/bin/node",
     factoryReleaseRequestPath: "/abs/req.json",
-    resolveCandidate: async () => {
+    resolveCandidate: async (_sha, consumer) => {
       await Promise.resolve();
       ready = true;
-      return { ok: true, engine: candidateEngine };
+      return { ok: true, engine: candidateEngineFor(consumer) };
     },
     spawn: async (argv) => {
       assert.equal(ready, true, "leaf argv must not spawn before readiness success");
@@ -2415,7 +2429,7 @@ test("matching pin SHA keeps in-process pin prepare", async () => {
     pinCommitSha: head,
     repoDir: "/repo",
     env: {},
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       return { code: 0, stdout: "", stderr: "" };
@@ -2437,7 +2451,7 @@ test("in_progress prepare re-invokes prepare and does not factory-gate until eli
     factoryReleaseRequestPath: "/abs/req.json",
     frgWaitAttempts: 5,
     delay: async () => {},
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       if (argv.includes("factory-release")) {
@@ -2482,6 +2496,73 @@ test("in_progress prepare re-invokes prepare and does not factory-gate until eli
   );
 });
 
+test("repeated FRG prepare polling uses the observer route while release mutations stay blocked (#1513)", async () => {
+  const resolvedConsumers: CandidateEngineConsumer[] = [];
+  const spawned: string[][] = [];
+  let prepareTicks = 0;
+  const bound = bindCandidateShipEndOperations(operations({
+    observeRelease: async () => null,
+  }), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    delay: async () => {},
+    isBoundPackLoopLive: async () => true,
+    resolveCandidate: async (_sha, consumer) => {
+      resolvedConsumers.push(consumer);
+      return {
+        ok: true,
+        engine: candidateEngineFor(
+          consumer,
+          consumer === "ship.frg-prepare-observe"
+            ? () => ({
+                proof: {
+                  engineRoot: "/cand",
+                  commitSha: head,
+                  readyRecordPath: "/state/ready.json",
+                  lockfileDigest: "d".repeat(64),
+                  processLockPath: "/state/process.lock",
+                  processLockDigest: "f".repeat(64),
+                },
+                release() {},
+              })
+            : () => null,
+        ),
+      };
+    },
+    spawn: async (argv) => {
+      spawned.push(argv);
+      if (argv.includes("factory-release")) {
+        prepareTicks += 1;
+        return prepareTicks === 1
+          ? {
+              code: 0,
+              stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1513" }),
+              stderr: "",
+            }
+          : { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  await bound.runFrgPack!(intent, train);
+  assert.equal(prepareTicks, 2, "the real ship composer must execute the second prepare tick");
+  assert.deepEqual(resolvedConsumers, ["ship.frg-prepare-observe"]);
+
+  await assert.rejects(
+    bound.prepareRelease(intent, head),
+    /candidate-engine lock defect/,
+  );
+  assert.deepEqual(resolvedConsumers, ["ship.frg-prepare-observe", "ship.stage-adapter"]);
+  assert.equal(
+    spawned.filter((argv) => argv.includes("release") && !argv.includes("factory-release")).length,
+    0,
+    "the same coordinator cannot mutate release state through the observer lease",
+  );
+});
+
 test("in_progress prepare within wait budget does not invoke factory-gate", async () => {
   const spawned: string[][] = [];
   const bound = bindCandidateShipEndOperations(operations(), {
@@ -2492,7 +2573,7 @@ test("in_progress prepare within wait budget does not invoke factory-gate", asyn
     frgWaitAttempts: 2,
     delay: async () => {},
     isBoundPackLoopLive: async () => false,
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       return {
@@ -2611,7 +2692,7 @@ test("live in_progress at cap keeps re-invoking prepare (#1150)", async () => {
     onFrgWaitTick: (tick) => {
       heartbeats.push({ attempt: tick.attempt, live: tick.live });
     },
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       prepareTicks++;
@@ -2649,7 +2730,7 @@ test("unknown liveness at cap keeps re-invoking prepare (#1150)", async () => {
     onFrgWaitTick: (tick) => {
       heartbeats.push({ attempt: tick.attempt, live: tick.live });
     },
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       prepareTicks++;
@@ -2681,7 +2762,7 @@ test("dead-loop in_progress at cap still throws resume-to-retry (#1150)", async 
     frgWaitAttempts: 2,
     delay: async () => {},
     isBoundPackLoopLive: async () => false,
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       return {
@@ -2971,7 +3052,7 @@ test("empty or malformed ledger stop at cap keeps re-invoking prepare (#1150)", 
     onFrgWaitTick: (tick) => {
       heartbeats.push({ attempt: tick.attempt, live: tick.live });
     },
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       prepareTicks++;
@@ -3018,7 +3099,7 @@ test("missing or mismatched ledger identity at cap keeps re-invoking prepare (#1
     onFrgWaitTick: (tick) => {
       heartbeats.push({ attempt: tick.attempt, live: tick.live });
     },
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       prepareTicks++;
@@ -3061,7 +3142,7 @@ test("missing request path fails closed before candidate FRG prepare", async () 
     pinCommitSha: PIN_SHA,
     repoDir: "/repo",
     env: {},
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       return { code: 0, stdout: "", stderr: "" };
@@ -3246,7 +3327,7 @@ test("candidate FRG pack re-invokes the same prepare request after factory-gate 
     factoryReleaseRequestPath: requestPath,
     frgWaitAttempts: 4,
     delay: async () => {},
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       if (argv.includes("factory-release")) {
@@ -3320,7 +3401,7 @@ test("runFrgPack fails closed after one attest when observe stays rejected (#129
     factoryReleaseRequestPath: requestPath,
     frgWaitAttempts: 8,
     delay: async () => {},
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       if (argv.includes("factory-release")) {
@@ -3365,7 +3446,7 @@ test("changed unsigned checkpoint resets the attest allowance (#1295)", async ()
     factoryReleaseRequestPath: "/abs/req.json",
     frgWaitAttempts: 4,
     delay: async () => {},
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       if (argv.includes("factory-release")) {
@@ -3410,7 +3491,7 @@ test("injected request resolver supplies the persisted prepare path when option 
     repoDir: "/repo",
     env: {},
     resolveFactoryReleaseRequestPath: async () => "/state/ships/ship-key/factory-release-prepare-request.json",
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       if (argv.includes("factory-release")) {
@@ -3444,7 +3525,7 @@ test("default candidate tag path spawns release ensure-tag on the candidate laun
     repoDir: "/repo",
     env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     nodeBin: "/usr/bin/node",
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       originHasTag = true;
@@ -3483,7 +3564,7 @@ test("candidate ensure-tag leaf fails closed on non-zero spawn without pin-proce
     pinCommitSha: PIN_SHA,
     repoDir: "/repo",
     env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async () => ({ code: 1, stdout: "", stderr: "candidate tag refused" }),
   });
   await assert.rejects(
@@ -3516,7 +3597,7 @@ test("in-engine HMAC children present KEY_FILE as KEY and prepare stays uncreden
       },
     },
     factoryReleaseRequestPath: "/abs/req.json",
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv, env) => {
       const verb = argv.includes("factory-gate")
         ? "attestor"
@@ -3580,7 +3661,7 @@ test("in-engine HMAC-verify does not spawn without a credential (#1181)", async 
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       if (argv.includes("factory-release")) {
@@ -3619,7 +3700,7 @@ test("in-engine HMAC-verify does not spawn on unreadable KEY_FILE (#1181)", asyn
       },
     },
     factoryReleaseRequestPath: "/abs/req.json",
-    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
       if (argv.includes("factory-release")) {

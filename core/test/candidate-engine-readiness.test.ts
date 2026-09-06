@@ -722,6 +722,151 @@ test("nested candidate start inherits the live parent lease and transfers it to 
   assert.equal(h.files.has(lockPath), true, "parent release must not remove the transferred lease");
 });
 
+test("immutable ship owner can poll while its detached pack supervisor holds the handoff (#1513)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  h.deps.digest = (buf) => createHash("sha256").update(buf).digest("hex");
+  h.deps.processAlive = (pid, starttime) =>
+    (pid === 111 && starttime === "parent-st") ||
+    (pid === 4242 && starttime === "child-st");
+
+  const firstTick = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "ship.frg-prepare-observe" },
+    h.deps,
+  );
+  const nestedStart = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(firstTick.ok, true);
+  assert.equal(nestedStart.ok, true);
+  if (!firstTick.ok || !nestedStart.ok) return;
+
+  const firstLease = firstTick.engine.acquireProcessLock?.();
+  assert.ok(firstLease);
+  if (!firstLease) return;
+  const guardedStart = bindInheritedCandidateProcessLease(
+    nestedStart.engine,
+    candidateProcessGuardEnv(firstLease.proof),
+    { ...h.deps, parentPid: () => 111 },
+  );
+  const started = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: guardedStart,
+    start: async (_engine, _env, handoff) => {
+      assert.equal(handoff({ pid: 4242, starttime: "child-st" }), true);
+      return "dispatched";
+    },
+  });
+  assert.equal(started.ok, true);
+  firstLease.release();
+
+  const secondTick = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "ship.frg-prepare-observe" },
+    h.deps,
+  );
+  assert.equal(secondTick.ok, true);
+  if (!secondTick.ok) return;
+  let observations = 0;
+  const observed = await runCandidateEngineProcess({
+    consumer: "ship.frg-prepare-observe",
+    engine: secondTick.engine,
+    start: async (_engine, env, handoff) => {
+      observations += 1;
+      assert.equal(
+        handoff({ pid: 5000, starttime: "observer-child" }),
+        false,
+        "an observation lease cannot replace the live pack handoff",
+      );
+      const nestedWhileLive = bindInheritedCandidateProcessLease(
+        nestedStart.engine,
+        env,
+        { ...h.deps, parentPid: () => 111 },
+      );
+      let nestedStarts = 0;
+      const nestedResult = await runCandidateEngineProcess({
+        consumer: "factory-release.pack-loop.start",
+        engine: nestedWhileLive,
+        start: async () => ++nestedStarts,
+      });
+      assert.equal(nestedResult.ok, false);
+      assert.equal(nestedStarts, 0);
+      return observations;
+    },
+  });
+  assert.equal(observed.ok, true);
+  assert.equal(observations, 1);
+
+  const lockPath = candidateRootLockPath(repo);
+  assert.equal(JSON.parse(h.files.get(lockPath)!).pid, 111);
+  assert.equal(JSON.parse(h.files.get(candidateProcessHandoffPath(lockPath))!).pid, 4242);
+
+  const mutatingLeaf = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "ship.stage-adapter" },
+    h.deps,
+  );
+  assert.equal(mutatingLeaf.ok, true);
+  if (!mutatingLeaf.ok) return;
+  let mutations = 0;
+  const mutationResult = await runCandidateEngineProcess({
+    consumer: "ship.stage-adapter",
+    engine: mutatingLeaf.engine,
+    start: async () => ++mutations,
+  });
+  assert.equal(mutationResult.ok, false);
+  assert.equal(mutations, 0, "release/finish/tag consumer remains blocked by the live handoff");
+
+  h.deps.parentIdentity = () => ({ pid: 999, starttime: "other-st" });
+  const unrelated = await runCandidateEngineProcess({
+    consumer: "ship.frg-prepare-observe",
+    engine: secondTick.engine,
+    start: async () => ++observations,
+  });
+  assert.equal(unrelated.ok, false);
+  if (!unrelated.ok) assert.equal(unrelated.kind, "lock");
+  assert.equal(observations, 1);
+});
+
+test("ship prepare observer refuses PID-only owner identity while handoff is live (#1513)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  h.deps.digest = (buf) => createHash("sha256").update(buf).digest("hex");
+  h.deps.parentIdentity = () => ({ pid: 111, starttime: null });
+  h.deps.processAlive = (pid) => pid === 111 || pid === 4242;
+  const prepared = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "ship.frg-prepare-observe" },
+    h.deps,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const first = await runCandidateEngineProcess({
+    consumer: "ship.frg-prepare-observe",
+    engine: prepared.engine,
+    start: async (_engine, _env, handoff) => {
+      assert.equal(handoff({ pid: 4242, starttime: "child-st" }), true);
+      return "dispatched";
+    },
+  });
+  assert.equal(first.ok, true);
+
+  let observations = 0;
+  const pidOnly = await runCandidateEngineProcess({
+    consumer: "ship.frg-prepare-observe",
+    engine: prepared.engine,
+    start: async () => ++observations,
+  });
+  assert.equal(pidOnly.ok, false);
+  assert.equal(observations, 0);
+});
+
 test("nested candidate claim serializes launch before either child can start (#1503)", async () => {
   const repo = "/repo";
   const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
