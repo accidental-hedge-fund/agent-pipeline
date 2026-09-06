@@ -481,6 +481,26 @@ export function decideExternalCommitAdvance(
 }
 
 /**
+ * Recognize an externally delivered fix before spawning the implementer.
+ * The worktree head must be the exact freshly resolved linked-PR head; merely
+ * moving past the reviewed SHA locally is insufficient because it may be an
+ * unpublished leftover from an earlier failed fix attempt.
+ */
+export function decidePreHarnessExternalAdvance(
+  comments: { author: string; body: string }[],
+  actor: string | null,
+  round: 1 | 2,
+  worktreeHead: string,
+  deliveryHead: string,
+): (ExternalCommitAdvanceDecision & { advance: true }) | null {
+  const decision = decideExternalCommitAdvance(comments, actor, round, worktreeHead);
+  if (!decision.advance) return null;
+  return worktreeHead.trim().toLowerCase() === deliveryHead.trim().toLowerCase()
+    ? decision
+    : null;
+}
+
+/**
  * Whether HEAD moving past the reviewed SHA (#349) was proven to have been
  * applied outside the fix harness, and so may skip the harness-prescribed
  * commit-subject check (`enforceExternalCommitGate`) rather than the normal
@@ -826,6 +846,13 @@ export async function advanceFix(
   const preRoundHead = deliveryPreflight.actualHead!;
   const managedBranch = branchName(issueNumber, wt.slug);
   const deliveryBranch = linkedDelivery.branch;
+  const preHarnessExternalAdvance = decidePreHarnessExternalAdvance(
+    detail.comments,
+    fixActor,
+    round,
+    preRoundHead,
+    linkedDelivery.headSha,
+  );
 
   // Use branch-diff to identify the OpenSpec change this branch introduced rather
   // than changes[0], which may be an unrelated pre-existing change in the worktree.
@@ -934,6 +961,29 @@ export async function advanceFix(
     shouldAttemptSalvage: ({ confirmedNoNewCommit, invokeResult }) =>
       !invokeResult.result.success || confirmedNoNewCommit,
     invoke: async () => {
+      if (preHarnessExternalAdvance) {
+        // The exact current PR head already contains commits past the triggering
+        // review. Skip the implementer, then let the existing external-commit
+        // path run every normal commit/spec/build/test gate before transition.
+        const result: HarnessResult = {
+          success: true,
+          stdout: "",
+          stderr: "",
+          exit_code: 0,
+          duration: 0,
+          timed_out: false,
+        };
+        return {
+          result,
+          retryResult: {
+            attempts: [],
+            finalResult: result,
+            budgetExhausted: false,
+            certainty: "known_complete",
+            observation: "verified-complete",
+          },
+        };
+      }
       // Crash-retry loop (#486): a fix-harness invocation that exits non-zero or
       // times out is retried in place, up to cfg.auto_recovery_max_retries
       // additional times, within the remaining fix_timeout budget — never

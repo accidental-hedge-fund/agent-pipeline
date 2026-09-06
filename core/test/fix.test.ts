@@ -15,6 +15,7 @@ import {
   computeEffectiveBlockingSet,
   decideDoesNotReproduceAdvance,
   decideExternalCommitAdvance,
+  decidePreHarnessExternalAdvance,
   decideHumanDecisionPark,
   enforceFixOpenspecConsistency,
   enforceFixCommitGate,
@@ -671,6 +672,33 @@ test("decideExternalCommitAdvance: actor unresolved (null) → fails closed, doe
   assert.equal(decision.reviewSha, null);
 });
 
+test("decidePreHarnessExternalAdvance: exact linked-PR delivery skips an unnecessary fix harness", () => {
+  const decision = decidePreHarnessExternalAdvance(
+    [reviewComment(2, SHA_REVIEWED)],
+    ACTOR,
+    2,
+    SHA_HEAD,
+    SHA_HEAD.toUpperCase(),
+  );
+  assert.ok(decision?.advance);
+  assert.equal(decision?.to, "pre-merge");
+});
+
+test("decidePreHarnessExternalAdvance: local-only or stale delivery heads fail closed", () => {
+  assert.equal(
+    decidePreHarnessExternalAdvance(
+      [reviewComment(2, SHA_REVIEWED)], ACTOR, 2, SHA_HEAD, SHA_REVIEWED,
+    ),
+    null,
+  );
+  assert.equal(
+    decidePreHarnessExternalAdvance(
+      [reviewComment(2, SHA_HEAD)], ACTOR, 2, SHA_HEAD, SHA_HEAD,
+    ),
+    null,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // resolveFixCommitGateMode + isCommitOnRemote (#349 pre-merge review-1 finding 1):
 // the external-commit subject exemption must only apply once the commit is
@@ -970,6 +998,12 @@ test("advanceFix source pin: adopted delivery identity is bound before the harne
   assert.match(src.slice(unavailableIdx, preflightIdx), /status: "blocked"/);
   assert.match(src.slice(preflightIdx, promptIdx), /blockerKind: "head-drift"/);
   assert.match(src.slice(promptIdx, roundIdx), /deliveryBranch,/);
+  const externalBypassIdx = src.indexOf("if (preHarnessExternalAdvance) {", roundIdx);
+  const harnessInvokeIdx = src.indexOf("const retryResult = await invokeFixHarnessWithRetry(", roundIdx);
+  assert.ok(
+    externalBypassIdx !== -1 && harnessInvokeIdx !== -1 && externalBypassIdx < harnessInvokeIdx,
+    "an exact externally delivered fix must bypass the implementer before its invocation",
+  );
   assert.match(src, /syncWorktreeToDelegatedExecutorResult\(wt\.path, deliveryBranch\)/);
   assert.match(src, /headBranch: deliveryBranch/);
   assert.match(src, /let externalDeliveryBranch: string \| null = linkedDelivery\?\.branch \?\? null/);

@@ -254,6 +254,8 @@ Before invoking the reviewer for a pre-merge delta round, `enforceReviewShaGate`
 The comment the pipeline posts at the ceiling SHALL name the observed round count, the configured cap, and the applied `ceiling_action`. When the count is below the cap, behavior SHALL be unchanged from before this requirement.
 Both park and demote ceiling artifacts SHALL bind the candidate SHA and participate in the same one-successor reset rule.
 
+When an item is in a fix stage and the managed worktree already equals the exact freshly resolved linked-PR head beyond the triggering review SHA, the pipeline SHALL skip the implementer invocation and validate that external repair through the normal commit, specification, build, test, and transition gates. A local-only or stale head SHALL NOT receive this bypass.
+
 #### Scenario: At the cap the reviewer is not invoked again
 
 - **WHEN** an item's durable delta-round count equals `review_policy.max_delta_rounds`, its latest delta artifact targets the current candidate, and pre-merge re-enters the SHA gate with a changed diff hash
