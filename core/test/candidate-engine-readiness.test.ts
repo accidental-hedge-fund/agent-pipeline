@@ -22,6 +22,7 @@ import {
   CANDIDATE_ENGINE_CONSUMERS,
   assertCandidateEngineConsumerInventoryComplete,
   bindInheritedCandidateProcessLease,
+  candidateProcessClaimPath,
   candidateProcessHandoffPath,
   candidateProcessGuardEnv,
   candidateEngineConsumerInventoryGaps,
@@ -608,9 +609,10 @@ test("detached pack loop retains the candidate-root lease until the child exits 
   const first = await runCandidateEngineProcess({
     consumer: "factory-release.pack-loop.start",
     engine: prepared.engine,
-    start: async () => ({ dispatch_state: "dispatched" as const, pid: 4242 }),
-    detachedSupervisor: (value) =>
-      value.dispatch_state === "dispatched" ? { pid: value.pid, starttime: null } : null,
+    start: async (_engine, _env, handoff) => {
+      assert.equal(handoff({ pid: 4242, starttime: null }), true);
+      return { dispatch_state: "dispatched" as const, pid: 4242 };
+    },
   });
   assert.equal(first.ok, true);
   const lockPath = candidateRootLockPath(repo);
@@ -690,11 +692,11 @@ test("nested candidate start inherits the live parent lease and transfers it to 
   const started = await runCandidateEngineProcess({
     consumer: "factory-release.pack-loop.start",
     engine: inherited,
-    start: async (_engine, env) => {
+    start: async (_engine, env, handoff) => {
       childGuardEnv = env;
+      assert.equal(handoff({ pid: 4242, starttime: "child-st" }), true);
       return { dispatch_state: "dispatched" as const, pid: 4242 };
     },
-    detachedSupervisor: (value) => ({ pid: value.pid, starttime: "child-st" }),
   });
   assert.equal(started.ok, true);
   const lockPath = candidateRootLockPath(repo);
@@ -718,6 +720,73 @@ test("nested candidate start inherits the live parent lease and transfers it to 
   assert.deepEqual(afterTransferGuard, { ok: true });
   parentLease.release();
   assert.equal(h.files.has(lockPath), true, "parent release must not remove the transferred lease");
+});
+
+test("nested candidate claim serializes launch before either child can start (#1503)", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+  });
+  h.deps.digest = (buf) => createHash("sha256").update(buf).digest("hex");
+  h.deps.processAlive = (pid) => pid === 111 || pid === 4242;
+  const outer = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "ship.stage-adapter" },
+    h.deps,
+  );
+  const inner = await sharedResolveAndPrepareCandidateEngine(
+    { repoDir: repo, candidateSha: SHA, consumer: "factory-release.pack-loop.start" },
+    h.deps,
+  );
+  assert.equal(outer.ok, true);
+  assert.equal(inner.ok, true);
+  if (!outer.ok || !inner.ok) return;
+  const parentLease = outer.engine.acquireProcessLock?.();
+  assert.ok(parentLease);
+  if (!parentLease) return;
+  const guarded = bindInheritedCandidateProcessLease(
+    inner.engine,
+    candidateProcessGuardEnv(parentLease.proof),
+    { ...h.deps, parentPid: () => 111 },
+  );
+  let allowFirst: (() => void) | undefined;
+  let firstHandoff: ((owner: { pid: number; starttime: string | null }) => boolean) | undefined;
+  const first = runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: guarded,
+    start: async (_engine, _env, handoff) => {
+      firstHandoff = handoff;
+      await new Promise<void>((resolve) => {
+        allowFirst = resolve;
+      });
+      assert.equal(handoff({ pid: 4242, starttime: null }), true);
+      return "first";
+    },
+  });
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  assert.ok(firstHandoff);
+  assert.equal(h.files.has(candidateProcessClaimPath(parentLease.proof.processLockPath)), true);
+  assert.equal(
+    inner.engine.acquireProcessLock?.(),
+    null,
+    "fresh acquisition/reclamation must contend on the same launch claim",
+  );
+  let losingStarts = 0;
+  const second = await runCandidateEngineProcess({
+    consumer: "factory-release.pack-loop.start",
+    engine: guarded,
+    start: async () => {
+      losingStarts += 1;
+      return "second";
+    },
+  });
+  assert.equal(second.ok, false);
+  assert.equal(losingStarts, 0, "the claim loser must not start a child");
+  allowFirst?.();
+  assert.equal((await first).ok, true);
+  assert.equal(h.files.has(candidateProcessClaimPath(parentLease.proof.processLockPath)), false);
+  assert.equal(JSON.parse(h.files.get(candidateProcessHandoffPath(parentLease.proof.processLockPath))!).pid, 4242);
 });
 
 test("partial or wrong-parent nested guard fails closed without deleting the parent lease (#1503)", async () => {
@@ -841,8 +910,10 @@ test("candidate process lock serializes distinct SHAs on one canonical root (#14
   const started = await runCandidateEngineProcess({
     consumer: "factory-release.pack-loop.start",
     engine: first.engine,
-    start: async () => ({ dispatch_state: "dispatched" as const, pid: 4242 }),
-    detachedSupervisor: (value) => ({ pid: value.pid, starttime: null }),
+    start: async (_engine, _env, handoff) => {
+      assert.equal(handoff({ pid: 4242, starttime: null }), true);
+      return { dispatch_state: "dispatched" as const, pid: 4242 };
+    },
   });
   assert.equal(started.ok, true);
 

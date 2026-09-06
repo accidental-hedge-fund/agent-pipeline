@@ -205,10 +205,12 @@ presented by its direct parent. The inner start revalidates that proof and
 transfers ownership to the acknowledged loop supervisor through an exclusively
 created handoff sidecar; the original guard-bound lock remains immutable, so
 the child sees a stable digest regardless of scheduling order. The validated
-handoff supervisor PID must equal the spawned child PID. The inner start does
-not acquire a second lease for the same root, release the parent's lease on
-failure, or fall back to a fresh lease when inherited guard fields are partial
-or invalid.
+handoff supervisor PID must equal the spawned child PID. A short-lived exclusive
+claim serializes inherited launch and handoff with every other launch and stale
+owner reclamation. Transfer happens before the detached child is unref'd; a
+failed transfer stops and reaps that child. The inner start does not acquire a
+second lease for the same root, release the parent's lease on failure, or fall
+back to a fresh lease when inherited guard fields are partial or invalid.
 Fail-closed recovery is candidate-local (`npm ci` in that candidate `core/`).
 It is not a global package reinstall. Identity-only resolution does not
 authorize ship-end spawn. Tugboat and in-engine `pipeline ship` share that

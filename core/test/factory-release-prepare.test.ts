@@ -41,7 +41,6 @@ import {
   isPendingLoopDispatch,
   isPostPilotReleaseVersion,
   observeDetachedChildStart,
-  packLoopDetachedSupervisor,
   parseFactoryReleasePrepareRequest,
   persistFactoryReleaseLoopBinding,
   productionCreateOrReusePackIssues,
@@ -2422,8 +2421,9 @@ test("production dispatch adopts the ship parent lease and transfers it to the d
       resolveCandidateDeps: inherited.resolveCandidateDeps,
       initBoundLoop: async () => ({ loop_run_id: "loop-nested-dispatch" }),
       persistBinding: async () => {},
-      spawnCandidateLoop: async (args) => {
+      spawnCandidateLoop: async (args, handoff) => {
         childEnv = args.candidateEnv;
+        assert.equal(handoff?.({ pid: 4242, starttime: null }), true);
         return { dispatch_state: "dispatched" as const, pid: 4242 };
       },
     },
@@ -2785,7 +2785,9 @@ function inheritedCandidateFixture(
       statePathTrusted: (p: string) =>
         p === stateDir || files.has(p),
       processAlive: (pid: number, starttime: string | null) =>
-        pid === process.ppid && starttime === "parent-start",
+        (pid === process.ppid && starttime === "parent-start") ||
+        (pid === process.pid && starttime === "nested-start"),
+      parentIdentity: () => ({ pid: process.pid, starttime: "nested-start" }),
     } as never,
   };
 }
@@ -3008,16 +3010,6 @@ test("missing candidate invocation fails closed and does not exec PATH pipeline"
       ),
     /missing typed candidate invocation/,
   );
-});
-
-test("pack-loop detached supervisor is the dispatched child pid (#1454)", () => {
-  assert.deepEqual(
-    packLoopDetachedSupervisor({ dispatch_state: "dispatched", pid: 4242 }),
-    { pid: 4242, starttime: null },
-  );
-  assert.equal(packLoopDetachedSupervisor({ dispatch_state: "bound", pid: 4242 }), null);
-  assert.equal(packLoopDetachedSupervisor({ dispatch_state: "dispatched" }), null);
-  assert.equal(packLoopDetachedSupervisor(undefined), null);
 });
 
 test("raw pack-loop consumer cannot spawn without an executable process-boundary proof (#1454)", async () => {
@@ -3247,6 +3239,56 @@ test("malformed handoff stops a still-running child before return", async () => 
   assert.equal(captured.killed, "SIGTERM");
   assert.equal(captured.unrefed, true);
   assert.equal(captured.pipesDestroyed, 2);
+});
+
+test("candidate lease handoff failure stops the attached child before return (#1503)", async () => {
+  const captured: { killed?: NodeJS.Signals | number; unrefed: boolean } = { unrefed: false };
+  const child = new EventEmitter() as EventEmitter & {
+    unref: () => void;
+    kill: (signal?: NodeJS.Signals | number) => boolean;
+    stdout: EventEmitter & { destroy: () => void };
+    stderr: EventEmitter & { destroy: () => void };
+    pid: number;
+  };
+  child.unref = () => {
+    captured.unrefed = true;
+  };
+  child.kill = (signal) => {
+    captured.killed = signal ?? "SIGTERM";
+    queueMicrotask(() => child.emit("exit", null, "SIGTERM"));
+    return true;
+  };
+  child.stdout = new EventEmitter() as EventEmitter & { destroy: () => void };
+  child.stderr = new EventEmitter() as EventEmitter & { destroy: () => void };
+  child.stdout.destroy = () => {};
+  child.stderr.destroy = () => {};
+  child.pid = 4242;
+  queueMicrotask(() => child.emit("spawn"));
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-lease-handoff-failure",
+      candidateInvocation: testInvocation("loop-lease-handoff-failure"),
+      candidateEnv: testCandidateEnv(),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      spawn: (() => child) as never,
+      env: { PATH: "/usr/bin" },
+      fileExists: () => true,
+      readHandoff: async () => validHandoff("loop-lease-handoff-failure"),
+      readSupervisor: async () => validHandoff("loop-lease-handoff-failure").supervisor,
+      realpath: (p: string) => p,
+      storeRunDir: "/state/runs/loop-lease-handoff-failure",
+      sleep: async () => {},
+      now: () => new Date("2026-08-29T00:00:01.000Z"),
+    },
+    () => false,
+  );
+  assert.equal(result.dispatch_state, "failed");
+  assert.match(result.last_error ?? "", /candidate_lease_handoff_failed/);
+  assert.equal(captured.killed, "SIGTERM");
+  assert.equal(captured.unrefed, true);
 });
 
 test("resume OS accept persists starting so a later invoke does not spawn a second child", async () => {

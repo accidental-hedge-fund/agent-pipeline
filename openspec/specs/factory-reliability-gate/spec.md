@@ -2502,8 +2502,10 @@ digest, and direct-parent process identity all match. It SHALL revalidate the
 candidate at the nested start boundary and transfer the lease record to the
 acknowledged detached supervisor through an atomic, exclusively created
 handoff record while keeping the child-guard-bound parent lock immutable. The
-acknowledged supervisor PID SHALL equal the spawned child PID. A failed or
-non-detached nested start SHALL
+acknowledged supervisor PID SHALL equal the spawned child PID. One exclusive
+claim SHALL serialize inherited launch and handoff against another launch and
+stale-owner reclamation. Transfer SHALL finish before the child is detached; a
+failed transfer SHALL stop and reap the child. A failed or non-detached nested start SHALL
 leave parent ownership intact. Partial, forged, stale, unreadable, wrong-root,
 wrong-SHA, or wrong-parent inherited evidence SHALL fail closed and SHALL NOT
 fall back to acquiring a fresh lease. An invocation without inherited guard
@@ -2516,6 +2518,7 @@ fields MAY acquire the ordinary fresh candidate lease.
 - **THEN** the nested launch SHALL start without contending with its own parent
 - **AND** the process lease SHALL be transferred to the acknowledged loop supervisor PID
 - **AND** the immutable parent-lock digest SHALL remain valid before and after transfer
+- **AND** a competing nested launch or stale-owner reclaimer SHALL NOT start while the claim is held
 
 #### Scenario: Bound-loop resume uses the same handoff contract
 

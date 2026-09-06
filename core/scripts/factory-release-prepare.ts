@@ -1416,17 +1416,6 @@ export interface PackLoopSpawnResult {
   spawn_attempt?: FactoryReleaseSpawnAttempt;
 }
 
-/** Live detached pack-loop supervisor that must keep the candidate-root lease. */
-export function packLoopDetachedSupervisor(
-  value: void | PackLoopSpawnResult,
-): { pid: number; starttime: string | null } | null {
-  if (!value || value.dispatch_state !== "dispatched") return null;
-  if (typeof value.pid !== "number" || !Number.isInteger(value.pid) || value.pid <= 0) {
-    return null;
-  }
-  return { pid: value.pid, starttime: null };
-}
-
 export interface DispatchPackLoopInput {
   repoDir: string;
   request: FactoryReleasePrepareRequest;
@@ -2242,7 +2231,8 @@ export type SpawnCandidateLoop = (args: {
   label: string;
   candidateInvocation?: CandidateInvocation;
   candidateEnv?: NodeJS.ProcessEnv;
-}) => Promise<void | PackLoopSpawnResult>;
+}, handoffCandidateLease?: (owner: { pid: number; starttime: string | null }) => boolean) =>
+  Promise<void | PackLoopSpawnResult>;
 
 /**
  * Wait for detached `spawn` or `error` before treating launch as confirmed.
@@ -2549,6 +2539,7 @@ export async function defaultSpawnCandidateLoop(
     candidateEnv?: NodeJS.ProcessEnv;
   },
   deps: SpawnCandidateLoopDeps = {},
+  handoffCandidateLease?: (owner: { pid: number; starttime: string | null }) => boolean,
 ): Promise<PackLoopSpawnResult> {
   const sourceEnv = deps.env ?? process.env;
   const now = deps.now ?? (() => new Date());
@@ -2651,6 +2642,30 @@ export async function defaultSpawnCandidateLoop(
           ? supervisor.pid
           : null;
       if (valid.ok && supervisorPid === child.pid) {
+        if (
+          handoffCandidateLease &&
+          !handoffCandidateLease({ pid: supervisorPid, starttime: null })
+        ) {
+          await stopFailedPackLoopChild(child, exitCode !== undefined, sleep);
+          const excerpt = await finishStderrEvidence(deps, evidencePath, pipes);
+          return {
+            dispatch_state: "failed",
+            pid: supervisorPid,
+            observation_deadline: deadline,
+            last_error: formatPackLoopLastError({
+              errorCode: "candidate_lease_handoff_failed",
+              excerpt: excerpt.excerpt,
+              evidencePath: excerpt.path,
+              writeError: excerpt.writeError,
+            }),
+            stderr_evidence_path: excerpt.path,
+            spawn_attempt: {
+              pid: supervisorPid,
+              error_code: "candidate_lease_handoff_failed",
+              at: isoNow(now()),
+            },
+          };
+        }
         child.unref?.();
         return {
           dispatch_state: "dispatched",
@@ -2730,8 +2745,9 @@ export async function defaultResumeBoundPackLoop(
     candidateEnv?: NodeJS.ProcessEnv;
   },
   deps: SpawnCandidateLoopDeps = {},
+  handoffCandidateLease?: (owner: { pid: number; starttime: string | null }) => boolean,
 ): Promise<PackLoopSpawnResult> {
-  return defaultSpawnCandidateLoop(args, deps);
+  return defaultSpawnCandidateLoop(args, deps, handoffCandidateLease);
 }
 
 /** Resume uses a fresh exact-candidate proof; a stored launcher identity alone never authorizes spawn. */
@@ -2788,11 +2804,11 @@ export async function productionResumeBoundPackLoop(
   const started = await runCandidateEngineProcess({
     consumer: "factory-release.pack-loop.resume",
     engine: guardedEngine,
-    start: (_checked, candidateEnv) => defaultResumeBoundPackLoop(
+    start: (_checked, candidateEnv, handoff) => defaultResumeBoundPackLoop(
       { ...args, candidateInvocation: invocation, candidateEnv },
       deps.spawnDeps,
+      handoff,
     ),
-    detachedSupervisor: packLoopDetachedSupervisor,
   });
   if (started.ok) return started.value;
   return {
@@ -3068,7 +3084,7 @@ export async function productionDispatchPackLoop(
   if (persistBound) await persistBound(loop_run_id, "bound");
   const spawn =
     deps.spawnCandidateLoop ??
-    ((spawnArgs) =>
+    ((spawnArgs, handoffCandidateLease) =>
       defaultSpawnCandidateLoop(
         {
           repoDir: spawnArgs.repoDir,
@@ -3088,13 +3104,14 @@ export async function productionDispatchPackLoop(
             if (deps.spawnDeps?.onAccepted) await deps.spawnDeps.onAccepted(info);
           },
         },
+        handoffCandidateLease,
       ));
   let spawnResult: void | PackLoopSpawnResult;
   try {
     const started = await runCandidateEngineProcess({
       consumer: "factory-release.pack-loop.start",
       engine: guardedEngine,
-      start: (_checked, candidateEnv) => spawn({
+      start: (_checked, candidateEnv, handoff) => spawn({
         repoDir: input.repoDir,
         loop_run_id,
         issue_numbers: input.issue_numbers,
@@ -3102,8 +3119,7 @@ export async function productionDispatchPackLoop(
         label: input.label,
         candidateInvocation: invocation,
         candidateEnv,
-      }),
-      detachedSupervisor: packLoopDetachedSupervisor,
+      }, handoff),
     });
     if (!started.ok) throw new Error(`pack-loop dispatch: ${started.error}`);
     spawnResult = started.value;
