@@ -2870,19 +2870,41 @@ function killOwnedDetachFixturePids(
     directOwners.push({ pid: playbookPid, argv: readProcArgv(playbookPid) });
   }
   const groups = new Map<number, string>();
+  const ownGroup = procGroup(process.pid);
   for (const owner of directOwners) {
+    const currentArgv = readProcArgv(owner.pid);
     const group = procGroup(owner.pid);
-    const startTime = procStartTime(owner.pid);
-    if (group === owner.pid && startTime !== undefined) {
-      groups.set(group, startTime);
-    }
-  }
-  for (const [group, startTime] of groups) {
+    const ownerStart = procStartTime(owner.pid);
     if (
-      procGroup(group) !== group ||
-      procStartTime(group) !== startTime
+      group === undefined ||
+      group === ownGroup ||
+      ownerStart === undefined ||
+      !argvOwnsFixture(currentArgv, dir, version)
     ) {
       continue;
+    }
+
+    const leaderStart = procStartTime(group);
+    if (leaderStart !== undefined && procGroup(group) !== group) continue;
+    groups.set(group, leaderStart ?? `leader-gone:${owner.pid}:${ownerStart}`);
+  }
+  for (const [group, identity] of groups) {
+    const currentLeaderStart = procStartTime(group);
+    if (currentLeaderStart !== undefined) {
+      if (procGroup(group) !== group || currentLeaderStart !== identity) continue;
+    } else {
+      const stillVerifiedMember = directOwners.some(
+        (owner) => {
+          const ownerStart = procStartTime(owner.pid);
+          return (
+            procGroup(owner.pid) === group &&
+            ownerStart !== undefined &&
+            identity === `leader-gone:${owner.pid}:${ownerStart}` &&
+            argvOwnsFixture(readProcArgv(owner.pid), dir, version)
+          );
+        },
+      );
+      if (!stillVerifiedMember) continue;
     }
     try {
       process.kill(-group, "SIGTERM");
@@ -3627,6 +3649,74 @@ test("fixture group tracking retains a live descendant after its leader exits", 
       2_000,
       "leader-exit fixture group to terminate",
     );
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reapDetachFixture captures a leader-gone group from its marked non-leader", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-leader-gone-"));
+  const stateRoot = path.join(dir, "state");
+  const version = `9.99.${process.pid}.${Date.now()}.leadergone`;
+  const memberPidFile = path.join(dir, "member.pid");
+  const childPidFile = path.join(dir, "child.pid");
+  const leader = spawn(
+    "bash",
+    [
+      "-c",
+      [
+        "bash -c 'trap \"exit 0\" TERM; sleep 3600 & child=$!; printf \"%s\\n\" \"$child\" > \"$1\"; wait \"$child\"' fixture-member \"$2\" \"$3\" --milestone \"$4\" &",
+        'printf "%s\\n" "$!" > "$1"',
+      ].join("\n"),
+      "fixture-leader",
+      memberPidFile,
+      childPidFile,
+      dir,
+      `v${version}`,
+    ],
+    { detached: true, stdio: "ignore" },
+  );
+  const leaderPid = leader.pid;
+  assert.ok(leaderPid && leaderPid > 0, "fixture group leader pid missing");
+  try {
+    await waitUntil(
+      () => fs.existsSync(memberPidFile) && fs.existsSync(childPidFile),
+      2_000,
+      "leader-gone member and child pids",
+    );
+    const memberPid = Number(fs.readFileSync(memberPidFile, "utf8").trim());
+    const childPid = Number(fs.readFileSync(childPidFile, "utf8").trim());
+    assert.ok(Number.isSafeInteger(memberPid) && memberPid > 0);
+    assert.ok(Number.isSafeInteger(childPid) && childPid > 0);
+    await waitUntil(
+      () => procStartTime(leaderPid) === undefined,
+      2_000,
+      "leader process to exit",
+    );
+    assert.equal(procStartTime(leaderPid), undefined, "leader must be reaped");
+    assert.equal(
+      procGroup(memberPid),
+      leaderPid,
+      "marked member must retain the detached group",
+    );
+    assert.equal(
+      procGroup(childPid),
+      leaderPid,
+      "unmarked child must share the detached group",
+    );
+    assert.equal(argvOwnsFixture(readProcArgv(memberPid), dir, version), true);
+    assert.equal(argvOwnsFixture(readProcArgv(childPid), dir, version), false);
+
+    await reapDetachFixture({ dir, stateRoot, version, children: [leader] });
+
+    assert.notEqual(procLiveness(memberPid), "live", "marked member leaked");
+    assert.notEqual(procLiveness(childPid), "live", "unmarked group child leaked");
+    assert.equal(fs.existsSync(dir), false);
+  } finally {
+    try {
+      process.kill(-leaderPid, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
