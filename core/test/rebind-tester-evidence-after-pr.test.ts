@@ -1130,6 +1130,7 @@ test("runAdvance attaches evidence-ordering diagnostic to a missing-role refuse"
 
 function boundPassed(over: Partial<TesterEvidence> = {}): TesterEvidence {
   return subjectlessPassed({
+    pr: 99,
     evidence_subject: {
       schema_version: 1,
       domain: "acme",
@@ -1281,6 +1282,100 @@ test("helper adopts prior-run SHA-matched Tester evidence without a second suite
   const stored = JSON.parse(io.files.get(testerEvidencePath(current)) ?? "{}") as TesterEvidence;
   assert.equal(stored.candidate_sha, SHA_S);
   assert.equal(stored.evidence_subject?.candidate_sha, SHA_S);
+});
+
+test("SHA/verifier-matched Tester with pr null binds the linked PR instead of already-bound", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1468";
+  plant(
+    io,
+    runDir,
+    boundPassed({
+      pr: null,
+      evidence_subject: {
+        schema_version: 1,
+        domain: "acme",
+        issue: 1468,
+        pr: null,
+        run_id: "1468/test-run",
+        candidate_sha: SHA_S,
+        diff_hash: null,
+        policy_hash: "e".repeat(64),
+        engine_fingerprint: ENGINE_FP,
+        verifier_fingerprint: VERIFIER_H,
+        required_evidence_set_revision: "f".repeat(64),
+      },
+    }),
+  );
+  let reproduced = false;
+  const result = await rebindTesterEvidenceAfterPr(
+    baseInput(io, {
+      runDir,
+      reproduce: async () => {
+        reproduced = true;
+        return { ok: false };
+      },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.action, "bind");
+    assert.equal(result.suiteCommandInvoked, false);
+    assert.equal(result.evidence?.pr, 99);
+    assert.equal(result.evidence?.issue, 1468);
+    assert.equal(result.evidence?.evidence_subject?.pr, 99);
+    assert.equal(result.evidence?.evidence_subject?.issue, 1468);
+  }
+  assert.equal(reproduced, false);
+  const stored = JSON.parse(io.files.get(testerEvidencePath(runDir)) ?? "{}") as TesterEvidence;
+  assert.equal(stored.pr, 99);
+  assert.equal(stored.evidence_subject?.pr, 99);
+});
+
+test("reproduce rebinds pinned engine A and does not accept installed engine B", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1468";
+  const ENGINE_B = "b".repeat(64);
+  assert.notEqual(ENGINE_FP, ENGINE_B);
+  const result = await rebindTesterEvidenceAfterPr(
+    baseInput(io, {
+      runDir,
+      engineFingerprint: ENGINE_FP,
+      reproduce: async ({ candidateSha, runDir: dest }) => {
+        plant(
+          io,
+          dest,
+          boundPassed({
+            candidate_sha: candidateSha,
+            evidence_subject: {
+              schema_version: 1,
+              domain: "acme",
+              issue: 1468,
+              pr: 99,
+              run_id: "1468/test-run",
+              candidate_sha: candidateSha,
+              diff_hash: null,
+              policy_hash: "e".repeat(64),
+              engine_fingerprint: ENGINE_B,
+              verifier_fingerprint: VERIFIER_H,
+              required_evidence_set_revision: "f".repeat(64),
+            },
+          }),
+        );
+        return { ok: true, candidate_sha: candidateSha };
+      },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.action, "reproduce");
+    assert.equal(result.suiteCommandInvoked, true);
+    assert.equal(result.evidence?.evidence_subject?.engine_fingerprint, ENGINE_FP);
+    assert.notEqual(result.evidence?.evidence_subject?.engine_fingerprint, ENGINE_B);
+  }
+  const stored = JSON.parse(io.files.get(testerEvidencePath(runDir)) ?? "{}") as TesterEvidence;
+  assert.equal(stored.evidence_subject?.engine_fingerprint, ENGINE_FP);
+  assert.notEqual(stored.evidence_subject?.engine_fingerprint, ENGINE_B);
 });
 
 test("runAdvance successor adopts prior-run Tester evidence without reproducing", async () => {

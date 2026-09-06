@@ -414,13 +414,136 @@ function alreadyBound(
   evidence: TesterEvidence,
   sha: string,
   verifierHash: string,
+  identity: {
+    issue: number;
+    pr: number | null;
+    domain?: string | null;
+    engineFingerprint?: string | null;
+  },
 ): boolean {
-  const subject = parseEvidenceSubjectDetailed(evidence.evidence_subject);
-  if (subject.status !== "ok") return false;
-  return (
-    candidateShaMatches(subject.subject.candidate_sha, sha) &&
-    subject.subject.verifier_fingerprint === verifierHash
-  );
+  const parsed = parseEvidenceSubjectDetailed(evidence.evidence_subject);
+  if (parsed.status !== "ok") return false;
+  const subject = parsed.subject;
+  if (!candidateShaMatches(subject.candidate_sha, sha)) return false;
+  if (subject.verifier_fingerprint !== verifierHash) return false;
+  if (subject.issue !== identity.issue) return false;
+  if (subject.pr !== identity.pr) return false;
+  if (evidence.issue !== identity.issue) return false;
+  if (evidence.pr !== identity.pr) return false;
+  const domain = typeof identity.domain === "string" ? identity.domain.trim() : "";
+  if (domain && subject.domain !== domain) return false;
+  const engineFp =
+    typeof identity.engineFingerprint === "string" ? identity.engineFingerprint.trim() : "";
+  if (engineFp && subject.engine_fingerprint !== engineFp) return false;
+  return true;
+}
+
+function rebindIdentity(input: RebindTesterEvidenceAfterPrInput): {
+  issue: number;
+  pr: number | null;
+  domain?: string;
+  engineFingerprint?: string | null;
+} {
+  return {
+    issue: input.issueNumber,
+    pr: input.prNumber,
+    domain: input.domain ?? input.cfg.domain ?? input.cfg.repo,
+    engineFingerprint: input.engineFingerprint,
+  };
+}
+
+async function bindMatchedTesterEvidence(
+  input: RebindTesterEvidenceAfterPrInput,
+  matched: TesterEvidence,
+  prHead: string,
+  pin: { hash: string; outcome: "passthrough" | "rebound" },
+): Promise<
+  | Extract<RebindTesterEvidenceResult, { ok: true; action: "bind" }>
+  | Extract<RebindTesterEvidenceResult, { ok: false }>
+> {
+  const io = input.io ?? defaultIo;
+  const writeFn = input.writeTesterEvidence ?? writeTesterEvidence;
+  const domain = (input.domain ?? input.cfg.domain ?? input.cfg.repo ?? "").trim();
+  const engineFp =
+    (typeof input.engineFingerprint === "string" && input.engineFingerprint.trim()) ||
+    matched.evidence_subject?.engine_fingerprint ||
+    "";
+  const verifierFp = resolveVerifierFingerprint({
+    engineFingerprint: engineFp || pin.hash,
+    trustedSurface: {
+      outcome: pin.outcome,
+      effective_verifier_hash: pin.hash,
+    },
+  });
+  if (!domain || !engineFp || !verifierFp) {
+    const result = failClosed(
+      input,
+      "tester_rebind_trusted_surface_unobservable",
+      "tester rebind: cannot form a well-formed evidence_subject from the trusted-surface pin",
+      prHead,
+      matched,
+    );
+    await persistBlockerRecord(input, result.blocker);
+    return result;
+  }
+  let subject;
+  try {
+    subject = buildEvidenceSubject({
+      domain,
+      issue: input.issueNumber,
+      pr: input.prNumber,
+      run_id: matched.run_id,
+      candidate_sha: prHead,
+      diff_hash: matched.evidence_subject?.diff_hash ?? null,
+      policy_hash: matched.evidence_subject?.policy_hash ?? matched.config_digest,
+      engine_fingerprint: engineFp,
+      verifier_fingerprint: verifierFp,
+      required_evidence_set_revision:
+        matched.evidence_subject?.required_evidence_set_revision ??
+        buildRequiredEvidenceSetRevisionFromGates({
+          testGateEnabled: input.cfg.test_gate?.enabled,
+          evalGateEnabled: input.cfg.eval_gate?.enabled,
+          visualGateEnabled: input.cfg.visual_gate?.enabled,
+          shipcheckGateEnabled: input.cfg.shipcheck_gate?.enabled,
+        }),
+    });
+  } catch {
+    const result = failClosed(
+      input,
+      "tester_rebind_trusted_surface_unobservable",
+      "tester rebind: evidence_subject construction failed closed",
+      prHead,
+      matched,
+    );
+    await persistBlockerRecord(input, result.blocker);
+    return result;
+  }
+  const bound: TesterEvidence = {
+    ...matched,
+    candidate_sha: prHead,
+    issue: input.issueNumber,
+    pr: input.prNumber,
+    evidence_subject: subject,
+  };
+  const written = await writeFn(input.runDir, bound, { io, appendEvent: false });
+  if (!written.ok) {
+    const result = failClosed(
+      input,
+      "tester_rebind_trusted_surface_unobservable",
+      `tester rebind: persist failed: ${written.error ?? "write failed"}`,
+      prHead,
+      matched,
+    );
+    await persistBlockerRecord(input, result.blocker);
+    return result;
+  }
+  return {
+    ok: true,
+    action: "bind",
+    candidateSha: prHead,
+    evidence: bound,
+    suiteCommandInvoked: false,
+  };
 }
 
 export async function rebindTesterEvidenceAfterPr(
@@ -490,7 +613,7 @@ export async function rebindTesterEvidenceAfterPr(
   }
 
   if (matched) {
-    if (alreadyBound(matched, prHead, pin.hash)) {
+    if (alreadyBound(matched, prHead, pin.hash, rebindIdentity(input))) {
       return {
         ok: true,
         action: "already-bound",
@@ -499,87 +622,7 @@ export async function rebindTesterEvidenceAfterPr(
         suiteCommandInvoked: false,
       };
     }
-    const domain = (input.domain ?? input.cfg.domain ?? input.cfg.repo ?? "").trim();
-    const engineFp =
-      (typeof input.engineFingerprint === "string" && input.engineFingerprint.trim()) ||
-      matched.evidence_subject?.engine_fingerprint ||
-      "";
-    const verifierFp = resolveVerifierFingerprint({
-      engineFingerprint: engineFp || pin.hash,
-      trustedSurface: {
-        outcome: pin.outcome,
-        effective_verifier_hash: pin.hash,
-      },
-    });
-    if (!domain || !engineFp || !verifierFp) {
-      const result = failClosed(
-        input,
-        "tester_rebind_trusted_surface_unobservable",
-        "tester rebind: cannot form a well-formed evidence_subject from the trusted-surface pin",
-        prHead,
-        matched,
-      );
-      await persistBlockerRecord(input, result.blocker);
-      return result;
-    }
-    let subject;
-    try {
-      subject = buildEvidenceSubject({
-        domain,
-        issue: input.issueNumber,
-        pr: input.prNumber,
-        run_id: matched.run_id,
-        candidate_sha: prHead,
-        diff_hash: matched.evidence_subject?.diff_hash ?? null,
-        policy_hash: matched.evidence_subject?.policy_hash ?? matched.config_digest,
-        engine_fingerprint: engineFp,
-        verifier_fingerprint: verifierFp,
-        required_evidence_set_revision:
-          matched.evidence_subject?.required_evidence_set_revision ??
-          buildRequiredEvidenceSetRevisionFromGates({
-            testGateEnabled: input.cfg.test_gate?.enabled,
-            evalGateEnabled: input.cfg.eval_gate?.enabled,
-            visualGateEnabled: input.cfg.visual_gate?.enabled,
-            shipcheckGateEnabled: input.cfg.shipcheck_gate?.enabled,
-          }),
-      });
-    } catch {
-      const result = failClosed(
-        input,
-        "tester_rebind_trusted_surface_unobservable",
-        "tester rebind: evidence_subject construction failed closed",
-        prHead,
-        matched,
-      );
-      await persistBlockerRecord(input, result.blocker);
-      return result;
-    }
-    const bound: TesterEvidence = {
-      ...matched,
-      candidate_sha: prHead,
-      issue: input.issueNumber,
-      pr: input.prNumber,
-      evidence_subject: subject,
-    };
-    const written = await writeFn(input.runDir, bound, { io, appendEvent: false });
-    if (!written.ok) {
-      const result = failClosed(
-        input,
-        "tester_rebind_trusted_surface_unobservable",
-        `tester rebind: persist failed: ${written.error ?? "write failed"}`,
-        prHead,
-        matched,
-      );
-      await persistBlockerRecord(input, result.blocker);
-      return result;
-    }
-    return {
-      ok: true,
-      action: "bind",
-      candidateSha: prHead,
-      evidence: bound,
-      suiteCommandInvoked: false,
-    };
+    return bindMatchedTesterEvidence(input, matched, prHead, pin);
   }
 
   if (input.cfg.test_gate?.enabled === false) {
@@ -624,11 +667,22 @@ export async function rebindTesterEvidenceAfterPr(
     await persistBlockerRecord(input, result.blocker);
     return result;
   }
+  if (alreadyBound(afterMatched, prHead, pin.hash, rebindIdentity(input))) {
+    return {
+      ok: true,
+      action: "reproduce",
+      candidateSha: prHead,
+      evidence: afterMatched,
+      suiteCommandInvoked: true,
+    };
+  }
+  const bound = await bindMatchedTesterEvidence(input, afterMatched, prHead, pin);
+  if (!bound.ok) return bound;
   return {
     ok: true,
     action: "reproduce",
     candidateSha: prHead,
-    evidence: afterMatched,
+    evidence: bound.evidence,
     suiteCommandInvoked: true,
   };
 }
