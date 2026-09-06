@@ -58,12 +58,14 @@ const ISSUE = 155;
 const STARTED_AT = "2026-06-16T21-11-35-000Z"; // filesystem-safe (hyphens + ms)
 const STARTED_AT_ISO = "2026-06-16T21:11:35.000Z"; // ISO for Date parsing
 
-function directAdmissionRoute(kind: "single" | "merge" | "merge-queue") {
-  return kind === "single"
-    ? "single.direct" as const
-    : kind === "merge"
-      ? "merge.direct" as const
-      : "merge-queue.apply" as const;
+function directAdmissionRoute(kind: "drive" | "single" | "merge" | "merge-queue") {
+  return kind === "drive"
+    ? "drive.numeric" as const
+    : kind === "single"
+      ? "single.direct" as const
+      : kind === "merge"
+        ? "merge.direct" as const
+        : "merge-queue.apply" as const;
 }
 
 // ---------------------------------------------------------------------------
@@ -85,8 +87,9 @@ test("trainRunIdFor: train- prefix cannot collide with <issue>-… advance ids",
   assert.ok(!/^\d+-/.test(trainId));
 });
 
-test("publicEntrypointRunIdFor: single/merge/merge-queue prefixes use the train timestamp helper (#1440)", () => {
+test("publicEntrypointRunIdFor: drive/single/merge/merge-queue prefixes use the train timestamp helper (#1440/#1493)", () => {
   const d = new Date("2026-08-28T17:28:03.000Z");
+  assert.equal(publicEntrypointRunIdFor("drive", d), "drive-2026-08-28T17-28-03-000Z");
   assert.equal(publicEntrypointRunIdFor("single", d), "single-2026-08-28T17-28-03-000Z");
   assert.equal(publicEntrypointRunIdFor("merge", d), "merge-2026-08-28T17-28-03-000Z");
   assert.equal(publicEntrypointRunIdFor("merge-queue", d), "merge-queue-2026-08-28T17-28-03-000Z");
@@ -486,10 +489,10 @@ test("initRunDir: non-fatal on I/O error (no throw)", async () => {
 
 // Regression: calling initRunDir twice for the same run-id must not overwrite
 // run.json or truncate events.jsonl — both are written-once / append-only.
-test("persistPublicEntrypointAdmission: writes kind and run_start.entrypoint through the existing store (#1440)", async () => {
+test("persistPublicEntrypointAdmission: writes kind and run_start.entrypoint through the existing store (#1440/#1493)", async () => {
   const { deps, readFile, flushes, directoryFlushes } = memRunStore();
   const startedAt = new Date("2026-08-28T17:28:03.000Z");
-  for (const kind of ["single", "merge", "merge-queue"] as const) {
+  for (const kind of ["drive", "single", "merge", "merge-queue"] as const) {
     const { runId, runDir } = await persistPublicEntrypointAdmission(
       {
         repoDir: REPO_DIR,
@@ -497,7 +500,7 @@ test("persistPublicEntrypointAdmission: writes kind and run_start.entrypoint thr
         route: directAdmissionRoute(kind),
         repo: "owner/repo",
         profile: "codex",
-        issue: kind === "single" ? ISSUE : undefined,
+        issue: kind === "drive" || kind === "single" ? ISSUE : undefined,
         startedAt,
         factoryControlRoot: REPO_DIR,
       },
@@ -507,7 +510,7 @@ test("persistPublicEntrypointAdmission: writes kind and run_start.entrypoint thr
     const meta = JSON.parse(readFile(path.join(runDir, "run.json")));
     assert.equal(meta.kind, kind);
     assert.equal(meta.run_id, runId);
-    if (kind === "single") assert.equal(meta.issue, ISSUE);
+    if (kind === "drive" || kind === "single") assert.equal(meta.issue, ISSUE);
     else assert.equal(meta.issue, undefined);
     const events = JSON.parse(readFile(path.join(runDir, "events.jsonl")).trim());
     assert.equal(events.type, "run_start");
@@ -526,7 +529,7 @@ test("persistPublicEntrypointAdmission: writes under factory-control generic sto
   const startedAt = new Date("2026-09-04T23:26:39.000Z");
   const controlRoot = "/control-repo";
   const candidateRepo = "/candidate-worktree";
-  for (const kind of ["single", "merge", "merge-queue"] as const) {
+  for (const kind of ["drive", "single", "merge", "merge-queue"] as const) {
     const result = await persistPublicEntrypointAdmission(
       {
         repoDir: candidateRepo,
@@ -534,7 +537,7 @@ test("persistPublicEntrypointAdmission: writes under factory-control generic sto
         route: directAdmissionRoute(kind),
         repo: "owner/repo",
         profile: "codex",
-        issue: kind === "single" ? ISSUE : undefined,
+        issue: kind === "drive" || kind === "single" ? ISSUE : undefined,
         startedAt,
         factoryControlRoot: controlRoot,
       },
@@ -1012,6 +1015,27 @@ test("initRunDir: train kind does not set issue to the first work-list number", 
   assert.equal(meta.issue, undefined);
   assert.deepEqual(meta.ordered_issues, [10, 11]);
   assert.equal(meta.merge_mode, false);
+});
+
+test("initRunDir: drive kind is serialized on run metadata and run_start (#1493)", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = "drive-2026-09-06T00-00-00-000Z";
+  const runDir = path.join(REPO_DIR, ".agent-pipeline", "runs", runId);
+  await initRunDir({
+    runDir,
+    runId,
+    issue: ISSUE,
+    repo: "owner/repo",
+    profile: "codex",
+    startedAt: STARTED_AT_ISO,
+    kind: "drive",
+  }, deps);
+  const meta = JSON.parse(readFile(path.join(runDir, "run.json")));
+  const event = JSON.parse(readFile(path.join(runDir, "events.jsonl")).trim());
+  assert.equal(meta.kind, "drive");
+  assert.equal(meta.issue, ISSUE);
+  assert.equal(event.entrypoint, "drive");
+  assert.equal(event.issue, ISSUE);
 });
 
 test("initRunDir: second call with same run-id is idempotent (run.json and events.jsonl unchanged)", async () => {

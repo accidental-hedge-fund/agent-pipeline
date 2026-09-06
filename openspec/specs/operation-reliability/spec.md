@@ -397,9 +397,9 @@ When unique-operation scoring runs for an in-flight ship's Factory Reliability G
 - **AND** that attempt SHALL NOT be recorded as a stable exclusion
 - **AND** entrypoint coverage SHALL still observe that attempt's mapped public entrypoint
 
-### Requirement: Public single, merge, and merge-queue admissions SHALL persist recognizable control-host run artifacts
+### Requirement: Public drive, single, merge, and merge-queue admissions SHALL persist recognizable control-host run artifacts
 
-Public-command admission of `pipeline single`, `pipeline merge`, and `pipeline merge-queue`, plus each merge admitted inside `pipeline train --merge`, SHALL use one shared unique-operation admission contract. Before the admitted operation crosses its protected execution or side-effect boundary, that contract SHALL durably persist and read-back verify a qualifying artifact in the control-host generic run store. The artifact SHALL carry the exact public entrypoint, matching `run.json.kind` and `run_start.entrypoint`, a non-empty `logical_operation_id`, and the existing non-secret run metadata. Direct admissions SHALL use their admitted root Logical Operation identity. A train-nested merge SHALL retain the train root `logical_operation_id` in a distinct `merge` physical record.
+Public-command admission of numeric `pipeline <issue>`, `pipeline single`, `pipeline merge`, and `pipeline merge-queue`, plus each merge admitted inside `pipeline train --merge`, SHALL use one shared unique-operation admission contract. Before the admitted operation crosses its protected execution or side-effect boundary, that contract SHALL durably persist and read-back verify a qualifying artifact in the control-host generic run store. The artifact SHALL carry the exact public entrypoint, matching `run.json.kind` and `run_start.entrypoint`, a non-empty `logical_operation_id`, and the existing non-secret run metadata. Direct admissions SHALL use their admitted root Logical Operation identity. A train-nested merge SHALL retain the train root `logical_operation_id` in a distinct `merge` physical record.
 
 A persistence or verification failure SHALL refuse the protected boundary and SHALL be reported as mechanical lifecycle evidence under the existing recovery policy. It SHALL NOT claim entrypoint coverage, success, completion, or human authority. A persisted admission stamp SHALL prove only that an attempt was admitted. It SHALL NOT by itself prove verified completion, a completed side effect, merge authority, release authority, or success. Nested child loop work SHALL remain a distinct mapped `loop` entrypoint. Numeric drive (`<issue>-<timestamp>`) SHALL remain `drive`. Unrecognized `kind` values such as `advance` SHALL NOT become `single`. A raw `train_merge_*` event without a qualifying nested merge admission artifact SHALL NOT count as `merge`. Collection SHALL NOT invent a present or successful entrypoint when its qualifying artifact is absent from the approved roots.
 
@@ -409,6 +409,14 @@ A persistence or verification failure SHALL refuse the protected boundary and SH
 - **THEN** the control-host generic run store SHALL contain a read-back-verified artifact whose public entrypoint, `run.json.kind`, and `run_start.entrypoint` are `single`
 - **AND** the artifact SHALL contain the admission's non-empty `logical_operation_id`
 - **AND** the supervised drive SHALL NOT start before that persistence succeeds
+
+#### Scenario: Numeric drive admission persists a recognizable artifact
+
+- **WHEN** an operator admits numeric `pipeline 42`
+- **THEN** the control-host generic run store SHALL contain a read-back-verified artifact whose public entrypoint, `run.json.kind`, and `run_start.entrypoint` are `drive`
+- **AND** the artifact SHALL contain a fresh non-empty `logical_operation_id` for a fresh external invocation
+- **AND** the one-item loop SHALL inherit that admitted identity
+- **AND** the supervised loop SHALL NOT start before that persistence succeeds
 
 #### Scenario: Merge admission persists a recognizable artifact
 
@@ -460,7 +468,7 @@ A persistence or verification failure SHALL refuse the protected boundary and SH
 #### Scenario: Absent artifacts stay fail-closed
 
 - **WHEN** unique-operation scoring collects attempts from the control-host stores
-- **AND** no qualifying `single`, `merge`, or `merge-queue` admission artifact exists
+- **AND** no qualifying `drive`, `single`, `merge`, or `merge-queue` admission artifact exists
 - **THEN** missing required coverage SHALL increase for each absent entrypoint
 - **AND** scoring SHALL NOT mint a synthetic presence or success for those entrypoints
 

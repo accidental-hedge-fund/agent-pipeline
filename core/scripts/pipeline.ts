@@ -28,6 +28,7 @@ import { publishIssueBodyOrThrow } from "./issue-body-publisher.ts";
 import {
   admitGeneratedHostLaunchFromEnv,
   assertRequiredAdmissionRoute,
+  assertRequiredAdmissionRouteForEntrypoint,
   type RequiredAdmissionRouteName,
 } from "./operation-reliability.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
@@ -3748,7 +3749,7 @@ export async function admitPublicOperation(
   },
   deps: PublicAdmissionGateDeps = {},
 ): Promise<PublicAdmissionResult> {
-  assertRequiredAdmissionRoute(input.route, input.kind, "public-admission");
+  assertRequiredAdmissionRouteForEntrypoint(input.route, input.kind);
   const admission = await (deps.persistPublicAdmission ?? persistPublicEntrypointAdmission)(input);
   if (!admission.acknowledged) {
     reportPublicEntrypointAdmissionFailure(deps.reportObservation, admission);
@@ -3782,12 +3783,9 @@ export interface SingleIssueCommandOutput {
    * machine-readable commands disable this so they retain one JSON document.
    */
   emitMachineOutput?: boolean;
-  /**
-   * Persist a control-host `single-*` admission artifact. `pipeline single`
-   * sets this. Numeric drive and train nested single omit it so those paths
-   * stay `drive` / nested loop.
-   */
-  persistPublicAdmission?: boolean;
+  /** Public admission to persist before the canonical one-item supervisor.
+   * Omitted for nested train advancement, which inherits its parent identity. */
+  admission?: "single" | "drive";
 }
 
 /**
@@ -3846,16 +3844,18 @@ export async function runSingleIssueCommand(
   }
 
   let admittedLogicalOperationId: string | undefined;
-  if (output.persistPublicAdmission === true) {
+  if (output.admission) {
+    const admissionKind = output.admission;
+    const admissionRoute = admissionKind === "drive" ? "drive.numeric" : "single.direct";
     const admission = await admitPublicOperation({
       repoDir: cfg.repo_dir,
-      kind: "single",
+      kind: admissionKind,
       repo: cfg.repo,
       domain: cfg.domain,
       profile: opts.profile ?? null,
       issue: issueNumber,
-      operationKey: `single:${cfg.repo}:${issueNumber}`,
-      route: "single.direct",
+      operationKey: `${admissionKind}:${cfg.repo}:${issueNumber}:${crypto.randomUUID()}`,
+      route: admissionRoute,
     }, deps);
     if (!admission.acknowledged) {
       const message = `admission refused (${admission.failure.kind}): ${admission.failure.diagnostic}`;
@@ -3942,7 +3942,9 @@ export async function admitMutatingNumericDrive(
   opts: CliOpts,
   deps: AdmitMutatingNumericDriveDeps = defaultAdmitMutatingNumericDriveDeps,
 ): Promise<void> {
-  await deps.runSingleIssue(String(issueNumber), opts);
+  await deps.runSingleIssue(String(issueNumber), opts, undefined, {
+    admission: "drive",
+  });
 }
 
 export interface TrainCommandDeps {
@@ -7089,7 +7091,7 @@ async function main(): Promise<void> {
   }
 
   if (isSingleCommand) {
-    await runSingleIssueCommand(cmd.args[1], opts, undefined, { persistPublicAdmission: true });
+    await runSingleIssueCommand(cmd.args[1], opts, undefined, { admission: "single" });
     return;
   }
 

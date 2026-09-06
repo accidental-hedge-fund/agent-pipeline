@@ -57,7 +57,7 @@ import {
 } from "./trusted-surface.ts";
 import { isLogicalOperationId, mintLogicalOperationId, resolveLogicalOperationId } from "./logical-operation.ts";
 import {
-  assertRequiredAdmissionRoute,
+  assertRequiredAdmissionRouteForEntrypoint,
   type RequiredAdmissionRouteName,
 } from "./operation-reliability.ts";
 
@@ -91,7 +91,7 @@ export function trainRunIdFor(startedAt: Date): RunId {
 }
 
 /** Public unique-operation entrypoints that require strict durable admission. */
-export type PublicEntrypointKind = "single" | "train" | "merge" | "merge-queue";
+export type PublicEntrypointKind = "drive" | "single" | "train" | "merge" | "merge-queue";
 
 export const PUBLIC_ADMISSION_STAMP_VERSION = "public-admission.v1" as const;
 
@@ -109,7 +109,7 @@ export interface PublicAdmissionStamp {
   binding_sha256: string;
 }
 
-/** Produce a public-entrypoint run-id (`single-` / `merge-` / `merge-queue-`
+/** Produce a public-entrypoint run-id (`drive-` / `single-` / `merge-` / `merge-queue-`
  *  plus the same filesystem-safe UTC timestamp as {@link trainRunIdFor}). */
 export function publicEntrypointRunIdFor(
   kind: PublicEntrypointKind,
@@ -1161,12 +1161,12 @@ export interface InitRunDirOpts {
   /**
    * Required for advance runs. Train runs (`kind: "train"`) omit this so
    * `run.json` is not a fake single-issue advance record. `single` may set
-   * it; `merge` / `merge-queue` omit it.
+   * it; public `drive` / `single` may set it; `merge` / `merge-queue` omit it.
    */
   issue?: number;
   /**
    * When `"train"`, write train identity (selector, merge mode, ordered issues).
-   * When `"single"` / `"merge"` / `"merge-queue"`, persist that public kind.
+   * When `"drive"` / `"single"` / `"merge"` / `"merge-queue"`, persist that public kind.
    */
   kind?: RunKind;
   mergeMode?: boolean;
@@ -1232,7 +1232,7 @@ export async function initRunDir(
           : "live-run";
     const isTrain = opts.kind === "train";
     const publicKind: PublicEntrypointKind | undefined =
-      opts.kind === "single" || opts.kind === "merge" || opts.kind === "merge-queue"
+      opts.kind === "drive" || opts.kind === "single" || opts.kind === "merge" || opts.kind === "merge-queue"
         ? opts.kind
         : undefined;
     const logicalOperationId = resolveLogicalOperationId({
@@ -1303,7 +1303,7 @@ export async function initRunDir(
 }
 
 /**
- * Write root for a public `single` / `merge` / `merge-queue` admission.
+ * Write root for a public `drive` / `single` / `merge` / `merge-queue` admission.
  * Unique-operation collection scores `runsDir(resolveFactoryControlRoot(...))`
  * plus loop state-home. Persist MUST land in that factory-control generic
  * store. A candidate-worktree `repoDir` is never a fallback: inability to
@@ -1668,8 +1668,8 @@ async function claimPublicLogicalOperation(input: {
 }
 
 /**
- * Persist a control-host generic-store run for a public `pipeline single` /
- * `pipeline merge` / `pipeline merge-queue` admission. Uses the existing
+ * Persist a control-host generic-store run for a public numeric drive /
+ * `pipeline single` / `pipeline merge` / `pipeline merge-queue` admission. Uses
  * the existing generic-store schema (no second run store). Protected work may
  * start only after this function returns `acknowledged: true`.
  */
@@ -1697,8 +1697,7 @@ export async function persistPublicEntrypointAdmission(
   },
   deps: PublicAdmissionStoreDeps = defaultPublicAdmissionStoreDeps,
 ): Promise<PublicAdmissionResult> {
-  const expectedBoundary = opts.kind === "train" ? "train-admission" : "public-admission";
-  assertRequiredAdmissionRoute(opts.route, opts.kind, expectedBoundary);
+  assertRequiredAdmissionRouteForEntrypoint(opts.route, opts.kind);
   const startedAt = opts.startedAt ?? new Date();
   const runId = opts.runId ?? publicEntrypointRunIdFor(opts.kind, startedAt);
   const suppliedLogicalId = opts.logicalOperationId?.trim() || null;

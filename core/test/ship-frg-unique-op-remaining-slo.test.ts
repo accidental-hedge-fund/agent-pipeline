@@ -148,7 +148,7 @@ test("runSingleIssueCommand persists a single admission on public pipeline singl
         },
         writeStdoutLine: () => {},
       },
-      { persistPublicAdmission: true, emitMachineOutput: false },
+      { admission: "single", emitMachineOutput: false },
     );
     assert.equal(result.exitCode, 0);
     assert.equal(result.runId, "loop-child-of-single");
@@ -204,7 +204,7 @@ test("runSingleIssueCommand refuses drive and retains owned evidence after admis
         },
         writeStdoutLine: () => {},
       },
-      { persistPublicAdmission: true, emitMachineOutput: false },
+      { admission: "single", emitMachineOutput: false },
     );
     assert.equal(result.exitCode, 1);
     assert.equal(drives, 0);
@@ -277,10 +277,14 @@ test("runSingleIssueCommand does not persist single for nested/numeric callers (
   }
 });
 
-test("persistPublicEntrypointAdmission plus mapping observes all three public commands (#1440)", async () => {
+test("persistPublicEntrypointAdmission plus mapping observes all four public commands (#1440/#1493)", async () => {
   const files = new Map<string, string>();
   const deps = persistMemDeps(files);
   const startedAt = new Date("2026-09-04T21:00:15.000Z");
+  await persistPublicEntrypointAdmission(
+    { repoDir: "/repo", kind: "drive", route: "drive.numeric", repo: "o/r", issue: 42, startedAt, factoryControlRoot: "/repo" },
+    deps,
+  );
   await persistPublicEntrypointAdmission(
     { repoDir: "/repo", kind: "single", route: "single.direct", repo: "o/r", issue: 42, startedAt, factoryControlRoot: "/repo" },
     deps,
@@ -296,7 +300,7 @@ test("persistPublicEntrypointAdmission plus mapping observes all three public co
   const kinds = [...files.keys()]
     .filter((k) => k.endsWith("/run.json"))
     .map((k) => JSON.parse(files.get(k)!).kind);
-  assert.deepEqual(kinds.sort(), ["merge", "merge-queue", "single"]);
+  assert.deepEqual(kinds.sort(), ["drive", "merge", "merge-queue", "single"]);
 });
 
 function persistMemDeps(files: Map<string, string>) {
