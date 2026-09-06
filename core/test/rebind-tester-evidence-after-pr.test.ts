@@ -725,6 +725,8 @@ async function driveDesignGateAdvance(opts: {
   priorTester?: TesterEvidence | null;
   startStage?: Stage;
   testGateEnabled?: boolean;
+  /** Invoke the delivery observer created by runAdvance (post-confirmation race). */
+  invokeObserver?: boolean;
   rebind?: AdvanceDeps["rebindTesterEvidenceAfterPr"];
   dispatch?: AdvanceDeps["dispatch"];
 }): Promise<{
@@ -732,6 +734,11 @@ async function driveDesignGateAdvance(opts: {
   setBlocked: Array<{ reason: string; kind: string | undefined }>;
   blockerEvents: Array<Record<string, unknown>>;
   dispatchCalls: number;
+  observerBefore: {
+    candidateSha?: string;
+    evidenceRole?: string | null;
+    artifactIdentity?: string | null;
+  } | null;
 }> {
   const repoDir = fs.mkdtempSync(join(os.tmpdir(), "rebind-run-advance-"));
   const domain = `rebind-adv-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -749,6 +756,11 @@ async function driveDesignGateAdvance(opts: {
   }
   const rebindCalls: RebindTesterEvidenceAfterPrInput[] = [];
   const setBlocked: Array<{ reason: string; kind: string | undefined }> = [];
+  let observerBefore: {
+    candidateSha?: string;
+    evidenceRole?: string | null;
+    artifactIdentity?: string | null;
+  } | null = null;
   const startStage = opts.startStage ?? "design-gate";
   const labels = [`pipeline:${startStage}`];
   let prHeadReads = 0;
@@ -844,10 +856,20 @@ async function driveDesignGateAdvance(opts: {
     }) as AdvanceDeps["setBlocked"],
     postComment: async () => {},
     postPrComment: async () => {},
-    dispatch: async (_c, _n, stage, ...rest) => {
+    dispatch: async (_c, _n, stage, dispatchOpts, ...rest) => {
       dispatchCalls++;
+      if (opts.invokeObserver) {
+        const observed = await dispatchOpts?.observeDeliveryStageEvidence?.("before");
+        if (observed) {
+          observerBefore = {
+            candidateSha: observed.candidateSha,
+            evidenceRole: observed.evidenceRole ?? null,
+            artifactIdentity: observed.artifactIdentity ?? null,
+          };
+        }
+      }
       const result = opts.dispatch
-        ? await opts.dispatch(_c, _n, stage, ...rest)
+        ? await opts.dispatch(_c, _n, stage, dispatchOpts, ...rest)
         : {
             advanced: false as const,
             status: "waiting" as const,
@@ -874,7 +896,7 @@ async function driveDesignGateAdvance(opts: {
           .map((line) => JSON.parse(line) as Record<string, unknown>)
           .filter((event) => event.type === "blocker_set")
       : [];
-    return { rebindCalls, setBlocked, blockerEvents, dispatchCalls };
+    return { rebindCalls, setBlocked, blockerEvents, dispatchCalls, observerBefore };
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
@@ -1207,4 +1229,111 @@ test("runAdvance fail-closes when PR head moves between bind and observer", asyn
       ?.detail?.evidence_ordering?.blocker_code,
     "tester_rebind_pr_head_mismatch",
   );
+});
+
+test("enabled test gate with unavailable producer fail-closes instead of not-applicable", async () => {
+  const io = memoryIo();
+  const result = await rebindTesterEvidenceAfterPr(
+    baseInput(io, {
+      cfg: { ...cfg(), test_gate: { ...cfg().test_gate, enabled: true } },
+      reproduce: async () => ({ ok: false, unavailable: true }),
+    }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.code, "tester_rebind_trusted_surface_unobservable");
+  }
+});
+
+test("runAdvance later-stage resume without worktree fail-closes when test gate is enabled", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "review-1",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    worktreeHead: null,
+    testGateEnabled: true,
+  });
+  assert.ok(driven.rebindCalls.length >= 1);
+  assert.equal(driven.dispatchCalls, 0);
+  assert.ok(driven.setBlocked.length > 0);
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_trusted_surface_unobservable",
+  );
+  assert.ok(
+    !driven.setBlocked.some((row) =>
+      /required implementation evidence role, observed missing/.test(row.reason),
+    ),
+  );
+});
+
+test("observer does not accept worktree S1 proof when live PR head is S2", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1468";
+  plant(io, runDir, boundPassed());
+  let observedLive: string | null | undefined;
+  const observer = createDeliveryStageEvidenceObserver(cfg(), 1468, "design-gate", false, {
+    getIssueDetail: async () => ({
+      number: 1468,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: "https://example.test/1468",
+      labels: ["pipeline:design-gate"],
+      comments: [],
+    }),
+    getOnDiskForIssue: async () => ({ path: "/wt/1468", slug: "1468-x" }) as never,
+    gitInWorktree: async (_cwd, args) => {
+      if (args[0] === "rev-parse") {
+        return { stdout: `${SHA_S}\n`, stderr: "", code: 0 };
+      }
+      if (args[0] === "diff") {
+        return { stdout: "core/scripts/pipeline-run.ts\n", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    getPrForIssue: async () => 99,
+    getPrDetail: async () => ({ number: 99, head_sha: SHA_B }) as never,
+    getPrDiff: async () => "",
+    expectedPrHeadSha: SHA_S,
+    onObservedPrHead: async (liveSha) => {
+      observedLive = liveSha;
+    },
+    runDir,
+    testerIo: io,
+  });
+  const evidence = await observer("before");
+  const binding = completingEvidenceBindingFailure({
+    stage: "design-gate",
+    ...evidence,
+  });
+  assert.equal(observedLive, SHA_B);
+  assert.equal(evidence.candidateSha, SHA_B);
+  assert.equal(evidence.evidenceRole, null);
+  assert.ok(binding);
+});
+
+test("runAdvance fail-closes when PR head moves after confirmation with worktree present", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    prHeadSequence: [SHA_S, SHA_S, SHA_B],
+    worktreeHead: SHA_S,
+    tester: boundPassed(),
+    invokeObserver: true,
+  });
+  assert.ok(driven.dispatchCalls >= 1);
+  assert.ok(driven.rebindCalls.length >= 2);
+  const lastRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
+  assert.equal(lastRebind?.prHeadSha, SHA_B);
+  assert.equal(lastRebind?.pushedHeadSha, SHA_S);
+  assert.equal(driven.observerBefore?.evidenceRole, null);
+  assert.equal(
+    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
+      ?.detail?.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_mismatch",
+  );
+  assert.ok(driven.setBlocked.some((row) => /disagrees with pushed head/.test(row.reason)));
 });

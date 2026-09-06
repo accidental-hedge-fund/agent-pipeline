@@ -137,12 +137,6 @@ export interface RebindTesterEvidenceAfterPrInput {
     unavailable?: boolean;
   }>;
   /**
-   * Later consumer stages: if no SHA-matched passed record exists and the
-   * producer cannot run, skip fail-closed so the observer can still use
-   * exact product-path proof.
-   */
-  allowSkipIfUnreproducible?: boolean;
-  /**
    * Successor-run lookup (#1468 review 2): a SHA-matched passed Tester record
    * from a prior run of the same issue, identified by exact candidate SHA.
    * Adopted into the current runDir so the consumer observer can read it.
@@ -592,16 +586,7 @@ export async function rebindTesterEvidenceAfterPr(
     };
   }
 
-  const skipUnreproducible = (): Extract<RebindTesterEvidenceResult, { ok: true }> => ({
-    ok: true,
-    action: "not-applicable",
-    candidateSha: prHead,
-    evidence: read.status === "ok" ? read.evidence : null,
-    suiteCommandInvoked: false,
-  });
-
   if (!input.reproduce) {
-    if (input.allowSkipIfUnreproducible) return skipUnreproducible();
     const result = failClosed(
       input,
       "tester_rebind_trusted_surface_unobservable",
@@ -623,9 +608,6 @@ export async function rebindTesterEvidenceAfterPr(
     ? observeTesterImplementationRole(afterMatched, prHead)
     : null;
   if (!reproduced.ok || !afterMatched || !afterRole) {
-    if (input.allowSkipIfUnreproducible && reproduced.unavailable) {
-      return skipUnreproducible();
-    }
     const result = failClosed(
       input,
       "tester_rebind_trusted_surface_unobservable",

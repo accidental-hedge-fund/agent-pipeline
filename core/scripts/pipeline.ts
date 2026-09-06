@@ -122,7 +122,7 @@ import {
   type PublishUnpublishedExecutorDeps,
 } from "./unpublished-stage-commit.ts";
 import { resolveEngineCommitSha } from "./engine-attribution.ts";
-import { resolvePinnedEngineIdentity, type EngineIdentity } from "./engine-identity.ts";
+
 import { buildEngineFingerprint } from "./evidence-subject.ts";
 import { formatPipelineVersionJson } from "./ship-end-identity.ts";
 import {
@@ -153,6 +153,7 @@ import {
   parseWriteHealthText,
   persistPublicEntrypointAdmission,
   readTrustedSurfaceDecision,
+  resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
   runsDir,
@@ -160,6 +161,7 @@ import {
   writeHealthTextForReadFailure,
   type PublicAdmissionResult,
   type PublicEntrypointKind,
+  type RunEngineIdentity,
   type RunEventsSummary,
   type RunStoreDeps,
   type TerminalLogTee,
@@ -2045,8 +2047,25 @@ export interface RealExecuteRecoveryDeps {
   getPrForIssue?: typeof getPrForIssue;
   getPrDetail?: typeof getPrDetail;
   readTrustedSurfaceDecision?: typeof import("./run-store.ts").readTrustedSurfaceDecision;
-  /** Pinned engine identity for subject construction on subject-less Tester records. */
-  resolvePinnedEngineIdentity?: () => EngineIdentity | null;
+  /** Blocked-run engine identity from run.json (not the currently installed engine). */
+  resolveRunEngineIdentity?: typeof resolveRunEngineIdentity;
+}
+
+function engineFingerprintFromPersistedRunEngine(
+  engine: RunEngineIdentity | null | undefined,
+): string | null {
+  if (!engine || typeof engine !== "object") return null;
+  if (typeof engine.version !== "string" || !engine.version.trim()) return null;
+  if (typeof engine.templates_fingerprint !== "string" || !engine.templates_fingerprint.trim()) {
+    return null;
+  }
+  return buildEngineFingerprint({
+    version: engine.version,
+    templates_fingerprint: engine.templates_fingerprint,
+    ...(typeof engine.commit_sha === "string" && engine.commit_sha
+      ? { commit_sha: engine.commit_sha }
+      : {}),
+  });
 }
 
 /** Production provider-neutral recovery registry. Substantive repair delegates
@@ -2769,14 +2788,15 @@ export function realExecuteRecovery(
         } catch {
           pushedHeadSha = null;
         }
-        const pinned = (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)();
-        const engineFingerprint = pinned
-          ? buildEngineFingerprint({
-              version: pinned.version,
-              templates_fingerprint: pinned.templates_fingerprint,
-              ...(pinned.commit_sha ? { commit_sha: pinned.commit_sha } : {}),
-            })
+        const persistedEngine = runDir
+          ? await (deps.resolveRunEngineIdentity ?? resolveRunEngineIdentity)(runDir, () => undefined)
           : undefined;
+        const engineFingerprint = engineFingerprintFromPersistedRunEngine(persistedEngine);
+        if (!engineFingerprint) {
+          return failed(
+            "rebind_tester_evidence_after_pr: blocked run engine identity is absent or malformed",
+          );
+        }
         const rebind = await rebindFn({
           cfg,
           issueNumber,

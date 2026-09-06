@@ -45,3 +45,19 @@ The engine SHALL NOT add a new `DurableBlockerClass` for this case. The engine S
 - **THEN** recovery SHALL NOT clear `pipeline:blocked`
 - **AND** SHALL NOT report the blocker recovered
 - **AND** SHALL leave the blocker in place for the consumer observer to evaluate exact product-path proof
+
+#### Scenario: recovery bind uses the blocked run's persisted engine identity
+
+- **WHEN** recovery binds a subject-less Tester record from a blocked run directory
+- **AND** that run's `run.json.engine` records identity A
+- **AND** the currently installed engine is identity B
+- **THEN** `evidence_subject.engine_fingerprint` SHALL derive from A
+- **AND** SHALL NOT derive from B
+
+#### Scenario: recovery fail-closes when blocked-run engine identity is absent
+
+- **WHEN** recovery runs the bind-or-reproduce recipe
+- **AND** the blocked run directory has no well-formed `run.json.engine`
+- **THEN** recovery SHALL fail closed
+- **AND** SHALL NOT clear `pipeline:blocked`
+- **AND** SHALL NOT rewrite Tester evidence with the currently installed engine identity

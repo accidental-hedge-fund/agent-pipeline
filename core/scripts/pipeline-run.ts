@@ -1097,7 +1097,12 @@ export function createDeliveryStageEvidenceObserver(
     | "gitInWorktree"
     | "runDir"
     | "testerIo"
-  > = {},
+  > & {
+    /** Confirmed PR head the pre-observer bind used. Observer re-reads the live PR. */
+    expectedPrHeadSha?: string | null | (() => string | null);
+    /** Pre-attempt hook after the observer's live PR read (mismatch / rebind). */
+    onObservedPrHead?: (liveSha: string | null) => Promise<void>;
+  } = {},
 ): DeliveryStageEvidenceObserver {
   return async (phase) => {
     const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
@@ -1127,6 +1132,7 @@ export function createDeliveryStageEvidenceObserver(
 
     let candidateSha = "";
     let paths: string[] = [];
+    let livePrSha: string | null = null;
     const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(() => null);
     if (wt) {
       const git = deps.gitInWorktree ?? gitInWorktree;
@@ -1143,9 +1149,41 @@ export function createDeliveryStageEvidenceObserver(
       if (pr) {
         const prDetail = await (deps.getPrDetail ?? getPrDetail)(cfg, pr).catch(() => null);
         candidateSha = prDetail?.head_sha.trim().toLowerCase() ?? "";
+        livePrSha = normalizeCandidateSha(candidateSha);
         const diff = await (deps.getPrDiff ?? getPrDiff)(cfg, pr).catch(() => "");
         paths = diffFilePaths(diff);
       }
+    }
+    if (deps.expectedPrHeadSha != null) {
+      if (!livePrSha) {
+        const pr = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(() => null);
+        if (pr) {
+          const prDetail = await (deps.getPrDetail ?? getPrDetail)(cfg, pr).catch(() => null);
+          livePrSha = normalizeCandidateSha(prDetail?.head_sha);
+        }
+      }
+      if (phase === "before" && deps.onObservedPrHead) {
+        await deps.onObservedPrHead(livePrSha);
+      }
+      const expected = normalizeCandidateSha(
+        typeof deps.expectedPrHeadSha === "function"
+          ? deps.expectedPrHeadSha()
+          : deps.expectedPrHeadSha,
+      );
+      if (!expected || !livePrSha || livePrSha !== expected) {
+        return {
+          candidateSha: livePrSha ?? "",
+          candidateEpoch: livePrSha ?? "",
+          evidenceRole: null,
+          artifactIdentity: null,
+          postconditionProven: false,
+        };
+      }
+      const localSha = normalizeCandidateSha(candidateSha);
+      if (localSha && localSha !== livePrSha) {
+        paths = [];
+      }
+      candidateSha = livePrSha;
     }
     const implementation = observeImplementDeliverablePaths({ paths, candidateSha });
     const exactImplementation = implementation.role === "implementation" && Boolean(implementation.artifact_id);
@@ -2973,6 +3011,11 @@ export async function runAdvance(
       // reproduce, and a missing/unobservable PR fails closed.
       let handoffPrHeadSha: string | null = null;
       let testerSubjectOmitted = false;
+      let observerMismatch: Extract<RebindTesterEvidenceResult, { ok: false }> | null = null;
+      let observerPrHeadBinding: {
+        expectedPrHeadSha: () => string | null;
+        onObservedPrHead: (liveSha: string | null) => Promise<void>;
+      } | undefined;
       if (isConsumerImplementationStage(stage) && runDir && !opts.dryRun) {
         const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
           () => null,
@@ -3018,7 +3061,6 @@ export async function runAdvance(
           domain: (cfg.domain || cfg.repo || "").trim() || undefined,
           engineFingerprint: engineFp,
           io: deps.testerIo,
-          allowSkipIfUnreproducible: stage !== "design-gate",
           resolvePriorShaMatchedTester: async (candidateSha) => {
             const sha = normalizeCandidateSha(candidateSha);
             if (!sha) return null;
@@ -3117,6 +3159,28 @@ export async function runAdvance(
           } else {
             handoffPrHeadSha = confirmSha;
           }
+          observerPrHeadBinding = {
+            expectedPrHeadSha: () => handoffPrHeadSha,
+            onObservedPrHead: async (liveSha) => {
+              const expected = handoffPrHeadSha;
+              if (!expected || liveSha === expected) return;
+              const livePrNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
+                () => null,
+              );
+              const mismatch = await rebindFn({
+                ...rebindInput(),
+                prNumber: livePrNumber,
+                prHeadSha: liveSha,
+                pushedHeadSha: expected,
+                reproduce: undefined,
+              });
+              if (!mismatch.ok) {
+                observerMismatch = mismatch;
+                return;
+              }
+              handoffPrHeadSha = mismatch.candidateSha;
+            },
+          };
         }
       }
 
@@ -3131,6 +3195,7 @@ export async function runAdvance(
                   ...deps,
                   runDir,
                   testerIo: deps.testerIo,
+                  ...observerPrHeadBinding,
                 })
               : undefined),
         };
@@ -3275,7 +3340,24 @@ export async function runAdvance(
           }
         }
       }
-      if (
+      if (observerMismatch) {
+        out = {
+          advanced: false,
+          status: "blocked",
+          reason: observerMismatch.summary,
+          blockerKind: "harness-failure",
+          diagnostic: observerMismatch.diagnostic,
+        };
+        if (!opts.dryRun) {
+          await (deps.setBlocked ?? setBlocked)(
+            cfg,
+            issueNumber,
+            observerMismatch.summary,
+            stage,
+            "harness-failure",
+          ).catch(() => {});
+        }
+      } else if (
         !out.advanced &&
         out.status === "waiting" &&
         isConsumerImplementationStage(stage)

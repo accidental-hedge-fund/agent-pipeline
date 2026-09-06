@@ -37,6 +37,9 @@
 - [x] 6.3 Successor run adopts a prior-run SHA-matched passed Tester record without a second suite command
 - [x] 6.4 Idempotent pre-observer bind/reproduce and ordering-diagnostic conversion use `isConsumerImplementationStage` (resume at review-1)
 - [x] 6.5 PR head movement between bind and observer fail-closes with `tester_rebind_pr_head_mismatch`
+- [x] 6.6 Enabled `test_gate` later-stage resume without a worktree fail-closes (no `not-applicable` skip)
+- [x] 6.7 Post-confirmation PR-head movement at the observer with a worktree present fail-closes with `tester_rebind_pr_head_mismatch`
+- [x] 6.8 Recovery derives `engine_fingerprint` from blocked `run.json.engine` (A), not the currently installed engine (B); absent/malformed identity fail-closes
 
 ## 7. Review 1 regressions
 

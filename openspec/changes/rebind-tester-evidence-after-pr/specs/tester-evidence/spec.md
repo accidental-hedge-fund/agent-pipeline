@@ -76,6 +76,24 @@ When SHA-matched Tester evidence already exists for that final PR head and recor
 - **OR** SHALL rebind or reproduce for S2 before the observer runs
 - **AND** SHALL NOT present S1 Tester evidence as current implementation-role proof for S2
 
+#### Scenario: enabled test gate later-stage resume without worktree fails closed
+
+- **WHEN** `test_gate.enabled` is true
+- **AND** a later consumer implementation stage resumes with no managed worktree
+- **AND** no SHA-matched passed Tester record exists for the final PR head
+- **THEN** the pipeline SHALL persist a typed actionable blocker
+- **AND** SHALL NOT dispatch the consumer delivery-stage observer
+- **AND** SHALL NOT return helper action `not-applicable`
+
+#### Scenario: PR head movement after confirmation is detected at the observer
+
+- **WHEN** bind and a confirmation read observed PR head S1
+- **AND** a managed worktree HEAD remains S1
+- **AND** the consumer observer's live PR read observes S2 where S1 ≠ S2
+- **THEN** the pipeline SHALL fail closed with typed blocker `tester_rebind_pr_head_mismatch`
+- **OR** SHALL rebind or reproduce for S2 before treating the observation as proven
+- **AND** SHALL NOT present S1 worktree HEAD or S1 Tester evidence as implementation-role proof for S2
+
 ### Requirement: Pipeline SHALL fail closed when PR head or trusted-surface identity cannot be observed after push
 
 If, after the implementation commit is pushed, the linked PR head is missing, is not a full 40-character hex SHA, or disagrees with the pushed head, or trusted-surface identity cannot be resolved, the pipeline SHALL fail closed with a typed actionable blocker. The pipeline SHALL NOT run a consumer delivery-stage observer against missing implementation-role evidence as if the post-PR bind had succeeded. This fail-closed rule SHALL apply at every consumer implementation stage, including `design-gate`, `review-1`, `fix-1`, and `pre-merge`. The blocker code SHALL be machine-readable on the observation or run evidence and SHALL NOT be only the generic `required implementation evidence role, observed missing` string.

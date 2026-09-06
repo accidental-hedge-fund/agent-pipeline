@@ -22,6 +22,17 @@ function cfg(): PipelineConfig {
   return { ...DEFAULT_CONFIG, repo: "owner/repo", repo_dir: "/repo", base_branch: "main" };
 }
 
+const PERSISTED_ENGINE = {
+  version: "1.40.1",
+  root: "/skill/core",
+  templates_fingerprint: "e".repeat(64),
+  commit_sha: "f".repeat(40),
+};
+
+function persistedEngineIdentity() {
+  return PERSISTED_ENGINE;
+}
+
 function mechanicalInput() {
   const diagnostic = buildStageDiagnostic({ blockerKind: "merge-conflict", reason: "cannot apply base", stage: "pre-merge" });
   return {
@@ -571,6 +582,7 @@ test("rebind_tester_evidence_after_pr executes the shared bind and does not repa
         suiteCommandInvoked: false,
       };
     },
+    resolveRunEngineIdentity: async () => persistedEngineIdentity(),
     getPrForIssue: async () => 99,
     getPrDetail: async () => ({ number: 99, head_sha: "a".repeat(40) }) as never,
     readTrustedSurfaceDecision: async () => ({
@@ -612,6 +624,7 @@ test("rebind_tester_evidence_after_pr passes pushed worktree HEAD for the mismat
   const execute = realExecuteRecovery(cfg(), {
     getOnDiskForIssue: async () => ({ path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never),
     gitHead: async () => pushed,
+    resolveRunEngineIdentity: async () => persistedEngineIdentity(),
     getPrForIssue: async () => 99,
     getPrDetail: async () => ({ number: 99, head_sha: prHead } as never),
     readTrustedSurfaceDecision: async () => ({
@@ -717,6 +730,18 @@ test("rebind_tester_evidence_after_pr binds a subject-less passed record with pi
   };
   fs.mkdirSync(runDir, { recursive: true });
   fs.writeFileSync(testerEvidencePath(runDir), `${JSON.stringify(subjectless, null, 2)}\n`);
+  fs.writeFileSync(
+    join(runDir, "run.json"),
+    `${JSON.stringify({
+      schema_version: 1,
+      run_id: runId,
+      issue: 42,
+      repo: "acme/widget",
+      profile: null,
+      started_at: "2026-09-05T21:00:00Z",
+      engine,
+    }, null, 2)}\n`,
+  );
   let receivedFingerprint: string | null | undefined;
   const execute = realExecuteRecovery(
     { ...cfg(), domain: "acme", repo_dir: repoDir },
@@ -729,7 +754,6 @@ test("rebind_tester_evidence_after_pr binds a subject-less passed record with pi
         candidate_sha: sha,
         effective_verifier_hash: "c".repeat(64),
       }) as never,
-      resolvePinnedEngineIdentity: () => engine,
       clearBlocked: async () => {},
       rebindTesterEvidenceAfterPr: async (input) => {
         receivedFingerprint = input.engineFingerprint;
@@ -805,10 +829,189 @@ test("rebind_tester_evidence_after_pr binds a subject-less passed record with pi
   }
 });
 
+test("rebind_tester_evidence_after_pr bind uses blocked-run engine A after install updates to B", async () => {
+  const repoDir = fs.mkdtempSync(join(os.tmpdir(), "rebind-engine-ab-"));
+  const runId = "1468-2026-09-06T00-00-00-000Z";
+  const runDir = runDirPath(repoDir, runId);
+  const sha = "a".repeat(40);
+  const engineA = {
+    version: "1.40.1",
+    root: "/skill/core",
+    templates_fingerprint: "a".repeat(64),
+    commit_sha: "1".repeat(40),
+  };
+  const engineB = {
+    version: "1.41.0",
+    root: "/skill/core",
+    templates_fingerprint: "b".repeat(64),
+    commit_sha: "2".repeat(40),
+  };
+  const fpA = buildEngineFingerprint({
+    version: engineA.version,
+    templates_fingerprint: engineA.templates_fingerprint,
+    commit_sha: engineA.commit_sha,
+  });
+  const fpB = buildEngineFingerprint({
+    version: engineB.version,
+    templates_fingerprint: engineB.templates_fingerprint,
+    commit_sha: engineB.commit_sha,
+  });
+  const subjectless: TesterEvidence = {
+    schema_version: TESTER_EVIDENCE_SCHEMA_VERSION,
+    kind: TESTER_EVIDENCE_KIND,
+    candidate_sha: sha,
+    run_id: runId,
+    issue: 42,
+    pr: null,
+    worktree_id: "pipeline-42-wt",
+    config_digest: computeConfigDigest({
+      command_identity: "npm test",
+      enabled: true,
+      timeout: 300,
+      max_output_chars: 4000,
+    }),
+    toolchain_fingerprint: { node: "v24.0.0", platform: "linux", arch: "x64" },
+    started_at: "2026-09-05T20:00:00Z",
+    ended_at: "2026-09-05T20:00:05Z",
+    duration_ms: 5000,
+    overall_status: "passed",
+    commands: [
+      {
+        identity: "npm test",
+        exit_code: 0,
+        duration_ms: 4800,
+        status: "passed",
+        output_excerpt: "ok",
+      },
+    ],
+    output_excerpt: "ok",
+    producer: { component: "test-build-gate" },
+  };
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(testerEvidencePath(runDir), `${JSON.stringify(subjectless, null, 2)}\n`);
+  fs.writeFileSync(
+    join(runDir, "run.json"),
+    `${JSON.stringify({
+      schema_version: 1,
+      run_id: runId,
+      issue: 42,
+      repo: "acme/widget",
+      profile: null,
+      started_at: "2026-09-05T21:00:00Z",
+      engine: engineA,
+    }, null, 2)}\n`,
+  );
+  let receivedFingerprint: string | null | undefined;
+  const execute = realExecuteRecovery(
+    { ...cfg(), domain: "acme", repo_dir: repoDir },
+    {
+      getOnDiskForIssue: async () => null,
+      getPrForIssue: async () => 99,
+      getPrDetail: async () => ({ number: 99, head_sha: sha }) as never,
+      readTrustedSurfaceDecision: async () => ({
+        outcome: "passthrough",
+        candidate_sha: sha,
+        effective_verifier_hash: "c".repeat(64),
+      }) as never,
+      clearBlocked: async () => {},
+      rebindTesterEvidenceAfterPr: async (input) => {
+        receivedFingerprint = input.engineFingerprint;
+        return rebindTesterEvidenceAfterPr(input);
+      },
+    },
+  );
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "required implementation evidence role, observed missing",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      trusted_surface_outcome: "passthrough",
+      pr_head: sha,
+      subject_omitted_because_unobservable: true,
+    },
+  });
+  try {
+    assert.notEqual(fpA, fpB);
+    const result = await execute({
+      ...mechanicalInput(),
+      action: "rebind_tester_evidence_after_pr",
+      blockerClass: "workflow-engine-defect",
+      diagnostic,
+      evidence: {
+        pr_number: 99,
+        pipeline_run_id: runId,
+        candidate_identity: `pr:99:run:${runId}`,
+      },
+    });
+    assert.equal(result.succeeded, true, result.error ?? result.evidence);
+    assert.equal(receivedFingerprint, fpA);
+    assert.notEqual(receivedFingerprint, fpB);
+    const stored = JSON.parse(fs.readFileSync(testerEvidencePath(runDir), "utf8")) as TesterEvidence;
+    assert.equal(stored.evidence_subject?.engine_fingerprint, fpA);
+    assert.notEqual(stored.evidence_subject?.engine_fingerprint, fpB);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("rebind_tester_evidence_after_pr fail-closes when blocked-run engine identity is absent", async () => {
+  let clears = 0;
+  let rebindCalls = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    clearBlocked: async () => { clears++; },
+    resolveRunEngineIdentity: async () => undefined,
+    getPrForIssue: async () => 99,
+    getPrDetail: async () => ({ number: 99, head_sha: "a".repeat(40) }) as never,
+    readTrustedSurfaceDecision: async () => ({
+      outcome: "passthrough",
+      candidate_sha: "a".repeat(40),
+      effective_verifier_hash: "c".repeat(64),
+    }) as never,
+    rebindTesterEvidenceAfterPr: async () => {
+      rebindCalls++;
+      return {
+        ok: true,
+        action: "bind",
+        candidateSha: "a".repeat(40),
+        evidence: { candidate_sha: "a".repeat(40) } as never,
+        suiteCommandInvoked: false,
+      };
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "required implementation evidence role, observed missing",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      trusted_surface_outcome: "passthrough",
+      pr_head: "a".repeat(40),
+    },
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "rebind_tester_evidence_after_pr",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(clears, 0);
+  assert.equal(rebindCalls, 0);
+  assert.match(result.error ?? "", /engine identity is absent or malformed/);
+});
+
 test("rebind_tester_evidence_after_pr disabled-gate not-applicable does not report recovered", async () => {
   let clears = 0;
   const execute = realExecuteRecovery(cfg(), {
     clearBlocked: async () => { clears++; },
+    resolveRunEngineIdentity: async () => persistedEngineIdentity(),
     getPrForIssue: async () => 99,
     getPrDetail: async () => ({ number: 99, head_sha: "a".repeat(40) }) as never,
     readTrustedSurfaceDecision: async () => ({
@@ -852,6 +1055,7 @@ test("rebind_tester_evidence_after_pr fail-closed does not report recovered", as
   let clears = 0;
   const execute = realExecuteRecovery(cfg(), {
     clearBlocked: async () => { clears++; },
+    resolveRunEngineIdentity: async () => persistedEngineIdentity(),
     getPrForIssue: async () => 99,
     getPrDetail: async () => ({ number: 99, head_sha: "a".repeat(40) }) as never,
     readTrustedSurfaceDecision: async () => null,
