@@ -31,6 +31,7 @@ import {
   generateDurableUnsignedFrg,
   honestLatestJsonBindsRequest,
   isBoundPackLoopTerminal,
+  lifecycleIssueNumbers,
   isPathInsideCheckout,
   REQUEST_INSIDE_CHECKOUT_TOKEN,
   resolveRequestPathForContainment,
@@ -45,6 +46,7 @@ import {
   persistFactoryReleaseLoopBinding,
   productionCreateOrReusePackIssues,
   productionDispatchPackLoop,
+  reconcileFrgPackLifecycle,
   rejectForbiddenRequestFields,
   targetCheckoutsForPrepare,
   unsignedDigestBindingMismatch,
@@ -576,6 +578,7 @@ function makeDeps(opts: {
   runRelease?: FactoryReleasePrepareDeps["runRelease"];
   generateCalls?: { n: number };
   releaseCalls?: { n: number };
+  reconcilePackLifecycle?: FactoryReleasePrepareDeps["reconcilePackLifecycle"];
 }): FactoryReleasePrepareDeps {
   const generateCalls = opts.generateCalls ?? { n: 0 };
   const releaseCalls = opts.releaseCalls ?? { n: 0 };
@@ -601,6 +604,7 @@ function makeDeps(opts: {
       return null;
     },
     observeExistingRelease: opts.observeExistingRelease ?? (async () => null),
+    reconcilePackLifecycle: opts.reconcilePackLifecycle,
     runRelease: async (version, releaseOpts, cfg) => {
       releaseCalls.n++;
       if (opts.runRelease) return opts.runRelease(version, releaseOpts, cfg);
@@ -2232,6 +2236,44 @@ test("productionCreateOrReusePackIssues reuses matching pack_run_id issues", asy
   );
   assert.deepEqual(result.issue_numbers, [55, 56]);
   assert.deepEqual(created, ["openspec"]);
+});
+
+test("productionCreateOrReusePackIssues re-observes and binds an ambiguous partial create", async () => {
+  let listCalls = 0;
+  let createCalls = 0;
+  const bound: number[][] = [];
+  await assert.rejects(
+    productionCreateOrReusePackIssues(
+      {
+        repoDir: "/repo",
+        request: baseRequest(),
+        pack: packWithTemplates(),
+        packRunId: "pack-partial-create",
+        rendered: renderFrgPackIssues(packWithTemplates(), {
+          release_version: "1.34.0",
+          pack_run_id: "pack-partial-create",
+        }),
+        onIssueNumbersBound: async (numbers) => { bound.push([...numbers]); },
+      },
+      {
+        listOpenPackIssues: async () => {
+          listCalls += 1;
+          if (listCalls === 1) return [];
+          return [
+            { number: 77, title: "docs", body: "pack-partial-create clean-docs" },
+            { number: 78, title: "openspec", body: "pack-partial-create clean-openspec" },
+          ];
+        },
+        createIssue: async () => {
+          createCalls += 1;
+          if (createCalls === 1) return 77;
+          throw new Error("response lost after create");
+        },
+      },
+    ),
+    /failed after binding \[77,78\]: response lost after create/,
+  );
+  assert.deepEqual(bound.at(-1), [77, 78]);
 });
 
 test("observeDetachedChildStart rejects child error and does not unref", async () => {
@@ -4227,4 +4269,427 @@ test("defaultResolveShipPathFromRun loads the closed unsigned checkpoint (#1295)
     readFile: (p) => mem.readFile(p),
   });
   assert.equal(missing.kind, "fail");
+});
+
+test("FRG pack lifecycle releases worktrees, CAS-deletes branches, and closes every fixture", async () => {
+  const order: string[] = [];
+  const openIssues = new Set([101, 102]);
+  const openPrs = new Map<number, number[]>([
+    [101, [201, 202, 204]],
+    [102, [203]],
+  ]);
+  const branches = new Map([
+    [201, { branch: "pipeline/101-a", headSha: "a".repeat(40), sameRepository: true, state: "open" as const }],
+    [202, { branch: "pipeline/101-b", headSha: "b".repeat(40), sameRepository: true, state: "open" as const }],
+    [203, { branch: "pipeline/102-c", headSha: "c".repeat(40), sameRepository: true, state: "open" as const }],
+    [204, { branch: "pipeline/101-closed", headSha: "d".repeat(40), sameRepository: true, state: "closed" as const }],
+  ]);
+  const deps = {
+    getIssueStateAndLabels: async (n: number) => ({
+      state: openIssues.has(n) ? "open" as const : "closed" as const,
+      labels: ["factory-gate"],
+    }),
+    findPrsForIssue: async (n: number) => ({ numbers: openPrs.get(n) ?? [], truncated: false }),
+    getPrBranch: async (n: number) => branches.get(n) ?? null,
+    releaseManagedWorktree: async (n: number) => {
+      order.push(`worktree:${n}`);
+      return { action: "released" as const, branch: `pipeline/${n}`, reason: "clean and recoverable" };
+    },
+    deleteRemoteBranch: async (branch: string) => {
+      order.push(`branch:${branch}`);
+    },
+    closePr: async (n: number) => {
+      order.push(`pr:${n}`);
+      const prior = branches.get(n)!;
+      branches.set(n, { ...prior, state: "closed" as const });
+    },
+    closeIssue: async (n: number) => {
+      order.push(`issue:${n}`);
+      openIssues.delete(n);
+    },
+  };
+  const first = await reconcileFrgPackLifecycle(
+    {
+      version: "1.40.1",
+      packRunId: "pack-1401-fixture",
+      issueNumbers: [102, 101, 101],
+      disposition: "completed",
+    },
+    deps,
+  );
+  assert.deepEqual(first.closed_prs, [201, 202, 203]);
+  assert.ok(first.deleted_branches.includes("pipeline/101-closed"));
+  assert.deepEqual(first.closed_issues, [101, 102]);
+  assert.equal(first.errors.length, 0);
+  assert.ok(order.indexOf("worktree:101") < order.indexOf("branch:pipeline/101-a"));
+  assert.ok(order.indexOf("branch:pipeline/101-a") < order.indexOf("pr:201"));
+  assert.ok(order.indexOf("pr:202") < order.indexOf("issue:101"));
+
+  const second = await reconcileFrgPackLifecycle(
+    {
+      version: "1.40.1",
+      packRunId: "pack-1401-fixture",
+      issueNumbers: [101, 102],
+      disposition: "completed",
+    },
+    deps,
+  );
+  assert.deepEqual(second.closed_prs, []);
+  assert.deepEqual(second.closed_issues, []);
+  assert.equal(second.errors.length, 0);
+});
+
+test("FRG pack lifecycle fails closed for a missing issue or unrelated PR branch", async () => {
+  let mutations = 0;
+  const baseDeps = {
+    findPrsForIssue: async () => ({ numbers: [301], truncated: false }),
+    getPrBranch: async () => ({
+      branch: "feature/unrelated",
+      headSha: "a".repeat(40),
+      sameRepository: true,
+      state: "open" as const,
+    }),
+    releaseManagedWorktree: async () => {
+      mutations += 1;
+      return { action: "released" as const, reason: "unexpected" };
+    },
+    deleteRemoteBranch: async () => { mutations += 1; },
+    closePr: async () => { mutations += 1; },
+    closeIssue: async () => { mutations += 1; },
+  };
+  const missing = await reconcileFrgPackLifecycle(
+    {
+      version: "1.40.1",
+      packRunId: "pack-missing-issue",
+      issueNumbers: [111],
+      disposition: "superseded",
+    },
+    { ...baseDeps, getIssueStateAndLabels: async () => null },
+  );
+  assert.match(missing.errors[0] ?? "", /bound fixture issue is missing or inaccessible/);
+
+  const unrelated = await reconcileFrgPackLifecycle(
+    {
+      version: "1.40.1",
+      packRunId: "pack-unrelated-pr",
+      issueNumbers: [112],
+      disposition: "superseded",
+    },
+    {
+      ...baseDeps,
+      getIssueStateAndLabels: async () => ({ state: "open" as const, labels: ["factory-gate"] }),
+    },
+  );
+  assert.match(unrelated.errors[0] ?? "", /not the managed same-repository fixture branch/);
+  assert.equal(mutations, 0);
+});
+
+test("legacy lifecycle recovery rejects a readable ledger without exact numeric issues", async () => {
+  const legacyIndex = {
+    schema_version: 1 as const,
+    version: "1.40.1",
+    request_fingerprint: "5".repeat(64),
+    candidate_git_sha: "a".repeat(40),
+    action_id: "legacy-action",
+    pack_run_id: "legacy-empty-pack",
+    loop_run_id: "legacy-empty-loop",
+    disposition: "active" as const,
+  };
+  await assert.rejects(
+    lifecycleIssueNumbers(
+      legacyIndex,
+      async () => JSON.parse('{"schema":1,"run_id":"legacy-empty-loop","items":{}}'),
+    ),
+    /no complete exact numeric fixture issue set/,
+  );
+  await assert.rejects(
+    lifecycleIssueNumbers(
+      legacyIndex,
+      async () => JSON.parse(
+        '{"schema":1,"run_id":"legacy-empty-loop","items":{"not-an-issue":{"state":"ready"}}}',
+      ),
+    ),
+    /no complete exact numeric fixture issue set/,
+  );
+});
+
+test("changed release request disposes the active version pack before generating one successor", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/frg-successor-request.json";
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  await mem.writeFile(
+    factoryReleaseVersionIndexPath("/repo", request.target_version),
+    JSON.stringify({
+      schema_version: 1,
+      version: request.target_version,
+      request_fingerprint: "1".repeat(64),
+      candidate_git_sha: "d".repeat(40),
+      action_id: "prior-action",
+      pack_run_id: "prior-pack",
+      loop_run_id: "prior-loop",
+      frg_run_id: "prior-frg",
+      issue_numbers: [701, 702],
+      disposition: "active",
+    }),
+  );
+  const order: string[] = [];
+  const outcome = await runFactoryReleasePrepare(
+    { requestPath, repoDir: "/repo" },
+    makeDeps({
+      fs: mem,
+      reconcilePackLifecycle: async (input) => {
+        order.push(`cleanup:${input.disposition}:${input.issueNumbers.join(",")}`);
+        return {
+          disposition: input.disposition,
+          closed_prs: [],
+          deleted_branches: [],
+          released_worktrees: [],
+          closed_issues: [...input.issueNumbers],
+          errors: [],
+        };
+      },
+      generate: async () => {
+        order.push("generate");
+        return { frg: unsignedPayload(), structurally_eligible: true };
+      },
+    }),
+  );
+  assert.equal(outcome.exitCode, 0);
+  assert.deepEqual(order.slice(0, 2), ["cleanup:superseded:701,702", "generate"]);
+  const priorReceipt = JSON.parse(
+    await mem.readFile(path.join(factoryReleaseWorkDir("/repo", "1".repeat(64)), "pack-disposition.json")),
+  );
+  assert.equal(priorReceipt.disposition, "superseded");
+});
+
+test("failed superseded-pack cleanup keeps the prior pack active and blocks successor generation", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/frg-successor-blocked.json";
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const indexPath = factoryReleaseVersionIndexPath("/repo", request.target_version);
+  await mem.writeFile(indexPath, JSON.stringify({
+    schema_version: 1,
+    version: request.target_version,
+    request_fingerprint: "2".repeat(64),
+    candidate_git_sha: "d".repeat(40),
+    action_id: "prior-action",
+    pack_run_id: "prior-pack",
+    issue_numbers: [801],
+    disposition: "active",
+  }));
+  let generated = 0;
+  const outcome = await runFactoryReleasePrepare(
+    { requestPath, repoDir: "/repo" },
+    makeDeps({
+      fs: mem,
+      generate: async () => {
+        generated += 1;
+        return { frg: unsignedPayload(), structurally_eligible: true };
+      },
+      reconcilePackLifecycle: async (input) => ({
+        disposition: input.disposition,
+        closed_prs: [],
+        deleted_branches: [],
+        released_worktrees: [],
+        closed_issues: [],
+        errors: ["issue #801: worktree retained: dirty"],
+      }),
+    }),
+  );
+  assert.equal(outcome.exitCode, 1);
+  assert.equal(outcome.result.status, "failed");
+  assert.equal(generated, 0);
+  const retained = JSON.parse(await mem.readFile(indexPath));
+  assert.equal(retained.disposition, "active");
+});
+
+test("incomplete fixture binding blocks a changed release request", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/frg-incomplete-successor.json";
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  await mem.writeFile(factoryReleaseVersionIndexPath("/repo", request.target_version), JSON.stringify({
+    schema_version: 1,
+    version: request.target_version,
+    request_fingerprint: "3".repeat(64),
+    candidate_git_sha: "d".repeat(40),
+    action_id: "prior-action",
+    pack_run_id: "partial-pack",
+    issue_numbers: [901],
+    fixture_set_complete: false,
+    disposition: "active",
+  }));
+  await assert.rejects(
+    runFactoryReleasePrepare(
+      { requestPath, repoDir: "/repo" },
+      makeDeps({ fs: mem }),
+    ),
+    /incomplete fixture binding; retry the same request before superseding/,
+  );
+});
+
+test("legacy active pack without recoverable fixture identity fails visibly", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/frg-legacy-no-identity.json";
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  await mem.writeFile(factoryReleaseVersionIndexPath("/repo", request.target_version), JSON.stringify({
+    schema_version: 1,
+    version: request.target_version,
+    request_fingerprint: "4".repeat(64),
+    candidate_git_sha: "d".repeat(40),
+    action_id: "prior-action",
+    pack_run_id: "legacy-pack",
+    disposition: "active",
+  }));
+  await assert.rejects(
+    runFactoryReleasePrepare(
+      { requestPath, repoDir: "/repo" },
+      makeDeps({ fs: mem }),
+    ),
+    /has neither issue_numbers nor loop_run_id; refusing cleanup/,
+  );
+});
+
+test("malformed active pack instance fails visibly before terminal reconciliation", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/frg-malformed-instance.json";
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const workDir = factoryReleaseWorkDir("/repo", factoryReleaseRequestFingerprint(request));
+  await mem.writeFile(factoryReleasePackInstancePath(workDir), "{not-json");
+  await assert.rejects(
+    runFactoryReleasePrepare(
+      { requestPath, repoDir: "/repo" },
+      makeDeps({ fs: mem }),
+    ),
+    /unreadable active pack instance.*JSON/,
+  );
+});
+
+test("post-creation pack mismatch reconciles exact fixtures to terminal_failed", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/frg-pack-mismatch-cleanup.json";
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const fingerprint = factoryReleaseRequestFingerprint(request);
+  const workDir = factoryReleaseWorkDir("/repo", fingerprint);
+  await mem.writeFile(factoryReleasePackInstancePath(workDir), JSON.stringify({
+    schema_version: 1,
+    kind: "factory_release_pack_instance",
+    request_fingerprint: fingerprint,
+    target_version: request.target_version,
+    candidate_git_sha: request.integrated_candidate.git_sha,
+    pack_id: request.frg_manifest.pack_id,
+    manifest_sha256: request.frg_manifest.sha256,
+    pack_run_id: "pack-mismatch-fixtures",
+    frg_run_id: "frg-mismatch-fixtures",
+    loop_run_id: "loop-mismatch-fixtures",
+    issue_numbers: [911, 912],
+    fixture_set_complete: true,
+    created_at: "2026-09-06T12:00:00.000Z",
+    updated_at: "2026-09-06T12:00:00.000Z",
+  }));
+  const reconciled: Array<{ disposition: string; issues: readonly number[] }> = [];
+  const outcome = await runFactoryReleasePrepare(
+    { requestPath, repoDir: "/repo" },
+    makeDeps({
+      fs: mem,
+      generate: async () => ({
+        frg: { ...unsignedPayload(), pack_id: "foreign-pack" },
+        structurally_eligible: true,
+      }),
+      reconcilePackLifecycle: async (input) => {
+        reconciled.push({ disposition: input.disposition, issues: [...input.issueNumbers] });
+        return {
+          disposition: input.disposition,
+          closed_prs: [],
+          deleted_branches: [],
+          released_worktrees: [911, 912],
+          closed_issues: [911, 912],
+          errors: [],
+        };
+      },
+    }),
+  );
+  assert.equal(outcome.exitCode, 1);
+  assert.equal(outcome.result.status, "failed");
+  if (outcome.result.status === "failed") assert.equal(outcome.result.defect_class, "pack_mismatch");
+  assert.deepEqual(reconciled, [{ disposition: "terminal_failed", issues: [911, 912] }]);
+  const index = JSON.parse(
+    await mem.readFile(factoryReleaseVersionIndexPath("/repo", request.target_version)),
+  );
+  assert.equal(index.disposition, "terminal_failed");
+});
+
+test("defaultStartBoundPackLoop durably binds fixture issues before dispatch failure", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const ctx = {
+    repoDir: "/repo",
+    workDir: "/state/release",
+    request,
+    pack: packWithTemplates(),
+    packRunId: "pack-1401-start-failure",
+    frgRunId: "frg-start-failure",
+    requestFingerprint: factoryReleaseRequestFingerprint(request),
+    writeFile: async (p: string, body: string) => { files.set(p, body); },
+    readFile: async (p: string) => {
+      const body = files.get(p);
+      if (body === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return body;
+    },
+    fileExists: async (p: string) => files.has(p),
+    now: () => new Date("2026-09-06T12:00:00Z"),
+  };
+  await assert.rejects(
+    defaultStartBoundPackLoop(ctx, {
+      createOrReusePackIssues: async () => ({ issue_numbers: [501, 502] }),
+      dispatchPackLoop: async () => { throw new Error("spawn failed"); },
+    }),
+    /spawn failed/,
+  );
+  const instance = JSON.parse(files.get(factoryReleasePackInstancePath(ctx.workDir))!);
+  assert.deepEqual(instance.issue_numbers, [501, 502]);
+  assert.equal(instance.loop_run_id, null);
+  const index = JSON.parse(files.get(factoryReleaseVersionIndexPath(ctx.repoDir, request.target_version))!);
+  assert.deepEqual(index.issue_numbers, [501, 502]);
+  assert.equal(index.fixture_set_complete, true);
+  assert.equal(index.disposition, "active");
+});
+
+test("defaultStartBoundPackLoop retains partial issue identity when creation fails", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const ctx = {
+    repoDir: "/repo",
+    workDir: "/state/partial-release",
+    request,
+    pack: packWithTemplates(),
+    packRunId: "pack-partial-start",
+    frgRunId: "frg-partial-start",
+    requestFingerprint: factoryReleaseRequestFingerprint(request),
+    writeFile: async (p: string, body: string) => { files.set(p, body); },
+    readFile: async (p: string) => files.get(p)!,
+    fileExists: async (p: string) => files.has(p),
+    now: () => new Date("2026-09-06T12:00:00Z"),
+  };
+  await assert.rejects(
+    defaultStartBoundPackLoop(ctx, {
+      createOrReusePackIssues: async (input) => {
+        await input.onIssueNumbersBound?.([601]);
+        throw new Error("second create failed");
+      },
+      dispatchPackLoop: async () => { throw new Error("must not dispatch"); },
+    }),
+    /second create failed/,
+  );
+  const instance = JSON.parse(files.get(factoryReleasePackInstancePath(ctx.workDir))!);
+  assert.deepEqual(instance.issue_numbers, [601]);
+  assert.equal(instance.fixture_set_complete, false);
+  const index = JSON.parse(files.get(factoryReleaseVersionIndexPath("/repo", request.target_version))!);
+  assert.deepEqual(index.issue_numbers, [601]);
+  assert.equal(index.fixture_set_complete, false);
 });

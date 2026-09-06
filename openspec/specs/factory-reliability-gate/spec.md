@@ -409,6 +409,68 @@ on release-eligible pass as specified by the post-pass disposition requirements.
 
 ---
 
+### Requirement: Factory-release FRG fixtures SHALL have one bounded terminal lifecycle
+
+`pipeline factory-release prepare` SHALL bind the exact synthetic issue numbers created or
+reused for a pack into durable pack-instance and per-version state before dispatching the pack
+loop. At most one pack for a release version SHALL remain active. Before a changed request
+fingerprint may create a successor, prepare SHALL reconcile the prior pack to `superseded`.
+After terminal ineligible scoring or any other terminal failure after fixture creation it SHALL
+reconcile that pack to `terminal_failed`; after structurally eligible scoring it SHALL reconcile
+it to `completed`. Reconciliation SHALL close
+every bound synthetic issue and every associated open PR without merge, safely release each
+clean managed worktree, and compare-and-delete each same-repository remote branch against the
+observed PR head. A linked PR SHALL be eligible for disposal only when its head follows the managed
+`pipeline/<issue>-...` fixture-branch identity for that exact issue. A missing bound issue, empty or
+malformed legacy issue identity, dirty or local-only worktree, ambiguously owned PR, moved branch,
+or otherwise unsafe artifact SHALL fail closed and keep the version active so the same request
+retries cleanup. Each completed
+terminal reconciliation SHALL write a durable disposition receipt. Re-running the same request
+or successor SHALL be idempotent and SHALL NOT accumulate orphan fixture packs. This prepare
+lifecycle is distinct from the standalone scorer's historical rule that a non-pass does not
+close artifacts as a scoring side effect.
+
+#### Scenario: Dispatch failure retains enough identity for terminal cleanup
+
+- **WHEN** issue creation succeeds and pack-loop dispatch fails
+- **THEN** `pack-instance.json` SHALL already contain the exact synthetic issue numbers
+- **AND** terminal cleanup SHALL be able to reconcile those issues without discovery by title
+
+#### Scenario: Partial issue creation fails closed
+
+- **WHEN** issue creation or its response fails after any fixture may have been created
+- **THEN** prepare SHALL retain an active incomplete fixture-set marker and every issue number it
+  can re-observe for that pack
+- **AND** a changed request SHALL NOT create a successor until the same request has completed the
+  exact fixture binding
+
+#### Scenario: Post-creation binding failure disposes the pack
+
+- **WHEN** a generated pack fails its request manifest binding after fixture creation
+- **THEN** prepare SHALL reconcile its exact fixtures to `terminal_failed`
+- **AND** cleanup failure SHALL retain the pack as active for an idempotent cleanup retry
+
+#### Scenario: Changed candidate disposes the former pack before creating a successor
+
+- **WHEN** the per-version index names an active pack for request fingerprint `A`
+- **AND** prepare is invoked for the same version with different fingerprint `B`
+- **THEN** every exact fixture bound to `A` SHALL be reconciled to `superseded` first
+- **AND** cleanup failure SHALL prevent creation of `B`
+- **AND** a successful retry SHALL reuse `B` or create exactly one successor
+
+#### Scenario: Terminal disposition is safe and repeatable
+
+- **WHEN** an exact pack reaches `completed` or `terminal_failed`
+- **THEN** cleanup SHALL release recoverable managed worktrees before deleting their branches
+- **AND** remote deletion SHALL require the branch to remain at the observed PR head
+- **AND** a merely related PR without the exact managed fixture-branch identity SHALL remain
+  untouched and fail reconciliation closed
+- **AND** no PR SHALL be merged
+- **AND** re-running cleanup after resources are absent or closed SHALL succeed without creating
+  replacement resources
+
+---
+
 ### Requirement: FRG runbook SHALL document post-pass pack auto-close
 
 The checked-in FRG runbook SHALL document that a release-eligible FRG pass auto-closes synthetic
@@ -2914,4 +2976,3 @@ When Factory Reliability Gate unique-operation scoring runs as a phase of an adm
 - **AND** missing required coverage SHALL increase for uncovered #1333 classes
 
 ---
-

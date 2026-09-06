@@ -792,6 +792,26 @@ Optional repeated CLI tokens:
 | Loop `concurrency.max_concurrent` | `2` | Multi-item composition without full factory blast radius |
 | Selector | `factory-gate` label **or** reliability milestone | Fixed pack, not product backlog |
 
+### Synthetic pack lifecycle
+
+The factory-release path keeps one active synthetic pack per target version. It records the
+pack's exact issue numbers before loop dispatch, so even a failed spawn remains cleanable. Issue
+creation is journaled after every reuse/create; an incomplete fixture-set marker blocks a changed
+request until the same request re-observes and finishes the exact binding. A changed
+candidate/action must dispose the previous pack as `superseded` before creating its one successor.
+Terminal ineligible packs and other terminal failures after fixture creation (including a manifest
+binding mismatch) are disposed as `terminal_failed`; eligible packs are disposed as `completed`
+while their evidence remains on disk.
+
+Disposal never merges. It releases each clean, recoverable managed worktree, compare-and-deletes
+same-repository remote branches at the observed PR heads, and closes all bound PRs and issues. A PR
+must use the exact managed `pipeline/<issue>-...` fixture branch; a normal PR that merely mentions
+the issue is never cleanup authority. Missing bound issues, malformed or empty legacy identity,
+unsafe worktree ownership, dirt, local-only commits, or a moved branch fail closed and leave the
+version active for the next identical invocation to retry. A successful terminal writes
+`pack-disposition.json` under that request's factory-release artifact directory. Re-running is
+idempotent: absent/closed artifacts remain disposed and no replacement pack is created.
+
 ## Release integration
 
 `pipeline release <X.Y.Z|major|minor|patch>` **after version resolution**:
