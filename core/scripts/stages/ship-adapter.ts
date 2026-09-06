@@ -25,6 +25,7 @@ import {
   resolveAndPrepareCandidateEngine,
   runCandidateEngineProcess,
   type CandidateEngine,
+  type CandidateEngineConsumer,
   type CandidateEngineResult,
   type PresentFrgAttestorCredentialDeps,
 } from "../ship-end-candidate.ts";
@@ -235,7 +236,10 @@ export interface RealShipCoordinatorDepsOptions {
   env?: NodeJS.ProcessEnv;
   /** Running process source SHA. Injected in tests; default is this engine checkout. */
   pinCommitSha?: string | null;
-  resolveCandidateEngine?: (sha: string) => Promise<CandidateEngineResult>;
+  resolveCandidateEngine?: (
+    sha: string,
+    consumer: CandidateEngineConsumer,
+  ) => Promise<CandidateEngineResult>;
   spawnShipEnd?: (
     argv: string[],
     env: NodeJS.ProcessEnv,
@@ -1513,7 +1517,7 @@ export interface CandidateShipEndContext {
     intent: ShipIntent,
     train: ShipTrainEvidence,
   ): Promise<string>;
-  resolveCandidate(sha: string): Promise<CandidateEngineResult>;
+  resolveCandidate(sha: string, consumer: CandidateEngineConsumer): Promise<CandidateEngineResult>;
   spawn(
     argv: string[],
     env: NodeJS.ProcessEnv,
@@ -1550,14 +1554,15 @@ function candidateReadinessError(kind: "readiness" | "lock", detail: string): Er
   );
 }
 
-async function spawnLeaf(
+async function startCandidateLeaf(
   ctx: CandidateShipEndContext,
   engine: CandidateEngine,
+  consumer: CandidateEngineConsumer,
   leaf: string[],
   env: NodeJS.ProcessEnv,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const started = await runCandidateEngineProcess({
-    consumer: "ship.stage-adapter",
+    consumer,
     engine,
     start: async (checked, childEnv) => {
       const argv = [...shipEndCliPrefix(checked, ctx.nodeBin ?? "node"), ...leaf];
@@ -1569,6 +1574,39 @@ async function spawnLeaf(
     throw candidateReadinessError(started.kind === "lock" ? "lock" : "readiness", started.error);
   }
   return started.value;
+}
+
+async function spawnFrgPrepareLeaf(
+  ctx: CandidateShipEndContext,
+  engine: CandidateEngine,
+  leaf: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  if (leaf[0] !== "factory-release" || leaf[1] !== "prepare") {
+    throw new Error("ship FRG prepare observer may only start factory-release prepare");
+  }
+  const started = await runCandidateEngineProcess({
+    consumer: "ship.frg-prepare-observe",
+    engine,
+    start: async (checked, childEnv) => {
+      const argv = [...shipEndCliPrefix(checked, ctx.nodeBin ?? "node"), ...leaf];
+      assertShipEndLeafArgv(argv);
+      return ctx.spawn(argv, { ...env, ...childEnv });
+    },
+  });
+  if (!started.ok) {
+    throw candidateReadinessError(started.kind === "lock" ? "lock" : "readiness", started.error);
+  }
+  return started.value;
+}
+
+async function spawnShipStageLeaf(
+  ctx: CandidateShipEndContext,
+  engine: CandidateEngine,
+  leaf: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return startCandidateLeaf(ctx, engine, "ship.stage-adapter", leaf, env);
 }
 
 async function delayMs(ctx: CandidateShipEndContext, ms: number): Promise<void> {
@@ -2256,8 +2294,11 @@ export function bindCandidateShipEndOperations(
   pinOps: ShipAdapterOperations,
   ctx: CandidateShipEndContext,
 ): ShipAdapterOperations {
-  const requireCandidate = async (sha: string): Promise<CandidateEngine> => {
-    const resolved = await ctx.resolveCandidate(sha);
+  const requireCandidate = async (
+    sha: string,
+    consumer: CandidateEngineConsumer,
+  ): Promise<CandidateEngine> => {
+    const resolved = await ctx.resolveCandidate(sha, consumer);
     if (!resolved.ok) {
       if (resolved.kind === "readiness" || resolved.kind === "lock") {
         throw candidateReadinessError(resolved.kind, resolved.error);
@@ -2269,6 +2310,11 @@ export function bindCandidateShipEndOperations(
         `resolved commit_sha ${resolved.engine.commitSha} does not equal candidate ${sha}`,
       );
     }
+    if (resolved.engine.consumer !== consumer) {
+      throw candidateIdentityError(
+        `resolved consumer ${resolved.engine.consumer ?? "none"} does not equal requested ${consumer}`,
+      );
+    }
     return resolved.engine;
   };
   const shouldSpawn = (candidateSha: string): boolean =>
@@ -2277,7 +2323,10 @@ export function bindCandidateShipEndOperations(
   return {
     ...pinOps,
     async runFrgPack(intent, train) {
-      const engine = await requireCandidate(train.integrated_head_oid);
+      const engine = await requireCandidate(
+        train.integrated_head_oid,
+        "ship.frg-prepare-observe",
+      );
       if (!shouldSpawn(train.integrated_head_oid)) {
         await pinOps.runFrgPack?.(intent, train);
         return;
@@ -2288,7 +2337,7 @@ export function bindCandidateShipEndOperations(
       let attestedCheckpointKey: string | null = null;
       for (;;) {
         attempt += 1;
-        const prep = await spawnLeaf(
+        const prep = await spawnFrgPrepareLeaf(
           ctx,
           engine,
           shipEndLeafArgv("factory-release-prepare", { requestPath }),
@@ -2321,9 +2370,13 @@ export function bindCandidateShipEndOperations(
               ),
             );
           }
-          const gate = await spawnLeaf(
+          const gateEngine = await requireCandidate(
+            train.integrated_head_oid,
+            "ship.stage-adapter",
+          );
+          const gate = await spawnShipStageLeaf(
             ctx,
-            engine,
+            gateEngine,
             shipEndLeafArgv("factory-gate", { version: intent.version, loopRunId }),
             hmacVerifyChildEnv(ctx.env, ctx.presentAttestorCredential),
           );
@@ -2373,11 +2426,11 @@ export function bindCandidateShipEndOperations(
       }
     },
     async prepareRelease(intent, candidateHeadOid) {
-      const engine = await requireCandidate(candidateHeadOid);
+      const engine = await requireCandidate(candidateHeadOid, "ship.stage-adapter");
       if (!shouldSpawn(candidateHeadOid)) {
         return pinOps.prepareRelease(intent, candidateHeadOid);
       }
-      const spawned = await spawnLeaf(
+      const spawned = await spawnShipStageLeaf(
         ctx,
         engine,
         shipEndLeafArgv("release", { version: intent.version }),
@@ -2397,11 +2450,11 @@ export function bindCandidateShipEndOperations(
       return observed.prepare;
     },
     async finishRelease(intent, release) {
-      const engine = await requireCandidate(release.candidate_head_oid);
+      const engine = await requireCandidate(release.candidate_head_oid, "ship.stage-adapter");
       if (!shouldSpawn(release.candidate_head_oid)) {
         return pinOps.finishRelease(intent, release);
       }
-      const spawned = await spawnLeaf(
+      const spawned = await spawnShipStageLeaf(
         ctx,
         engine,
         shipEndLeafArgv("release-finish", { pr: release.pr }),
@@ -2419,7 +2472,7 @@ export function bindCandidateShipEndOperations(
       return observed.finish;
     },
     async ensureTag(intent, release) {
-      const engine = await requireCandidate(release.candidate_head_oid);
+      const engine = await requireCandidate(release.candidate_head_oid, "ship.stage-adapter");
       if (!shouldSpawn(release.candidate_head_oid)) {
         return pinOps.ensureTag(intent, release);
       }
@@ -2443,7 +2496,7 @@ export function bindCandidateShipEndOperations(
           throw candidateReadinessError(started.kind === "lock" ? "lock" : "readiness", started.error);
         }
       } else {
-        const spawned = await spawnLeaf(
+        const spawned = await spawnShipStageLeaf(
           ctx,
           engine,
           shipEndLeafArgv("ensure-tag", {
@@ -2601,18 +2654,38 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
   if (!opts.progress) throw new Error("pipeline ship: progress callback is required");
   const env = opts.env ?? process.env;
   const pinSha = opts.pinCommitSha !== undefined ? opts.pinCommitSha : runningProcessPinSha();
-  const resolve =
-    opts.resolveCandidateEngine ??
-    (async (sha: string) =>
-      resolveAndPrepareCandidateEngine(
+  const resolve = opts.resolveCandidateEngine ?? (async (
+    sha: string,
+    consumer: CandidateEngineConsumer,
+  ) => {
+    if (consumer === "ship.frg-prepare-observe") {
+      return resolveAndPrepareCandidateEngine(
         {
           repoDir: opts.repoDir,
           candidateSha: sha,
           candidateEngineRootEnv: env.PIPELINE_CANDIDATE_ENGINE_ROOT,
-          consumer: "ship.stage-adapter",
+          consumer: "ship.frg-prepare-observe",
         },
         defaultResolveAndPrepareDeps(),
-      ));
+      );
+    }
+    if (consumer !== "ship.stage-adapter") {
+      return {
+        ok: false as const,
+        kind: "identity" as const,
+        error: `ship candidate-engine consumer is not supported: ${consumer}`,
+      };
+    }
+    return resolveAndPrepareCandidateEngine(
+      {
+        repoDir: opts.repoDir,
+        candidateSha: sha,
+        candidateEngineRootEnv: env.PIPELINE_CANDIDATE_ENGINE_ROOT,
+        consumer: "ship.stage-adapter",
+      },
+      defaultResolveAndPrepareDeps(),
+    );
+  });
   const spawn =
     opts.spawnShipEnd ??
     (async (argv, spawnEnv) => {

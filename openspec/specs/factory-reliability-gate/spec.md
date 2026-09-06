@@ -2549,6 +2549,23 @@ fields MAY acquire the ordinary fresh candidate lease.
 - **THEN** the nested candidate process SHALL NOT start
 - **AND** the parent lease SHALL remain intact
 
+### Requirement: The immutable ship lease owner SHALL observe its live pack handoff
+
+While a detached pack-loop supervisor holds a valid, live candidate lease handoff, the candidate boundary SHALL permit the exact immutable parent-lock owner to re-enter only the dedicated `ship.frg-prepare-observe` candidate boundary to run the next request-bound prepare observation tick. Re-entry SHALL require the same owner PID and nonempty process-start identity, canonical engine root, exact candidate SHA, readiness proof, parent lock digest, and unchanged live handoff. PID-only identity SHALL NOT authorize re-entry. The observation boundary SHALL reject any leaf other than `factory-release prepare`. The observation lease SHALL NOT replace or remove either record and SHALL NOT be transferable. Other candidate consumers, another process, and malformed, stale, or mismatched evidence SHALL remain excluded. A guarded observation child SHALL still fail closed if it attempts a nested candidate start while the live handoff exists.
+
+#### Scenario: Ship polls the pack loop it detached
+
+- **WHEN** the immutable ship coordinator starts another candidate prepare tick
+- **AND** its exact-candidate detached pack supervisor still holds the verified handoff
+- **THEN** the prepare observation child SHALL start under the unchanged parent-lock proof
+- **AND** observer release SHALL preserve both the parent lock and handoff
+- **AND** the observer SHALL NOT transfer the lease or start another nested candidate process
+
+#### Scenario: A contender cannot use observer re-entry
+
+- **WHEN** the candidate consumer is not `ship.frg-prepare-observe`, the leaf is not `factory-release prepare`, or the current PID and nonempty process-start identity do not exactly match the immutable parent-lock owner
+- **THEN** acquisition SHALL remain unavailable while the detached handoff is live
+
 ### Requirement: Pack provenance presence SHALL NOT reject a bound from-run attestation
 
 Factory Reliability Gate (FRG) attestation observation SHALL NOT treat `pack_provenance != null` as sufficient grounds to reject HMAC-pass `--from-run` evidence. `pack_provenance` SHALL still fail closed when its own validation fails. `pack_provenance` SHALL NOT substitute for HMAC-covered `factory_release_binding`. A from-run score that includes both `pack_provenance` and a matching `factory_release_binding` SHALL remain observable as accepted when the rest of the binding holds.
