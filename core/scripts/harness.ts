@@ -46,6 +46,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildStageAccountingRecord } from "./accounting.ts";
+import { beginInvocationObservation, type ObservabilityDeps } from "./observability.ts";
 import {
   buildTreatmentFingerprint,
   defaultProductionPreflightDeps,
@@ -381,6 +382,8 @@ export interface HarnessResult {
 }
 
 export interface InvokeOptions {
+  /** Inject local telemetry I/O; no dashboard/network dependency. */
+  observabilityDeps?: ObservabilityDeps;
   /** Per-call wall-clock timeout in seconds. */
   timeoutSec?: number;
   /** Optional model override. Honored by claude (`--model`) and codex (`-m`). Ignored for custom reviewer CLIs. */
@@ -704,6 +707,11 @@ export async function invoke(
   }
 
   let result: HarnessResult;
+  const observation = opts.accounting ? await beginInvocationObservation({
+    runDir: opts.accounting.runDir, issue: opts.accounting.issue,
+    stage: opts.accounting.stage, harness, cwd,
+    startedAt: startedAt.toISOString(),
+  }, opts.observabilityDeps).catch(() => null) : null;
   try {
     let abortBackgroundWait:
       | ((
@@ -741,7 +749,7 @@ export async function invoke(
             stage: opts.accounting.stage,
           }
         : undefined,
-      env: harnessChildEnvOverlay(opts.env),
+      env: harnessChildEnvOverlay(observation ? { ...opts.env, ...observation.env } : opts.env),
       // The cost/usage-bearing envelope line always arrives last, so telemetry
       // capture keeps the tail of the stream rather than the head (#429).
       captureMode,
@@ -749,9 +757,11 @@ export async function invoke(
       stdinPayload,
       abortPromise,
       onStdoutChunk:
-        supervisor == null
+        supervisor == null && observation == null
           ? undefined
           : (chunk) => {
+              observation?.feed(chunk);
+              if (!supervisor) return;
               for (const event of parseLifecycle(chunk, {
                 adapter: adapter.name,
                 invocationId,
@@ -889,6 +899,7 @@ export async function invoke(
 
     const record = buildStageAccountingRecord({
       runId: path.basename(opts.accounting.runDir),
+      invocationId: observation?.id ?? randomUUID(),
       issue: opts.accounting.issue,
       stage: opts.accounting.stage,
       harness,
@@ -930,6 +941,7 @@ export async function invoke(
       opts.accounting.runStoreDeps,
     ).catch(() => {});
   }
+  await observation?.finish(result.stdout, new Date().toISOString()).catch(() => {});
   // #492: an oversize-argv refusal is a distinct, actionable failure — the CLI
   // WAS found, the prompt was simply too large for a positional argument. Name
   // the review_harness remedy instead of the "not found" message below, which

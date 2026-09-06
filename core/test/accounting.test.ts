@@ -15,8 +15,8 @@ import {
   sanitizeStageAccountingRecord,
 } from "../scripts/accounting.ts";
 
-test("STAGE_ACCOUNTING_SCHEMA_VERSION: bumped to 6 for #778 treatment fingerprint (additive — no field removed)", () => {
-  assert.equal(STAGE_ACCOUNTING_SCHEMA_VERSION, 6);
+test("STAGE_ACCOUNTING_SCHEMA_VERSION: bumped to 7 for optional invocation identity and cache-write usage", () => {
+  assert.equal(STAGE_ACCOUNTING_SCHEMA_VERSION, 7);
 });
 
 test("buildStageAccountingRecord: model-endpoint provenance fields are carried when present (#434)", () => {

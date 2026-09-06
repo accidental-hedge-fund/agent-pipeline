@@ -30,7 +30,8 @@ import type {
 // throttled, termination reason). Adds no required field and removes none;
 // readers must not gate on this value equalling a specific version (design.md
 // decision 5).
-export const STAGE_ACCOUNTING_SCHEMA_VERSION = 6;
+// v7: optional invocation identity and cache-write usage for fleet attribution.
+export const STAGE_ACCOUNTING_SCHEMA_VERSION = 7;
 
 export interface UsageAccountingExtraction {
   usage?: StageAccountingUsage;
@@ -45,6 +46,7 @@ export interface UsageAccountingExtraction {
 
 export interface BuildStageAccountingRecordInput {
   runId: string;
+  invocationId?: string;
   issue: number;
   stage: string;
   harness: string;
@@ -101,6 +103,7 @@ const NUMERIC_USAGE_FIELDS: Record<string, keyof StageAccountingUsage> = {
   cached_input_tokens: "cached_input_tokens",
   cachedInputTokens: "cached_input_tokens",
   cache_read_input_tokens: "cached_input_tokens",
+  cache_creation_input_tokens: "cache_creation_input_tokens",
   reasoning_tokens: "reasoning_tokens",
   reasoningTokens: "reasoning_tokens",
   reasoning_output_tokens: "reasoning_tokens",
@@ -174,6 +177,7 @@ export function buildStageAccountingRecord(input: BuildStageAccountingRecordInpu
   const record: StageAccountingRecord = {
     schema_version: STAGE_ACCOUNTING_SCHEMA_VERSION,
     run_id: cleanRequiredString(input.runId),
+    ...(input.invocationId ? { invocation_id: input.invocationId } : {}),
     issue: nonNegativeInteger(input.issue),
     stage: cleanRequiredString(input.stage),
     harness: cleanRequiredString(usage.harness ?? input.harness),
@@ -261,6 +265,8 @@ export function sanitizeStageAccountingRecord(record: StageAccountingRecord): St
     cost_usd: cost.usd,
   };
   const promptChars = finiteNonNegative(record.prompt_chars);
+  const invocationId = cleanOptionalString(record.invocation_id ?? null);
+  if (invocationId !== null) cleaned.invocation_id = invocationId;
   if (promptChars !== null) cleaned.prompt_chars = nonNegativeInteger(promptChars);
   const promptEstimatedTokens = finiteNonNegative(record.prompt_estimated_tokens);
   if (promptEstimatedTokens !== null) cleaned.prompt_estimated_tokens = nonNegativeInteger(promptEstimatedTokens);

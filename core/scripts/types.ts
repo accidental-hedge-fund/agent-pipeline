@@ -2221,6 +2221,7 @@ export interface StageAccountingUsage {
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
   cached_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
   reasoning_tokens?: number | null;
   cost_usd?: number | null;
 }
@@ -2230,6 +2231,8 @@ export interface StageAccountingUsage {
 export interface StageAccountingRecord {
   schema_version: number;
   run_id: string;
+  /** A single execution attempt, distinct from a native harness session. */
+  invocation_id?: string;
   issue: number;
   stage: string;
   harness: string;

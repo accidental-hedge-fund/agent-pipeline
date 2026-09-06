@@ -238,6 +238,7 @@ Uninstall removes the host skill tree. For Claude it also removes legacy install
 | **[docs/cli.md](docs/cli.md)** | Full CLI command reference (generated from the command registry) |
 | **[docs/config.md](docs/config.md)** | `.github/pipeline.yml` config key reference (generated from the Zod schema) |
 | **[docs/concepts.md](docs/concepts.md)** | Advanced/optional topics: [implementer/reviewer pair](docs/concepts.md#implementer-and-reviewer-pair), gates, OpenSpec, review policy, desktop integration, troubleshooting |
+| **[docs/observability.md](docs/observability.md)** | Optional fleet telemetry, pipeline attribution, accounting ownership, and rollback |
 | **[CHANGELOG.md](CHANGELOG.md)** | Per-version release history (generated from git tags) |
 | **[ROADMAP.md](ROADMAP.md)** | Human-readable forward plan (GitHub milestones are release-plan authority) |
 

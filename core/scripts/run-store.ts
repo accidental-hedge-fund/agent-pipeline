@@ -43,6 +43,7 @@ import type {
   PlanningLeverageSnapshotEvent,
 } from "./planning-leverage/schema.ts";
 import { accountingSummary, sanitizeStageAccountingRecord } from "./accounting.ts";
+import { enqueueAccountingObservation } from "./observability.ts";
 import { RUNS_ARTIFACT, HISTORY_ARTIFACT, artifactSubdir } from "./artifact-ignore.ts";
 import {
   buildEvidenceSubjectDiagnostics,
@@ -1003,6 +1004,8 @@ export function writeHealthForOperatorSurface(
 // ---------------------------------------------------------------------------
 
 export interface RunStoreDeps {
+  /** Optional local-only export; injected test deps perform no ambient I/O. */
+  accountingSink?: (runDir: string, record: StageAccountingRecord) => Promise<void>;
   readFile: (p: string) => Promise<string>;
   writeFile: (p: string, data: string) => Promise<void>;
   /** Append to file using O_APPEND semantics (create if absent). */
@@ -1047,6 +1050,7 @@ export interface RunStoreDeps {
 }
 
 export const defaultRunStoreDeps: RunStoreDeps = {
+  accountingSink: enqueueAccountingObservation,
   readFile: (p) => fsp.readFile(p, "utf8"),
   writeFile: (p, data) => fsp.writeFile(p, data, "utf8"),
   appendFile: (p, data) => fsp.appendFile(p, data, "utf8"),
@@ -1122,6 +1126,8 @@ export interface RunMeta {
   /** Ordered work-list issue numbers when known at train init. */
   ordered_issues?: number[];
   repo: string;
+  /** Owning durable loop when explicitly supplied by the dispatcher. */
+  loop_run_id?: string;
   profile: string | null;
   started_at: string;
   /** Omitted when the engine identity cannot be resolved at run-directory
@@ -1167,6 +1173,7 @@ export interface InitRunDirOpts {
   selector?: TrainRunSelector;
   orderedIssues?: readonly number[];
   repo: string;
+  loopRunId?: string;
   profile: string | null;
   startedAt: string;
   engine?: RunEngineIdentity;
@@ -1237,6 +1244,7 @@ export async function initRunDir(
       run_id: opts.runId,
       logical_operation_id: logicalOperationId,
       repo: opts.repo,
+      ...(opts.loopRunId ? { loop_run_id: opts.loopRunId } : {}),
       profile: opts.profile,
       started_at: opts.startedAt,
       ...(isTrain
@@ -2153,6 +2161,11 @@ export async function emitStageAccounting(
     console.warn(
       `[pipeline] run-store: emitStageAccounting failed (non-fatal): ${(err as Error).message}`,
     );
+  }
+  try {
+    await deps.accountingSink?.(runDir, event);
+  } catch (err) {
+    console.warn(`[pipeline] observability export failed (non-fatal): ${(err as Error).message}`);
   }
 }
 
