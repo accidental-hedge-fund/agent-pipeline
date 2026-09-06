@@ -78,6 +78,7 @@ function makeDeps(opts: {
   runDeltaReview?: RunDeltaReviewFn;
   getCommitDeltaDiff?: () => Promise<string>;
   priorCeilingSha?: string;
+  postCeilingDeltaSha?: string;
 }): { deps: ShaGateDeps; rec: Rec; cfg: PipelineConfig } {
   const rec: Rec = { comments: [], transitions: [], blocked: [], createIssueCalls: [], addIssueCommentCalls: [] };
   const comments = fourPriorDeltaComments(opts.finalBlocking);
@@ -87,6 +88,12 @@ function makeDeps(opts: {
       body:
         "## Pipeline: Pre-merge delta round ceiling reached — human decision required\n" +
         `<!-- reviewed-sha: ${opts.priorCeilingSha} -->`,
+    });
+  }
+  if (opts.postCeilingDeltaSha) {
+    comments.push({
+      author: TEST_ACTOR,
+      body: deltaComment(opts.postCeilingDeltaSha, computeDiffHash(diffFor(4)), opts.finalBlocking),
     });
   }
   const cfg = {
@@ -240,6 +247,33 @@ test("enforceReviewShaGate: a fixed successor gets reviewed after a superseded c
     await enforceReviewShaGate(cfg, 483, 99, deps);
   });
   assert.equal(reviewerCalls, 1, "stale exhausted history must not park the successor without review");
+});
+
+test("enforceReviewShaGate: H1 ceiling then H2 delta then H3 fix routes to bounded full review", async (t) => {
+  let reviewerCalls = 0;
+  const { deps, rec, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING],
+    maxDeltaRounds: 4,
+    ceilingAction: "park",
+    priorCeilingSha: SHA_3,
+    postCeilingDeltaSha: SHA_4,
+    runDeltaReview: async () => {
+      reviewerCalls += 1;
+      return { verdict: "approve", findings: [], summary: "must not run" } as DeltaReviewResult;
+    },
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 483, 99, deps);
+  });
+  assert.equal(reviewerCalls, 0, "H3 must not receive another unbounded delta review");
+  assert.deepEqual(out, {
+    advanced: true,
+    from: "pre-merge",
+    to: "review-2",
+    summary: "delta-review budget exhausted; superseding fix requires a fresh full review",
+  });
+  assert.deepEqual(rec.transitions.at(-1), { from: "pre-merge", to: "review-2" });
 });
 
 test("enforceReviewShaGate: hitting the delta-round ceiling never consumes max_adversarial_rounds budget", async (t) => {

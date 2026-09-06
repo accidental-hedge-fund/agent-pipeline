@@ -265,7 +265,8 @@ The comment the pipeline posts at the ceiling SHALL name the observed round coun
 - **GIVEN** a prior candidate head exhausted `review_policy.max_delta_rounds`
 - **WHEN** a fix produces a new candidate head
 - **THEN** the stale ceiling SHALL NOT prevent the new candidate's first delta review
-- **AND** after that review is recorded for the new head, the durable item-level ceiling SHALL apply again
+- **AND** after that review is recorded for the new head, the durable item-level delta ceiling SHALL apply again
+- **AND** if a further fix supersedes that reviewed successor, pre-merge SHALL route the new candidate to a bounded full review rather than granting another delta reset or parking it on stale findings
 
 #### Scenario: Ceiling under park routes to needs-human
 

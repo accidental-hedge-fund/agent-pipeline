@@ -70,6 +70,7 @@ import {
   buildPriorRoundDigest,
   countDeltaRounds,
   hasSupersededDeltaCeiling,
+  hasSupersededPostCeilingDelta,
   detectSuspectedChurn,
   priorAdvisoryFindings,
   priorAdvisorySurfaceFiles,
@@ -1086,6 +1087,20 @@ export async function enforceReviewShaGate(
         trustedOverrideActors: cfg.trusted_override_actors,
         candidateSha: head,
       });
+      const spentResetWasSuperseded = hasSupersededPostCeilingDelta(detail.comments, {
+        actor,
+        trustedOverrideActors: cfg.trusted_override_actors,
+        candidateSha: head,
+      });
+      if (deltaRoundCap > 0 && deltaRoundCount >= deltaRoundCap && spentResetWasSuperseded) {
+        await transitionFn(cfg, issueNumber, "pre-merge", "review-2");
+        return {
+          advanced: true,
+          from: "pre-merge",
+          to: "review-2",
+          summary: "delta-review budget exhausted; superseding fix requires a fresh full review",
+        };
+      }
       if (deltaRoundCap > 0 && deltaRoundCount >= deltaRoundCap && !staleCeilingReset) {
         if (deps.runDir) {
           const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");

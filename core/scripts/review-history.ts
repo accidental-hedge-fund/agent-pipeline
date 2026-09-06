@@ -571,6 +571,27 @@ export function hasSupersededDeltaCeiling(
   return !!priorDelta && !deltaReviewTargetsCandidate(priorDelta.body, opts.candidateSha);
 }
 
+/** A post-ceiling delta was spent, then its candidate was superseded again. */
+export function hasSupersededPostCeilingDelta(
+  comments: { author: string | null; body: string }[],
+  opts: { actor: string | null; trustedOverrideActors?: string[]; candidateSha: string },
+): boolean {
+  if (opts.actor === null) return false;
+  const trusted = new Set<string>(opts.trustedOverrideActors ?? []);
+  trusted.add(opts.actor);
+  const trustedComments = comments.filter((c) => c.author !== null && trusted.has(c.author));
+  const ceilingIndex = trustedComments.findLastIndex((c) =>
+    c.body.startsWith("## Pipeline: Pre-merge delta round ceiling reached")
+  );
+  if (ceilingIndex < 0) return false;
+  const postCeilingDelta = trustedComments
+    .slice(ceilingIndex + 1)
+    .filter((c) => c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX))
+    .at(-1);
+  return !!postCeilingDelta &&
+    !deltaReviewTargetsCandidate(postCeilingDelta.body, opts.candidateSha);
+}
+
 /**
  * Counts an issue's prior pre-merge delta rounds purely from its comment
  * thread (#483): a comment counts as one delta round when its body begins

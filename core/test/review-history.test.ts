@@ -10,6 +10,7 @@ import {
   DIGEST_MAX_ENTRIES_PER_ROUND,
   DIGEST_MAX_ROUNDS,
   hasSupersededDeltaCeiling,
+  hasSupersededPostCeilingDelta,
   matchSettledAlternative,
   matchSettledFinding,
   renderPriorRoundDigest,
@@ -1090,6 +1091,14 @@ test("hasSupersededDeltaCeiling: a fixed successor can escape a stale exhausted 
     hasSupersededDeltaCeiling(comments, { actor: "pipeline-bot", candidateSha: "c".repeat(40) }),
     false,
     "H1 ceiling → H2 review cannot grant another reset to H3",
+  );
+  assert.equal(
+    hasSupersededPostCeilingDelta(comments, {
+      actor: "pipeline-bot",
+      candidateSha: "c".repeat(40),
+    }),
+    true,
+    "H3 must leave the exhausted delta path for a bounded full review",
   );
 });
 
