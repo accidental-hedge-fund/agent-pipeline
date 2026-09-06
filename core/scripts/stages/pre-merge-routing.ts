@@ -665,11 +665,24 @@ export async function advance(
     }
 
     // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
+    const resolveArchiveDelivery = deps.resolveLinkedPrDelivery ?? resolveLinkedPrDelivery;
     const archiveOutcome = await maybeArchiveOpenspec(
       cfg,
       issueNumber,
       pipelineRunId,
-      { ...deps, runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+      {
+        ...deps,
+        runDir: opts.runDir,
+        runStoreDeps: opts.runStoreDeps,
+        // Bind archive delivery to the same per-tick PR snapshot already used
+        // by the SHA gate; maybeArchiveOpenspec remains directly testable with
+        // legacy synthetic fixtures when this production seam is absent.
+        resolveLinkedPrDelivery: (deliveryCfg, deliveryIssue) =>
+          resolveArchiveDelivery(deliveryCfg, deliveryIssue, {
+            getPrForIssue: async () => prNumber,
+            getPrDetail: async () => prDetail,
+          }),
+      },
       opts.stateDir,
       prNumber,
     );

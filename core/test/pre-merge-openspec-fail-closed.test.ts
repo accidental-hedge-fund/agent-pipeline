@@ -493,7 +493,16 @@ test("advance(): #464 shape — worktree misreports OpenSpec inactive but the PR
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR,
     getIssueDetail: (async () => ({ comments: [{ body: reviewComment, author: "test-actor" }] })) as AdvancePreMergeDeps["getIssueDetail"],
-    getPrDetail: (async () => ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" })) as AdvancePreMergeDeps["getPrDetail"],
+    getPrDetail: (async () => ({
+      number: PR,
+      state: "open",
+      head_ref: "b",
+      head_sha: SHA_HEAD,
+      head_repo_full_name: cfg.repo,
+      is_cross_repository: false,
+      mergeable: true,
+      mergeable_state: "CLEAN",
+    })) as AdvancePreMergeDeps["getPrDetail"],
     getPrCommits: async () => [],
     getPrChecks: (async () => [{ name: "ci", bucket: "pass" }]) as AdvancePreMergeDeps["getPrChecks"],
     // Worktree present but reports OpenSpec inactive (the exact class of bug D1
@@ -540,7 +549,16 @@ test("advance(): openspec.enabled off → head-side guard is skipped even though
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR,
     getIssueDetail: (async () => ({ comments: [{ body: reviewComment, author: "test-actor" }] })) as AdvancePreMergeDeps["getIssueDetail"],
-    getPrDetail: (async () => ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" })) as AdvancePreMergeDeps["getPrDetail"],
+    getPrDetail: (async () => ({
+      number: PR,
+      state: "open",
+      head_ref: "b",
+      head_sha: SHA_HEAD,
+      head_repo_full_name: cfg.repo,
+      is_cross_repository: false,
+      mergeable: true,
+      mergeable_state: "CLEAN",
+    })) as AdvancePreMergeDeps["getPrDetail"],
     getPrCommits: async () => [],
     getPrChecks: (async () => [{ name: "ci", bucket: "pass" }]) as AdvancePreMergeDeps["getPrChecks"],
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
@@ -601,7 +619,16 @@ test("advance(): override-resumed pre-merge (blocking delta-review key overridde
         { body: overrideComment, author: "test-actor" },
       ],
     })) as AdvancePreMergeDeps["getIssueDetail"],
-    getPrDetail: (async () => ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" })) as AdvancePreMergeDeps["getPrDetail"],
+    getPrDetail: (async () => ({
+      number: PR,
+      state: "open",
+      head_ref: "b",
+      head_sha: SHA_HEAD,
+      head_repo_full_name: cfg.repo,
+      is_cross_repository: false,
+      mergeable: true,
+      mergeable_state: "CLEAN",
+    })) as AdvancePreMergeDeps["getPrDetail"],
     getPrCommits: async () => [],
     getPrChecks: (async () => [{ name: "ci", bucket: "pass" }]) as AdvancePreMergeDeps["getPrChecks"],
     // Shared active-change set comes from PR tip (#714); must not hit network.

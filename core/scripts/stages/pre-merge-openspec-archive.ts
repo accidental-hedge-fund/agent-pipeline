@@ -46,6 +46,7 @@ import {
 import { invoke } from "../harness.ts";
 import {
   DEFAULT_GIT_PUSH_AUTH,
+  deliveryPushArgs,
   formatPushAuthFailure,
   gitExecForwardingEnv,
   runConfiguredGitPush,
@@ -349,6 +350,36 @@ export async function maybeArchiveOpenspec(
     return preMergeBlocked(reason, "openspec-invalid", "openspec-invalid", diagnostic);
   };
 
+  // Explicitly-disabled OpenSpec is a true no-op: do not require delivery
+  // authority for a mutation that cannot occur.
+  const mode = cfg.openspec?.enabled ?? "auto";
+  if (mode === "off") {
+    await recordDecision("skipped", "openspec-inactive");
+    return null;
+  }
+
+  // A managed branch is workspace identity only. Resolve the exact same-repo
+  // delivery identity lazily once we know an archive/rematerialization mutation
+  // is required. Inactive OpenSpec remains a side-effect-free no-op.
+  let delivery: Awaited<ReturnType<typeof resolveLinkedPrDelivery>> = null;
+  let deliveryResolutionAttempted = false;
+  const requireDelivery = async (): Promise<Outcome | null> => {
+    if (prNumber === undefined || !deps.resolveLinkedPrDelivery) return null;
+    if (!deliveryResolutionAttempted) {
+      deliveryResolutionAttempted = true;
+      delivery = await deps.resolveLinkedPrDelivery(cfg, issueNumber, {
+        getPrForIssue: async () => prNumber,
+        getPrDetail: deps.getPrDetail,
+      });
+    }
+    if (delivery) return null;
+    const reason =
+      "Pre-merge OpenSpec archive could not resolve an open same-repository linked PR delivery identity";
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "head-drift");
+    await recordDecision("fail", reason);
+    return preMergeBlocked(reason, "head-drift");
+  };
+
   let wt = await getForIssueFn(cfg, issueNumber);
   if (!wt) {
     // Worktree missing: resolve active membership from the reviewed PR-head tree
@@ -357,8 +388,7 @@ export async function maybeArchiveOpenspec(
     // disables the integration outright regardless of tip contents.
     // When tip has active change(s) or membership is unconfirmed, rematerialize
     // first (#769) instead of parking needs-human solely for absence.
-    const mode = cfg.openspec?.enabled ?? "auto";
-    if (mode === "off" || prNumber === undefined) {
+    if (prNumber === undefined) {
       await recordDecision("skipped", "openspec-inactive");
       return null;
     }
@@ -393,11 +423,23 @@ export async function maybeArchiveOpenspec(
       return null;
     }
 
+    const deliveryBlock = await requireDelivery();
+    if (deliveryBlock) return deliveryBlock;
+
     const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
     const remat = await ensureFn(cfg, issueNumber, {
       getOnDiskForIssue: getForIssueFn,
       runDir: deps.runDir,
       runStoreDeps: deps.runStoreDeps,
+      ...(delivery
+        ? {
+            recoveryTarget: {
+              branch: delivery.branch,
+              headSha: delivery.headSha,
+              prNumber: delivery.prNumber,
+            },
+          }
+        : {}),
     });
     if (remat.result === "fail") {
       if (isOccupiedWorktreeFault(remat)) {
@@ -443,6 +485,8 @@ export async function maybeArchiveOpenspec(
     await recordDecision("skipped", "openspec-inactive");
     return null;
   }
+  const deliveryBlock = await requireDelivery();
+  if (deliveryBlock) return deliveryBlock;
 
   // Shared active-change set is finalized ONLY after archive-base sync below
   // (#714). Do not emit `no-candidates` from a pre-sync PR path probe — an empty
@@ -545,7 +589,8 @@ export async function maybeArchiveOpenspec(
   // guard above so the fast-forward always operates on a known-clean tree.
   // Final candidate resolution (#714) happens only after this sync so a lagging
   // worktree cannot omit stacked/foreign active changes present on the reviewed head.
-  const branch = branchName(issueNumber, wt.slug);
+  const managedBranch = branchName(issueNumber, wt.slug);
+  const branch = delivery?.branch ?? managedBranch;
   // Fetch with an explicit refspec so `refs/remotes/origin/<branch>` itself is updated —
   // `git fetch origin <branch>` with no destination only populates FETCH_HEAD, leaving the
   // tracking ref (and the `rev-parse origin/<branch>` read below) stale (#579 review 1).
@@ -577,6 +622,13 @@ export async function maybeArchiveOpenspec(
     return preMergeBlocked("rev-parse failed before archive", "needs-human");
   }
   const reviewedHead = reviewedHeadRes.stdout.trim();
+  if (delivery && reviewedHead.toLowerCase() !== delivery.headSha.toLowerCase()) {
+    const reason =
+      `fresh origin/${branch} head \`${reviewedHead}\` != authorized PR head \`${delivery.headSha}\``;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "head-drift");
+    await recordDecision("fail", reason);
+    return preMergeBlocked(reason, "head-drift");
+  }
   let archiveBase = localHeadBefore.stdout.trim();
   if (archiveBase !== reviewedHead) {
     // Fast-forward only — never a merge/rebase that could rewrite history. If the
@@ -934,15 +986,18 @@ export async function maybeArchiveOpenspec(
     await recordDecision("fail", "archive commit failed");
     return preMergeBlocked("archive commit failed", "push-failed");
   }
-  // Plain push, deliberately never `--force`/`--force-with-lease` (#579): a
-  // non-fast-forward rejection here means the remote moved again since the
-  // sync guard above ran, and that is a block signal, not a cue to overwrite
-  // the reviewed head. Configured push-auth (#980) owns the transport.
+  // An adopted PR branch publishes with an exact expected-head lease; legacy
+  // direct-call fixtures without delivery identity retain their plain push.
+  // Either form rejects remote movement after the sync guard rather than
+  // overwriting a newer head. Configured push-auth (#980) owns the transport.
   const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
+  const pushArgs = delivery
+    ? deliveryPushArgs(managedBranch, branch, delivery.headSha)
+    : ["push", "origin", branch];
   const push = await runConfiguredGitPush({
     cwd: wt.path,
     auth: pushAuth,
-    args: ["push", "origin", branch],
+    args: pushArgs,
     deps: {
       gitConfigGet: async (cwd, key) => {
         const r = await gitFn(cwd, ["config", "--get", key], { ignoreFailure: true });
@@ -957,7 +1012,7 @@ export async function maybeArchiveOpenspec(
       issueNumber,
       "pre-merge",
       makeCommandRecord(
-        `git push origin ${branch}`,
+        `git ${pushArgs.join(" ")}`,
         push.code,
         0,
         push.code !== 0

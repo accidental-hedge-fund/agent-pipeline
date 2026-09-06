@@ -859,6 +859,32 @@
       "migrated_outcome": "compatibility park projection"
     },
     {
+      "site_id": "stages.pre-merge-openspec-archive:head-drift#0",
+      "module": "scripts/stages/pre-merge-openspec-archive.ts",
+      "line": 367,
+      "occurrence": 0,
+      "match": "Pre-merge OpenSpec archive could not resolve an open same-repository linked PR delivery identity",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "head-drift",
+      "canonical_reason": "workflow-state",
+      "notes": "archive mutation requires exact same-repository PR delivery authority (#1478)",
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
+    },
+    {
+      "site_id": "stages.pre-merge-openspec-archive:head-drift#1",
+      "module": "scripts/stages/pre-merge-openspec-archive.ts",
+      "line": 613,
+      "occurrence": 1,
+      "match": "fresh origin/${branch} head `${reviewedHead}` != authorized PR head `${delivery.headSha}`",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "head-drift",
+      "canonical_reason": "workflow-state",
+      "notes": "fresh fetched delivery head must equal the authorized PR candidate before archive mutation (#1478)",
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
+    },
+    {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#0",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
       "line": 212,
