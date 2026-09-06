@@ -31,6 +31,7 @@ import {
   buildRequiredEvidenceSetRevision,
   resolveVerifierFingerprint,
 } from "../scripts/evidence-subject.ts";
+import { computeTrustedSurfaceFromObjectSource } from "../scripts/trusted-surface-candidate.ts";
 
 const CANDIDATE = "a".repeat(40);
 const BASE = "b".repeat(40);
@@ -542,4 +543,38 @@ test("resolveVerifierFingerprint: passthrough/rebound use effective hash; blocke
   const legacy = resolveVerifierFingerprint({ engineFingerprint: engineFp });
   assert.ok(legacy);
   assert.notEqual(legacy, pass.effective_verifier_hash);
+});
+
+test("object-source refresh recomputes a live candidate instead of reusing persisted state", async () => {
+  const decision = await computeTrustedSurfaceFromObjectSource({
+    candidateSha: CANDIDATE,
+    enginePin: ENGINE,
+    source: {
+      resolveBaseSha: async () => BASE,
+      listChangedPaths: async () => ({ paths: ["src/current.ts"] }),
+      readBaseBlob: async () => ({ kind: "content", content: "base" }),
+    },
+  });
+
+  assert.equal(decision.candidate_sha, CANDIDATE);
+  assert.equal(decision.base_sha, BASE);
+  assert.equal(decision.outcome, "passthrough");
+  assert.ok(decision.effective_verifier_hash);
+});
+
+test("object-source refresh fails closed when a changed trusted base blob is unreadable", async () => {
+  const decision = await computeTrustedSurfaceFromObjectSource({
+    candidateSha: CANDIDATE,
+    enginePin: ENGINE,
+    source: {
+      resolveBaseSha: async () => BASE,
+      listChangedPaths: async () => ({ paths: [".github/pipeline.yml"] }),
+      readBaseBlob: async () => ({ kind: "unreadable", error: "missing base object" }),
+    },
+  });
+
+  assert.equal(decision.outcome, "blocked");
+  assert.equal(decision.effective_verifier_hash, null);
+  assert.equal(decision.reason.code, "base_unreadable");
+  assert.match(decision.reason.summary, /missing base object/);
 });

@@ -5704,6 +5704,85 @@ test("typed production-preflight refusal does not claim scratch or dirt recipes"
   assert.equal(actions.includes("publish_unpublished_stage_commit"), false);
 });
 
+test("tester evidence-ordering diagnostic skips scratch/publish and claims rebind", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const actions: string[] = [];
+  let dispatchCount = 0;
+  const prHead = "a".repeat(40);
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "required implementation evidence role, observed missing",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      trusted_surface_outcome: "passthrough",
+      pr_head: prHead,
+      subject_omitted_because_unobservable: true,
+    },
+  });
+  const observe = fakeObserveDeps({
+    async getLocalHead() {
+      return { branch: "pipeline/100-x", sha: prHead };
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    if (dispatchCount === 1) {
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "blocked_recoverable",
+        evidence: { pr_number: 99, pipeline_run_id: "advance-100" },
+        diagnostic,
+      };
+    }
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: 99, pipeline_run_id: "advance-100-retry" },
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    actions.push(input.action);
+    return { succeeded: true, evidence: "rebound tester evidence" };
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const cycle = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(cycle.stop, null);
+  assert.deepEqual(actions, ["rebind_tester_evidence_after_pr"]);
+  const finalLedger = await readLedger(deps, "run-1");
+  const skipped = finalLedger.recovery_attempts
+    .filter((attempt) => attempt.outcome === "skipped")
+    .map((attempt) => attempt.action);
+  assert.deepEqual(skipped, [
+    "unlink_engine_scratch",
+    "checkpoint_owned_harness_dirt",
+    "publish_unpublished_stage_commit",
+  ]);
+  assert.equal(
+    finalLedger.recovery_attempts.some(
+      (attempt) =>
+        attempt.action === "rebind_tester_evidence_after_pr" && attempt.outcome !== "skipped",
+    ),
+    true,
+  );
+});
+
 test("inapplicable never-started preflight recipes are not recovery exhaustion", async () => {
   const engineDefect = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
   const contract = testContract({

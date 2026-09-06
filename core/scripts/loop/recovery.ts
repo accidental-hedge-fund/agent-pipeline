@@ -222,13 +222,15 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
     repeated_evidence_limit: 3,
   },
   "workflow-engine-defect": {
-    // #1020 / #1246 / #1272: unlink scratch, then checkpoint owned leftovers,
-    // then publish an unpublished stage commit, then restart/repair.
-    // Publish is before implementer repair.
+    // #1020 / #1246 / #1272 / #1468: unlink scratch, then checkpoint owned leftovers,
+    // then publish an unpublished stage commit, then rebind Tester evidence after PR,
+    // then restart/repair. Publish is before implementer repair. Rebind is
+    // diagnostic-scoped (inapplicable for unrelated engine defects).
     recipes: [
       "unlink_engine_scratch",
       "checkpoint_owned_harness_dirt",
       "publish_unpublished_stage_commit",
+      "rebind_tester_evidence_after_pr",
       "restart_workflow_engine",
       "repair_pipeline_item",
     ],
@@ -295,6 +297,21 @@ const STALE_DEFAULT_POLICY_ENTRIES: Partial<Record<DurableBlockerClass, readonly
       recipes: [
         "unlink_engine_scratch",
         "checkpoint_owned_harness_dirt",
+        "restart_workflow_engine",
+        "repair_pipeline_item",
+      ],
+      retry_budget: 2,
+      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
+      terminal_outcome: "retry",
+      run_fatal: true,
+      repeated_evidence_limit: 2,
+    },
+    // Pre-#1468 default (unlink, checkpoint, publish, restart/repair; no Tester rebind).
+    {
+      recipes: [
+        "unlink_engine_scratch",
+        "checkpoint_owned_harness_dirt",
+        "publish_unpublished_stage_commit",
         "restart_workflow_engine",
         "repair_pipeline_item",
       ],

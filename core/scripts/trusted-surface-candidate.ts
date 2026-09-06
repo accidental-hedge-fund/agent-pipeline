@@ -11,7 +11,12 @@
 import { STAGES, type Stage } from "./types.ts";
 import {
   classifyGitShowResult,
+  classifyPaths,
+  computeTrustedSurfaceDecision,
   normalizeFullSha,
+  type TrustedEnginePin,
+  type TrustedSurfaceDecision,
+  type TrustedSurfaceExtraPath,
 } from "./trusted-surface.ts";
 
 /** All-zero SHA written only when fail-closed persist needs a schema-complete field. */
@@ -73,6 +78,97 @@ export type TrustedSurfaceObjectSource = {
     | { kind: "unreadable"; error: string }
   >;
 };
+
+export type ComputeTrustedSurfaceFromObjectSourceInput = {
+  candidateSha: string;
+  enginePin: TrustedEnginePin;
+  extraPaths?: readonly TrustedSurfaceExtraPath[];
+  source: TrustedSurfaceObjectSource;
+};
+
+/**
+ * Recompute the trusted-surface decision for an already-resolved candidate.
+ * Recovery can use the same git-object authority as ordinary no-worktree
+ * execution; callers persist the result in their authoritative run directory.
+ */
+export async function computeTrustedSurfaceFromObjectSource(
+  input: ComputeTrustedSurfaceFromObjectSourceInput,
+): Promise<TrustedSurfaceDecision> {
+  const candidateSha = normalizeFullSha(input.candidateSha);
+  if (!candidateSha) {
+    return computeTrustedSurfaceDecision({
+      candidate_paths: [".github/pipeline.yml"],
+      candidate_sha: TRUSTED_SURFACE_SENTINEL_SHA,
+      base_sha: null,
+      engine_pin: input.enginePin,
+      base_readable: false,
+    });
+  }
+
+  const baseSha = normalizeFullSha(
+    input.source.resolveBaseSha
+      ? await input.source.resolveBaseSha(candidateSha).catch(() => null)
+      : null,
+  );
+  const listed = await input.source.listChangedPaths(baseSha, candidateSha);
+  if ("error" in listed) {
+    const blocked = computeTrustedSurfaceDecision({
+      candidate_paths: [".github/pipeline.yml"],
+      candidate_sha: candidateSha,
+      base_sha: baseSha,
+      engine_pin: input.enginePin,
+      base_readable: false,
+    });
+    return {
+      ...blocked,
+      outcome: "blocked",
+      effective_verifier_hash: null,
+      reason: { code: "diff_unresolved", summary: listed.error },
+    };
+  }
+
+  const extraPaths = input.extraPaths ?? [];
+  const touched = [...new Set(classifyPaths(listed.paths, extraPaths).map((c) => c.path))];
+  const baseBlobs = new Map<string, string | null>();
+  let baseError = "";
+  if (baseSha && touched.length > 0) {
+    if (!input.source.readBaseBlob) {
+      baseError = "Trusted-surface object source cannot read base blobs for changed paths";
+    } else {
+      for (const path of touched) {
+        const blob = await input.source.readBaseBlob(baseSha, path);
+        if (blob.kind === "content") baseBlobs.set(path, blob.content);
+        else if (blob.kind === "absent") baseBlobs.set(path, null);
+        else {
+          baseError = blob.error;
+          break;
+        }
+      }
+    }
+  }
+
+  let decision = computeTrustedSurfaceDecision({
+    candidate_paths: listed.paths,
+    candidate_sha: candidateSha,
+    base_sha: baseSha,
+    engine_pin: input.enginePin,
+    base_readable: baseSha !== null && !baseError,
+    extra_paths: extraPaths,
+    read_base_content: (path) => {
+      if (!baseBlobs.has(path)) throw new Error(`base content not resolved for path: ${path}`);
+      return baseBlobs.get(path)!;
+    },
+  });
+  if (baseError) {
+    decision = {
+      ...decision,
+      outcome: "blocked",
+      effective_verifier_hash: null,
+      reason: { code: "base_unreadable", summary: baseError },
+    };
+  }
+  return decision;
+}
 
 export function isTrustedSurfaceSentinelSha(sha: string | null | undefined): boolean {
   if (typeof sha !== "string") return false;

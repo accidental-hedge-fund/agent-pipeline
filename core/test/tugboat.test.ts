@@ -63,6 +63,9 @@ function tugboatSpawnEnv(
     delete env.TUGBOAT_SKIP_TRAIN;
     delete env.TUGBOAT_CANDIDATE_COMPOSER;
   }
+  // Host/pipeline child env can pin a real checkout. The unavailable-engine
+  // pin stub treats this as a successful candidate and skips fail-closed.
+  delete env.PIPELINE_CANDIDATE_ENGINE_ROOT;
   Object.assign(env, extra);
   return env;
 }
@@ -5882,12 +5885,14 @@ test("tugboatSpawnEnv omits inherited skip-train unless asserting skip-train (#1
         TUGBOAT_SKIP_TRAIN: "1",
         TUGBOAT_CANDIDATE_COMPOSER: "deadbeef",
         TUGBOAT_CANDIDATE_SHA: "parent-sha",
+        PIPELINE_CANDIDATE_ENGINE_ROOT: "/host/engine",
         PATH: "/usr/bin",
       },
     },
   );
   assert.equal(isolated.TUGBOAT_SKIP_TRAIN, undefined);
   assert.equal(isolated.TUGBOAT_CANDIDATE_COMPOSER, undefined);
+  assert.equal(isolated.PIPELINE_CANDIDATE_ENGINE_ROOT, undefined);
   assert.equal(isolated.TUGBOAT_CANDIDATE_SHA, "c".repeat(40));
   assert.equal(isolated.TUGBOAT_BASE_BRANCH, "main");
   assert.equal(isolated.TUGBOAT_OPEN_RELEASE_PR, "12");
@@ -5897,6 +5902,11 @@ test("tugboatSpawnEnv omits inherited skip-train unless asserting skip-train (#1
     { inheritParentSkipTrain: true, parentEnv: tugboatReleaseCiParentEnv() },
   );
   assert.equal(inherited.TUGBOAT_SKIP_TRAIN, "1");
+  const fixtureRoot = tugboatSpawnEnv(
+    { PIPELINE_CANDIDATE_ENGINE_ROOT: "/fixture/cand" },
+    { parentEnv: { PIPELINE_CANDIDATE_ENGINE_ROOT: "/host/engine" } },
+  );
+  assert.equal(fixtureRoot.PIPELINE_CANDIDATE_ENGINE_ROOT, "/fixture/cand");
 });
 
 test("named #1150 / #1151 spawn-real tugboat tests keep original FRG and candidate assertions (#1192)", () => {
@@ -5911,6 +5921,7 @@ test("named #1150 / #1151 spawn-real tugboat tests keep original FRG and candida
   assert.match(src, /FRG pack still in_progress within wait budget/);
   assert.match(src, /candidate-engine identity defect|cannot resolve candidate engine/);
   assert.match(src, /tugboatSpawnEnv/);
+  assert.match(src, /delete env\.PIPELINE_CANDIDATE_ENGINE_ROOT/);
   assert.match(src, /assertSkipTrainProof/);
 });
 

@@ -193,6 +193,12 @@ export const RECOVERY_RECIPES = [
    * Ordered after checkpoint_owned_harness_dirt and before repair.
    */
   "publish_unpublished_stage_commit",
+  /**
+   * #1468: bind or reproduce SHA-matched Tester evidence after PR-backed
+   * trusted-surface resolution. Diagnostic-scoped for the evidence-ordering
+   * refuse; inapplicable for unrelated workflow-engine-defect.
+   */
+  "rebind_tester_evidence_after_pr",
   "repair_pipeline_item",
   "rerun_ci",
   "resync_workflow_state",

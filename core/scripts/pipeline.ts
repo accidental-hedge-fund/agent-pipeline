@@ -90,6 +90,11 @@ import { makePipelineRunId } from "./traceability.ts";
 import { mintLogicalOperationId } from "./logical-operation.ts";
 import { normalizeFullSha } from "./trusted-surface.ts";
 import {
+  computeTrustedSurfaceFromObjectSource,
+  gitRepoObjectSource,
+  type ComputeTrustedSurfaceFromObjectSourceInput,
+} from "./trusted-surface-candidate.ts";
+import {
   branchName,
   ensureManagedWorktree,
   getForIssue,
@@ -122,6 +127,8 @@ import {
   type PublishUnpublishedExecutorDeps,
 } from "./unpublished-stage-commit.ts";
 import { resolveEngineCommitSha } from "./engine-attribution.ts";
+
+import { buildEngineFingerprint } from "./evidence-subject.ts";
 import { formatPipelineVersionJson } from "./ship-end-identity.ts";
 import {
   bundlePath,
@@ -150,6 +157,9 @@ import {
   listRunIds,
   parseWriteHealthText,
   persistPublicEntrypointAdmission,
+  persistTrustedSurfaceDecision,
+  readTrustedSurfaceDecision,
+  resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
   runsDir,
@@ -157,6 +167,7 @@ import {
   writeHealthTextForReadFailure,
   type PublicAdmissionResult,
   type PublicEntrypointKind,
+  type RunEngineIdentity,
   type RunEventsSummary,
   type RunStoreDeps,
   type TerminalLogTee,
@@ -2035,6 +2046,49 @@ export interface RealExecuteRecoveryDeps {
   ownership?: OwnershipDeps;
   /** #1272: inspect/execute unpublished stage-commit publish. */
   publishUnpublished?: PublishUnpublishedExecutorDeps;
+  /** #1468: shared Tester bind-or-reproduce. Tests inject fakes. */
+  rebindTesterEvidenceAfterPr?: (
+    input: import("./rebind-tester-evidence-after-pr.ts").RebindTesterEvidenceAfterPrInput,
+  ) => Promise<import("./rebind-tester-evidence-after-pr.ts").RebindTesterEvidenceResult>;
+  getPrForIssue?: typeof getPrForIssue;
+  getPrDetail?: typeof getPrDetail;
+  readTrustedSurfaceDecision?: typeof import("./run-store.ts").readTrustedSurfaceDecision;
+  computeTrustedSurfaceFromObjectSource?: (
+    input: ComputeTrustedSurfaceFromObjectSourceInput,
+  ) => ReturnType<typeof computeTrustedSurfaceFromObjectSource>;
+  persistTrustedSurfaceDecision?: typeof persistTrustedSurfaceDecision;
+  /** Blocked-run engine identity from run.json (not the currently installed engine). */
+  resolveRunEngineIdentity?: typeof resolveRunEngineIdentity;
+}
+
+const TEMPLATES_FINGERPRINT_RE = /^[0-9a-f]{64}$/;
+
+function engineFingerprintFromPersistedRunEngine(
+  engine: RunEngineIdentity | null | undefined,
+): string | null {
+  if (!engine || typeof engine !== "object") return null;
+  if (typeof engine.version !== "string" || !engine.version.trim()) return null;
+  if (typeof engine.root !== "string" || !engine.root.trim()) return null;
+  if (
+    typeof engine.templates_fingerprint !== "string" ||
+    !TEMPLATES_FINGERPRINT_RE.test(engine.templates_fingerprint)
+  ) {
+    return null;
+  }
+  const rawCommit = engine.commit_sha;
+  if (rawCommit === undefined || rawCommit === null || rawCommit === "") {
+    return buildEngineFingerprint({
+      version: engine.version,
+      templates_fingerprint: engine.templates_fingerprint,
+    });
+  }
+  const commitSha = normalizeFullSha(typeof rawCommit === "string" ? rawCommit : null);
+  if (!commitSha) return null;
+  return buildEngineFingerprint({
+    version: engine.version,
+    templates_fingerprint: engine.templates_fingerprint,
+    commit_sha: commitSha,
+  });
 }
 
 /** Production provider-neutral recovery registry. Substantive repair delegates
@@ -2726,6 +2780,120 @@ export function realExecuteRecovery(
         return {
           succeeded: true,
           evidence: published.evidence,
+        };
+      }
+      case "rebind_tester_evidence_after_pr": {
+        const issueNumber = Number(input.itemId);
+        if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+          return failed(`rebind_tester_evidence_after_pr requires a positive numeric item id`);
+        }
+        if (input.blockerClass === "specification-decision" || input.blockerClass === "missing-authority") {
+          return failed(
+            `rebind_tester_evidence_after_pr does not apply to human-authority class ${input.blockerClass}`,
+          );
+        }
+        const rebindFn = deps.rebindTesterEvidenceAfterPr ??
+          (await import("./rebind-tester-evidence-after-pr.ts")).rebindTesterEvidenceAfterPr;
+        const getPr = deps.getPrForIssue ?? getPrForIssue;
+        const getDetailPr = deps.getPrDetail ?? getPrDetail;
+        const prNumber = await getPr(cfg, issueNumber).catch(() => null);
+        const prDetail = prNumber
+          ? await getDetailPr(cfg, prNumber).catch(() => null)
+          : null;
+        const runId = input.evidence?.pipeline_run_id?.trim() ?? "";
+        const runDir = runId ? runDirPath(cfg.repo_dir, runId) : "";
+        const readTs = deps.readTrustedSurfaceDecision ?? readTrustedSurfaceDecision;
+        let trustedSurface = runDir ? await readTs(runDir).catch(() => null) : null;
+        let pushedHeadSha: string | null = null;
+        try {
+          const wt = await getWorktree(cfg, issueNumber);
+          if (wt) pushedHeadSha = await gitHead(wt.path);
+        } catch {
+          pushedHeadSha = null;
+        }
+        const persistedEngine = runDir
+          ? await (deps.resolveRunEngineIdentity ?? resolveRunEngineIdentity)(runDir, () => undefined)
+          : undefined;
+        const engineFingerprint = engineFingerprintFromPersistedRunEngine(persistedEngine);
+        if (!engineFingerprint) {
+          return failed(
+            "rebind_tester_evidence_after_pr: blocked run engine identity is absent or malformed",
+          );
+        }
+        const livePrHeadSha = normalizeFullSha(prDetail?.head_sha);
+        const storedCandidateSha = normalizeFullSha(trustedSurface?.candidate_sha);
+        if (
+          runDir &&
+          livePrHeadSha &&
+          (!trustedSurface ||
+            trustedSurface.outcome === "blocked" ||
+            storedCandidateSha !== livePrHeadSha)
+        ) {
+          const computeFresh =
+            deps.computeTrustedSurfaceFromObjectSource ?? computeTrustedSurfaceFromObjectSource;
+          const fresh = await computeFresh({
+            candidateSha: livePrHeadSha,
+            enginePin: persistedEngine!,
+            extraPaths: cfg.trusted_surface?.extra_paths ?? [],
+            source: gitRepoObjectSource(cfg.repo_dir, gitInWt, cfg.base_branch),
+          }).catch(() => null);
+          if (fresh) {
+            const persistFresh =
+              deps.persistTrustedSurfaceDecision ?? persistTrustedSurfaceDecision;
+            trustedSurface = await persistFresh(runDir, fresh).catch(() => null);
+          } else {
+            trustedSurface = null;
+          }
+        }
+        const rebind = await rebindFn({
+          cfg,
+          issueNumber,
+          stage: input.diagnostic.detail.stage ?? "design-gate",
+          runDir,
+          prNumber,
+          prHeadSha: prDetail?.head_sha ?? null,
+          pushedHeadSha,
+          trustedSurface,
+          domain: (cfg.domain || cfg.repo || "").trim() || undefined,
+          engineFingerprint,
+          reproduce: async ({ runDir: dest }) => {
+            const wt = await getWorktree(cfg, issueNumber);
+            if (!wt) return { ok: false };
+            const { runTestGate } = await import("./testgate.ts");
+            const gate = await runTestGate(
+              cfg,
+              issueNumber,
+              wt.path,
+              {},
+              input.runId,
+              "test-gate",
+              undefined,
+              dest,
+            );
+            return { ok: gate.passed === true, candidate_sha: gate.persist?.candidate_sha ?? null };
+          },
+        });
+        if (!rebind.ok) {
+          return failed(`${rebind.code}: ${rebind.summary}`);
+        }
+        if (rebind.action === "not-applicable") {
+          return failed(
+            "rebind_tester_evidence_after_pr: not-applicable is not a recovered blocker; leave blocked for the consumer observer",
+          );
+        }
+        try {
+          await clear(cfg, issueNumber);
+        } catch (err) {
+          return failed(
+            `rebind_tester_evidence_after_pr succeeded but could not clear blocked: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        return {
+          succeeded: true,
+          evidence:
+            `rebind_tester_evidence_after_pr: ${rebind.action} Tester evidence for ${rebind.candidateSha}`,
         };
       }
       case "wait_and_retry":

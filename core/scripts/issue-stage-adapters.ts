@@ -742,6 +742,13 @@ export interface RunDeliveryStageAdapterInput {
    * accepts a producer-created Candidate epoch only while both observations agree.
    */
   producerCompletionEvidence?: () => DeliveryStageEvidence | null;
+  /**
+   * Proven S2 Candidate after a stage-owned push (`fix-1`, `fix-2`, `pre-merge`).
+   * The adapter may keep the handler outcome when this snapshot matches the
+   * post-attempt observation. It must not treat the pre-attempt S1 binding as
+   * S2 proof.
+   */
+  stageOwnedSuccessorEvidence?: () => DeliveryStageEvidence | null;
   attempt: () => Promise<Outcome>;
 }
 
@@ -783,6 +790,27 @@ function sameEvidenceBinding(before: DeliveryStageEvidence, after: DeliveryStage
     before.evidenceRole === after.evidenceRole &&
     before.artifactIdentity === after.artifactIdentity
   );
+}
+
+function isStageOwnedSuccessorStage(stage: DeliveryStage): boolean {
+  return stage === "fix-1" || stage === "fix-2" || stage === "pre-merge";
+}
+
+function stageOwnedSuccessorBindingAccepted(input: {
+  stage: DeliveryStage;
+  outcome: Outcome;
+  preAttemptEvidence: DeliveryStageEvidence | null;
+  evidence: DeliveryStageEvidence;
+  successor: DeliveryStageEvidence | null;
+}): boolean {
+  if (!input.successor || !input.preAttemptEvidence || !input.outcome.advanced) return false;
+  if (!isStageOwnedSuccessorStage(input.stage)) return false;
+  if (sameEvidenceBinding(input.preAttemptEvidence, input.evidence)) return false;
+  if (input.evidence.postconditionProven !== true) return false;
+  if (completingEvidenceBindingFailure({ stage: input.stage, ...input.evidence }) !== null) {
+    return false;
+  }
+  return sameEvidenceBinding(input.successor, input.evidence);
 }
 
 export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInput): Promise<Outcome> {
@@ -868,7 +896,19 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
         completingEvidenceBindingFailure({ stage: input.stage, ...evidence }) === null &&
         producerCompletionEvidence !== null &&
         sameEvidenceBinding(producerCompletionEvidence, evidence);
-      if (preAttemptEvidence && !sameEvidenceBinding(preAttemptEvidence, evidence) && !producerEstablishedEvidence) {
+      const ownedSuccessorBinding = stageOwnedSuccessorBindingAccepted({
+        stage: input.stage,
+        outcome,
+        preAttemptEvidence,
+        evidence,
+        successor: input.stageOwnedSuccessorEvidence?.() ?? null,
+      });
+      if (
+        preAttemptEvidence &&
+        !sameEvidenceBinding(preAttemptEvidence, evidence) &&
+        !producerEstablishedEvidence &&
+        !ownedSuccessorBinding
+      ) {
         const waiting: Outcome = {
           advanced: false,
           status: "waiting",
@@ -931,7 +971,18 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
       const retry = await input.attempt();
       if (input.observeEvidence) {
         evidence = await input.observeEvidence("after", retry);
-        if (preAttemptEvidence && !sameEvidenceBinding(preAttemptEvidence, evidence)) {
+        const ownedSuccessorReplay = stageOwnedSuccessorBindingAccepted({
+          stage: input.stage,
+          outcome: retry,
+          preAttemptEvidence,
+          evidence,
+          successor: input.stageOwnedSuccessorEvidence?.() ?? null,
+        });
+        if (
+          preAttemptEvidence &&
+          !sameEvidenceBinding(preAttemptEvidence, evidence) &&
+          !ownedSuccessorReplay
+        ) {
           const waiting: Outcome = {
             advanced: false,
             status: "waiting",

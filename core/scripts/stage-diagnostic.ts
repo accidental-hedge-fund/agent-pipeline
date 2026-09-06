@@ -73,6 +73,21 @@ export interface StageDiagnosticDetail {
   preflight_class?: string;
   preflight_reason_code?: "environment-auth" | "capability-refusal";
   preflight_intervention_kind?: "auth-tooling-preflight-failure";
+  /**
+   * Structured post-PR Tester evidence-ordering fields (#1468). Present when
+   * a consumer delivery stage is missing implementation-role evidence after
+   * PR-backed trusted-surface resolution. Classification must use these
+   * fields, not free-form reason prose.
+   */
+  evidence_ordering?: {
+    kind: "tester_rebind_after_pr";
+    required_role: "implementation";
+    observed_role: string;
+    trusted_surface_outcome?: string;
+    subject_omitted_because_unobservable?: boolean;
+    pr_head?: string | null;
+    blocker_code?: string;
+  };
 }
 
 export interface StageDiagnostic {
@@ -200,6 +215,7 @@ function evidenceKeyFor(
     preflight_class: detail.preflight_class ?? null,
     preflight_reason_code: detail.preflight_reason_code ?? null,
     preflight_intervention_kind: detail.preflight_intervention_kind ?? null,
+    evidence_ordering: detail.evidence_ordering ?? null,
   });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
@@ -397,6 +413,7 @@ export function buildStageDiagnostic(input: {
   preflightClass?: string;
   preflightReasonCode?: "environment-auth" | "capability-refusal";
   preflightInterventionKind?: "auth-tooling-preflight-failure";
+  evidenceOrdering?: StageDiagnosticDetail["evidence_ordering"];
 }): StageDiagnostic {
   const detail: StageDiagnosticDetail = {
     blocker_kind: input.blockerKind,
@@ -412,6 +429,7 @@ export function buildStageDiagnostic(input: {
     ...(input.preflightInterventionKind !== undefined
       ? { preflight_intervention_kind: input.preflightInterventionKind }
       : {}),
+    ...(input.evidenceOrdering !== undefined ? { evidence_ordering: input.evidenceOrdering } : {}),
   };
   const reasonCode = input.reasonCode ?? reasonCodeFor(input.blockerKind, input.offrampClass);
   const diagnostic: StageDiagnostic = {
