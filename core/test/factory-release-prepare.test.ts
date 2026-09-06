@@ -45,6 +45,7 @@ import {
   persistFactoryReleaseLoopBinding,
   productionCreateOrReusePackIssues,
   productionDispatchPackLoop,
+  reconcileFrgPackLifecycle,
   rejectForbiddenRequestFields,
   targetCheckoutsForPrepare,
   unsignedDigestBindingMismatch,
@@ -576,6 +577,7 @@ function makeDeps(opts: {
   runRelease?: FactoryReleasePrepareDeps["runRelease"];
   generateCalls?: { n: number };
   releaseCalls?: { n: number };
+  reconcilePackLifecycle?: FactoryReleasePrepareDeps["reconcilePackLifecycle"];
 }): FactoryReleasePrepareDeps {
   const generateCalls = opts.generateCalls ?? { n: 0 };
   const releaseCalls = opts.releaseCalls ?? { n: 0 };
@@ -601,6 +603,7 @@ function makeDeps(opts: {
       return null;
     },
     observeExistingRelease: opts.observeExistingRelease ?? (async () => null),
+    reconcilePackLifecycle: opts.reconcilePackLifecycle,
     runRelease: async (version, releaseOpts, cfg) => {
       releaseCalls.n++;
       if (opts.runRelease) return opts.runRelease(version, releaseOpts, cfg);
@@ -4227,4 +4230,199 @@ test("defaultResolveShipPathFromRun loads the closed unsigned checkpoint (#1295)
     readFile: (p) => mem.readFile(p),
   });
   assert.equal(missing.kind, "fail");
+});
+
+test("FRG pack lifecycle releases worktrees, CAS-deletes branches, and closes every fixture", async () => {
+  const order: string[] = [];
+  const openIssues = new Set([101, 102]);
+  const openPrs = new Map<number, number[]>([
+    [101, [201, 202, 204]],
+    [102, [203]],
+  ]);
+  const branches = new Map([
+    [201, { branch: "pipeline/101-a", headSha: "a".repeat(40), sameRepository: true, state: "open" as const }],
+    [202, { branch: "pipeline/101-b", headSha: "b".repeat(40), sameRepository: true, state: "open" as const }],
+    [203, { branch: "pipeline/102-c", headSha: "c".repeat(40), sameRepository: true, state: "open" as const }],
+    [204, { branch: "pipeline/101-closed", headSha: "d".repeat(40), sameRepository: true, state: "closed" as const }],
+  ]);
+  const deps = {
+    getIssueStateAndLabels: async (n: number) => ({
+      state: openIssues.has(n) ? "open" as const : "closed" as const,
+      labels: ["factory-gate"],
+    }),
+    findPrsForIssue: async (n: number) => ({ numbers: openPrs.get(n) ?? [], truncated: false }),
+    getPrBranch: async (n: number) => branches.get(n) ?? null,
+    releaseManagedWorktree: async (n: number) => {
+      order.push(`worktree:${n}`);
+      return { action: "released" as const, branch: `pipeline/${n}`, reason: "clean and recoverable" };
+    },
+    deleteRemoteBranch: async (branch: string) => {
+      order.push(`branch:${branch}`);
+    },
+    closePr: async (n: number) => {
+      order.push(`pr:${n}`);
+      const prior = branches.get(n)!;
+      branches.set(n, { ...prior, state: "closed" as const });
+    },
+    closeIssue: async (n: number) => {
+      order.push(`issue:${n}`);
+      openIssues.delete(n);
+    },
+  };
+  const first = await reconcileFrgPackLifecycle(
+    {
+      version: "1.40.1",
+      packRunId: "pack-1401-fixture",
+      issueNumbers: [102, 101, 101],
+      disposition: "completed",
+    },
+    deps,
+  );
+  assert.deepEqual(first.closed_prs, [201, 202, 203]);
+  assert.ok(first.deleted_branches.includes("pipeline/101-closed"));
+  assert.deepEqual(first.closed_issues, [101, 102]);
+  assert.equal(first.errors.length, 0);
+  assert.ok(order.indexOf("worktree:101") < order.indexOf("branch:pipeline/101-a"));
+  assert.ok(order.indexOf("branch:pipeline/101-a") < order.indexOf("pr:201"));
+  assert.ok(order.indexOf("pr:202") < order.indexOf("issue:101"));
+
+  const second = await reconcileFrgPackLifecycle(
+    {
+      version: "1.40.1",
+      packRunId: "pack-1401-fixture",
+      issueNumbers: [101, 102],
+      disposition: "completed",
+    },
+    deps,
+  );
+  assert.deepEqual(second.closed_prs, []);
+  assert.deepEqual(second.closed_issues, []);
+  assert.equal(second.errors.length, 0);
+});
+
+test("changed release request disposes the active version pack before generating one successor", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/frg-successor-request.json";
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  await mem.writeFile(
+    factoryReleaseVersionIndexPath("/repo", request.target_version),
+    JSON.stringify({
+      schema_version: 1,
+      version: request.target_version,
+      request_fingerprint: "1".repeat(64),
+      candidate_git_sha: "d".repeat(40),
+      action_id: "prior-action",
+      pack_run_id: "prior-pack",
+      loop_run_id: "prior-loop",
+      frg_run_id: "prior-frg",
+      issue_numbers: [701, 702],
+      disposition: "active",
+    }),
+  );
+  const order: string[] = [];
+  const outcome = await runFactoryReleasePrepare(
+    { requestPath, repoDir: "/repo" },
+    makeDeps({
+      fs: mem,
+      reconcilePackLifecycle: async (input) => {
+        order.push(`cleanup:${input.disposition}:${input.issueNumbers.join(",")}`);
+        return {
+          disposition: input.disposition,
+          closed_prs: [],
+          deleted_branches: [],
+          released_worktrees: [],
+          closed_issues: [...input.issueNumbers],
+          errors: [],
+        };
+      },
+      generate: async () => {
+        order.push("generate");
+        return { frg: unsignedPayload(), structurally_eligible: true };
+      },
+    }),
+  );
+  assert.equal(outcome.exitCode, 0);
+  assert.deepEqual(order.slice(0, 2), ["cleanup:superseded:701,702", "generate"]);
+  const priorReceipt = JSON.parse(
+    await mem.readFile(path.join(factoryReleaseWorkDir("/repo", "1".repeat(64)), "pack-disposition.json")),
+  );
+  assert.equal(priorReceipt.disposition, "superseded");
+});
+
+test("failed superseded-pack cleanup keeps the prior pack active and blocks successor generation", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/frg-successor-blocked.json";
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const indexPath = factoryReleaseVersionIndexPath("/repo", request.target_version);
+  await mem.writeFile(indexPath, JSON.stringify({
+    schema_version: 1,
+    version: request.target_version,
+    request_fingerprint: "2".repeat(64),
+    candidate_git_sha: "d".repeat(40),
+    action_id: "prior-action",
+    pack_run_id: "prior-pack",
+    issue_numbers: [801],
+    disposition: "active",
+  }));
+  let generated = 0;
+  const outcome = await runFactoryReleasePrepare(
+    { requestPath, repoDir: "/repo" },
+    makeDeps({
+      fs: mem,
+      generate: async () => {
+        generated += 1;
+        return { frg: unsignedPayload(), structurally_eligible: true };
+      },
+      reconcilePackLifecycle: async (input) => ({
+        disposition: input.disposition,
+        closed_prs: [],
+        deleted_branches: [],
+        released_worktrees: [],
+        closed_issues: [],
+        errors: ["issue #801: worktree retained: dirty"],
+      }),
+    }),
+  );
+  assert.equal(outcome.exitCode, 1);
+  assert.equal(outcome.result.status, "failed");
+  assert.equal(generated, 0);
+  const retained = JSON.parse(await mem.readFile(indexPath));
+  assert.equal(retained.disposition, "active");
+});
+
+test("defaultStartBoundPackLoop durably binds fixture issues before dispatch failure", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const ctx = {
+    repoDir: "/repo",
+    workDir: "/state/release",
+    request,
+    pack: packWithTemplates(),
+    packRunId: "pack-1401-start-failure",
+    frgRunId: "frg-start-failure",
+    requestFingerprint: factoryReleaseRequestFingerprint(request),
+    writeFile: async (p: string, body: string) => { files.set(p, body); },
+    readFile: async (p: string) => {
+      const body = files.get(p);
+      if (body === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return body;
+    },
+    fileExists: async (p: string) => files.has(p),
+    now: () => new Date("2026-09-06T12:00:00Z"),
+  };
+  await assert.rejects(
+    defaultStartBoundPackLoop(ctx, {
+      createOrReusePackIssues: async () => ({ issue_numbers: [501, 502] }),
+      dispatchPackLoop: async () => { throw new Error("spawn failed"); },
+    }),
+    /spawn failed/,
+  );
+  const instance = JSON.parse(files.get(factoryReleasePackInstancePath(ctx.workDir))!);
+  assert.deepEqual(instance.issue_numbers, [501, 502]);
+  assert.equal(instance.loop_run_id, null);
+  const index = JSON.parse(files.get(factoryReleaseVersionIndexPath(ctx.repoDir, request.target_version))!);
+  assert.deepEqual(index.issue_numbers, [501, 502]);
+  assert.equal(index.disposition, "active");
 });
