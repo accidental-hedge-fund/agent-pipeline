@@ -7,7 +7,7 @@
 ## 2. Verify Scope and Repository Gates
 
 - [x] 2.1 Inspect the implementation diff and verify that non-OpenSpec changes comprise only the run-scoped fixture and its unit test, with no production behavior changes.
-- [ ] 2.2 Run `node scripts/build.mjs`, `openspec validate --all`, and `npm run ci` from the repository root; verify generated hosts remain fresh and every required gate passes.
+- [x] 2.2 Run `node scripts/build.mjs`, `openspec validate --all`, and `npm run ci` from the repository root; verify generated hosts remain fresh and every required gate passes.
 
 ## 3. Verify FRG Lifecycle
 
