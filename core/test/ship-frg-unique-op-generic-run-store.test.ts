@@ -512,7 +512,7 @@ test("fallback-identity unbound train/loop do not inflate missing_correlation or
   assert.ok(section.entrypoint_coverage.observed.includes("loop"));
 });
 
-test("in-flight complete inventory covers all five #1333 classes for the scored SHA (#1434)", async () => {
+test("in-flight complete inventory alone does not mint #1333 execution coverage (#1525)", async () => {
   const files = new Map<string, string>();
   seedPrefixCoverage(files, GENERIC);
   const withoutInventory = await runFactoryGate(
@@ -545,11 +545,10 @@ test("in-flight complete inventory covers all five #1333 classes for the scored 
   );
   const before = withoutInventory.evidence.operation_reliability!.integrity.missing_required_coverage;
   const after = withInventory.evidence.operation_reliability!.integrity.missing_required_coverage;
-  assert.equal(after, before - REQUIRED_LIFECYCLE_CLASSES_1333.length);
-  assert.equal(after, 1, "only #1301 live train-loop linkage should remain missing");
+  assert.equal(after, before);
 });
 
-test("other-candidate host executed rows do not suppress inventory fallback (#1434)", async () => {
+test("other-candidate host rows do not suppress exact-candidate qualification (#1525)", async () => {
   const files = new Map<string, string>();
   seedPrefixCoverage(files, GENERIC);
   writeBoundRun(files, GENERIC, {
@@ -577,10 +576,7 @@ test("other-candidate host executed rows do not suppress inventory fallback (#14
       repoDir: CANDIDATE_REPO,
       inFlightShip: true,
       resolveUniqueOperationRunsRoots: () => dualRoots(),
-      loadCandidateFaultRecoveryInventory: async () => ({
-        rows: FAULT_RECOVERY_MATRIX,
-        sourceSha: CANDIDATE,
-      }),
+      loadCandidateQualificationRows: async () => executedRowsForSha(CANDIDATE),
       scoreInput: scoreInput(),
       stdout: () => {},
       stderr: () => {},
@@ -593,7 +589,7 @@ test("other-candidate host executed rows do not suppress inventory fallback (#14
   assert.equal(after, 1, "only #1301 live train-loop linkage should remain missing");
 });
 
-test("binder-rejected host executed rows do not suppress inventory fallback (#1434)", async () => {
+test("binder-rejected host rows do not suppress exact-candidate qualification (#1525)", async () => {
   const files = new Map<string, string>();
   seedPrefixCoverage(files, GENERIC);
   const cell = FAULT_RECOVERY_MATRIX.find((row) => !row.not_applicable);
@@ -626,10 +622,7 @@ test("binder-rejected host executed rows do not suppress inventory fallback (#14
       repoDir: CANDIDATE_REPO,
       inFlightShip: true,
       resolveUniqueOperationRunsRoots: () => dualRoots(),
-      loadCandidateFaultRecoveryInventory: async () => ({
-        rows: FAULT_RECOVERY_MATRIX,
-        sourceSha: CANDIDATE,
-      }),
+      loadCandidateQualificationRows: async () => executedRowsForSha(CANDIDATE),
       scoreInput: scoreInput(),
       stdout: () => {},
       stderr: () => {},
@@ -652,10 +645,7 @@ test("inventory from a different SHA does not populate #1333 coverage (#1434)", 
       repoDir: CANDIDATE_REPO,
       inFlightShip: true,
       resolveUniqueOperationRunsRoots: () => dualRoots(),
-      loadCandidateFaultRecoveryInventory: async () => ({
-        rows: FAULT_RECOVERY_MATRIX,
-        sourceSha: OTHER,
-      }),
+      loadCandidateQualificationRows: async () => executedRowsForSha(OTHER),
       scoreInput: scoreInput(),
       stdout: () => {},
       stderr: () => {},
@@ -750,10 +740,7 @@ test("standalone factory-gate does not mint inventory rows (#1434)", async () =>
       version: "1.29.1",
       repoDir: CANDIDATE_REPO,
       resolveUniqueOperationRunsRoots: () => dualRoots(),
-      loadCandidateFaultRecoveryInventory: async () => ({
-        rows: FAULT_RECOVERY_MATRIX,
-        sourceSha: CANDIDATE,
-      }),
+      loadCandidateQualificationRows: async () => executedRowsForSha(CANDIDATE),
       scoreInput: {
         ...scoreInput(),
         unique_operation_manifest: {
@@ -1101,10 +1088,7 @@ test("followable control-host train_loop_linked with child run_id fallback satis
       repoDir: CANDIDATE_REPO,
       inFlightShip: true,
       resolveUniqueOperationRunsRoots: () => dualRoots(),
-      loadCandidateFaultRecoveryInventory: async () => ({
-        rows: FAULT_RECOVERY_MATRIX,
-        sourceSha: CANDIDATE,
-      }),
+      loadCandidateQualificationRows: async () => executedRowsForSha(CANDIDATE),
       scoreInput: scoreInput({
         unique_operation_manifest: {
           ...passingUniqueOperationManifest({
@@ -1167,10 +1151,7 @@ test("duplicate stale child id in an earlier approved root does not drop a path-
       repoDir: CANDIDATE_REPO,
       inFlightShip: true,
       resolveUniqueOperationRunsRoots: () => dualRoots(),
-      loadCandidateFaultRecoveryInventory: async () => ({
-        rows: FAULT_RECOVERY_MATRIX,
-        sourceSha: CANDIDATE,
-      }),
+      loadCandidateQualificationRows: async () => executedRowsForSha(CANDIDATE),
       scoreInput: scoreInput({
         unique_operation_manifest: {
           ...passingUniqueOperationManifest({
@@ -1285,10 +1266,7 @@ test("child minted logical id without event logical id satisfies #1301 (#1440)",
       repoDir: CANDIDATE_REPO,
       inFlightShip: true,
       resolveUniqueOperationRunsRoots: () => dualRoots(),
-      loadCandidateFaultRecoveryInventory: async () => ({
-        rows: FAULT_RECOVERY_MATRIX,
-        sourceSha: CANDIDATE,
-      }),
+      loadCandidateQualificationRows: async () => executedRowsForSha(CANDIDATE),
       scoreInput: scoreInput({
         unique_operation_manifest: {
           ...passingUniqueOperationManifest({
@@ -1346,7 +1324,7 @@ test("pipeline single/merge/merge-queue execute only after acknowledged public a
   assert.match(mergeDispatch, /kind:\s*"merge-queue"/);
 });
 
-test("HEAD mismatch with complete inventory covers all five #1333 classes (#1440)", async () => {
+test("exact-candidate qualification covers all five #1333 classes despite HEAD mismatch (#1525)", async () => {
   const files = new Map<string, string>();
   seedPrefixCoverage(files, GENERIC);
   const result = await runFactoryGate(
@@ -1355,10 +1333,7 @@ test("HEAD mismatch with complete inventory covers all five #1333 classes (#1440
       repoDir: CANDIDATE_REPO,
       inFlightShip: true,
       resolveUniqueOperationRunsRoots: () => dualRoots(),
-      loadCandidateFaultRecoveryInventory: async () => ({
-        rows: FAULT_RECOVERY_MATRIX,
-        sourceSha: CANDIDATE,
-      }),
+      loadCandidateQualificationRows: async () => executedRowsForSha(CANDIDATE),
       scoreInput: scoreInput(),
       stdout: () => {},
       stderr: () => {},

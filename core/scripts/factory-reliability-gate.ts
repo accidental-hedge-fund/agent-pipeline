@@ -59,7 +59,6 @@ import {
   type UniqueOperationReliability,
 } from "./operation-reliability.ts";
 import {
-  assertFaultRecoveryInventoryComplete,
   bindExecutedMatrixRowsForCandidate,
   type ExecutedMatrixRow,
   type FaultRecoveryMatrixRow,
@@ -4279,10 +4278,9 @@ export interface FactoryGateOpts {
    */
   inFlightShip?: boolean;
   /**
-   * In-flight ship #1333 inventory loader. When host artifacts have no
-   * binder-accepted executed rows for the scored SHA, a complete inventory
-   * whose `sourceSha` equals that SHA is mapped to executed rows. Standalone
-   * factory-gate must omit this or it is ignored.
+   * Legacy exact-candidate inventory loader retained for source/API
+   * compatibility. Inventory is expectation data only and is never converted
+   * into executed rows (#1525).
    */
   loadCandidateFaultRecoveryInventory?: (args: {
     candidateSha: string;
@@ -4290,6 +4288,15 @@ export interface FactoryGateOpts {
   }) =>
     | Promise<{ rows: readonly FaultRecoveryMatrixRow[]; sourceSha?: string | null }>
     | { rows: readonly FaultRecoveryMatrixRow[]; sourceSha?: string | null };
+  /**
+   * Candidate qualification rows observed by real deterministic processes.
+   * Unlike the legacy inventory loader above, these are execution evidence and
+   * are always passed back through the matrix binder.
+   */
+  loadCandidateQualificationRows?: (args: {
+    candidateSha: string;
+    repoDir: string;
+  }) => Promise<readonly ExecutedMatrixRow[]> | readonly ExecutedMatrixRow[];
   /**
    * Post-1.33 --from-run collect. When omitted, production builds hybrid-v2
    * provenance from the live pack + Layer A TAP (#1118). Tests inject a fake.
@@ -4626,36 +4633,6 @@ async function uniqueOperationRunsRoots(opts: FactoryGateOpts): Promise<string[]
     return canonicalizeUniqueOperationRunsRoots(opts.resolveUniqueOperationRunsRoots(opts));
   }
   return defaultResolveUniqueOperationRunsRoots(opts);
-}
-
-function executedRowsFromCompleteInventory(
-  inventory: { rows: readonly FaultRecoveryMatrixRow[]; sourceSha?: string | null },
-  scoredSha: string,
-): ExecutedMatrixRow[] {
-  const sha = scoredSha.trim();
-  const sourceSha = (inventory.sourceSha ?? "").trim();
-  if (!sha || !sourceSha || sourceSha !== sha) return [];
-  try {
-    assertFaultRecoveryInventoryComplete(inventory.rows);
-  } catch {
-    return [];
-  }
-  const executed: ExecutedMatrixRow[] = [];
-  for (const cell of inventory.rows) {
-    if (cell.not_applicable) continue;
-    executed.push({
-      candidate_sha: sha,
-      layer: cell.layer,
-      lifecycle_class: cell.lifecycle_class,
-      operation: cell.operation,
-      fault_state: cell.fault_state,
-      entrypoint: cell.entrypoint,
-      host: cell.host,
-      observed_terminal: cell.expected_terminal,
-      passed: true,
-    });
-  }
-  return bindExecutedMatrixRowsForCandidate(executed, sha, inventory.rows);
 }
 
 function executedMatrixRowsFromArtifactValue(value: unknown): ExecutedMatrixRow[] {
@@ -5170,16 +5147,15 @@ export async function runFactoryGate(
       scoredCandidateSha,
     );
     let executedRows = boundHostRows;
-    if (
-      collectorInFlightShip &&
-      boundHostRows.length === 0 &&
-      opts.loadCandidateFaultRecoveryInventory
-    ) {
-      const inventory = await opts.loadCandidateFaultRecoveryInventory({
+    if (collectorInFlightShip && opts.loadCandidateQualificationRows) {
+      const qualificationRows = await opts.loadCandidateQualificationRows({
         candidateSha: scoredCandidateSha,
         repoDir: opts.repoDir,
       });
-      executedRows = executedRowsFromCompleteInventory(inventory, scoredCandidateSha);
+      executedRows = bindExecutedMatrixRowsForCandidate(
+        [...boundHostRows, ...qualificationRows],
+        scoredCandidateSha,
+      );
     }
     computeInput = {
       ...computeInput,

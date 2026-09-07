@@ -20,6 +20,7 @@ import { writeFileSync, readFileSync, realpathSync, existsSync, promises as fsPr
 import { spawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import { Command, Option } from "commander";
+import { runInstalledCliQualificationProbe } from "./installed-cli-qualification.ts";
 import { resolveConfig, resolveReleaseConfig, resolveLoopNativeGoalAttestation, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
 import { ensureArtifactIgnoreBlock } from "./artifact-ignore.ts";
 import { spawnDetached } from "./detach.ts";
@@ -443,6 +444,8 @@ export const VERSION: string = (() => {
 })();
 
 export interface CliOpts {
+  /** Internal, closed, mutation-free installed-CLI qualification fixture. */
+  qualificationProbe?: string;
   /**
    * Parent logical-operation identity for nested loop/single admission (#1368).
    * Internal: train/ship handoff. Not a public CLI flag.
@@ -981,6 +984,12 @@ export function buildCmd(): Command {
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
     .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number)
     .option("--run-id <id>", "internal: pin the run-store run id (set by the detached launcher so the inner run uses the caller's run directory)")
+    .addOption(
+      new Option(
+        "--qualification-probe <absolute-path>",
+        "internal: execute one closed installed-CLI qualification probe",
+      ).hideHelp(),
+    )
     .option("--no-edit", "release: skip opening $EDITOR after ROADMAP scaffold (commit as scaffolded)")
     .option(
       "--theme <text>",
@@ -4723,6 +4732,12 @@ async function main(): Promise<void> {
 
   const opts = cmd.opts<CliOpts>();
   let numArg = cmd.args[0];
+  if (opts.qualificationProbe) {
+    const routedOperation = /^\d+$/.test(numArg ?? "")
+      ? "drive"
+      : String(numArg ?? "");
+    await runInstalledCliQualificationProbe(opts.qualificationProbe, routedOperation);
+  }
   const isInit = opts.init || numArg === "init";
   // `pipeline doctor` is a standalone command (like `init`): it runs the
   // preflight checks and exits, with no issue number. Distinct from the

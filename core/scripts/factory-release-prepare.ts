@@ -24,6 +24,7 @@ import * as crypto from "node:crypto";
 import { existsSync, realpathSync as fsRealpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   artifactSubdir,
@@ -88,6 +89,12 @@ import {
   type PackLoopLivenessStatus,
 } from "./loop/pack-loop-liveness.ts";
 import { parseExactGitSha } from "./ship-end-identity.ts";
+import {
+  qualificationArtifactPath,
+  readInstalledCliQualificationArtifact,
+  runInstalledCliQualification,
+  type InstalledCliQualificationArtifact,
+} from "./installed-cli-qualification.ts";
 import {
   MATRIX_COVERAGE_LAYERS,
   MATRIX_FAULT_STATES,
@@ -368,6 +375,11 @@ export interface FactoryReleasePrepareDeps {
    * filesystem when only protocol state is under test.
    */
   loadPack?(): Promise<LoadedFrgPack>;
+  /** Exact-candidate deterministic gate that must pass before fixture mutation. */
+  qualifyCandidate(
+    request: FactoryReleasePrepareRequest,
+    ctx: { repoDir: string },
+  ): Promise<InstalledCliQualificationArtifact>;
   /** Re-observe / create unsigned pack artifacts for this exact request. */
   generateUnsignedFrg(
     request: FactoryReleasePrepareRequest,
@@ -1449,6 +1461,7 @@ export interface ScoreBoundPackLoopArgs {
   resolveUniqueOperationRunsRoots?: FactoryGateOpts["resolveUniqueOperationRunsRoots"];
   uniqueOperationRunsRoot?: string;
   loadCandidateFaultRecoveryInventory?: FactoryGateOpts["loadCandidateFaultRecoveryInventory"];
+  loadCandidateQualificationRows?: FactoryGateOpts["loadCandidateQualificationRows"];
 }
 
 export interface ScoreBoundPackLoopResult {
@@ -1502,6 +1515,7 @@ export interface DurableGenerateOptions {
   resolveUniqueOperationRunsRoots?: FactoryGateOpts["resolveUniqueOperationRunsRoots"];
   uniqueOperationRunsRoot?: string;
   loadCandidateFaultRecoveryInventory?: FactoryGateOpts["loadCandidateFaultRecoveryInventory"];
+  loadCandidateQualificationRows?: FactoryGateOpts["loadCandidateQualificationRows"];
   /**
    * Terminal score through factory-gate --from-run (no --observations).
    * Tests inject this seam.
@@ -2070,6 +2084,10 @@ export async function defaultScoreBoundPackLoop(
     loadCandidateFaultRecoveryInventory:
       args.loadCandidateFaultRecoveryInventory ??
       defaultLoadCandidateFaultRecoveryInventory,
+    loadCandidateQualificationRows:
+      args.loadCandidateQualificationRows ??
+      ((input) =>
+        readInstalledCliQualificationArtifact(input.repoDir, input.candidateSha)?.rows ?? []),
     stdout: () => {},
     stderr: () => {},
     now: args.now,
@@ -3931,6 +3949,7 @@ export async function generateDurableUnsignedFrg(
       resolveUniqueOperationRunsRoots: opts.resolveUniqueOperationRunsRoots,
       uniqueOperationRunsRoot: opts.uniqueOperationRunsRoot,
       loadCandidateFaultRecoveryInventory: opts.loadCandidateFaultRecoveryInventory,
+      loadCandidateQualificationRows: opts.loadCandidateQualificationRows,
     });
   } catch (err) {
     return refuseSyntheticTrivialPack(request, {
@@ -4443,6 +4462,17 @@ export function defaultFactoryReleasePrepareDeps(
       }),
     fileExists,
     loadPack: overrides.loadPack ?? (() => loadFrgPack(defaultFrgPackRoot())),
+    qualifyCandidate:
+      overrides.qualifyCandidate ??
+      (async (request, ctx) => {
+        const candidateRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+        return runInstalledCliQualification({
+          candidateSha: request.integrated_candidate.git_sha,
+          launcherPath: path.join(candidateRoot, "scripts", "pipeline-launcher.mjs"),
+          repoDir: ctx.repoDir,
+          env: overrides.env ?? process.env,
+        });
+      }),
     generateUnsignedFrg:
       overrides.generateUnsignedFrg ??
       ((request, ctx) =>
@@ -4908,6 +4938,26 @@ export async function runFactoryReleasePrepare(
   if (
     priorVersion &&
     priorVersion.request_fingerprint !== fingerprint &&
+    priorVersion.candidate_git_sha === request.integrated_candidate.git_sha &&
+    (priorVersion.disposition === undefined ||
+      priorVersion.disposition === "active" ||
+      priorVersion.disposition === "terminal_failed")
+  ) {
+    return {
+      exitCode: 1,
+      result: failedResult(
+        request,
+        "frg_pack_replay_required",
+        `factory-release prepare: candidate ${request.integrated_candidate.git_sha} already has ` +
+          `terminal FRG pack ${priorVersion.pack_run_id ?? "unknown"}; replay its persisted request ` +
+          `${priorVersion.request_fingerprint} instead of creating a successor`,
+        checkpointId("failed", fingerprint),
+      ),
+    };
+  }
+  if (
+    priorVersion &&
+    priorVersion.request_fingerprint !== fingerprint &&
     (priorVersion.disposition === undefined || priorVersion.disposition === "active")
   ) {
     const priorIssues = await lifecycleIssueNumbers(priorVersion);
@@ -4957,6 +5007,28 @@ export async function runFactoryReleasePrepare(
     };
   }
   const manifestPath = path.join(pack.root_dir, "manifest.json");
+
+  // Local deterministic qualification is the release gate's first candidate
+  // execution. It deliberately precedes generateUnsignedFrg, which is the
+  // first surface allowed to create or dispatch remote fixture issues.
+  try {
+    await deps.qualifyCandidate(request, { repoDir: opts.repoDir });
+  } catch (err) {
+    const artifactPath = qualificationArtifactPath(
+      opts.repoDir,
+      request.integrated_candidate.git_sha,
+    );
+    return {
+      exitCode: 1,
+      result: failedResult(
+        request,
+        "installed_cli_qualification_failed",
+        `factory-release prepare: exact-candidate qualification failed ` +
+          `(artifact ${artifactPath}): ${(err as Error).message}`,
+        checkpointId("failed", fingerprint),
+      ),
+    };
+  }
 
   let store = await loadCheckpoint(deps, checkpointPath);
   if (store && !requestsMatch(store.request, request)) {
@@ -5115,29 +5187,21 @@ export async function runFactoryReleasePrepare(
         generated.message ??
         `FRG structural eligibility failed for ${request.target_version}`;
       const defect = generated.defect_class ?? "frg_not_eligible";
-      const cleanup = await reconcileLifecycle({
-        version: request.target_version,
-        packRunId: currentIndex.pack_run_id ?? `unknown-${fingerprint.slice(0, 12)}`,
-        issueNumbers: currentIssues,
-        disposition: "terminal_failed",
-      });
       await persistPackDisposition(
         deps,
         opts.repoDir,
         currentIndex,
-        cleanup.errors.length > 0 ? "active" : "terminal_failed",
+        "active",
         currentIssues,
-        cleanup,
       );
-      const terminalMessage = cleanup.errors.length > 0
-        ? `${msg}; FRG fixture cleanup incomplete: ${cleanup.errors.join("; ")}`
-        : msg;
       store = {
         ...store,
-        phase: "failed",
+        // Keep this request replayable: the next identical tick re-observes
+        // and re-scores the same bound pack instead of minting a successor.
+        phase: "frg_running",
         failure: {
-          defect_class: cleanup.errors.length > 0 ? "frg_pack_cleanup_failed" : defect,
-          message: terminalMessage,
+          defect_class: defect,
+          message: msg,
         },
         updated_at: isoNow(deps.now()),
       };
@@ -5146,8 +5210,8 @@ export async function runFactoryReleasePrepare(
         exitCode: 1,
         result: failedResult(
           request,
-          cleanup.errors.length > 0 ? "frg_pack_cleanup_failed" : defect,
-          terminalMessage,
+          defect,
+          msg,
           checkpointId("failed", fingerprint),
           generated.liveness,
         ),
