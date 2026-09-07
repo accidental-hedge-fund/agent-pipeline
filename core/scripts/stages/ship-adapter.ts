@@ -41,7 +41,8 @@ import {
 } from "../factory-reliability-gate.ts";
 import {
   FRG_HYBRID_PILOT_VERSION,
-  FRG_HYBRID_V2_MANIFEST_SHA256,
+  FRG_HYBRID_V2_POLICY_ID,
+  hybridManifestSha256Accepted,
   isFrgHybridV1PolicyId,
   isFrgHybridV2PolicyId,
 } from "../frg-pack-observations.ts";
@@ -2075,7 +2076,11 @@ async function validateResolvedFactoryReleaseRequest(
   }
   if (
     request.frg_manifest.pack_id !== FRG_PACK_MANIFEST.pack_id ||
-    request.frg_manifest.sha256 !== FRG_HYBRID_V2_MANIFEST_SHA256
+    !hybridManifestSha256Accepted(
+      FRG_HYBRID_V2_POLICY_ID,
+      request.target_version,
+      request.frg_manifest.sha256,
+    )
   ) {
     throw new Error("ship FRG: factory-release request pack identity does not match the current FRG pack");
   }
