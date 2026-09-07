@@ -179,6 +179,34 @@ test("missing, malformed, and unknown diagnostics are protocol failures", () => 
   );
 });
 
+test("process-exit detail is runtime-validated before it can influence recovery", () => {
+  const valid = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "nested advance child exited with code 1",
+    processExit: {
+      kind: "nested_advance_child",
+      code: 1,
+      signal: null,
+      store_initialized: false,
+    },
+  });
+  assert.equal(projectStageDiagnostic(valid).disposition, "recover");
+
+  for (const process_exit of [
+    { kind: "nested_advance_child", code: 0, signal: null, store_initialized: false },
+    { kind: "nested_advance_child", code: 1, signal: "SIGTERM", store_initialized: false },
+    { kind: "nested_advance_child", code: null, signal: "", store_initialized: false },
+    { kind: "nested_advance_child", code: 1, signal: null },
+  ]) {
+    const malformed = {
+      ...valid,
+      detail: { ...valid.detail, process_exit },
+    };
+    assert.equal(projectStageDiagnostic(malformed).disposition, "protocol_failure");
+  }
+});
+
 test("the final blocker_set controls classification; malformed final event does not fall back", () => {
   const text = [
     JSON.stringify({ type: "blocker_set", blocker_kind: "merge-conflict", reason: "conflict" }),

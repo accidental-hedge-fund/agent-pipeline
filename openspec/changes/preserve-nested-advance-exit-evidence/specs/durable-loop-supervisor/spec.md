@@ -21,3 +21,10 @@ When a spawned whole-item advance terminates with a nonzero exit code or signal 
 - **WHEN** `pipeline/loop-execution@1` reports `failed` with a valid recoverable diagnostic
 - **THEN** the supervisor SHALL persist and pass that exact diagnostic to recovery
 - **AND** it SHALL NOT replace the reason, evidence key, or structured detail with a generic normalized-failure diagnostic
+
+#### Scenario: Authoritative observer failure does not erase process evidence
+
+- **WHEN** a nested child terminates abnormally
+- **AND** the subsequent authoritative issue observation fails
+- **THEN** the dispatch response SHALL retain the structured child termination diagnostic
+- **AND** the observer failure SHALL NOT collapse the response to an unexplained generic failure

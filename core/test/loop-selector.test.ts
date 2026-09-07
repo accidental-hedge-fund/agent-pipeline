@@ -267,9 +267,9 @@ test("buildTerminalLinkagePayload without pin omits events and uses synthetic id
 // realDispatchItem with injected spawn/gh seams (#667).
 // ---------------------------------------------------------------------------
 
-function fakeSpawnChild(exitCode = 0): ChildProcess {
+function fakeSpawnChild(exitCode: number | null = 0, signal: NodeJS.Signals | null = null): ChildProcess {
   const ee = new EventEmitter() as ChildProcess;
-  queueMicrotask(() => ee.emit("exit", exitCode, null));
+  queueMicrotask(() => ee.emit("exit", exitCode, signal));
   return ee;
 }
 
@@ -505,6 +505,40 @@ test("realDispatchItem keeps authoritative ready-to-deploy despite a nonzero chi
 
   assert.equal(response.outcome, "ready_to_deploy");
   assert.equal(response.diagnostic, undefined);
+});
+
+test("realDispatchItem preserves a child signal when authoritative observation fails", async () => {
+  const fixedNow = new Date("2026-07-29T13:49:56.421Z");
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      eventsPathExists: () => false,
+      spawn: (() => fakeSpawnChild(null, "SIGTERM")) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => {
+        throw new Error("injected observer failure");
+      },
+    },
+  );
+
+  const response = await dispatch({
+    schema: "pipeline/loop-execution@1",
+    item_id: "623",
+    repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: "loop-run-observer-failure",
+  });
+
+  assert.equal(response.outcome, "failed");
+  assert.deepEqual(response.diagnostic?.detail.process_exit, {
+    kind: "nested_advance_child",
+    code: null,
+    signal: "SIGTERM",
+    store_initialized: false,
+  });
 });
 
 test("realDispatchItem publishes start linkage only after store becomes ready mid-wait (#667)", async () => {

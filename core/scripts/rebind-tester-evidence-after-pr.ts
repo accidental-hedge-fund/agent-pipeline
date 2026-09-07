@@ -19,7 +19,11 @@ import {
   parseEvidenceSubjectDetailed,
   resolveVerifierFingerprint,
 } from "./evidence-subject.ts";
-import { buildStageDiagnostic, type StageDiagnostic } from "./stage-diagnostic.ts";
+import {
+  buildStageDiagnostic,
+  isNestedAdvanceProcessExit,
+  type StageDiagnostic,
+} from "./stage-diagnostic.ts";
 import {
   candidateShaMatches,
   normalizeCandidateSha,
@@ -227,11 +231,8 @@ export function filterRecipesForWorkflowEngineDiagnostic<T extends string>(
   diagnostic: unknown,
 ): T[] {
   const processExit = (diagnostic as { detail?: { process_exit?: unknown } } | null)?.detail
-    ?.process_exit as Record<string, unknown> | undefined;
-  if (
-    processExit?.kind === "nested_advance_child" &&
-    (typeof processExit.code === "number" || typeof processExit.signal === "string")
-  ) {
+    ?.process_exit;
+  if (isNestedAdvanceProcessExit(processExit)) {
     return recipes.filter((recipe) => recipe === "restart_workflow_engine");
   }
   if (isTesterEvidenceOrderingDiagnostic(diagnostic)) {

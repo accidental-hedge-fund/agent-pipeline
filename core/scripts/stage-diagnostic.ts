@@ -97,6 +97,27 @@ export interface StageDiagnosticDetail {
   };
 }
 
+export type NestedAdvanceProcessExit = NonNullable<StageDiagnosticDetail["process_exit"]>;
+
+/** Validate the complete process-exit shape before it can influence recovery. */
+export function isNestedAdvanceProcessExit(value: unknown): value is NestedAdvanceProcessExit {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<NestedAdvanceProcessExit>;
+  const hasNonzeroCode =
+    typeof candidate.code === "number" &&
+    Number.isFinite(candidate.code) &&
+    Number.isInteger(candidate.code) &&
+    candidate.code > 0;
+  const hasSignal =
+    typeof candidate.signal === "string" && candidate.signal.trim().length > 0;
+  return (
+    candidate.kind === "nested_advance_child" &&
+    typeof candidate.store_initialized === "boolean" &&
+    ((hasNonzeroCode && candidate.signal === null) ||
+      (candidate.code === null && hasSignal))
+  );
+}
+
 export interface StageDiagnostic {
   readonly schema: typeof STAGE_DIAGNOSTIC_SCHEMA;
   reason_code: StageDiagnosticReasonCode;
@@ -307,6 +328,9 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
   const authorityEvidence = detail && typeof detail === "object"
     ? (detail as Partial<StageDiagnosticDetail>).authority_evidence
     : undefined;
+  const processExit = detail && typeof detail === "object"
+    ? (detail as Partial<StageDiagnosticDetail>).process_exit
+    : undefined;
   const validAuthorityEvidence =
     Array.isArray(authorityEvidence) &&
     authorityEvidence.length > 0 &&
@@ -327,7 +351,8 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
     detail.reason.trim().length === 0 ||
     (detail.stage !== undefined &&
       (typeof detail.stage !== "string" || detail.stage.trim().length === 0)) ||
-    (detail.offramp_class !== undefined && !isPreMergeOfframpClass(detail.offramp_class))
+    (detail.offramp_class !== undefined && !isPreMergeOfframpClass(detail.offramp_class)) ||
+    (processExit !== undefined && !isNestedAdvanceProcessExit(processExit))
   ) {
     return {
       blockerClass: "workflow-engine-defect",

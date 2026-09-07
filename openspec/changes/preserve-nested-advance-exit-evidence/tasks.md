@@ -7,6 +7,7 @@
 
 - [x] 2.1 Filter structured nested-child process exits to workflow-engine restart and verify unrelated repair recipes are excluded
 - [x] 2.2 Verify recovery selection uses structured fields and does not depend on exit-like prose
+- [x] 2.3 Runtime-validate structured exit detail and retain abnormal termination when authoritative observation fails
 
 ## 3. Integration verification
 

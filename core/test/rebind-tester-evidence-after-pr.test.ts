@@ -658,6 +658,35 @@ test("nested advance exit-like prose does not select process-lifecycle recovery"
   assert.equal(applicable.includes("restart_workflow_engine"), true);
 });
 
+test("malformed or successful process-exit detail cannot suppress ordinary recovery", () => {
+  for (const process_exit of [
+    { kind: "nested_advance_child", code: 0, signal: null, store_initialized: false },
+    { kind: "nested_advance_child", code: 1, signal: "SIGTERM", store_initialized: false },
+    { kind: "nested_advance_child", code: null, signal: "", store_initialized: false },
+    { kind: "nested_advance_child", code: 1, signal: null },
+  ]) {
+    const diagnostic = {
+      ...buildStageDiagnostic({
+        reasonCode: "workflow-engine-defect",
+        blockerKind: "harness-failure",
+        reason: "untrusted process detail",
+        stage: "loop-dispatch",
+      }),
+      detail: {
+        blocker_kind: "harness-failure",
+        reason: "untrusted process detail",
+        stage: "loop-dispatch",
+        process_exit,
+      },
+    };
+    const applicable = filterRecipesForWorkflowEngineDiagnostic(
+      DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes,
+      diagnostic,
+    );
+    assert.equal(applicable.includes("unlink_engine_scratch"), true);
+  }
+});
+
 test("4.2 inapplicable scratch is a skip, not a spent success", () => {
   const diagnostic = buildTesterEvidenceOrderingDiagnostic({
     stage: "design-gate",
