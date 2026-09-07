@@ -1100,10 +1100,13 @@ observation file as authority for either set.
 This policy **succeeds** the 1.33.0-only hybrid v1 expiry. v1.33.0 evidence
 bound to hybrid v1 remains historically valid for that version only. The scorer
 SHALL resolve the expected pack-manifest SHA and closed Layer A probe matrix by
-policy id: historical `factory-gate-v1-hybrid-v1` uses the frozen pre-v2
-manifest identity; current `factory-gate-v1-hybrid-v2` uses the current
-manifest identity. Relabeling current-manifest provenance as hybrid v1 SHALL
-NOT satisfy historical v1.
+policy id and release version: historical `factory-gate-v1-hybrid-v1` uses the
+frozen pre-v2 manifest identity; hybrid-v2 releases through `1.40.0` may carry
+the frozen pre-fixture-contract identity; and the corrected current identity
+is valid for newly rendered packs. Releases from `1.40.1` SHALL refuse the
+pre-correction identity. Relabeling current-manifest provenance as hybrid v1,
+or relabeling the frozen hybrid-v2 manifest as a later version's identity,
+SHALL NOT satisfy historical evidence.
 
 #### Scenario: Historical hybrid v1 evidence with the frozen v1 manifest SHA remains valid
 
@@ -1181,6 +1184,56 @@ NOT satisfy historical v1.
   closed schema
 - **AND** only runner-derived live/ledger/derived evidence and closed Layer A
   TAP hashes MAY contribute to a release-eligible pass
+
+### Requirement: Generated clean fixtures SHALL separate implementation from controller lifecycle evidence
+
+The checked-in `factory-gate-v1` clean-docs and clean-openspec templates SHALL
+describe synthetic clean-path conformance, unchanged production behavior, the
+exact run-scoped fixture and executable test paths, verification commands, and
+why no shared production classifier, recovery recipe, gate, or controller
+repair is required. Both fixtures SHALL traverse ordinary issue-readiness,
+planning, plan review, implementation, and review without an issue-number,
+label-only, or reduced-rigor bypass.
+
+The templates SHALL explicitly separate implementer-owned work and verification
+that can complete before pre-merge archive from controller-owned future
+observations. Ready-to-deploy, merge/deployment state, OpenSpec archive itself,
+and post-recording issue/PR cleanup SHALL remain acceptance obligations in
+requirements/scenarios or another lifecycle evidence surface, but SHALL NOT be
+copied into the same change's `tasks.md` as unchecked pre-archive prerequisites.
+The archive gate SHALL continue to reject genuine unchecked implementation or
+verification tasks.
+
+#### Scenario: OpenSpec planning keeps future lifecycle observations out of tasks
+
+- **WHEN** ordinary OpenSpec planning renders a generated clean fixture into a
+  proposal, requirements/scenarios, and `tasks.md`
+- **THEN** `tasks.md` SHALL contain only implementer-owned work and verification
+  that can finish before pre-merge archive
+- **AND** controller-owned archive, ready-to-deploy, merge/deployment state, and
+  post-recording cleanup observations SHALL remain required lifecycle evidence
+  outside that checklist
+- **AND** those future observations SHALL NOT be silently checked, discarded,
+  or treated as evidence before they occur
+
+#### Scenario: Genuine incomplete fixture implementation still blocks archive
+
+- **WHEN** a generated fixture's OpenSpec `tasks.md` has an unchecked fixture,
+  executable-test, or pre-archive verification task
+- **THEN** pre-merge SHALL refuse to archive the change
+- **AND** the generated-fixture lifecycle partition SHALL NOT waive that task
+
+#### Scenario: Template hash evolution preserves historical evidence
+
+- **WHEN** the current clean fixture templates and manifest hashes change for
+  the `1.40.1` lifecycle correction
+- **THEN** new `1.40.1` fixture instances SHALL bind the new manifest and
+  template hashes
+- **AND** hybrid-v2 evidence for releases through `1.40.0` that was produced
+  with the frozen pre-correction manifest identity SHALL remain valid with that
+  identity
+- **AND** the product SHALL NOT reinterpret historical version-bound artifacts
+  as if they were generated from the corrected templates
 
 ### Requirement: FRG runbook SHALL document durable hybrid v2 as current policy
 

@@ -25,12 +25,18 @@ export const FRG_HYBRID_REPLACEMENT_ISSUE = 908;
  */
 export const FRG_HYBRID_V1_MANIFEST_SHA256 =
   "d1fc4bfb4852a600875693e666ffbede65314dda045846d1513fb13da03f9b6a";
+/** Frozen hybrid-v2 identity before the v1.40.1 fixture lifecycle correction. */
+export const FRG_HYBRID_V2_PRE_FIXTURE_CONTRACT_MANIFEST_SHA256 =
+  "27f65953f20032c7b8d6d86ae1e69e26f951e6f5fed25e499a9a8f51463f2e2e";
+/** Last release version that can carry the pre-correction hybrid-v2 identity. */
+export const FRG_HYBRID_V2_PRE_FIXTURE_CONTRACT_MAX_VERSION = "1.40.0";
 /**
- * sha256 of the current `factory-gate-v1/manifest.json` (hybrid v2).
- * Drift-guarded against `loadFrgPack().manifest_sha256`.
+ * sha256 of the current `factory-gate-v1/manifest.json` (hybrid v2), containing
+ * the v1.40.1 fixture lifecycle contract. Drift-guarded against
+ * `loadFrgPack().manifest_sha256`.
  */
 export const FRG_HYBRID_V2_MANIFEST_SHA256 =
-  "27f65953f20032c7b8d6d86ae1e69e26f951e6f5fed25e499a9a8f51463f2e2e";
+  "346624a8b5447f7ddcb14d2ad94b35f7e3f34024175c7a98f50c99d6bfa3d7f4";
 /**
  * Frozen historical hybrid-v1 Layer A probe ids.
  * Decode `factory-gate-v1-hybrid-v1` / 1.33.0 evidence only.
@@ -90,11 +96,63 @@ export function isFrgHybridV1PolicyId(id: string): boolean {
   return id === FRG_HYBRID_PILOT_POLICY_ID;
 }
 
-/** Expected pack-manifest SHA for a known hybrid policy. Undefined if unknown. */
-export function expectedHybridManifestSha256(policyId: string): string | undefined {
+function compareSemver(left: string, right: string): number | null {
+  if (!/^\d+\.\d+\.\d+$/.test(left) || !/^\d+\.\d+\.\d+$/.test(right)) return null;
+  const l = left.split(".").map(Number);
+  const r = right.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if (l[i]! !== r[i]!) return l[i]! < r[i]! ? -1 : 1;
+  }
+  return 0;
+}
+
+function semverAtMost(left: string, right: string): boolean {
+  const comparison = compareSemver(left, right);
+  return comparison !== null && comparison <= 0;
+}
+
+/**
+ * Expected pack-manifest SHA for a known hybrid policy and release version.
+ * Omitting the release version selects the current authoring identity. Frozen
+ * historical identities remain version-bound rather than being redefined by a
+ * current template edit.
+ */
+export function expectedHybridManifestSha256(
+  policyId: string,
+  releaseVersion?: string,
+): string | undefined {
   if (isFrgHybridV1PolicyId(policyId)) return FRG_HYBRID_V1_MANIFEST_SHA256;
-  if (isFrgHybridV2PolicyId(policyId)) return FRG_HYBRID_V2_MANIFEST_SHA256;
+  if (isFrgHybridV2PolicyId(policyId)) {
+    if (
+      releaseVersion !== undefined &&
+      semverAtMost(releaseVersion, FRG_HYBRID_V2_PRE_FIXTURE_CONTRACT_MAX_VERSION)
+    ) {
+      return FRG_HYBRID_V2_PRE_FIXTURE_CONTRACT_MANIFEST_SHA256;
+    }
+    return FRG_HYBRID_V2_MANIFEST_SHA256;
+  }
   return undefined;
+}
+
+/**
+ * Validate a manifest identity without invalidating immutable hybrid-v2
+ * evidence produced before the fixture-contract correction. The current
+ * identity remains valid for newly rendered/retried packs; the frozen identity
+ * is accepted only for releases that could have produced it.
+ */
+export function hybridManifestSha256Accepted(
+  policyId: string,
+  releaseVersion: string | undefined,
+  actualSha256: string,
+): boolean {
+  if (isFrgHybridV1PolicyId(policyId)) {
+    return actualSha256 === FRG_HYBRID_V1_MANIFEST_SHA256;
+  }
+  if (!isFrgHybridV2PolicyId(policyId)) return false;
+  if (actualSha256 === FRG_HYBRID_V2_MANIFEST_SHA256) return true;
+  return releaseVersion !== undefined &&
+    semverAtMost(releaseVersion, FRG_HYBRID_V2_PRE_FIXTURE_CONTRACT_MAX_VERSION) &&
+    actualSha256 === FRG_HYBRID_V2_PRE_FIXTURE_CONTRACT_MANIFEST_SHA256;
 }
 
 /**
@@ -111,12 +169,9 @@ export function expectedHybridLayerAProbeIds(
 
 /** True when `version` is strictly after the 1.33.0 hybrid-v1 pin. */
 export function isPostHybridPilotVersion(version: string | undefined): boolean {
-  if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) return false;
-  const [maj, min, pat] = version.split(".").map(Number);
-  const [pMaj, pMin, pPat] = FRG_HYBRID_PILOT_VERSION.split(".").map(Number);
-  if (maj !== pMaj) return (maj ?? 0) > (pMaj ?? 0);
-  if (min !== pMin) return (min ?? 0) > (pMin ?? 0);
-  return (pat ?? 0) > (pPat ?? 0);
+  if (typeof version !== "string") return false;
+  const comparison = compareSemver(version, FRG_HYBRID_PILOT_VERSION);
+  return comparison !== null && comparison > 0;
 }
 
 /**

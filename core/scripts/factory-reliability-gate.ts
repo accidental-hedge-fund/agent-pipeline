@@ -33,7 +33,7 @@ import {
   FRG_HYBRID_REPLACEMENT_ISSUE,
   FRG_HYBRID_V2_POLICY_ID,
   expectedHybridLayerAProbeIds,
-  expectedHybridManifestSha256,
+  hybridManifestSha256Accepted,
   hybridProvenanceRequired,
   isFrgHybridV1PolicyId,
   isFrgHybridV2PolicyId,
@@ -1510,11 +1510,13 @@ function hybridSplitProofValid(
   opts: { historicalV1: boolean },
 ): boolean {
   const provenance = evidence.pack_provenance;
-  const expectedManifestSha = expectedHybridManifestSha256(provenance?.policy_id ?? "");
   if (
     !provenance ||
-    !expectedManifestSha ||
-    provenance.manifest_sha256 !== expectedManifestSha ||
+    !hybridManifestSha256Accepted(
+      provenance.policy_id,
+      evidence.version,
+      provenance.manifest_sha256,
+    ) ||
     (opts.historicalV1 && provenance.replacement_issue !== FRG_HYBRID_REPLACEMENT_ISSUE) ||
     provenance.release_version !== evidence.version ||
     provenance.pack_id !== FRG_PACK_MANIFEST.pack_id ||
