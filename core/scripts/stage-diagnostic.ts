@@ -352,7 +352,11 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
     (detail.stage !== undefined &&
       (typeof detail.stage !== "string" || detail.stage.trim().length === 0)) ||
     (detail.offramp_class !== undefined && !isPreMergeOfframpClass(detail.offramp_class)) ||
-    (processExit !== undefined && !isNestedAdvanceProcessExit(processExit))
+    (processExit !== undefined &&
+      (!isNestedAdvanceProcessExit(processExit) ||
+        detail.blocker_kind !== "harness-failure" ||
+        detail.stage !== "loop-dispatch" ||
+        candidate.reason_code !== "workflow-engine-defect"))
   ) {
     return {
       blockerClass: "workflow-engine-defect",

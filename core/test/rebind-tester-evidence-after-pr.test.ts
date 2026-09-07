@@ -687,6 +687,31 @@ test("malformed or successful process-exit detail cannot suppress ordinary recov
   }
 });
 
+test("process-exit detail outside nested loop dispatch cannot narrow recovery", () => {
+  const valid = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "nested advance child exited with code 1",
+    stage: "loop-dispatch",
+    processExit: {
+      kind: "nested_advance_child",
+      code: 1,
+      signal: null,
+      store_initialized: true,
+    },
+  });
+  const diagnostic = {
+    ...valid,
+    detail: { ...valid.detail, stage: "review-1" },
+  };
+  const applicable = filterRecipesForWorkflowEngineDiagnostic(
+    DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes,
+    diagnostic,
+  );
+  assert.equal(applicable.includes("unlink_engine_scratch"), true);
+  assert.equal(applicable.includes("restart_workflow_engine"), true);
+});
+
 test("4.2 inapplicable scratch is a skip, not a spent success", () => {
   const diagnostic = buildTesterEvidenceOrderingDiagnostic({
     stage: "design-gate",

@@ -184,6 +184,7 @@ test("process-exit detail is runtime-validated before it can influence recovery"
     reasonCode: "workflow-engine-defect",
     blockerKind: "harness-failure",
     reason: "nested advance child exited with code 1",
+    stage: "loop-dispatch",
     processExit: {
       kind: "nested_advance_child",
       code: 1,
@@ -205,6 +206,12 @@ test("process-exit detail is runtime-validated before it can influence recovery"
     };
     assert.equal(projectStageDiagnostic(malformed).disposition, "protocol_failure");
   }
+
+  const wrongContext = {
+    ...valid,
+    detail: { ...valid.detail, stage: "review-1" },
+  };
+  assert.equal(projectStageDiagnostic(wrongContext).disposition, "protocol_failure");
 });
 
 test("the final blocker_set controls classification; malformed final event does not fall back", () => {

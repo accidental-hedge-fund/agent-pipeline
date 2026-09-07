@@ -22,7 +22,7 @@ See `proposal.md`. The dispatch seam already observes the child `exit` event but
 2. Construct the diagnostic only after fresh issue/run classification still resolves to `failed`. This preserves the authoritative-observer rule: a process exit is ingress evidence, not lifecycle truth.
 3. Preserve any valid `recover` diagnostic returned with a failed loop-execution response. Invalid, capacity, or authority-shaped diagnostics still fail closed through the existing generic engine-defect path.
 4. Filter structured nested-child exits to `restart_workflow_engine`. Product repair and evidence-rebind recipes cannot repair a dead dispatcher process and were the source of the observed recovery delay. Matching free-form reason text was rejected because recovery decisions must be deterministic and non-linguistic.
-5. Validate the complete process-exit shape centrally before any consumer may narrow recovery. Exactly one abnormal termination fact is required: a positive integer exit code or a non-empty signal. Authoritative observation failure retains an already-observed abnormal termination because failure to observe is not contrary completion evidence.
+5. Validate the complete process-exit shape and its producer context centrally before any consumer may narrow recovery. Exactly one abnormal termination fact is required: a positive integer exit code or a non-empty signal. The enclosing diagnostic must be the `workflow-engine-defect` / `harness-failure` / `loop-dispatch` tuple. Authoritative observation failure retains an already-observed abnormal termination because failure to observe is not contrary completion evidence.
 
 ## Risks / Trade-offs
 

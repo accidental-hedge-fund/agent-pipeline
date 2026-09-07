@@ -22,6 +22,7 @@ import {
 import {
   buildStageDiagnostic,
   isNestedAdvanceProcessExit,
+  STAGE_DIAGNOSTIC_SCHEMA,
   type StageDiagnostic,
 } from "./stage-diagnostic.ts";
 import {
@@ -230,9 +231,15 @@ export function filterRecipesForWorkflowEngineDiagnostic<T extends string>(
   recipes: readonly T[],
   diagnostic: unknown,
 ): T[] {
-  const processExit = (diagnostic as { detail?: { process_exit?: unknown } } | null)?.detail
-    ?.process_exit;
-  if (isNestedAdvanceProcessExit(processExit)) {
+  const candidate = diagnostic as Partial<StageDiagnostic> | null;
+  const processExit = candidate?.detail?.process_exit;
+  if (
+    candidate?.schema === STAGE_DIAGNOSTIC_SCHEMA &&
+    candidate.reason_code === "workflow-engine-defect" &&
+    candidate.detail?.blocker_kind === "harness-failure" &&
+    candidate.detail.stage === "loop-dispatch" &&
+    isNestedAdvanceProcessExit(processExit)
+  ) {
     return recipes.filter((recipe) => recipe === "restart_workflow_engine");
   }
   if (isTesterEvidenceOrderingDiagnostic(diagnostic)) {
