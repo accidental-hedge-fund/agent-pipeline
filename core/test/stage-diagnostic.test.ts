@@ -198,6 +198,8 @@ test("process-exit detail is runtime-validated before it can influence recovery"
     { kind: "nested_advance_child", code: 0, signal: null, store_initialized: false },
     { kind: "nested_advance_child", code: 1, signal: "SIGTERM", store_initialized: false },
     { kind: "nested_advance_child", code: null, signal: "", store_initialized: false },
+    { kind: "nested_advance_child", code: null, signal: "not-a-signal", store_initialized: false },
+    { kind: "nested_advance_child", code: 256, signal: null, store_initialized: false },
     { kind: "nested_advance_child", code: 1, signal: null },
   ]) {
     const malformed = {

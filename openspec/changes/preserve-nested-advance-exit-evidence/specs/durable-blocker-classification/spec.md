@@ -16,9 +16,9 @@ Recovery classification SHALL recognize nested-child process termination from st
 - **THEN** recovery SHALL NOT infer the nested-child process-exit treatment from that prose
 - **AND** ordinary workflow-engine diagnostic filtering SHALL continue to apply
 
-#### Scenario: Malformed or successful exit detail cannot narrow recovery
+#### Scenario: Malformed, impossible, or successful exit detail cannot narrow recovery
 
-- **WHEN** process-exit detail reports exit code zero, an empty signal, contradictory code and signal, or omits a required member
+- **WHEN** process-exit detail reports exit code zero or outside 1–255, an unknown signal name, contradictory code and signal, or omits a required member
 - **THEN** diagnostic projection SHALL reject that detail as a protocol failure
 - **AND** recovery recipe filtering SHALL NOT select restart-only treatment from it
 

@@ -1715,6 +1715,8 @@ export function realDispatchItem(
         : null;
 
     let startLinkage: Promise<void> = Promise.resolve();
+    let startLinkageFailed = false;
+    let startLinkageError: unknown;
     let storeReady = false;
     let childTermination: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     const terminationDiagnostic = (): StageDiagnostic | undefined => {
@@ -1742,7 +1744,15 @@ export function realDispatchItem(
       if (hooks?.onAdvanceLinked) {
         startLinkage = Promise.resolve(
           hooks.onAdvanceLinked(buildStartLinkagePayload(request.item_id, pin)),
-        ).then(() => undefined);
+        )
+          .then(() => undefined)
+          .catch((err: unknown) => {
+            // Observe immediately so a rejection cannot become unhandled while
+            // the child is still running. It is surfaced after child exit unless
+            // abnormal process evidence must remain available to recovery.
+            startLinkageFailed = true;
+            startLinkageError = err;
+          });
       }
       return true;
     };
@@ -1839,6 +1849,7 @@ export function realDispatchItem(
     // Linkage write errors must surface separately from spawn failure — when
     // the store was confirmed, a failed append is not a "no store" path.
     await startLinkage;
+    if (startLinkageFailed && !terminationDiagnostic()) throw startLinkageError;
 
     let outcome: LoopExecutionResponse["outcome"] = "failed";
     let diagnostic: StageDiagnostic | undefined;

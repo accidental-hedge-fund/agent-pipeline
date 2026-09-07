@@ -28,3 +28,10 @@ When a spawned whole-item advance terminates with a nonzero exit code or signal 
 - **AND** the subsequent authoritative issue observation fails
 - **THEN** the dispatch response SHALL retain the structured child termination diagnostic
 - **AND** the observer failure SHALL NOT collapse the response to an unexplained generic failure
+
+#### Scenario: Durable start-linkage failure does not erase process evidence
+
+- **WHEN** a nested child terminates abnormally after initializing its run store
+- **AND** publication of its durable start linkage fails
+- **THEN** the dispatch response SHALL retain the structured child termination diagnostic
+- **AND** recovery SHALL NOT collapse the response to an unexplained generic failure

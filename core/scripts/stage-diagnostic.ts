@@ -3,6 +3,7 @@
 // and free-form blocker prose never grant human-authority status.
 
 import { createHash } from "node:crypto";
+import { constants as osConstants } from "node:os";
 import {
   PRE_MERGE_OFFRAMP_CLASSES,
   isPreMergeOfframpClass,
@@ -99,6 +100,8 @@ export interface StageDiagnosticDetail {
 
 export type NestedAdvanceProcessExit = NonNullable<StageDiagnosticDetail["process_exit"]>;
 
+const PROCESS_SIGNAL_NAMES: ReadonlySet<string> = new Set(Object.keys(osConstants.signals));
+
 /** Validate the complete process-exit shape before it can influence recovery. */
 export function isNestedAdvanceProcessExit(value: unknown): value is NestedAdvanceProcessExit {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -107,9 +110,10 @@ export function isNestedAdvanceProcessExit(value: unknown): value is NestedAdvan
     typeof candidate.code === "number" &&
     Number.isFinite(candidate.code) &&
     Number.isInteger(candidate.code) &&
-    candidate.code > 0;
+    candidate.code > 0 &&
+    candidate.code <= 255;
   const hasSignal =
-    typeof candidate.signal === "string" && candidate.signal.trim().length > 0;
+    typeof candidate.signal === "string" && PROCESS_SIGNAL_NAMES.has(candidate.signal);
   return (
     candidate.kind === "nested_advance_child" &&
     typeof candidate.store_initialized === "boolean" &&

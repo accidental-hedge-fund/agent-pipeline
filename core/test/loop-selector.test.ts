@@ -541,6 +541,48 @@ test("realDispatchItem preserves a child signal when authoritative observation f
   });
 });
 
+test("realDispatchItem preserves abnormal exit when durable start linkage rejects", async () => {
+  const fixedNow = new Date("2026-07-29T13:49:56.421Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 623, fixedNow);
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      eventsPathExists: (candidate) => candidate === expectedPin.events_path,
+      spawn: (() => fakeSpawnChild(1)) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: [], state: "open" }) as never,
+      getPrForIssue: async () => null,
+    },
+  );
+
+  const response = await dispatch(
+    {
+      schema: "pipeline/loop-execution@1",
+      item_id: "623",
+      repo: { name: "acme/w", base_branch: "main" },
+      engine: "claude",
+      worktree_policy: "default",
+      done_definition: "pipeline:ready-to-deploy",
+      run_id: "loop-run-linkage-rejection",
+    },
+    {
+      onAdvanceLinked: async () => {
+        throw new Error("injected durable linkage append failure");
+      },
+    },
+  );
+
+  assert.equal(response.outcome, "failed");
+  assert.deepEqual(response.diagnostic?.detail.process_exit, {
+    kind: "nested_advance_child",
+    code: 1,
+    signal: null,
+    store_initialized: true,
+  });
+  assert.equal(response.evidence.events_path, expectedPin.events_path);
+});
+
 test("realDispatchItem publishes start linkage only after store becomes ready mid-wait (#667)", async () => {
   const fixedNow = new Date("2026-07-29T13:49:56.421Z");
   const expectedPin = pinAdvanceRunIdentity("/repo", 623, fixedNow);
