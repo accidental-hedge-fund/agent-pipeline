@@ -2257,15 +2257,16 @@ type CandidateEngineConsumer = import("../scripts/ship-end-candidate.ts").Candid
 function candidateEngineFor(
   consumer: CandidateEngineConsumer,
   acquireProcessLock?: import("../scripts/ship-end-candidate.ts").CandidateEngine["acquireProcessLock"],
+  engineRoot = "/cand",
 ): import("../scripts/ship-end-candidate.ts").CandidateEngine {
   const engine: import("../scripts/ship-end-candidate.ts").CandidateEngine = {
-    engineRoot: "/cand",
-    launcherPath: "/cand/scripts/pipeline-launcher.mjs",
+    engineRoot,
+    launcherPath: path.join(engineRoot, "scripts/pipeline-launcher.mjs"),
     commitSha: head,
     consumer,
     acquireProcessLock: acquireProcessLock ?? (() => ({
       proof: {
-        engineRoot: "/cand",
+        engineRoot,
         commitSha: head,
         readyRecordPath: "/state/ready.json",
         lockfileDigest: "d".repeat(64),
@@ -4642,6 +4643,16 @@ test("real coordinator defaults spawn candidate ensure-tag leaf and persist requ
   );
 });
 
+function showCandidateManifestFrom(root: string) {
+  return async (_candidate: unknown, relPath: string): Promise<Buffer | null> => {
+    try {
+      return fs.readFileSync(path.join(root, relPath));
+    } catch {
+      return null;
+    }
+  };
+}
+
 test("persistShipFactoryReleaseRequest writes a secret-free request and reuses it", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ship-frg-req-"));
   const repoDir = path.join(tmp, "repo");
@@ -4651,8 +4662,18 @@ test("persistShipFactoryReleaseRequest writes a secret-free request and reuses i
   fs.writeFileSync(path.join(manifestDir, "manifest.json"), JSON.stringify({ pack_id: "factory-gate-v1" }));
   const env = { AGENT_PIPELINE_STATE_HOME: stateHome };
   try {
-    const first = await persistShipFactoryReleaseRequest(intent, train, { repoDir, env });
-    const second = await persistShipFactoryReleaseRequest(intent, train, { repoDir, env });
+    const candidate = { engineRoot: repoDir, commitSha: head };
+    const showCandidateBlob = showCandidateManifestFrom(repoDir);
+    const first = await persistShipFactoryReleaseRequest(intent, train, {
+      candidate,
+      env,
+      showCandidateBlob,
+    });
+    const second = await persistShipFactoryReleaseRequest(intent, train, {
+      candidate,
+      env,
+      showCandidateBlob,
+    });
     assert.equal(first, second);
     assert.equal(
       isPathInsideCheckout(first, repoDir),
@@ -4686,7 +4707,13 @@ test("persistShipFactoryReleaseRequest fails closed on malformed or mismatched c
     ),
   );
   try {
-    const requestPath = await persistShipFactoryReleaseRequest(intent, train, { repoDir, env });
+    const candidate = { engineRoot: repoDir, commitSha: head };
+    const showCandidateBlob = showCandidateManifestFrom(repoDir);
+    const requestPath = await persistShipFactoryReleaseRequest(intent, train, {
+      candidate,
+      env,
+      showCandidateBlob,
+    });
     const request = JSON.parse(fs.readFileSync(requestPath, "utf8")) as Record<string, unknown>;
     const mismatched = JSON.stringify({
       ...request,
@@ -4695,14 +4722,14 @@ test("persistShipFactoryReleaseRequest fails closed on malformed or mismatched c
     fs.writeFileSync(requestPath, mismatched);
 
     await assert.rejects(
-      persistShipFactoryReleaseRequest(intent, train, { repoDir, env }),
+      persistShipFactoryReleaseRequest(intent, train, { candidate, env, showCandidateBlob }),
       /does not match the current ship candidate/,
     );
     assert.equal(fs.readFileSync(requestPath, "utf8"), mismatched);
 
     fs.writeFileSync(requestPath, "{not-json");
     await assert.rejects(
-      persistShipFactoryReleaseRequest(intent, train, { repoDir, env }),
+      persistShipFactoryReleaseRequest(intent, train, { candidate, env, showCandidateBlob }),
       /invalid persisted factory-release request JSON/,
     );
     assert.equal(fs.readFileSync(requestPath, "utf8"), "{not-json");
@@ -4728,7 +4755,11 @@ test("OLD to NEW train persistence dispatches the NEW candidate request and pres
     ),
   );
   try {
-    const oldPath = await persistShipFactoryReleaseRequest(intent, oldTrain, { repoDir, env });
+    const oldPath = await persistShipFactoryReleaseRequest(intent, oldTrain, {
+      candidate: { engineRoot: repoDir, commitSha: oldHead },
+      env,
+      showCandidateBlob: showCandidateManifestFrom(repoDir),
+    });
     const oldText = fs.readFileSync(oldPath, "utf8");
     let selectedPath = "";
     let selectedRequest: Record<string, unknown> | null = null;
@@ -4736,9 +4767,16 @@ test("OLD to NEW train persistence dispatches the NEW candidate request and pres
       pinCommitSha: PIN_SHA,
       repoDir,
       env,
-      resolveFactoryReleaseRequestPath: (nextIntent, nextTrain) =>
-        persistShipFactoryReleaseRequest(nextIntent, nextTrain, { repoDir, env }),
-      resolveCandidate: resolveTestCandidate,
+      resolveFactoryReleaseRequestPath: (nextIntent, nextTrain, candidate) =>
+        persistShipFactoryReleaseRequest(nextIntent, nextTrain, {
+          candidate,
+          env,
+          showCandidateBlob: showCandidateManifestFrom(repoDir),
+        }),
+      resolveCandidate: async (_sha, consumer) => ({
+        ok: true as const,
+        engine: candidateEngineFor(consumer, undefined, repoDir),
+      }),
       spawn: async (argv) => {
         selectedPath = argv[argv.indexOf("--request") + 1] ?? "";
         selectedRequest = JSON.parse(fs.readFileSync(selectedPath, "utf8")) as Record<string, unknown>;
@@ -4755,6 +4793,108 @@ test("OLD to NEW train persistence dispatches the NEW candidate request and pres
     assert.notEqual(selectedPath, oldPath);
     assert.equal(fs.readFileSync(oldPath, "utf8"), oldText, "OLD request remains immutable evidence");
     assert.deepEqual(selectedRequest?.integrated_candidate, { git_sha: head });
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("default ship request binds the exact candidate manifest instead of the target checkout (#1527)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ship-frg-candidate-manifest-"));
+  const repoDir = path.join(tmp, "old-target");
+  const candidateDir = path.join(tmp, "new-candidate");
+  const stateHome = path.join(tmp, "state");
+  const manifestRel = "core/scripts/frg-packs/factory-gate-v1/manifest.json";
+  const candidateManifest = fs.readFileSync(
+    path.join(__dirname, "../scripts/frg-packs/factory-gate-v1/manifest.json"),
+  );
+  fs.mkdirSync(path.join(repoDir, path.dirname(manifestRel)), { recursive: true });
+  fs.mkdirSync(path.join(candidateDir, path.dirname(manifestRel)), { recursive: true });
+  fs.writeFileSync(
+    path.join(repoDir, manifestRel),
+    JSON.stringify({ pack_id: "factory-gate-v1", source: "old-target" }),
+  );
+  fs.writeFileSync(path.join(candidateDir, manifestRel), candidateManifest);
+  const env = { AGENT_PIPELINE_STATE_HOME: stateHome };
+  const spawned: string[][] = [];
+  try {
+    const bound = bindCandidateShipEndOperations(operations(), {
+      pinCommitSha: PIN_SHA,
+      repoDir,
+      env,
+      resolveFactoryReleaseRequestPath: (nextIntent, nextTrain, candidate) =>
+        persistShipFactoryReleaseRequest(nextIntent, nextTrain, {
+          candidate,
+          env,
+          showCandidateBlob: showCandidateManifestFrom(candidateDir),
+        }),
+      resolveCandidate: async (_sha, consumer) => ({
+        ok: true as const,
+        engine: candidateEngineFor(consumer, undefined, candidateDir),
+      }),
+      spawn: async (argv) => {
+        spawned.push(argv);
+        return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+      },
+    });
+
+    await bound.runFrgPack!(intent, train);
+
+    const requestPath = persistedShipFactoryReleaseRequestPath(intent, train, env);
+    const request = JSON.parse(fs.readFileSync(requestPath, "utf8")) as FactoryReleasePrepareRequest;
+    assert.equal(request.integrated_candidate.git_sha, head);
+    assert.equal(
+      request.frg_manifest.sha256,
+      createHash("sha256").update(candidateManifest).digest("hex"),
+    );
+    assert.equal(spawned.length, 1);
+    assert.ok(spawned[0]!.includes(requestPath));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("missing exact-candidate manifest publishes no request and dispatches no fixture (#1527)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ship-frg-missing-candidate-manifest-"));
+  const repoDir = path.join(tmp, "old-target");
+  const candidateDir = path.join(tmp, "new-candidate");
+  const stateHome = path.join(tmp, "state");
+  const manifestRel = "core/scripts/frg-packs/factory-gate-v1/manifest.json";
+  fs.mkdirSync(path.join(repoDir, path.dirname(manifestRel)), { recursive: true });
+  fs.mkdirSync(candidateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(repoDir, manifestRel),
+    fs.readFileSync(path.join(__dirname, "../scripts/frg-packs/factory-gate-v1/manifest.json")),
+  );
+  const env = { AGENT_PIPELINE_STATE_HOME: stateHome };
+  const spawned: string[][] = [];
+  try {
+    const bound = bindCandidateShipEndOperations(operations(), {
+      pinCommitSha: PIN_SHA,
+      repoDir,
+      env,
+      resolveFactoryReleaseRequestPath: (nextIntent, nextTrain, candidate) =>
+        persistShipFactoryReleaseRequest(nextIntent, nextTrain, {
+          candidate,
+          env,
+          showCandidateBlob: async () => null,
+        }),
+      resolveCandidate: async (_sha, consumer) => ({
+        ok: true as const,
+        engine: candidateEngineFor(consumer, undefined, candidateDir),
+      }),
+      spawn: async (argv) => {
+        spawned.push(argv);
+        return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+      },
+    });
+
+    await assert.rejects(
+      bound.runFrgPack!(intent, train),
+      /exact-candidate manifest missing or unreadable/,
+    );
+
+    assert.equal(fs.existsSync(persistedShipFactoryReleaseRequestPath(intent, train, env)), false);
+    assert.deepEqual(spawned, []);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
