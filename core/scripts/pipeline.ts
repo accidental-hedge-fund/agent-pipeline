@@ -5033,6 +5033,12 @@ async function main(): Promise<void> {
           `  Finish:  pipeline release finish <pr>`,
       );
       process.exit(2);
+    } else if (opts.dryRun && typeof opts.packedCandidate === "string") {
+      console.error(
+        "pipeline release: --dry-run cannot be combined with --packed-candidate; " +
+          "candidate-bound release preparation requires exact-checkout alignment.",
+      );
+      process.exit(2);
     }
   }
 
@@ -5402,6 +5408,17 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     try {
+      if (typeof opts.packedCandidate === "string") {
+        const { alignReleaseCheckoutToCandidate } = await import("./stages/ship-adapter.ts");
+        await alignReleaseCheckoutToCandidate(
+          localCfg.base_branch,
+          opts.packedCandidate,
+          async (args) => {
+            const result = await gitInWorktree(localCfg.repo_dir, args);
+            return result.stdout.trim();
+          },
+        );
+      }
       const releaseDeps = realReleaseDeps(localCfg.repo_dir);
       if (opts.json) {
         // Keep stdout as a one-document machine contract. Release preparation

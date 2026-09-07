@@ -1054,7 +1054,16 @@ export function shipEndLeafArgv(
       return ["factory-gate", "--for", args.version, "--from-run", args.loopRunId];
     case "release":
       if (!args.version) throw new Error("release requires a bare X.Y.Z version");
-      return ["release", args.version, "--no-edit"];
+      if (!parseExactGitSha(args.packedCandidate)) {
+        throw new Error("release requires a 40-hex --packed-candidate");
+      }
+      return [
+        "release",
+        args.version,
+        "--no-edit",
+        "--packed-candidate",
+        args.packedCandidate!,
+      ];
     case "release-finish":
       if (!args.pr || args.pr <= 0) throw new Error("release finish requires a PR number");
       return ["release", "finish", String(args.pr), "--json"];

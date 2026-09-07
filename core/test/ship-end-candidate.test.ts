@@ -151,8 +151,17 @@ test("ship-end leaf argv never re-enters ship or train", () => {
   assert.doesNotMatch(prepare.join(" "), /\bship\b|\btrain\b/);
   assertShipEndLeafArgv(prepare);
 
-  const release = shipEndLeafArgv("release", { version: "1.39.5" });
-  assert.deepEqual(release, ["release", "1.39.5", "--no-edit"]);
+  const release = shipEndLeafArgv("release", {
+    version: "1.39.5",
+    packedCandidate: SHA,
+  });
+  assert.deepEqual(release, [
+    "release",
+    "1.39.5",
+    "--no-edit",
+    "--packed-candidate",
+    SHA,
+  ]);
   assertShipEndLeafArgv(release);
 
   const finish = shipEndLeafArgv("release-finish", { pr: 42 });

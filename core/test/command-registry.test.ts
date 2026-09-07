@@ -68,6 +68,15 @@ test("command-registry: merge allowedFlags does not include jsonEvents, detach, 
   }
 });
 
+test("command-registry: release accepts the internal exact-candidate binding flag (#1540)", () => {
+  const release = lookupCommand("release");
+  assert.ok(release);
+  assert.deepEqual(
+    validateFlags(release, fakeCmdWithCliFlag("packedCandidate")),
+    [],
+  );
+});
+
 // ---------------------------------------------------------------------------
 // 2.3  lookupCommand: numeric / undefined → advance entry
 // ---------------------------------------------------------------------------
