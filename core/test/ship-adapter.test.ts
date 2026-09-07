@@ -2197,18 +2197,50 @@ test("ship publication accepts only an annotated tag peeled to the release merge
   );
 });
 
-test("ship release checkout is fast-forwarded and must equal the FRG candidate", async () => {
+test("ship release checkout advances the current worktree branch to the exact FRG candidate", async () => {
   const calls: string[] = [];
   await alignReleaseCheckoutToCandidate("main", head, async (args) => {
     calls.push(args.join(" "));
-    return args[0] === "rev-parse" ? head : "";
+    if (args.join(" ") === "remote get-url origin") return "git@example.invalid:repo.git";
+    if (args.join(" ") === "rev-parse --verify origin/main") return head;
+    if (args.join(" ") === "rev-parse HEAD") return head;
+    return "";
   });
-  assert.deepEqual(calls, ["checkout main", "merge --ff-only origin/main", "rev-parse HEAD"]);
+  assert.deepEqual(calls, [
+    "remote get-url origin",
+    "fetch origin main",
+    "rev-parse --verify origin/main",
+    "rev-parse HEAD",
+  ]);
+
+  const older = "e".repeat(40);
+  calls.length = 0;
+  await alignReleaseCheckoutToCandidate("main", head, async (args) => {
+    calls.push(args.join(" "));
+    if (args.join(" ") === "remote get-url origin") return "git@example.invalid:repo.git";
+    if (args.join(" ") === "rev-parse --verify origin/main") return head;
+    if (args.join(" ") === "rev-parse HEAD") return calls.includes(`merge --ff-only ${head}`)
+      ? head
+      : older;
+    return "";
+  });
+  assert.deepEqual(calls, [
+    "remote get-url origin",
+    "fetch origin main",
+    "rev-parse --verify origin/main",
+    "rev-parse HEAD",
+    `merge-base --is-ancestor ${older} ${head}`,
+    `merge --ff-only ${head}`,
+    "rev-parse HEAD",
+  ]);
 
   await assert.rejects(
-    alignReleaseCheckoutToCandidate("main", head, async (args) =>
-      args[0] === "rev-parse" ? "f".repeat(40) : ""),
-    /does not match the FRG candidate/,
+    alignReleaseCheckoutToCandidate("main", head, async (args) => {
+      if (args.join(" ") === "remote get-url origin") return "git@example.invalid:repo.git";
+      if (args.join(" ") === "rev-parse --verify origin/main") return "f".repeat(40);
+      return "";
+    }),
+    /origin\/main moved after FRG/,
   );
 });
 
@@ -2365,6 +2397,11 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
   assert.ok(spawned.some((argv) => argv.includes("factory-release") && argv.includes("/cand/scripts/pipeline-launcher.mjs")));
   assert.ok(spawned.some((argv) => argv.includes("factory-gate") && argv.includes("--from-run")));
   assert.ok(spawned.some((argv) => argv[argv.length - 2] === "release" || argv.includes("release")));
+  assert.ok(spawned.some((argv) =>
+    argv.includes("release") &&
+    argv.includes("--packed-candidate") &&
+    argv.includes(head)
+  ));
   assert.ok(
     spawned.some((argv) =>
       argv.includes("ensure-tag") &&

@@ -523,11 +523,29 @@ export async function alignReleaseCheckoutToCandidate(
   git: (args: string[]) => Promise<string>,
 ): Promise<void> {
   const candidate = requireOid(candidateHeadOid, "ship release candidate");
-  await git(["checkout", baseBranch]);
-  await git(["merge", "--ff-only", `origin/${baseBranch}`]);
-  const localHead = requireOid(await git(["rev-parse", "HEAD"]), "ship release local head");
+  let hasOrigin = false;
+  try {
+    hasOrigin = (await git(["remote", "get-url", "origin"])).trim().length > 0;
+  } catch {
+    // A caller may provide an isolated checkout with an explicit origin/<base>
+    // tracking ref but no configured network remote (for example, a Git proof).
+  }
+  if (hasOrigin) await git(["fetch", "origin", baseBranch]);
+  const originHead = requireOid(
+    await git(["rev-parse", "--verify", `origin/${baseBranch}`]),
+    "ship release origin head",
+  );
+  if (originHead !== candidate) {
+    throw new Error(`ship release: origin/${baseBranch} moved after FRG; start a new candidate shipment`);
+  }
+  let localHead = requireOid(await git(["rev-parse", "HEAD"]), "ship release local head");
   if (localHead !== candidate) {
-    throw new Error("ship release: local base checkout does not match the FRG candidate");
+    await git(["merge-base", "--is-ancestor", localHead, candidate]);
+    await git(["merge", "--ff-only", candidate]);
+    localHead = requireOid(await git(["rev-parse", "HEAD"]), "ship release local head");
+  }
+  if (localHead !== candidate) {
+    throw new Error("ship release: current checkout does not match the exact FRG candidate");
   }
 }
 
@@ -2587,7 +2605,10 @@ export function bindCandidateShipEndOperations(
       const spawned = await spawnShipStageLeaf(
         ctx,
         engine,
-        shipEndLeafArgv("release", { version: intent.version }),
+        shipEndLeafArgv("release", {
+          version: intent.version,
+          packedCandidate: candidateHeadOid,
+        }),
         uncredentialedPrepareEnv(ctx.env),
       );
       if (spawned.code !== 0) {

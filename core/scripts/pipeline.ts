@@ -5402,6 +5402,17 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     try {
+      if (typeof opts.packedCandidate === "string") {
+        const { alignReleaseCheckoutToCandidate } = await import("./stages/ship-adapter.ts");
+        await alignReleaseCheckoutToCandidate(
+          localCfg.base_branch,
+          opts.packedCandidate,
+          async (args) => {
+            const result = await gitInWorktree(localCfg.repo_dir, args);
+            return result.stdout.trim();
+          },
+        );
+      }
       const releaseDeps = realReleaseDeps(localCfg.repo_dir);
       if (opts.json) {
         // Keep stdout as a one-document machine contract. Release preparation
