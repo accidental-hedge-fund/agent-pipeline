@@ -47,6 +47,8 @@ import {
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, type LoopExecutionRequest, type LoopExecutionResponse } from "../scripts/loop-execution-contract.ts";
 import { buildStageDiagnostic, projectStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 import { consultLifecycleRecord } from "../scripts/recovery-lifecycle-ownership.ts";
+import { realExecuteRecovery } from "../scripts/pipeline.ts";
+import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 
 const READY_LABEL = "pipeline:ready-to-deploy";
 // The precondition stage gate (#568, capability `loop-precondition-stage-gate`) excludes a
@@ -2935,6 +2937,232 @@ test("recovery performs deterministic redispatch before model repair", async () 
   assert.ok(actions.every((action) => action === "resync_workflow_state" || action === "repair_pipeline_item"));
   assert.ok(finalLedger.recovery_attempts.every((attempt) => attempt.outcome === "recovered"));
   assert.ok((finalLedger.items["100"].recovery_budgets_remaining["workflow-state"] ?? 0) < 3);
+});
+
+test("production recovery skips inapplicable HEAD verification and preserves the same-candidate repair cursor across redispatch", async () => {
+  const implementationCi = DEFAULT_RECOVERY_POLICY["implementation-ci"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "implementation-ci": {
+        ...implementationCi,
+        per_strategy_bound: 1,
+        backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
+        repeated_evidence_limit: 5,
+      },
+    },
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const head = "a".repeat(40);
+  let blockedLabelPresent = false;
+  let dispatchCount = 0;
+  let worktreeProbes = 0;
+  let rerunClears = 0;
+  let repairCalls = 0;
+  let recoverySleeps = 0;
+  const detailedDiagnostic = buildStageDiagnostic({
+    reasonCode: "implementation-ci",
+    blockerKind: "openspec-invalid",
+    reason: "Pre-merge cannot archive the OpenSpec change: unchecked tasks remain",
+    stage: "pre-merge",
+  });
+  const attestedDiagnostic = buildStageDiagnostic({
+    reasonCode: "implementation-ci",
+    blockerKind: "openspec-invalid",
+    reason: "trusted current blocker-kind attestation",
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return {
+        state: "open",
+        labels: ["pipeline:pre-merge", ...(blockedLabelPresent ? ["blocked"] : [])],
+      };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: head, merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "fail" }];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: head };
+    },
+    async baseBranchContainsSha() {
+      return false;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    blockedLabelPresent = true;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_recoverable",
+      evidence: { pr_number: 12, pipeline_run_id: `advance-${dispatchCount}` },
+      diagnostic: dispatchCount === 1 ? detailedDiagnostic : attestedDiagnostic,
+    };
+  };
+  const pipelineConfig: PipelineConfig = {
+    ...DEFAULT_CONFIG,
+    repo: "acme/widgets",
+    repo_dir: "/repo",
+    base_branch: "main",
+  };
+  const executeRecovery = realExecuteRecovery(pipelineConfig, {
+    getIssueDetail: async () => ({
+      number: 100,
+      state: "open",
+      title: "fixture",
+      body: "",
+      labels: blockedLabelPresent ? ["blocked"] : [],
+      milestone: null,
+      comments: [],
+    }),
+    clearBlocked: async () => {
+      rerunClears++;
+      blockedLabelPresent = false;
+    },
+    getOnDiskForIssue: async () => {
+      worktreeProbes++;
+      return null;
+    },
+    repairPipelineItem: async () => {
+      repairCalls++;
+      return { succeeded: false, evidence: "OpenSpec tasks still incomplete", error: "OpenSpec tasks still incomplete" };
+    },
+  });
+  const supervisorDeps: SupervisorDeps = {
+    store: deps,
+    observe,
+    dispatchItem,
+    executeRecovery,
+    recoverySleep: async () => {
+      recoverySleeps++;
+    },
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle(supervisorDeps, "run-1", token, "claude");
+  await runSupervisorCycle(supervisorDeps, "run-1", token, "claude");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  const verifyAttempts = finalLedger.recovery_attempts.filter(
+    (attempt) => attempt.action === "verify_head_goal",
+  );
+  const rerunAttempt = finalLedger.recovery_attempts.find((attempt) => attempt.action === "rerun_ci");
+  const repairAttempt = finalLedger.recovery_attempts.find(
+    (attempt) => attempt.action === "repair_pipeline_item",
+  );
+  const events = await readEvents(deps, "run-1");
+  const rerunEvent = events.find(
+    (event) => event.kind === "loop_recovery_action_executed" &&
+      (event.data as { action?: string }).action === "rerun_ci",
+  );
+  assert.equal(dispatchCount, 2);
+  assert.equal(worktreeProbes, 0, "inapplicable verify_head_goal must not reach its executor");
+  assert.equal(recoverySleeps, 0, "inapplicable verify_head_goal must not schedule backoff");
+  assert.equal(
+    rerunClears,
+    1,
+    `rerun_ci remains an applicable redispatch resync alias: ${JSON.stringify(finalLedger.recovery_attempts)}`,
+  );
+  assert.equal(repairCalls, 1, "the repeated same-candidate blocker advances to substantive repair");
+  assert.equal(verifyAttempts.length, 1);
+  assert.equal(verifyAttempts[0]?.outcome, "skipped");
+  assert.equal(verifyAttempts[0]?.attempts_per_strategy?.verify_head_goal ?? 0, 0);
+  assert.equal(rerunAttempt?.outcome, "recovered");
+  assert.equal(repairAttempt?.outcome, "failed");
+  assert.equal(rerunAttempt?.episode_id, repairAttempt?.episode_id);
+  assert.equal((rerunEvent?.data as { postcondition?: string })?.postcondition, "redispatch_admissible");
+  assert.equal(
+    (rerunEvent?.data as { resolved_original_invariant?: boolean })?.resolved_original_invariant,
+    false,
+  );
+});
+
+test("production recovery keeps applicable no-commits HEAD verification and its failure budget", async () => {
+  const implementationCi = DEFAULT_RECOVERY_POLICY["implementation-ci"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "implementation-ci": {
+        ...implementationCi,
+        backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
+      },
+    },
+  });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "pending") }));
+  const head = "b".repeat(40);
+  let worktreeProbes = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "no-commits",
+    reason: "implementer returned without a commit",
+    stage: "implementing",
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:implementing", "blocked"] };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: head, merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "fail" }];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: head };
+    },
+    async baseBranchContainsSha() {
+      return false;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: 12, pipeline_run_id: "advance-no-commits" },
+    diagnostic,
+  });
+  const executeRecovery = realExecuteRecovery({
+    ...DEFAULT_CONFIG,
+    repo: "acme/widgets",
+    repo_dir: "/repo",
+    base_branch: "main",
+  }, {
+    getOnDiskForIssue: async () => {
+      worktreeProbes++;
+      return null;
+    },
+  });
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  const finalLedger = await readLedger(deps, "run-1");
+  const verifyAttempt = finalLedger.recovery_attempts.find(
+    (attempt) => attempt.action === "verify_head_goal",
+  );
+  assert.equal(worktreeProbes, 1, "applicable no-commits recovery reaches the production executor");
+  assert.equal(verifyAttempt?.outcome, "failed");
+  assert.equal(verifyAttempt?.attempts_per_strategy?.verify_head_goal, 1);
+  assert.equal(verifyAttempt?.budget_remaining, 2);
+  assert.match(verifyAttempt?.error ?? "", /no managed worktree/);
 });
 
 test("pipeline-internal tip resumes the existing recovery episode cursor (#1462)", async () => {

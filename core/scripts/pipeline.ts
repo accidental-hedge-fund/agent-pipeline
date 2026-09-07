@@ -288,6 +288,10 @@ import {
   parseAdvanceEventsJsonl,
 } from "./loop/stage-progress.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
+import {
+  candidateHeadPresentInRecoveryIdentity,
+  recoveryRecipeApplicability,
+} from "./loop/recovery-applicability.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
 import {
   createRepairPipelineItemExecutor,
@@ -2273,16 +2277,7 @@ export function realExecuteRecovery(
     if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
       return failed(`verify_head_goal requires a positive numeric item id`);
     }
-    const blockerKind = input.diagnostic.detail.blocker_kind;
     const stage = input.diagnostic.detail.stage ?? "implementing";
-    // Only no-commits (and equivalent implementation-outcome) blocks are in
-    // scope for goal-satisfaction recovery; other implementation-ci kinds fall
-    // through so later recipes (rerun_ci / repair) can run.
-    if (blockerKind !== "no-commits") {
-      return failed(
-        `verify_head_goal does not apply to blocker_kind=${blockerKind}; trying next recipe`,
-      );
-    }
     const wt = await getWorktree(cfg, issueNumber);
     if (!wt) {
       return failed(`verify_head_goal: no managed worktree for #${issueNumber}`);
@@ -2792,10 +2787,15 @@ export function realExecuteRecovery(
   };
 
   return async (input) => {
-    const projection = projectStageDiagnostic(input.diagnostic);
-    if (projection.disposition !== "recover" || projection.blockerClass !== input.blockerClass) {
+    const applicability = recoveryRecipeApplicability({
+      action: input.action,
+      blockerClass: input.blockerClass,
+      diagnostic: input.diagnostic,
+      candidateHeadPresent: candidateHeadPresentInRecoveryIdentity(input.candidateIdentity),
+    });
+    if (!applicability.applicable) {
       return failed(
-        `recovery action ${input.action} refused diagnostic disposition ${projection.disposition} for class ${input.blockerClass}`,
+        `recovery action ${input.action} is inapplicable: ${applicability.reason}`,
       );
     }
     switch (input.action) {

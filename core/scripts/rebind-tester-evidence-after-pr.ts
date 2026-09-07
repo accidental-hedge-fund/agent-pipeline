@@ -212,7 +212,9 @@ export function isTesterEvidenceOrderingDiagnostic(diagnostic: unknown): boolean
   }
   const ts = fields.trusted_surface_outcome;
   const subjectOmitted = fields.subject_omitted_because_unobservable === true;
-  if (ts !== "passthrough" && ts !== "rebound" && !subjectOmitted) return false;
+  // A stale pre-PR blocked decision is also a legitimate rebind input: the
+  // executor refreshes it against the current PR head before binding.
+  if (ts !== "passthrough" && ts !== "rebound" && ts !== "blocked" && !subjectOmitted) return false;
   if (fields.pr_head != null && fields.pr_head !== "") {
     if (!normalizeCandidateSha(fields.pr_head)) return false;
   }

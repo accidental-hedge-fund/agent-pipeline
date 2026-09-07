@@ -123,10 +123,10 @@ import {
   type StageDiagnostic,
 } from "../stage-diagnostic.ts";
 import {
-  filterRecipesForHarnessBackgroundWait,
-  filterRecipesForNeverStartedPreflight,
-} from "../harness-adapters/background-job-lifecycle.ts";
-import { filterRecipesForWorkflowEngineDiagnostic } from "../rebind-tester-evidence-after-pr.ts";
+  recoveryProgressEvidence,
+  recoveryRecipeOnlyProvesRedispatch,
+  recoveryRecipeApplicability,
+} from "./recovery-applicability.ts";
 import {
   evaluateRunFatalResumeEligibility,
   formatRunFatalResumeRefusal,
@@ -1036,11 +1036,17 @@ async function executeBlockedRecovery(
   }
 
   const currentEpoch = observedCandidateEpoch(item);
+  const progressEvidenceIdentity = fingerprintEvidence(recoveryProgressEvidence({
+    blockerClass: item.blocked_theme,
+    diagnostic: persisted.diagnostic,
+  }));
   let matchingAttempts = ledger.recovery_attempts.filter(
     (attempt) =>
       attempt.item_id === itemId &&
       attempt.class === item.blocked_theme &&
-      attempt.evidence_fingerprint === item.evidence_fingerprint,
+      ((attempt.evidence_identity === progressEvidenceIdentity &&
+        attemptBelongsToCandidateEpoch(attempt, currentEpoch)) ||
+        attempt.evidence_fingerprint === item.evidence_fingerprint),
   );
   const staleStarted = matchingAttempts.filter(
     (attempt) =>
@@ -1073,7 +1079,9 @@ async function executeBlockedRecovery(
       (attempt) =>
         attempt.item_id === itemId &&
         attempt.class === item.blocked_theme &&
-        attempt.evidence_fingerprint === item.evidence_fingerprint,
+        ((attempt.evidence_identity === progressEvidenceIdentity &&
+          attemptBelongsToCandidateEpoch(attempt, currentEpoch)) ||
+          attempt.evidence_fingerprint === item.evidence_fingerprint),
     );
   }
   let attempt = [...matchingAttempts].reverse().find((candidate) => candidate.outcome === "started");
@@ -1122,18 +1130,7 @@ async function executeBlockedRecovery(
       return { ledger, attempted: false };
     }
     const hasCandidateHead = Boolean(item.last_verified_identity?.head_sha.trim());
-    const reasonFiltered =
-      persisted.diagnostic.reason_code === "harness-background-wait"
-        ? filterRecipesForHarnessBackgroundWait(policy.recipes)
-        : policy.recipes;
     const preflightNeverStarted = persisted.diagnostic.detail.preflight_failed === true;
-    const neverStartedFiltered = preflightNeverStarted
-      ? filterRecipesForNeverStartedPreflight(reasonFiltered)
-      : reasonFiltered;
-    const diagnosticFiltered =
-      item.blocked_theme === "workflow-engine-defect"
-        ? filterRecipesForWorkflowEngineDiagnostic(neverStartedFiltered, persisted.diagnostic)
-        : neverStartedFiltered;
     const candidateIdentity = recoveryCandidateIdentity(
       contract,
       item,
@@ -1142,20 +1139,22 @@ async function executeBlockedRecovery(
     );
     const candidateEpoch = recoveryEpisodeCandidateEpoch(
       item,
-      candidateIdentity.replace(/\|attempt=\d+$/i, ""),
+      candidateIdentity.replace(/\|advance=.*$/i, ""),
     );
     const episodeKey = {
       operation: "loop_recovery",
       invariant: item.blocked_theme,
       candidate_epoch: candidateEpoch,
-      evidence_identity: item.evidence_fingerprint ?? "",
+      evidence_identity: progressEvidenceIdentity,
     };
     let episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, episodeKey) ?? emptyEpisode(episodeKey, deps.store.now().toISOString());
     const isApplicable = (recipe: RecoveryRecipe): boolean => {
-      if (!diagnosticFiltered.includes(recipe)) return false;
-      if (recipe === "verify_head_goal" && !hasCandidateHead) return false;
-      if (recipe === "repair_pipeline_item" && !hasCandidateHead) return false;
-      return true;
+      return recoveryRecipeApplicability({
+        action: recipe,
+        blockerClass: item.blocked_theme!,
+        diagnostic: persisted.diagnostic,
+        candidateHeadPresent: hasCandidateHead,
+      }).applicable;
     };
     const lastMatching = matchingAttempts[matchingAttempts.length - 1];
     const preferRepairAfterFindingsPrep =
@@ -1188,18 +1187,17 @@ async function executeBlockedRecovery(
         candidateIdentity,
         candidateEpoch,
         invariant: item.blocked_theme,
+        evidenceIdentity: progressEvidenceIdentity,
         skipInapplicable: true,
       });
       ledger = skipResult.ledger;
     }
     if (selected.kind === "exhausted") {
-      if (preflightNeverStarted && neverStartedFiltered.length === 0) {
+      if (preflightNeverStarted && policy.recipes.every((recipe) => !isApplicable(recipe))) {
         await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
           item_id: itemId,
           reason: "inapplicable_recipes",
-          skipped_recipes: reasonFiltered.filter(
-            (recipe) => !neverStartedFiltered.includes(recipe),
-          ),
+          skipped_recipes: policy.recipes,
         }).catch(() => {});
         return { ledger, attempted: false };
       }
@@ -1236,6 +1234,7 @@ async function executeBlockedRecovery(
       candidateIdentity,
       candidateEpoch,
       invariant: item.blocked_theme,
+      evidenceIdentity: progressEvidenceIdentity,
     });
     ledger = started.ledger;
     attempt = started.attempt;
@@ -1403,7 +1402,11 @@ async function executeBlockedRecovery(
     evidence: execution.evidence,
     error: execution.error ?? null,
     candidate_head: execution.candidateHead ?? null,
-    postcondition: execution.succeeded ? "verified" : "failed",
+    postcondition: execution.succeeded
+      ? recoveryRecipeOnlyProvesRedispatch(attempt.action) ? "redispatch_admissible" : "verified"
+      : "failed",
+    resolved_original_invariant: execution.succeeded &&
+      !recoveryRecipeOnlyProvesRedispatch(attempt.action),
   });
 
   const beforeCompletion = await readLedger(deps.store, runId, token);

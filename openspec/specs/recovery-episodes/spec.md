@@ -116,6 +116,14 @@ RecoverySupervisor SHALL evaluate whether a configured deterministic recipe is a
 - **AND** SHALL NOT charge a substantive repair attempt
 - **AND** SHALL keep the Logical Operation owned as Cooling or an external-condition wait
 
+#### Scenario: Diagnostic contract skips HEAD verification before execution
+
+- **WHEN** an `implementation-ci` diagnostic carries blocker kind `openspec-invalid` on a current candidate HEAD
+- **AND** the configured sequence begins with `verify_head_goal`
+- **THEN** RecoverySupervisor SHALL record `verify_head_goal` as an inapplicable skip before claim, backoff, or executor invocation
+- **AND** SHALL continue to the next applicable recipe without charging a `verify_head_goal` attempt
+- **AND** `verify_head_goal` SHALL remain applicable to a `no-commits` diagnostic on a current candidate
+
 ---
 
 ### Requirement: Later configured recipes SHALL remain reachable in production order
@@ -141,6 +149,13 @@ When consecutive observations on the same Recovery Episode carry the same normal
 - **WHEN** an item re-blocks with the same evidence identity after a claimed strategy
 - **THEN** RecoverySupervisor SHALL advance the cursor or persist Cooling with `next_eligible_at` in the future
 - **AND** SHALL NOT claim the same strategy again in that same cycle
+
+#### Scenario: Redispatch transport does not reset unresolved stage progress
+
+- **WHEN** a redispatch-only recipe makes whole-item redispatch admissible without changing the candidate
+- **AND** redispatch returns the same blocker kind through a different run or attestation envelope
+- **THEN** RecoverySupervisor SHALL retain the episode's skips, spent attempts, and strategy cursor
+- **AND** SHALL dispatch the next applicable recipe rather than treating the transport envelope as resolution of the original stage invariant
 
 #### Scenario: Cooling wake honors next_eligible_at
 

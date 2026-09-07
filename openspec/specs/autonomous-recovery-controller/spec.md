@@ -141,6 +141,13 @@ deterministic action indefinitely.
 - **AND** it SHALL invoke `repair_pipeline_item` only when the same current evidence returns and a
   later configured recipe retains budget
 
+#### Scenario: Mechanical resync proves redispatch, not the blocked stage goal
+
+- **WHEN** `rerun_ci` or another mechanical resync clears a blocked projection without changing the candidate
+- **THEN** the controller SHALL record only that normal whole-item redispatch is admissible
+- **AND** SHALL NOT certify the original stage invariant as resolved until its authoritative observer proves it
+- **AND** the same blocker returning after redispatch SHALL retain the candidate-scoped recovery cursor
+
 ### Requirement: Authentication recovery SHALL verify rather than impersonate
 
 The `environment-auth` recovery recipe SHALL perform a live non-interactive authentication probe
@@ -923,4 +930,3 @@ When RecoverySupervisor selects recipes named by this capability, it SHALL evalu
 - **WHEN** `auto_recover` observes an inapplicable deterministic recipe
 - **THEN** it SHALL record the skip on the Recovery Episode
 - **AND** SHALL NOT decrement a private `auto_recovery_max_retries` or class-wide budget as the reason a later recipe is unreachable
-
