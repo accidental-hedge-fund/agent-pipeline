@@ -3165,6 +3165,122 @@ test("production recovery keeps applicable no-commits HEAD verification and its 
   assert.match(verifyAttempt?.error ?? "", /no managed worktree/);
 });
 
+test("production recovery keeps explicitly different implementation stages in independent episodes", async () => {
+  const implementationCi = DEFAULT_RECOVERY_POLICY["implementation-ci"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "implementation-ci": {
+        ...implementationCi,
+        per_strategy_bound: 1,
+        backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
+        repeated_evidence_limit: 5,
+      },
+    },
+  });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "pending") }));
+  const head = "c".repeat(40);
+  let blockedLabelPresent = false;
+  let dispatchCount = 0;
+  let worktreeProbes = 0;
+  let clearCalls = 0;
+  const diagnostics = [
+    buildStageDiagnostic({
+      reasonCode: "implementation-ci",
+      blockerKind: "no-commits",
+      reason: "planning returned without a commit",
+      stage: "planning",
+    }),
+    buildStageDiagnostic({
+      reasonCode: "implementation-ci",
+      blockerKind: "no-commits",
+      reason: "pre-merge returned without a commit",
+      stage: "pre-merge",
+    }),
+  ];
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return {
+        state: "open",
+        labels: ["pipeline:implementing", ...(blockedLabelPresent ? ["blocked"] : [])],
+      };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: head, merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "fail" }];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: head };
+    },
+    async baseBranchContainsSha() {
+      return false;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    blockedLabelPresent = true;
+    const diagnostic = diagnostics[Math.min(dispatchCount, diagnostics.length - 1)];
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_recoverable",
+      evidence: { pr_number: 12, pipeline_run_id: `advance-${dispatchCount}` },
+      diagnostic,
+    };
+  };
+  const executeRecovery = realExecuteRecovery({
+    ...DEFAULT_CONFIG,
+    repo: "acme/widgets",
+    repo_dir: "/repo",
+    base_branch: "main",
+  }, {
+    clearBlocked: async () => {
+      clearCalls++;
+      blockedLabelPresent = false;
+    },
+    getOnDiskForIssue: async () => {
+      worktreeProbes++;
+      return { path: "/wt", slug: "fixture" };
+    },
+    gitHead: async () => head,
+    isWorktreeClean: async () => true,
+    probeImplementDeliverable: async () => ({
+      present: true,
+      role: "implementation",
+      artifact_id: "sha256:implementation",
+      candidate_sha: head,
+      candidate_epoch: head,
+      description: "branch-introduced OpenSpec deliverable at HEAD",
+    }),
+    probeGatesGreen: async () => true,
+    postComment: async () => {},
+  });
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  const verifyAttempts = finalLedger.recovery_attempts.filter(
+    (attempt) => attempt.action === "verify_head_goal",
+  );
+  assert.equal(dispatchCount, 2);
+  assert.equal(worktreeProbes, 2, "each authoritative stage runs its own production goal check");
+  assert.equal(clearCalls, 1, "only the planning goal check succeeds");
+  assert.equal(verifyAttempts.length, 2);
+  assert.equal(verifyAttempts[0]?.outcome, "recovered");
+  assert.equal(verifyAttempts[1]?.outcome, "failed");
+  assert.equal(verifyAttempts[1]?.attempts_per_strategy?.verify_head_goal, 1);
+  assert.notEqual(verifyAttempts[0]?.episode_id, verifyAttempts[1]?.episode_id);
+});
+
 test("pipeline-internal tip resumes the existing recovery episode cursor (#1462)", async () => {
   const shaS = "a".repeat(40);
   const shaH = "b".repeat(40);

@@ -153,9 +153,16 @@ When consecutive observations on the same Recovery Episode carry the same normal
 #### Scenario: Redispatch transport does not reset unresolved stage progress
 
 - **WHEN** a redispatch-only recipe makes whole-item redispatch admissible without changing the candidate
-- **AND** redispatch returns the same blocker kind through a different run or attestation envelope
+- **AND** redispatch returns the same blocker kind through a different run or stage-omitted attestation envelope
 - **THEN** RecoverySupervisor SHALL retain the episode's skips, spent attempts, and strategy cursor
 - **AND** SHALL dispatch the next applicable recipe rather than treating the transport envelope as resolution of the original stage invariant
+
+#### Scenario: Authoritative stages retain independent recovery progress
+
+- **WHEN** the same candidate reports the same implementation blocker kind with an explicitly different authoritative stage
+- **THEN** RecoverySupervisor SHALL use a distinct normalized evidence identity for that stage invariant
+- **AND** SHALL NOT inherit skipped, spent, or exhausted strategies from the earlier stage
+- **AND** an applicable action that fails SHALL consume its normal attempt under the new episode
 
 #### Scenario: Cooling wake honors next_eligible_at
 

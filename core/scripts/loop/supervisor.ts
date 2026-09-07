@@ -708,11 +708,10 @@ function serializeRecoveryEvidence(
   } satisfies PersistedRecoveryEvidence);
 }
 
-function persistedRecoveryEvidence(item: LoopItemLedgerEntry): PersistedRecoveryEvidence | null {
-  const blocked = [...item.history].reverse().find((entry) => entry.to === "blocked" && entry.evidence);
-  if (!blocked?.evidence) return null;
+function parsePersistedRecoveryEvidence(evidence: string | undefined): PersistedRecoveryEvidence | null {
+  if (!evidence) return null;
   try {
-    const parsed = JSON.parse(blocked.evidence) as Partial<PersistedRecoveryEvidence>;
+    const parsed = JSON.parse(evidence) as Partial<PersistedRecoveryEvidence>;
     if (
       parsed.schema !== LOOP_RECOVERY_EVIDENCE_SCHEMA ||
       projectStageDiagnostic(parsed.diagnostic).disposition === "protocol_failure" ||
@@ -726,6 +725,72 @@ function persistedRecoveryEvidence(item: LoopItemLedgerEntry): PersistedRecovery
   } catch {
     return null;
   }
+}
+
+function persistedRecoveryEvidence(item: LoopItemLedgerEntry): PersistedRecoveryEvidence | null {
+  const blocked = [...item.history].reverse().find((entry) => entry.to === "blocked" && entry.evidence);
+  return parsePersistedRecoveryEvidence(blocked?.evidence);
+}
+
+/**
+ * A transport fallback can omit the stage while reporting the same unresolved
+ * implementation blocker. Resume only the most recent authoritative invariant
+ * recorded for this candidate. Explicit stages always define their own identity,
+ * and a substantively recovered episode is not reopened by a coarse envelope.
+ */
+function recoveryProgressIdentityForBlockedItem(
+  item: LoopItemLedgerEntry,
+  attempts: readonly LoopRecoveryAttempt[],
+  persisted: PersistedRecoveryEvidence,
+  candidateEpoch: string,
+): string {
+  const directIdentity = fingerprintEvidence(recoveryProgressEvidence({
+    blockerClass: item.blocked_theme as DurableBlockerClass,
+    diagnostic: persisted.diagnostic,
+  }));
+  if (
+    item.blocked_theme !== "implementation-ci" ||
+    persisted.diagnostic.detail.stage?.trim() ||
+    persisted.diagnostic.reason_code !== "implementation-ci"
+  ) {
+    return directIdentity;
+  }
+
+  const { blocker_kind: _blockerKind, reason: _reason, stage: _stage, ...qualifiers } =
+    persisted.diagnostic.detail;
+  if (Object.values(qualifiers).some((value) => value !== undefined)) return directIdentity;
+
+  const blockerKind = persisted.diagnostic.detail.blocker_kind;
+  const priorBlocked = item.history.filter((entry) => entry.to === "blocked" && entry.evidence);
+  priorBlocked.pop(); // The latest blocked entry supplied `persisted` above.
+  for (const entry of priorBlocked.reverse()) {
+    const prior = parsePersistedRecoveryEvidence(entry.evidence);
+    if (!prior || !prior.diagnostic.detail.stage?.trim()) continue;
+    const projection = projectStageDiagnostic(prior.diagnostic);
+    if (
+      projection.disposition !== "recover" ||
+      projection.blockerClass !== "implementation-ci" ||
+      prior.diagnostic.detail.blocker_kind !== blockerKind
+    ) {
+      continue;
+    }
+    const priorIdentity = fingerprintEvidence(recoveryProgressEvidence({
+      blockerClass: "implementation-ci",
+      diagnostic: prior.diagnostic,
+    }));
+    const episodeAttempts = attempts.filter(
+      (attempt) =>
+        attempt.item_id === item.id &&
+        attempt.class === "implementation-ci" &&
+        attempt.evidence_identity === priorIdentity &&
+        attemptBelongsToCandidateEpoch(attempt, candidateEpoch),
+    );
+    const resolved = episodeAttempts.some(
+      (attempt) => attempt.outcome === "recovered" && !recoveryRecipeOnlyProvesRedispatch(attempt.action),
+    );
+    return resolved ? directIdentity : priorIdentity;
+  }
+  return directIdentity;
 }
 
 function engineDefectDiagnostic(reason: string): StageDiagnostic {
@@ -1036,10 +1101,12 @@ async function executeBlockedRecovery(
   }
 
   const currentEpoch = observedCandidateEpoch(item);
-  const progressEvidenceIdentity = fingerprintEvidence(recoveryProgressEvidence({
-    blockerClass: item.blocked_theme,
-    diagnostic: persisted.diagnostic,
-  }));
+  const progressEvidenceIdentity = recoveryProgressIdentityForBlockedItem(
+    item,
+    ledger.recovery_attempts,
+    persisted,
+    currentEpoch,
+  );
   let matchingAttempts = ledger.recovery_attempts.filter(
     (attempt) =>
       attempt.item_id === itemId &&

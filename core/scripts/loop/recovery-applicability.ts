@@ -70,12 +70,18 @@ export function recoveryProgressEvidence(input: {
   blockerClass: DurableBlockerClass;
   diagnostic: StageDiagnostic;
 }): string {
-  // Implementation-CI redispatch may project the same authoritative blocker
-  // through a coarse attestation diagnostic. Preserve the blocker kind across
-  // that envelope change. Other classes retain the full diagnostic identity
+  // An authoritative implementation stage is part of the invariant: planning
+  // and implementing can run different goal checks even for the same blocker
+  // kind. A later stage-omitted attestation is joined to its preceding
+  // unresolved invariant by the supervisor's durable-history resolver, not by
+  // erasing every stage here. Other classes retain the full diagnostic identity
   // so material facts such as HTTP status remain distinct.
+  const { reason: _reason, ...invariantDetail } = input.diagnostic.detail;
   const evidence = input.blockerClass === "implementation-ci"
-    ? { blocker_kind: input.diagnostic.detail.blocker_kind }
+    ? {
+        reason_code: input.diagnostic.reason_code,
+        detail: invariantDetail,
+      }
     : { diagnostic: input.diagnostic };
   return JSON.stringify({
     schema: "pipeline/recovery-progress-evidence@1",
