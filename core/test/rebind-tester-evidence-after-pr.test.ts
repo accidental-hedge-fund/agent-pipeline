@@ -59,6 +59,8 @@ import {
 } from "../scripts/tester-evidence.ts";
 import { DEFAULT_CONFIG, type PipelineConfig, type Stage } from "../scripts/types.ts";
 import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
+import { advance as advancePreMerge } from "../scripts/stages/pre_merge.ts";
+import { encodeReviewArtifact } from "../scripts/stages/review.ts";
 
 const SHA_S = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -840,6 +842,8 @@ async function driveDesignGateAdvance(opts: {
   prHeadSequence?: string[];
   worktreeHead?: string | null;
   worktreeHeadAfter?: string | null;
+  worktreeHeadAfterDispatch?: Array<string | null>;
+  prHeadAfterDispatch?: Array<string | null>;
   changedPaths?: string[];
   tester?: TesterEvidence | null;
   priorTester?: TesterEvidence | null;
@@ -855,6 +859,7 @@ async function driveDesignGateAdvance(opts: {
   compensationStripsStageLabel?: boolean;
   rebind?: AdvanceDeps["rebindTesterEvidenceAfterPr"];
   dispatch?: AdvanceDeps["dispatch"];
+  once?: boolean;
 }): Promise<{
   rebindCalls: RebindTesterEvidenceAfterPrInput[];
   setBlocked: Array<{ reason: string; kind: string | undefined }>;
@@ -874,6 +879,7 @@ async function driveDesignGateAdvance(opts: {
     artifactIdentity?: string | null;
     postconditionProven?: boolean;
   } | null;
+  testerEvidence: TesterEvidence | null;
 }> {
   const repoDir = fs.mkdtempSync(join(os.tmpdir(), "rebind-run-advance-"));
   const domain = `rebind-adv-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -909,6 +915,7 @@ async function driveDesignGateAdvance(opts: {
   let prNumberReads = 0;
   let dispatchCalls = 0;
   let currentWorktreeHead = opts.worktreeHead ?? null;
+  let currentPrHead = opts.prHeadSha ?? SHA_S;
   const pipelineCfg = {
     repo: "acme/widget",
     domain,
@@ -924,6 +931,7 @@ async function driveDesignGateAdvance(opts: {
       reviewerSource: "default",
     },
     steps: { standard_review: true, adversarial_review: true },
+    review_policy: DEFAULT_CONFIG.review_policy,
     auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
     papercuts: { enabled: false, auto_file: false },
     corrections: { auto_file: false },
@@ -960,6 +968,14 @@ async function driveDesignGateAdvance(opts: {
           author: "pipeline-bot",
           body: `## Pipeline: review-1\n<!-- pipeline-audit: run=${runId} state=review-1 -->`,
         },
+        {
+          author: "pipeline-bot",
+          body: `## Pipeline: pre-merge\n<!-- pipeline-audit: run=${runId} state=pre-merge -->`,
+        },
+        {
+          author: "pipeline-bot",
+          body: `## Pipeline: review-2\n<!-- pipeline-audit: run=${runId} state=review-2 -->`,
+        },
       ],
     })) as AdvanceDeps["getIssueDetail"],
     getGhActor: async () => "pipeline-bot",
@@ -973,7 +989,7 @@ async function driveDesignGateAdvance(opts: {
       const sequenced = opts.prHeadSequence?.[prHeadReads++];
       return {
         number: requestedPrNumber,
-        head_sha: sequenced ?? opts.prHeadSha ?? SHA_S,
+        head_sha: sequenced ?? currentPrHead,
       } as never;
     },
     getOnDiskForIssue: async () =>
@@ -1051,8 +1067,14 @@ async function driveDesignGateAdvance(opts: {
             status: "waiting" as const,
             reason: "delivery-stage evidence binding refused before execution: required implementation evidence role, observed missing",
           };
-      if (opts.worktreeHeadAfter !== undefined) {
+      const dispatchIndex = dispatchCalls - 1;
+      if (opts.worktreeHeadAfterDispatch?.[dispatchIndex] !== undefined) {
+        currentWorktreeHead = opts.worktreeHeadAfterDispatch[dispatchIndex] ?? null;
+      } else if (opts.worktreeHeadAfter !== undefined) {
         currentWorktreeHead = opts.worktreeHeadAfter;
+      }
+      if (opts.prHeadAfterDispatch?.[dispatchIndex] !== undefined) {
+        currentPrHead = opts.prHeadAfterDispatch[dispatchIndex] ?? null;
       }
       // Real consumer handlers transition the pipeline label during the attempt,
       // before the post-attempt observer runs.
@@ -1077,7 +1099,7 @@ async function driveDesignGateAdvance(opts: {
   };
   try {
     await withoutHostPinAuthorityEnv(() =>
-      runAdvance(pipelineCfg, issue, { runId, once: true }, deps),
+      runAdvance(pipelineCfg, issue, { runId, once: opts.once ?? true }, deps),
     );
     const eventsPath = join(runDir, "events.jsonl");
     const events = fs.existsSync(eventsPath)
@@ -1100,6 +1122,10 @@ async function driveDesignGateAdvance(opts: {
       pipelineStage,
       observerBefore,
       observerAfter,
+      testerEvidence: (() => {
+        const raw = io.files.get(testerEvidencePath(runDir));
+        return raw ? JSON.parse(raw) as TesterEvidence : null;
+      })(),
     };
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
@@ -1282,6 +1308,34 @@ function boundPassedAt(sha: string): TesterEvidence {
       required_evidence_set_revision: "f".repeat(64),
     },
   });
+}
+
+function blockingAutofixReviewComment(sha: string): string {
+  return [
+    "## Review 2 (Adversarial) — needs-attention",
+    "",
+    "No-ship: blocking findings remain.",
+    "",
+    "**1. [HIGH] Remove obsolete audit-only files** `override-key: 5284604a` `category: correctness`",
+    "",
+    `<!-- reviewed-sha: ${sha} -->`,
+    "<!-- pipeline-blocking-keys: 5284604a -->",
+    encodeReviewArtifact({
+      round: 2,
+      reviewedSha: sha,
+      diffHash: "abcd1234",
+      blockingKeys: ["5284604a"],
+      review1Risk: null,
+      bodyHash: "00",
+      blockingFindings: [{
+        key: "5284604a",
+        surface: "openspec/changes/obsolete|correctness",
+        severity: "high",
+        title: "Remove obsolete audit-only files",
+        confidence: 0.95,
+      }],
+    }),
+  ].join("\n");
 }
 
 async function ownedAwareRebind(input: RebindTesterEvidenceAfterPrInput) {
@@ -2144,6 +2198,165 @@ test("runAdvance rebinds a successful pre-merge autofix push instead of treating
     ),
     true,
   );
+});
+
+function realAutofixConservativeDispatch(): {
+  dispatch: NonNullable<AdvanceDeps["dispatch"]>;
+  rounds: () => number;
+} {
+  let rounds = 0;
+  return {
+    rounds: () => rounds,
+    dispatch: async (_cfg, _issue, stage, dispatchOpts) => {
+      rounds++;
+      if (stage === "implementing") {
+        return {
+          advanced: true,
+          from: "implementing",
+          to: "pre-merge",
+          summary: "implementation A pushed",
+        };
+      }
+      if (stage === "pre-merge") {
+        let deltaReads = 0;
+        const gate = await advancePreMerge(_cfg, _issue, {
+          pipelineRunId: "1468/test-run",
+          onOwnedCandidateSuccessor: dispatchOpts.onOwnedCandidateSuccessor,
+        }, {
+          getPrForIssue: async () => 99,
+          getIssueDetail: async () => ({
+            title: "audit-only autofix",
+            comments: [{ author: "pipeline-bot", body: blockingAutofixReviewComment(SHA_C) }],
+          }) as never,
+          getPrDetail: async () => ({ head_sha: SHA_S, head_ref: "pipeline/1468-test" }) as never,
+          getPrCommits: async () => [
+            { oid: SHA_C, messageHeadline: "reviewed baseline" },
+            { oid: SHA_S, messageHeadline: "implementation A" },
+          ] as never,
+          getPrDiff: async () => "diff --git a/obsolete b/obsolete\n-deleted audit file\n",
+          getCommitDeltaDiff: async () => {
+            deltaReads++;
+            if (deltaReads > 1) {
+              throw new Error("post-autofix diff unavailable; use conservative full review");
+            }
+            return "diff --git a/obsolete b/obsolete\n-deleted audit file\n";
+          },
+          runDeltaReview: async () => ({
+            verdict: "needs-attention",
+            summary: "obsolete audit path remains",
+            findings: [{
+              severity: "high",
+              title: "Remove obsolete audit-only files",
+              body: "Delete the obsolete audit path.",
+              confidence: 0.95,
+              file: "openspec/changes/obsolete/tasks.md",
+              line_start: 1,
+              line_end: 1,
+              category: "correctness",
+            }],
+          }),
+          postComment: async () => {},
+          transition: async () => {},
+          setBlocked: async () => assert.fail("owned autofix successor must not be parked"),
+          getForIssue: async () => ({ path: "/wt/1468", slug: "1468-test" }) as never,
+          getGhActor: async () => "pipeline-bot",
+          attemptPreMergeAutoFix: async (_findings, _title, _comment, claimAttempt) => {
+            assert.equal(await claimAttempt?.(), true);
+            return { status: "fix-committed", headSha: SHA_B };
+          },
+        });
+        assert.equal(gate?.advanced, true);
+        assert.equal(gate?.to, "review-2", "real conservative fallback routes to review-2");
+        return gate;
+      }
+      return {
+        advanced: false,
+        status: "waiting",
+        reason: "stop after proving the review-2 candidate handoff",
+      };
+    },
+  };
+}
+
+test("runAdvance hands a real pre-merge autofix successor to conservative re-review (#1541)", async () => {
+  const composed = realAutofixConservativeDispatch();
+  const reproducedCandidates: string[] = [];
+  const driven = await driveDesignGateAdvance({
+    startStage: "implementing",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    // The autofix successor is an audit-only commit: the deliverable path set
+    // remains empty, so SHA equality—not a changed-path heuristic—must drive it.
+    changedPaths: [],
+    worktreeHeadAfterDispatch: [SHA_S, SHA_B, SHA_B],
+    prHeadAfterDispatch: [SHA_S, SHA_B, SHA_B],
+    tester: boundPassed(),
+    rebind: (input) => rebindTesterEvidenceAfterPr({
+      ...input,
+      reproduce: async ({ candidateSha, runDir }) => {
+        reproducedCandidates.push(candidateSha);
+        const evidence = boundPassedAt(candidateSha);
+        await input.io?.writeFile?.(
+          testerEvidencePath(runDir),
+          `${JSON.stringify(evidence, null, 2)}\n`,
+        );
+        return { ok: true, candidate_sha: candidateSha };
+      },
+    }),
+    once: false,
+    dispatch: composed.dispatch,
+  });
+
+  assert.equal(composed.rounds(), 3);
+  assert.deepEqual(reproducedCandidates, [SHA_B], "Tester producer reruns for B; A evidence is not reused");
+  const reviewRebind = driven.rebindCalls[driven.rebindCalls.length - 1];
+  assert.equal(reviewRebind?.stage, "review-2");
+  assert.equal(reviewRebind?.prNumber, 99);
+  assert.equal(reviewRebind?.pushedPrNumber, 99);
+  assert.equal(reviewRebind?.prHeadSha, SHA_B);
+  assert.equal(reviewRebind?.pushedHeadSha, SHA_B);
+  assert.equal(driven.testerEvidence?.candidate_sha, SHA_B);
+  assert.equal(driven.testerEvidence?.evidence_subject?.candidate_sha, SHA_B);
+  assert.equal(driven.testerEvidence?.evidence_subject?.pr, 99);
+  assert.equal(driven.setBlocked.length, 0);
+});
+
+test("real autofix successor blocks when fresh B Tester proof is missing (#1541)", async () => {
+  const composed = realAutofixConservativeDispatch();
+  const driven = await driveDesignGateAdvance({
+    startStage: "implementing",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    changedPaths: [],
+    worktreeHeadAfterDispatch: [SHA_S, SHA_B],
+    prHeadAfterDispatch: [SHA_S, SHA_B],
+    tester: boundPassed(),
+    once: false,
+    dispatch: composed.dispatch,
+  });
+  assert.equal(composed.rounds(), 2, "review-2 handler is never dispatched without fresh B proof");
+  assert.ok(driven.setBlocked.some((row) => /producer did not persist SHA-matched/.test(row.reason)));
+  assert.equal(driven.testerEvidence?.candidate_sha, SHA_S, "A evidence is not relabeled as B");
+});
+
+test("owned successor handoff rejects an equal-head replacement PR (#1541)", async () => {
+  const io = memoryIo();
+  const result = await rebindTesterEvidenceAfterPr(
+    baseInput(io, {
+      prNumber: 100,
+      prHeadSha: SHA_B,
+      pushedPrNumber: 99,
+      pushedHeadSha: SHA_B,
+      trustedSurface: passthrough(SHA_B),
+    }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.code, "tester_rebind_pr_head_mismatch");
+    assert.match(result.summary, /linked PR changed from #99 to #100/);
+  }
 });
 
 test("runAdvance still fail-closes unowned post-attempt drift at fix-1 when worktree stays at S1", async () => {

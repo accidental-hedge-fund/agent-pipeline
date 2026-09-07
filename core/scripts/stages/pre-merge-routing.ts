@@ -171,6 +171,12 @@ export interface AdvancePreMergeOpts {
    *  `advance()` call without a polling loop), the CI-gate grace window and the
    *  no-run recovery guard are skipped (pre-existing behaviour). */
   pollingCtx?: PreMergePollingContext;
+  /** Exact successor established by the pre-merge autofix CAS push. */
+  onOwnedCandidateSuccessor?: (candidate: {
+    prNumber: number;
+    previousSha: string;
+    successorSha: string;
+  }) => void;
 }
 
 /**
@@ -647,6 +653,7 @@ export async function advance(
         ...deps,
         runDir: opts.runDir,
         runStoreDeps: opts.runStoreDeps,
+        onOwnedCandidateSuccessor: opts.onOwnedCandidateSuccessor,
         attemptPreMergeAutoFix: preAutoFixFn,
       },
     );

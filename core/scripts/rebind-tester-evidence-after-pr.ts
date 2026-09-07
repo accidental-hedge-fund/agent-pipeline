@@ -126,6 +126,8 @@ export interface RebindTesterEvidenceAfterPrInput {
   prNumber: number | null;
   prHeadSha: string | null | undefined;
   pushedHeadSha?: string | null;
+  /** PR identity paired with pushedHeadSha when a stage-owned successor is handed off. */
+  pushedPrNumber?: number | null;
   trustedSurface: TrustedSurfaceRebindDecision | null;
   domain?: string;
   engineFingerprint?: string | null;
@@ -588,6 +590,22 @@ export async function rebindTesterEvidenceAfterPr(
     return result;
   }
   const pushed = normalizeCandidateSha(input.pushedHeadSha);
+  if (
+    pushed &&
+    input.pushedPrNumber != null &&
+    input.prNumber !== input.pushedPrNumber
+  ) {
+    const result = failClosed(
+      input,
+      "tester_rebind_pr_head_mismatch",
+      `tester rebind: linked PR changed from #${input.pushedPrNumber} to ` +
+        `${input.prNumber == null ? "unbound" : `#${input.prNumber}`} after candidate ${pushed} was pushed`,
+      prHead,
+      null,
+    );
+    await persistBlockerRecord(input, result.blocker);
+    return result;
+  }
   if (pushed && pushed !== prHead) {
     const result = failClosed(
       input,
