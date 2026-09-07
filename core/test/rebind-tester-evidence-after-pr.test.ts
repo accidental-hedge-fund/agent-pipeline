@@ -58,6 +58,7 @@ import {
   type TesterEvidenceIoDeps,
 } from "../scripts/tester-evidence.ts";
 import { DEFAULT_CONFIG, type PipelineConfig, type Stage } from "../scripts/types.ts";
+import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 
 const SHA_S = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -618,6 +619,43 @@ test("1.4 / 4.2 evidence-ordering diagnostic does not charge scratch or publish"
       );
     }
   }
+});
+
+test("nested advance process-exit diagnostics restart the engine without product-repair recipes", () => {
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "nested advance child exited with signal SIGTERM",
+    stage: "loop-dispatch",
+    processExit: {
+      kind: "nested_advance_child",
+      code: null,
+      signal: "SIGTERM",
+      store_initialized: true,
+    },
+  });
+  assert.deepEqual(
+    filterRecipesForWorkflowEngineDiagnostic(
+      DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes,
+      diagnostic,
+    ),
+    ["restart_workflow_engine"],
+  );
+});
+
+test("nested advance exit-like prose does not select process-lifecycle recovery", () => {
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "nested advance child exited with code 1",
+    stage: "loop-dispatch",
+  });
+  const applicable = filterRecipesForWorkflowEngineDiagnostic(
+    DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes,
+    diagnostic,
+  );
+  assert.equal(applicable.includes("unlink_engine_scratch"), true);
+  assert.equal(applicable.includes("restart_workflow_engine"), true);
 });
 
 test("4.2 inapplicable scratch is a skip, not a spent success", () => {

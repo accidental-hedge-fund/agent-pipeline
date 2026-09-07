@@ -1,0 +1,17 @@
+## ADDED Requirements
+
+### Requirement: Nested-child process exits SHALL select process-lifecycle recovery
+
+Recovery classification SHALL recognize nested-child process termination from structured diagnostic fields, not free-form prose. For that diagnostic, the workflow-engine recovery sequence SHALL select `restart_workflow_engine` and SHALL treat scratch cleanup, harness-dirt checkpointing, unpublished-commit publication, Tester evidence rebind, and product repair as inapplicable. Those inapplicable recipes SHALL NOT consume their per-strategy budgets.
+
+#### Scenario: Structured nested-child exit routes directly to restart
+
+- **WHEN** a workflow-engine diagnostic carries a nested-child exit code or signal
+- **THEN** the applicable recovery recipes SHALL contain `restart_workflow_engine`
+- **AND** no scratch, publication, Tester-rebind, or product-repair recipe SHALL be applicable
+
+#### Scenario: Exit-like prose does not alter recovery selection
+
+- **WHEN** a workflow-engine diagnostic mentions a child exit only in its free-form reason and omits structured process-exit evidence
+- **THEN** recovery SHALL NOT infer the nested-child process-exit treatment from that prose
+- **AND** ordinary workflow-engine diagnostic filtering SHALL continue to apply

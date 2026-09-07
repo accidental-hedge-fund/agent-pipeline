@@ -3354,6 +3354,11 @@ export async function runSupervisorCycle(
         const reason = dispatchError
           ? `pipeline/loop-execution@1 dispatch rejected for item ${itemId}: ${dispatchError}`
           : `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, normalized to failed`;
+        const reportedProjection = projectStageDiagnostic(response?.diagnostic);
+        const reportedRecoverable =
+          response?.diagnostic && reportedProjection.disposition === "recover"
+            ? { diagnostic: response.diagnostic, blockerClass: reportedProjection.blockerClass }
+            : null;
         const latest = await readLedger(deps.store, runId, token);
         const alreadyBlocked = latest.items[itemId]?.state === "blocked";
         // A legacy/in-process child may have durably recorded its own block
@@ -3375,8 +3380,8 @@ export async function runSupervisorCycle(
               token,
               itemId,
               engine,
-              blockerClass: "workflow-engine-defect",
-              diagnostic: engineDefectDiagnostic(reason),
+              blockerClass: reportedRecoverable?.blockerClass ?? "workflow-engine-defect",
+              diagnostic: reportedRecoverable?.diagnostic ?? engineDefectDiagnostic(reason),
               evidence: transportEvidence,
               allowAlreadyStopped: true,
             });

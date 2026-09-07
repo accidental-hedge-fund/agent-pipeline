@@ -88,6 +88,13 @@ export interface StageDiagnosticDetail {
     pr_head?: string | null;
     blocker_code?: string;
   };
+  /** Structured process-boundary evidence from the durable loop dispatcher. */
+  process_exit?: {
+    kind: "nested_advance_child";
+    code: number | null;
+    signal: string | null;
+    store_initialized: boolean;
+  };
 }
 
 export interface StageDiagnostic {
@@ -216,6 +223,7 @@ function evidenceKeyFor(
     preflight_reason_code: detail.preflight_reason_code ?? null,
     preflight_intervention_kind: detail.preflight_intervention_kind ?? null,
     evidence_ordering: detail.evidence_ordering ?? null,
+    process_exit: detail.process_exit ?? null,
   });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
@@ -414,6 +422,7 @@ export function buildStageDiagnostic(input: {
   preflightReasonCode?: "environment-auth" | "capability-refusal";
   preflightInterventionKind?: "auth-tooling-preflight-failure";
   evidenceOrdering?: StageDiagnosticDetail["evidence_ordering"];
+  processExit?: StageDiagnosticDetail["process_exit"];
 }): StageDiagnostic {
   const detail: StageDiagnosticDetail = {
     blocker_kind: input.blockerKind,
@@ -430,6 +439,7 @@ export function buildStageDiagnostic(input: {
       ? { preflight_intervention_kind: input.preflightInterventionKind }
       : {}),
     ...(input.evidenceOrdering !== undefined ? { evidence_ordering: input.evidenceOrdering } : {}),
+    ...(input.processExit !== undefined ? { process_exit: input.processExit } : {}),
   };
   const reasonCode = input.reasonCode ?? reasonCodeFor(input.blockerKind, input.offrampClass);
   const diagnostic: StageDiagnostic = {

@@ -1716,6 +1716,7 @@ export function realDispatchItem(
 
     let startLinkage: Promise<void> = Promise.resolve();
     let storeReady = false;
+    let childTermination: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     const confirmStoreReady = (): boolean => {
       if (!pin || storeReady) return storeReady;
       if (!eventsPathExistsFn(pin.events_path)) return false;
@@ -1786,8 +1787,9 @@ export function realDispatchItem(
             reject(err);
           }
         });
-        child.on("exit", () => {
+        child.on("exit", (code, signal) => {
           stopPoll();
+          childTermination = { code, signal };
           // Final confirmation: child may have created the store just before exit,
           // or fakes may only emit `exit` (no `spawn`). Never publish start
           // linkage / events_path without this check.
@@ -1894,6 +1896,29 @@ export function realDispatchItem(
       }
       diagnostic = resolution.diagnostic ?? undefined;
       outcome = classifyDispatchOutcome(detail, diagnostic, eventsTextForClassify);
+      if (outcome === "failed" && !diagnostic && childTermination) {
+        const termination = childTermination as {
+          code: number | null;
+          signal: NodeJS.Signals | null;
+        };
+        if (termination.code !== 0 || termination.signal !== null) {
+          const terminationText = termination.signal
+            ? `signal ${termination.signal}`
+            : `code ${String(termination.code)}`;
+          diagnostic = buildStageDiagnostic({
+            reasonCode: "workflow-engine-defect",
+            blockerKind: "harness-failure",
+            reason: `nested advance child exited with ${terminationText}`,
+            stage: "loop-dispatch",
+            processExit: {
+              kind: "nested_advance_child",
+              code: termination.code,
+              signal: termination.signal,
+              store_initialized: storeReady,
+            },
+          });
+        }
+      }
       // Pure capacity is ops admission, not a product block: clear the label so
       // re-admission after a slot frees does not thrash on an already-blocked
       // early-exit (#718). Clear MUST succeed before capacity_wait is safe for a

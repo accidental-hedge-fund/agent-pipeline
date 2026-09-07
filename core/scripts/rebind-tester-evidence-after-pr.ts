@@ -226,6 +226,14 @@ export function filterRecipesForWorkflowEngineDiagnostic<T extends string>(
   recipes: readonly T[],
   diagnostic: unknown,
 ): T[] {
+  const processExit = (diagnostic as { detail?: { process_exit?: unknown } } | null)?.detail
+    ?.process_exit as Record<string, unknown> | undefined;
+  if (
+    processExit?.kind === "nested_advance_child" &&
+    (typeof processExit.code === "number" || typeof processExit.signal === "string")
+  ) {
+    return recipes.filter((recipe) => recipe === "restart_workflow_engine");
+  }
   if (isTesterEvidenceOrderingDiagnostic(diagnostic)) {
     return filterRecipesForTesterEvidenceOrdering(recipes);
   }

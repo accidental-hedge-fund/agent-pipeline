@@ -267,9 +267,9 @@ test("buildTerminalLinkagePayload without pin omits events and uses synthetic id
 // realDispatchItem with injected spawn/gh seams (#667).
 // ---------------------------------------------------------------------------
 
-function fakeSpawnChild(): ChildProcess {
+function fakeSpawnChild(exitCode = 0): ChildProcess {
   const ee = new EventEmitter() as ChildProcess;
-  queueMicrotask(() => ee.emit("exit", 0, null));
+  queueMicrotask(() => ee.emit("exit", exitCode, null));
   return ee;
 }
 
@@ -461,9 +461,50 @@ test("realDispatchItem spawn-then-exit without store omits start linkage and eve
     },
   );
   assert.equal(response.outcome, "failed");
+  assert.equal(response.diagnostic?.reason_code, "workflow-engine-defect");
+  assert.match(
+    response.diagnostic?.detail.reason ?? "",
+    /nested advance child exited with code 1/,
+    "the parent must preserve a nonzero child exit instead of reducing it to an unexplained failed outcome",
+  );
+  assert.deepEqual(response.diagnostic?.detail.process_exit, {
+    kind: "nested_advance_child",
+    code: 1,
+    signal: null,
+    store_initialized: false,
+  });
   assert.equal(response.evidence.pipeline_run_id, expectedPin.pipeline_run_id);
   assert.equal(response.evidence.events_path, undefined, "must not advertise a non-existent events.jsonl as live");
   assert.equal(linked.length, 0, "must not publish start linkage before store confirmation");
+});
+
+test("realDispatchItem keeps authoritative ready-to-deploy despite a nonzero child exit", async () => {
+  const fixedNow = new Date("2026-07-29T13:49:56.421Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 623, fixedNow);
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      eventsPathExists: (candidate) => candidate === expectedPin.events_path,
+      spawn: (() => fakeSpawnChild(1)) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: ["pipeline:ready-to-deploy"], state: "open" }) as never,
+      getPrForIssue: async () => 99,
+    },
+  );
+
+  const response = await dispatch({
+    schema: "pipeline/loop-execution@1",
+    item_id: "623",
+    repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: "loop-run-authoritative-ready",
+  });
+
+  assert.equal(response.outcome, "ready_to_deploy");
+  assert.equal(response.diagnostic, undefined);
 });
 
 test("realDispatchItem publishes start linkage only after store becomes ready mid-wait (#667)", async () => {
