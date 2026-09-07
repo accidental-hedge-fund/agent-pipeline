@@ -184,6 +184,8 @@ test("test workers veto every ambient telemetry read/write even with explicit op
     assert.equal(await beginInvocationObservation({ runDir, issue: 42, stage: "review", harness: "grok", cwd: "/repo", startedAt: "2026-09-06T00:00:00Z" }, enabledConfig), null);
     await enqueueAccountingObservation(runDir, record(), enabledConfig);
     await createLifecycleObservationSink(enabledConfig)(runDir, { schema_version: 1, type: "stage_start", at: "2026-09-06T00:00:00Z", stage: "review" });
+    await enqueueAccountingObservation(runDir, record(), enabledConfig, { ...defaultObservabilityDeps });
+    assert.equal(await beginInvocationObservation({ runDir, issue: 42, stage: "review", harness: "grok", cwd: "/repo", startedAt: "2026-09-06T00:00:00Z" }, enabledConfig, { ...defaultObservabilityDeps }), null);
     assert.equal(calls, 0, "an enrolled HOME must not receive fixture telemetry");
   } finally {
     Object.assign(defaultObservabilityDeps, original);

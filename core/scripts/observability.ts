@@ -69,7 +69,9 @@ export function observabilityEnabled(config?: ObservabilityConfig): config is Ob
  * This safety veto cannot enable telemetry; ordinary CLI evaluations are real
  * traffic and are configured independently through pipeline.yml. */
 export function observabilityIoEnabled(config: ObservabilityConfig | undefined, deps: ObservabilityDeps): config is ObservabilityConfig {
-  return observabilityEnabled(config) && !(deps === defaultObservabilityDeps && process.env.NODE_TEST_CONTEXT);
+  const ambientIo = deps === defaultObservabilityDeps ||
+    (["read", "list", "write", "remove"] as const).some((key) => deps[key] === defaultObservabilityDeps[key]);
+  return observabilityEnabled(config) && !(ambientIo && process.env.NODE_TEST_CONTEXT);
 }
 
 function contractMetadata(config?: ObservabilityConfig) {
@@ -304,14 +306,14 @@ export async function enqueueAccountingObservation(
 }
 
 async function enqueueObservation(event: { event_id: string; [key: string]: unknown }, config: ObservabilityConfig, deps: ObservabilityDeps): Promise<void> {
-    const { inbox } = observabilityPaths(config, deps);
-    let files: string[] = [];
-    try { files = await deps.list(inbox); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    if (files.length >= 10_000) throw new Error("inbox reached 10000 files; source accounting retained in run events");
-    const filename = createHash("sha256").update(event.event_id).digest("hex");
-    await deps.write(path.join(inbox, `${filename}.json`), event);
+  const { inbox } = observabilityPaths(config, deps);
+  let files: string[] = [];
+  try { files = await deps.list(inbox); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (files.length >= 10_000) throw new Error("inbox reached 10000 files; source accounting retained in run events");
+  const filename = createHash("sha256").update(event.event_id).digest("hex");
+  await deps.write(path.join(inbox, `${filename}.json`), event);
 }
 
 /** A per-run dispatcher projects durable lifecycle evidence into cost-free
