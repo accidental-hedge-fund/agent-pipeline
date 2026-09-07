@@ -52,6 +52,8 @@ test("observability resolves disabled defaults when absent or empty", () => {
   }
   assert.deepEqual(DEFAULT_CONFIG.observability, {
     enabled: false,
+    traffic_class: "real",
+    execution_purpose: "operational",
     exporter: { type: "file", directory: "~/.local/state/agent-pipeline/observability" },
   });
 });
@@ -62,10 +64,11 @@ test("observability partial blocks merge exporter defaults without enabling impl
     enabled: true,
   });
   assert.deepEqual(resolve("observability:\n  exporter:\n    directory: /var/spool/pipeline\n").observability, {
-    enabled: false,
+    ...DEFAULT_CONFIG.observability,
     exporter: { type: "file", directory: "/var/spool/pipeline" },
   });
   assert.deepEqual(resolve("observability:\n  enabled: true\n  exporter:\n    directory: ~/pipeline-spool\n").observability, {
+    ...DEFAULT_CONFIG.observability,
     enabled: true,
     exporter: { type: "file", directory: "~/pipeline-spool" },
   });

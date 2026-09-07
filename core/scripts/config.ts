@@ -2363,8 +2363,8 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     },
     observability: {
       enabled: fileConfig.observability?.enabled ?? DEFAULT_CONFIG.observability.enabled,
-      ...(fileConfig.observability?.traffic_class ? { traffic_class: fileConfig.observability.traffic_class } : {}),
-      ...(fileConfig.observability?.execution_purpose ? { execution_purpose: fileConfig.observability.execution_purpose } : {}),
+      traffic_class: fileConfig.observability?.traffic_class ?? DEFAULT_CONFIG.observability.traffic_class,
+      execution_purpose: fileConfig.observability?.execution_purpose ?? DEFAULT_CONFIG.observability.execution_purpose,
       exporter: {
         type: fileConfig.observability?.exporter?.type ?? DEFAULT_CONFIG.observability.exporter.type,
         directory: fileConfig.observability?.exporter?.directory ?? DEFAULT_CONFIG.observability.exporter.directory,
@@ -4215,8 +4215,8 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       : [
         "# observability: # SECURITY: opt-in metadata-only local usage export; no backend dependency or network delivery from the pipeline",
         `#   enabled: ${yamlScalar(observability.enabled)} # ${sd("observability.enabled", "enable metadata-only usage export; disabled by default, configured only here")}`,
-        "#   # traffic_class: real # optional: real, synthetic, unknown; synthetic omits usage/cost",
-        "#   # execution_purpose: operational # optional: operational, test, evaluation, verification, unknown",
+        `#   traffic_class: ${yamlScalar(observability.traffic_class)} # ${sd("observability.traffic_class", "real, synthetic, unknown; synthetic omits usage/cost")}`,
+        `#   execution_purpose: ${yamlScalar(observability.execution_purpose)} # ${sd("observability.execution_purpose", "operational, test, evaluation, verification, unknown")}`,
         `#   exporter: # ${sd("observability.exporter", "provider-neutral local exporter")}`,
         `#     type: ${yamlScalar(observability.exporter.type)} # ${sd("observability.exporter.type", "file exporter; a separate collector owns backend delivery")}`,
         `#     directory: ${yamlScalar(observability.exporter.directory)} # ${sd("observability.exporter.directory", "absolute or ~/ spool root containing inbox/ and context/")}`,

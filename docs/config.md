@@ -577,7 +577,7 @@ Nested fields:
 ### `observability`
 
 - **Type:** object
-- **Default:** `{"enabled":false,"exporter":{"type":"file","directory":"~/.local/state/agent-pipeline/observability"}}`
+- **Default:** `{"enabled":false,"traffic_class":"real","execution_purpose":"operational","exporter":{"type":"file","directory":"~/.local/state/agent-pipeline/observability"}}`
 - **Description:** Opt-in, provider-neutral usage observability configured only in pipeline.yml. Independent of papercuts and event_sink; disabled by default. Local export failures never change stage outcomes.
 
 Nested fields:

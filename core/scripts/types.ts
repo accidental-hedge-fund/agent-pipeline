@@ -1840,6 +1840,8 @@ export const DEFAULT_CONFIG: Omit<
   doctor: { runOnStart: false, failFast: false },
   observability: {
     enabled: false,
+    traffic_class: "real",
+    execution_purpose: "operational",
     exporter: {
       type: "file",
       directory: "~/.local/state/agent-pipeline/observability",
