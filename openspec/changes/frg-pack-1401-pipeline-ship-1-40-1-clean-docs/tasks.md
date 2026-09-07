@@ -1,11 +1,11 @@
 ## 1. Run-scoped fixture
 
-- [ ] 1.1 Create `core/test/fixtures/frg/pack-1401-pipeline-ship-1.40.1/clean-docs.json` with `release_version` exactly `1.40.1`, then parse the file to verify the stored literal.
+- [x] 1.1 Create `core/test/fixtures/frg/pack-1401-pipeline-ship-1.40.1/clean-docs.json` with `release_version` exactly `1.40.1`, then parse the file to verify the stored literal.
 
 ## 2. Executable conformance test
 
-- [ ] 2.1 Create `core/test/frg-pack-1401-pipeline-ship-1.40.1-clean-docs.test.ts` so it reads only the exact run-scoped fixture and asserts the literal `1.40.1`, with no network, git, or subprocess I/O.
-- [ ] 2.2 Run `cd core && node --test --experimental-strip-types test/frg-pack-1401-pipeline-ship-1.40.1-clean-docs.test.ts`, then temporarily change the fixture release value and rerun to verify the test fails before restoring `1.40.1` and confirming it passes.
+- [x] 2.1 Create `core/test/frg-pack-1401-pipeline-ship-1.40.1-clean-docs.test.ts` so it reads only the exact run-scoped fixture and asserts the literal `1.40.1`, with no network, git, or subprocess I/O.
+- [x] 2.2 Run `cd core && node --test --experimental-strip-types test/frg-pack-1401-pipeline-ship-1.40.1-clean-docs.test.ts`, then temporarily change the fixture release value and rerun to verify the test fails before restoring `1.40.1` and confirming it passes.
 
 ## 3. Repository verification
 
