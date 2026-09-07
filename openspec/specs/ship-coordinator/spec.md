@@ -561,7 +561,7 @@ When that observation succeeds, the coordinator SHALL NOT invoke train mutation 
 
 ### Requirement: Ship FRG observation SHALL return null when latest.json is not yet release-eligible
 
-Ship FRG observation SHALL return null when `.agent-pipeline/frg/<X.Y.Z>/latest.json` is absent, unreadable, or not release-eligible for the ship version. After train observation has proven the integrated candidate and no later ship phase has run, coordinator `next_action` SHALL be `frg_pack`. Observation SHALL NOT throw the tag-path fail-closed message that names `Cannot create or push tag`. Observation returning null SHALL NOT skip a later ensure-tag or publication phase. Candidate-identity defects during observation (base advanced after the recorded train, recorded train not contained in base, HMAC candidate SHA mismatch after a valid eligible read, or base advanced after the initial observe read while latest.json is missing, unreadable, or not release-eligible) SHALL still fail closed.
+Ship FRG observation SHALL return null when `.agent-pipeline/frg/<X.Y.Z>/latest.json` is absent, unreadable, or not release-eligible for the ship version. After train observation has proven the integrated candidate and no later ship phase has run, coordinator `next_action` SHALL be `frg_pack`. Observation SHALL NOT throw the tag-path fail-closed message that names `Cannot create or push tag`. Observation returning null SHALL NOT skip a later ensure-tag or publication phase. Before accepted FRG or release evidence exists, reconciliation SHALL re-observe planned merge containment at the current base tip; a newly advanced base SHALL become the train candidate and invalidate downstream checkpoint evidence. Once accepted FRG or release evidence exists, reconciliation SHALL preserve its historical candidate binding and SHALL NOT broaden post-FRG supersession. Candidate-identity defects during candidate-bound observation (recorded train not contained in base, HMAC candidate SHA mismatch after a valid eligible read, or base advanced after the initial observe read while latest.json is missing, unreadable, or not release-eligible) SHALL still fail closed.
 
 #### Scenario: Missing latest.json is not observed, not a tag-path throw
 
@@ -589,13 +589,28 @@ Ship FRG observation SHALL return null when `.agent-pipeline/frg/<X.Y.Z>/latest.
 - **AND** publication / `release ensure-tag` SHALL still fail closed unless that artifact is release-eligible
 - **AND** ship SHALL NOT omit ensure-tag because an earlier observe returned null
 
-#### Scenario: Candidate identity defects still fail closed during observe
+#### Scenario: Candidate-bound identity defects still fail closed during observe
 
-- **WHEN** ship FRG observation runs against a recorded train candidate
-- **AND** base has advanced past that candidate, the candidate is no longer contained in base, or a valid eligible `latest.json` has HMAC `candidate_git_sha` that is not that candidate
+- **WHEN** ship FRG observation runs against a candidate that its caller requires to remain current or historically bound
+- **AND** base has advanced when current identity is required, the candidate is no longer contained in base, or a valid eligible `latest.json` has HMAC `candidate_git_sha` that is not that candidate
 - **THEN** observation SHALL fail closed
 - **AND** it SHALL NOT return null
 - **AND** it SHALL NOT start FRG pack on that drifted identity
+
+#### Scenario: Pre-FRG reconciliation adopts the current base candidate
+
+- **WHEN** a completed train checkpoint exists without accepted FRG or release evidence
+- **AND** the configured base has advanced while still containing every planned merge result
+- **THEN** reconciliation SHALL record the current base tip as the train candidate
+- **AND** it SHALL invalidate stale downstream checkpoint evidence for the earlier candidate
+- **AND** an unchanged base SHALL retain the existing train checkpoint idempotently
+
+#### Scenario: Qualified candidate remains historically bound
+
+- **WHEN** accepted FRG or release evidence is bound to train candidate `C`
+- **AND** the configured base later advances while still containing `C`
+- **THEN** reconciliation SHALL re-observe and preserve candidate `C`
+- **AND** it SHALL retain the existing post-FRG fail-closed supersession policy
 
 #### Scenario: Observe-null still fail-closes when base advances during the evidence read
 
