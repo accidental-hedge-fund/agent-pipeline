@@ -565,12 +565,19 @@ test("pre-merge auto-fix 5.1: all-correctness blocks → auto-fix → re-review 
     reReviewFindings: [], // re-review approves
     autoFixResult: "fix-committed",
   });
+  const successors: Array<{ prNumber: number; previousSha: string; successorSha: string }> = [];
+  deps.onOwnedCandidateSuccessor = (candidate) => successors.push(candidate);
   let out: any;
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
   });
   assert.equal(out, null, "auto-fix + re-review approved → pre-merge proceeds");
   assert.equal(rec.autoFixCalls, 1, "fix seam called exactly once");
+  assert.deepEqual(successors, [{
+    prNumber: 99,
+    previousSha: SHA_HEAD,
+    successorSha: SHA_AFTER_FIX,
+  }], "SHA gate hands the exact CAS-pushed autofix successor to its caller");
   assert.deepEqual(rec.blocked, [], "setBlocked must NOT be called");
   const deltaComments = rec.comments.filter((c) => c.startsWith(DELTA_REVIEW_MARKER_PREFIX));
   assert.equal(deltaComments.length, 2, "initial delta comment + re-review delta comment both posted");

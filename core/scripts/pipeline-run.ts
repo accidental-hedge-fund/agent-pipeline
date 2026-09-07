@@ -301,6 +301,12 @@ export interface AdvanceOpts {
    * as S2 evidence.
    */
   stageOwnedSuccessorEvidence?: () => DeliveryStageEvidence | null;
+  /** Internal pre-merge handoff from a successful owned candidate push. */
+  onOwnedCandidateSuccessor?: (candidate: {
+    prNumber: number;
+    previousSha: string;
+    successorSha: string;
+  }) => void;
 }
 
 /** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
@@ -1508,7 +1514,15 @@ async function dispatchStageHandler(
       // exit the loop, requiring the user to re-invoke. Our skill is
       // manual-only, so pre-merge owns the wait itself, capped at
       // cfg.ci_timeout.
-      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+      return preMergeStage.advancePolling(cfg, issueNumber, {
+        dryRun,
+        model,
+        pipelineRunId,
+        stateDir,
+        runDir,
+        runStoreDeps,
+        onOwnedCandidateSuccessor: opts.onOwnedCandidateSuccessor,
+      });
     case "visual-gate":
       return visualStage.advanceVisual(cfg, issueNumber, { dryRun, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "eval-gate":
@@ -2717,7 +2731,7 @@ export async function runAdvance(
     // identity even when deployReady.finalize() has already removed the worktree.
     let lastKnownBranch: string | null = null;
     // SHA implementing just pushed. Rebind compares it to the linked PR head.
-    let lastPushedImplementationSha: string | null = null;
+    let lastPushedCandidate: { sha: string; prNumber: number | null } | null = null;
     // Whether deploy_ready.finalize ran this invocation (#773). Residual re-entry
     // can exhaust MAX_ITERATIONS on the advance that labels the issue R2D, leaving
     // PR tagging / Pipeline Complete unrun unless we defer-finalize after the loop.
@@ -3171,7 +3185,8 @@ export async function runAdvance(
         testerSubjectOmitted = testerSubjectOmittedBecauseUnobservable(
           existingTester.status === "ok" ? existingTester.evidence : null,
         );
-        let pushedHeadSha = lastPushedImplementationSha;
+        let pushedHeadSha = lastPushedCandidate?.sha ?? null;
+        const pushedPrNumber = lastPushedCandidate?.prNumber ?? null;
         if (!pushedHeadSha) {
           const wtForPush = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
             () => null,
@@ -3199,6 +3214,7 @@ export async function runAdvance(
           prNumber,
           prHeadSha,
           pushedHeadSha,
+          pushedPrNumber,
           trustedSurface: currentTrustedSurface,
           domain: (cfg.domain || cfg.repo || "").trim() || undefined,
           engineFingerprint: engineFp,
@@ -3404,7 +3420,10 @@ export async function runAdvance(
                 }
                 handoffPrHeadSha = rebound.candidateSha;
                 handoffPrNumber = livePrNumber;
-                lastPushedImplementationSha = rebound.candidateSha;
+                lastPushedCandidate = {
+                  sha: rebound.candidateSha,
+                  prNumber: livePrNumber,
+                };
                 ownedCandidateMutationRebound = true;
                 return;
               }
@@ -3458,6 +3477,12 @@ export async function runAdvance(
           ...opts,
           observeDeliveryStageEvidence,
           stageOwnedSuccessorEvidence: () => ownedSuccessorEvidence,
+          onOwnedCandidateSuccessor: (candidate) => {
+            lastPushedCandidate = {
+              sha: candidate.successorSha,
+              prNumber: candidate.prNumber,
+            };
+          },
         };
         out = await (deps.dispatch ?? dispatch)(
           cfg,
@@ -3616,7 +3641,13 @@ export async function runAdvance(
             const headAfter = (
               await gitFn(wtAfter.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
             ).stdout.trim();
-            lastPushedImplementationSha = normalizeCandidateSha(headAfter);
+            const sha = normalizeCandidateSha(headAfter);
+            if (sha) {
+              const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
+                () => null,
+              );
+              lastPushedCandidate = { sha, prNumber };
+            }
           }
         }
         await recordStage(stateDir, issueNumber, {

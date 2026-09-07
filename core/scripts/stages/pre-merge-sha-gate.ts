@@ -443,6 +443,12 @@ export interface ShaGateDeps {
   getGhActor?: () => Promise<string | null>;
   runDir?: string;
   runStoreDeps?: RunStoreDeps;
+  /** Receives the exact successor only after the autofix seam reports its successful push. */
+  onOwnedCandidateSuccessor?: (candidate: {
+    prNumber: number;
+    previousSha: string;
+    successorSha: string;
+  }) => void;
   /**
    * Injectable seam for the bounded pre-merge auto-fix round (#359, #747).
    * When provided, called when (a) category partition yields a non-empty
@@ -867,6 +873,13 @@ export async function enforceReviewShaGate(
               claimAttempt,
             );
             if (fixRes.status === "fix-committed" || fixRes.status === "noop-clean") {
+              if (fixRes.status === "fix-committed") {
+                deps.onOwnedCandidateSuccessor?.({
+                  prNumber,
+                  previousSha: head,
+                  successorSha: fixRes.headSha,
+                });
+              }
               // HEAD may have moved (or re-verify is required). Bounce pre-merge
               // so the SHA gate / delta path re-runs against the post-fix state.
               console.log(
@@ -1654,6 +1667,13 @@ export async function enforceReviewShaGate(
           // unchanged head (#698). Both share the single re-review path; neither
           // counts as a second auto-fix attempt.
           if (fixRes && (fixRes.status === "fix-committed" || fixRes.status === "noop-clean")) {
+            if (fixRes.status === "fix-committed") {
+              deps.onOwnedCandidateSuccessor?.({
+                prNumber,
+                previousSha: targetHead,
+                successorSha: fixRes.headSha,
+              });
+            }
             const wasNoopClean = fixRes.status === "noop-clean";
             if (wasNoopClean) {
               // Completion evidence marker (in addition to attempt-started).
