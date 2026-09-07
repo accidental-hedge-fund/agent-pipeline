@@ -34,6 +34,20 @@ const execFileAsync = promisify(execFile);
 const GENERIC = "/control-repo/.agent-pipeline/runs";
 const STATE_HOME = "/host-state/runs";
 
+function qualificationRows(candidateSha: string) {
+  return FAULT_RECOVERY_MATRIX.filter((row) => !row.not_applicable).map((row) => ({
+    candidate_sha: candidateSha,
+    layer: row.layer,
+    lifecycle_class: row.lifecycle_class,
+    operation: row.operation,
+    fault_state: row.fault_state,
+    entrypoint: row.entrypoint,
+    host: row.host,
+    observed_terminal: row.expected_terminal,
+    passed: true,
+  }));
+}
+
 function memFs(files: Map<string, string>): FrgFsDeps {
   return {
     async readFile(p) {
@@ -554,10 +568,7 @@ test("in-flight ship inherits parent train logical id onto scored operation (#14
       repoDir: "/candidate-worktree",
       inFlightShip: true,
       resolveUniqueOperationRunsRoots: () => [STATE_HOME, GENERIC],
-      loadCandidateFaultRecoveryInventory: async () => ({
-        rows: FAULT_RECOVERY_MATRIX,
-        sourceSha: "c".repeat(40),
-      }),
+      loadCandidateQualificationRows: async () => qualificationRows("c".repeat(40)),
       scoreInput: {
         ...scoreInput("c".repeat(40)),
         unique_operation_manifest: {
@@ -591,7 +602,7 @@ async function git(cwd: string, args: string[]): Promise<string> {
   return String(stdout).trim();
 }
 
-test("live from-run inventory attach when HEAD differs from scored SHA (#1440 4.4)", async () => {
+test("live from-run static inventory cannot attach execution when HEAD differs (#1525)", async () => {
   const root = await mkdtemp(join(tmpdir(), "pipeline-1440-inv-"));
   try {
     await git(root, ["init"]);
@@ -643,15 +654,8 @@ test("live from-run inventory attach when HEAD differs from scored SHA (#1440 4.
       memFs(files),
     );
     const section = result.evidence.operation_reliability!;
-    assert.ok((section.executed_matrix_rows ?? []).length > 0);
-    assert.ok((section.executed_matrix_rows ?? []).every((row) => row.candidate_sha === scoredSha));
-    for (const cls of REQUIRED_LIFECYCLE_CLASSES_1333) {
-      assert.ok(
-        (section.executed_matrix_rows ?? []).some((row) => row.lifecycle_class === cls),
-        `missing class ${cls}`,
-      );
-    }
-    assert.equal(section.integrity.missing_required_coverage, 1, "only #1301 live train-link remains");
+    assert.equal((section.executed_matrix_rows ?? []).length, 0);
+    assert.equal(section.integrity.missing_required_coverage, 6);
     assert.ok(typeof defaultScoreBoundPackLoop === "function");
     assert.match(uniqueOperationSloFailure(section) ?? "", /missing required coverage/);
   } finally {

@@ -69,7 +69,7 @@ test_gate: # run the repo's tests/build before opening a PR
   enabled: true # set false to disable entirely
   command: npm run ci # explicit command; auto-detected when absent
   max_attempts: 3 # fix-harness invocations before blocking
-  timeout: 300 # seconds per test/build run
+  timeout: 900 # full CI includes staged candidate qualification and subprocess integration suites
 
 eval_gate: # run the repo's eval harness after pre-merge
   enabled: false # set true to enable (one-time declaration per repo)

@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { artifactSubdir, FACTORY_RELEASE_ARTIFACT } from "../scripts/artifact-ignore.ts";
+import type { InstalledCliQualificationArtifact } from "../scripts/installed-cli-qualification.ts";
 import {
   buildFactoryReleaseUnsignedDigestBinding,
   compareSemver,
@@ -573,6 +574,9 @@ function hermeticPrepareDeps(
 ): FactoryReleasePrepareDeps {
   return defaultFactoryReleasePrepareDeps({
     listRemainingOpenMilestoneIssues: async () => [],
+    qualifyCandidate:
+      overrides.qualifyCandidate ??
+      (async () => ({}) as InstalledCliQualificationArtifact),
     ...overrides,
   });
 }
@@ -948,9 +952,11 @@ test("post-attestation reuses an already-merged release PR and does not call run
   const requestPath = "/tmp/req-134.json";
   await mem.writeFile(requestPath, JSON.stringify(request));
   const releaseCalls = { n: 0 };
+  const generateCalls = { n: 0 };
   const deps = makeDeps({
     fs: mem,
     releaseCalls,
+    generateCalls,
     observe: async (_req, unsigned) => observeForUnsigned(unsigned, request),
     observeExistingRelease: async () => ({
       pr: 1109,
@@ -1019,9 +1025,11 @@ test("structural FRG failure blocks complete and does not open a release PR", as
   const requestPath = "/tmp/req-134.json";
   await mem.writeFile(requestPath, JSON.stringify(request));
   const releaseCalls = { n: 0 };
+  const generateCalls = { n: 0 };
   const deps = makeDeps({
     fs: mem,
     releaseCalls,
+    generateCalls,
     generate: async () =>
       ({
         frg: unsignedPayload(),
@@ -1038,6 +1046,13 @@ test("structural FRG failure blocks complete and does not open a release PR", as
   assert.equal(outcome.result.defect_class, "scenario_missing");
   assert.match(outcome.result.message, /1\.34\.0/);
   assert.equal(releaseCalls.n, 0);
+  const replay = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(replay.exitCode, 1);
+  assert.equal(generateCalls.n, 2, "same request re-observes and re-scores its retained pack");
+  const index = JSON.parse(
+    await mem.readFile(factoryReleaseVersionIndexPath("/repo", request.target_version)),
+  );
+  assert.equal(index.disposition, "active");
 });
 
 test("refuses attestation key in candidate environment", async () => {
@@ -1510,6 +1525,45 @@ test("factory-release prepare leftover open issue fails closed before pack-loop 
   );
   assert.equal(packLoopStarts, 0);
   assert.equal(generateCalls.n, 0);
+});
+
+test("candidate qualification failure creates and dispatches zero remote fixtures (#1525)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest({ milestone: "v1.40.1" });
+  const requestPath = "/tmp/req-qualification-failed.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  let generated = 0;
+  let dispatched = 0;
+  const deps = hermeticPrepareDeps({
+    env: {},
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    qualifyCandidate: async () => {
+      throw new Error("single/rejection retained no owner");
+    },
+    generateUnsignedFrg: async () => {
+      generated += 1;
+      throw new Error("must not generate");
+    },
+    dispatchPackLoop: async () => {
+      dispatched += 1;
+      throw new Error("must not dispatch");
+    },
+    observeAttestation: async () => null,
+    runRelease: async () => null,
+  });
+
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(outcome.exitCode, 1);
+  assert.equal(outcome.result.status, "failed");
+  assert.equal(outcome.result.defect_class, "installed_cli_qualification_failed");
+  assert.match(outcome.result.message ?? "", /\.agent-pipeline\/qualification/);
+  assert.equal(generated, 0);
+  assert.equal(dispatched, 0);
 });
 
 test("request fingerprint is stable for the same binding", () => {
@@ -4861,6 +4915,37 @@ test("post-creation pack mismatch reconciles exact fixtures to terminal_failed",
     await mem.readFile(factoryReleaseVersionIndexPath("/repo", request.target_version)),
   );
   assert.equal(index.disposition, "terminal_failed");
+});
+
+test("unchanged candidate cannot manufacture a successor while its canary is retained (#1525)", async () => {
+  const request = baseRequest({ action_id: "new-action-same-candidate" });
+  const requestPath = "/tmp/frg-same-candidate-successor.json";
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  await mem.writeFile(
+    factoryReleaseVersionIndexPath("/repo", request.target_version),
+    JSON.stringify({
+      schema_version: 1,
+      version: request.target_version,
+      request_fingerprint: "9".repeat(64),
+      candidate_git_sha: request.integrated_candidate.git_sha,
+      action_id: "original-action",
+      pack_run_id: "pack-retained-for-replay",
+      issue_numbers: [911, 912],
+      fixture_set_complete: true,
+      disposition: "active",
+    }),
+  );
+  const generated = { n: 0 };
+  const outcome = await runFactoryReleasePrepare(
+    { requestPath, repoDir: "/repo" },
+    makeDeps({ fs: mem, generateCalls: generated }),
+  );
+  assert.equal(outcome.exitCode, 1);
+  assert.equal(outcome.result.status, "failed");
+  assert.equal(outcome.result.defect_class, "frg_pack_replay_required");
+  assert.match(outcome.result.message ?? "", /pack-retained-for-replay/);
+  assert.equal(generated.n, 0);
 });
 
 test("defaultStartBoundPackLoop durably binds fixture issues before dispatch failure", async () => {

@@ -2775,7 +2775,7 @@ Release-eligible FRG unique-operation evidence SHALL set `covered_lifecycle_clas
 
 ### Requirement: Ship FRG unique-operation scoring SHALL use control-host durable evidence bound to the scored candidate
 
-Ship FRG unique-operation scoring SHALL collect unique-operation attempts and #1301 live train-loop linkage from the control-host generic run store used for train, advance, and merge (`<control-repo>/.agent-pipeline/runs`) and from the loop state-home runs root. Followable `train_loop_linked` child run, event, and handoff paths SHALL resolve inside those control-host roots; a path that escapes into the candidate worktree SHALL NOT be loaded as unique-operation evidence. It SHALL NOT treat an empty candidate-worktree `.agent-pipeline/runs` directory as proof that train, loop, merge, or merge-queue never ran. In-flight ship scoring SHALL keep unbound control-host attempts that lack `candidate_sha`. Standalone factory-gate scoring SHALL omit unbound attempts. In-flight ship scoring SHALL pass candidate-bound #1333 executed matrix rows through the existing unique-operation coverage seam, including rows attached from a complete candidate-tree inventory. GitHub pack-issue labels, comment prose, and factory-gate 2-item pack proofs (clean-docs, clean-openspec, hybrid v2 Layer A) SHALL NOT substitute for unique-operation coverage. When the control-host generic store and the loop state-home are both empty of collectable train, loop, and merge evidence, unique-operation coverage SHALL fail closed as missing required coverage. This capability SHALL NOT add a second unique-operation aggregator, Factory Reliability Gate runner, or scheduler.
+Ship FRG unique-operation scoring SHALL collect unique-operation attempts and #1301 live train-loop linkage from the control-host generic run store used for train, advance, and merge (`<control-repo>/.agent-pipeline/runs`) and from the loop state-home runs root. Followable `train_loop_linked` child run, event, and handoff paths SHALL resolve inside those control-host roots; a path that escapes into the candidate worktree SHALL NOT be loaded as unique-operation evidence. It SHALL NOT treat an empty candidate-worktree `.agent-pipeline/runs` directory as proof that train, loop, merge, or merge-queue never ran. In-flight ship scoring SHALL keep unbound control-host attempts that lack `candidate_sha`. Standalone factory-gate scoring SHALL omit unbound attempts. In-flight ship scoring SHALL pass candidate-bound #1333 executed matrix rows through the existing unique-operation coverage seam, including rows from a validated exact-candidate qualification artifact. Static inventory SHALL NOT be converted into executed rows. GitHub pack-issue labels, comment prose, and factory-gate 2-item pack proofs (clean-docs, clean-openspec, hybrid v2 Layer A) SHALL NOT substitute for unique-operation coverage. When the control-host generic store and the loop state-home are both empty of collectable train, loop, and merge evidence, unique-operation coverage SHALL fail closed as missing required coverage. This capability SHALL NOT add a second unique-operation aggregator, Factory Reliability Gate runner, or scheduler.
 
 #### Scenario: Empty candidate-worktree run-store does not fail a host-proven ship
 
@@ -2826,14 +2826,14 @@ Ship FRG unique-operation scoring SHALL collect unique-operation attempts and #1
 - **THEN** those rows SHALL feed #1333 `covered_lifecycle_classes` through the existing binder
 - **AND** helper stamps and pack labels SHALL NOT populate that coverage
 
-#### Scenario: In-flight ship #1333 rows may come from a complete candidate-tree inventory
+#### Scenario: In-flight ship inventory alone receives no executed coverage
 
 - **WHEN** in-flight ship FRG scoring runs for candidate SHA `C`
 - **AND** durable executed matrix rows bound to `C` are absent from host run artifacts
-- **AND** the candidate tree's fault-recovery matrix inventory-completeness guard passes
-- **THEN** inventory rows bound to `C` SHALL feed #1333 `covered_lifecycle_classes` through the existing binder
+- **AND** the candidate tree's inventory is complete but no validated qualification artifact exists
+- **THEN** inventory completeness alone SHALL NOT populate #1333 `covered_lifecycle_classes`
 - **AND** helper stamps SHALL NOT populate that coverage
-- **AND** absence of a complete inventory SHALL fail as missing required coverage
+- **AND** missing executed coverage SHALL fail as missing required coverage
 
 #### Scenario: Candidate-worktree child handoff does not satisfy host #1301 linkage
 
@@ -2919,39 +2919,6 @@ When `factory-release prepare` refuses structural eligibility because unique-ope
 - **AND** `factory-release prepare` scores that pack as not structurally eligible
 - **THEN** the hard-gate message SHALL include both failure strings
 - **AND** the message SHALL NOT equal only `factory-release prepare: FRG structural eligibility failed for <version>. Hard gate: release preparation blocked.`
-
-### Requirement: In-flight ship FRG scoring SHALL attach candidate-bound #1333 executed rows from a complete matrix inventory
-
-When Factory Reliability Gate unique-operation scoring runs as a phase of an admitted in-flight `ship`, scoring SHALL attach `executed_matrix_rows` bound to the scored candidate SHA from the candidate tree's fault-recovery matrix inventory when the inventory-completeness guard passes for that tree. Those rows SHALL feed `covered_lifecycle_classes` through the existing executed-row binder. Scoring SHALL load that inventory from the git object at the scored SHA. Checkout HEAD MAY differ from that SHA. Scoring SHALL NOT stamp helper `covered_lifecycle_classes` lists. An incomplete inventory SHALL NOT attach rows. Standalone factory-gate scoring SHALL NOT mint inventory rows. Absence of durable executed rows on standalone factory-gate SHALL fail as missing required coverage.
-
-#### Scenario: Complete inventory covers all five #1333 classes for the scored SHA
-
-- **WHEN** in-flight ship FRG scoring runs for candidate SHA `C`
-- **AND** the candidate tree's fault-recovery matrix inventory-completeness guard passes
-- **THEN** unique-operation evidence SHALL cover lifecycle classes `mechanical`, `workflow`, `infrastructure`, `authentication`, and `unknown` from inventory rows bound to `C`
-- **AND** helper `covered_lifecycle_classes` stamps SHALL NOT populate that coverage
-
-#### Scenario: Incomplete inventory does not mint #1333 coverage
-
-- **WHEN** in-flight ship FRG scoring runs for candidate SHA `C`
-- **AND** the candidate tree's fault-recovery matrix inventory-completeness guard fails
-- **THEN** scoring SHALL NOT attach inventory rows
-- **AND** missing required coverage SHALL increase for uncovered #1333 classes
-
-#### Scenario: Standalone factory-gate does not mint inventory rows
-
-- **WHEN** standalone factory-gate unique-operation scoring runs for candidate SHA `C`
-- **AND** durable executed matrix rows bound to `C` are absent
-- **THEN** scoring SHALL NOT attach inventory rows
-- **AND** missing required coverage SHALL increase
-
-#### Scenario: Checkout HEAD mismatch does not refuse a complete blob at the scored SHA
-
-- **WHEN** in-flight ship FRG scoring runs for candidate SHA `C`
-- **AND** the scoring worktree HEAD is not `C`
-- **AND** the commit-bound inventory blob at `C` passes the inventory-completeness guard
-- **THEN** scoring SHALL attach inventory rows bound to `C`
-- **AND** those rows SHALL feed the five required #1333 lifecycle classes
 
 ### Requirement: In-flight ship unique-operation scoring SHALL observe single, merge, and merge-queue from control-host artifacts
 
@@ -3043,24 +3010,37 @@ When Factory Reliability Gate unique-operation scoring runs as a phase of an adm
 - **THEN** #1301 live train-link SHALL be treated as present
 - **AND** missing required coverage SHALL NOT increase for that live train-link cell
 
-### Requirement: In-flight ship #1333 attach SHALL succeed on a live from-run score when the commit-bound inventory at the scored SHA is complete
-
-When Factory Reliability Gate unique-operation scoring runs as a phase of an admitted in-flight `ship`, scoring SHALL attach binder-accepted `executed_matrix_rows` for the five required #1333 lifecycle classes from the commit-bound fault-recovery inventory blob at the scored candidate SHA when that inventory-completeness guard passes. Checkout HEAD of the scoring worktree MAY differ from that SHA. A live `factory-gate --from-run` / `defaultScoreBoundPackLoop` score SHALL attach those rows when the blob at the scored SHA is complete. Scoring SHALL NOT stamp helper `covered_lifecycle_classes` lists. An unreadable, incomplete, or other-SHA blob SHALL NOT attach rows. Standalone factory-gate scoring SHALL NOT mint inventory rows.
-
-#### Scenario: Live from-run attaches #1333 rows when HEAD differs from the scored SHA
-
-- **WHEN** in-flight ship unique-operation scoring runs for candidate SHA `C` from a pack-loop `--from-run`
-- **AND** the scoring worktree HEAD is not `C`
-- **AND** the commit-bound inventory blob at `C` passes the inventory-completeness guard
-- **THEN** scored evidence `executed_matrix_rows` SHALL be nonempty and bound to `C`
-- **AND** unique-operation evidence SHALL cover lifecycle classes `mechanical`, `workflow`, `infrastructure`, `authentication`, and `unknown`
-- **AND** helper `covered_lifecycle_classes` stamps SHALL NOT populate that coverage
-
-#### Scenario: Incomplete blob on live from-run stays fail-closed
-
-- **WHEN** in-flight ship unique-operation scoring runs for candidate SHA `C` from a pack-loop `--from-run`
-- **AND** the commit-bound inventory blob at `C` fails the inventory-completeness guard
-- **THEN** scoring SHALL NOT attach inventory rows
-- **AND** missing required coverage SHALL increase for uncovered #1333 classes
-
 ---
+
+### Requirement: Deterministic candidate qualification SHALL precede remote fixture creation
+
+Factory-release preparation SHALL run or re-observe exact-candidate installed-CLI qualification before creating a remote FRG fixture issue or PR. Missing or failed qualification SHALL stop at a typed preflight defect with the artifact path and failed cells. It SHALL NOT create, replace, or dispatch a remote fixture pack. A passing qualification artifact SHALL be reused idempotently for the same candidate.
+
+#### Scenario: Qualification failure creates no fixtures
+
+- **WHEN** exact-candidate installed-CLI qualification is missing, stale, malformed, or has a failed required case
+- **THEN** factory-release preparation SHALL fail before its first remote fixture mutation
+- **AND** no successor fixture pair SHALL be created
+
+#### Scenario: Passing qualification is reused
+
+- **WHEN** the same candidate and matrix version are prepared again after qualification passed
+- **THEN** preparation SHALL validate and reuse the existing artifact
+- **AND** it SHALL NOT rerun qualification or create an additional fixture pair solely to rediscover local faults
+
+### Requirement: Remote FRG SHALL be one final candidate-bound canary
+
+After deterministic qualification passes, a release candidate MAY create at most one active remote fixture pair. A canary failure SHALL retain its pack identity and artifacts for replay and diagnosis. Automatic retry SHALL reconcile or resume that same pack; it SHALL NOT manufacture a fresh pair for the unchanged candidate. A changed candidate SHALL require new deterministic qualification before one successor canary is permitted, and the prior pack SHALL be reconciled first.
+
+#### Scenario: Same-candidate retry reuses the pack
+
+- **WHEN** candidate `C` has a failed or interrupted canary pack with persisted identity
+- **AND** release preparation is retried without changing `C`
+- **THEN** preparation SHALL replay or resume the same pack artifacts
+- **AND** it SHALL NOT create a new pair
+
+#### Scenario: Changed candidate gets one successor only after qualification
+
+- **WHEN** candidate changes from `C1` to `C2`
+- **THEN** the `C1` pack SHALL be reconciled before any successor mutation
+- **AND** exact-candidate qualification for `C2` SHALL pass before the single `C2` canary pair is created

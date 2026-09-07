@@ -172,7 +172,7 @@ export interface FaultRecoveryMatrixGap {
 }
 
 const ADAPTER_MODULE = "test/fault-recovery-matrix.test.ts";
-const INSTALLED_CLI_MODULE = "test/fault-recovery-installed-cli.test.ts";
+const INSTALLED_CLI_MODULE = "../scripts/installed-cli-qualification.test.mjs";
 const HOST_MODULE = "test/fault-recovery-host-conformance.test.ts";
 
 const EVAL_HOLDOUT_PATTERNS = [/\/evals\//, /evals-/, /holdout/];
@@ -574,9 +574,15 @@ export function collectFaultRecoveryCoverageGaps(
     }
     const body = bodies.get(rel) ?? "";
     if (!body) continue;
+    const realInstalledQualification =
+      row.layer === "installed_cli" &&
+      body.includes("runInstalledCliQualification") &&
+      body.includes("pipeline-launcher.mjs") &&
+      !body.includes("COMMAND_REGISTRY") &&
+      !body.includes("observeAdapterFault");
     const generatedTitle =
       (row.layer === "adapter_contract" && body.includes("adapter contract: ${")) ||
-      (row.layer === "installed_cli" && body.includes("installed-cli: ${")) ||
+      realInstalledQualification ||
       (row.layer === "host_conformance" && body.includes("host conformance: ${")) ||
       (row.ship_model === "semver" && body.includes("ship-model semver phase: ${"));
     if (!generatedTitle && !body.includes(sub)) {
