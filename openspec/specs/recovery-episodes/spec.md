@@ -154,8 +154,10 @@ When consecutive observations on the same Recovery Episode carry the same normal
 
 - **WHEN** a redispatch-only recipe makes whole-item redispatch admissible without changing the candidate
 - **AND** redispatch returns the same blocker kind through a different run or stage-omitted attestation envelope
+- **AND** the nearest preceding authoritative invariant has current-candidate episode evidence and remains unresolved
 - **THEN** RecoverySupervisor SHALL retain the episode's skips, spent attempts, and strategy cursor
 - **AND** SHALL dispatch the next applicable recipe rather than treating the transport envelope as resolution of the original stage invariant
+- **AND** SHALL NOT scan past an intervening authoritative invariant or borrow an identity without matching current-candidate episode evidence
 
 #### Scenario: Authoritative stages retain independent recovery progress
 

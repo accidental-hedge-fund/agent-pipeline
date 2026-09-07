@@ -3086,6 +3086,168 @@ test("production recovery skips inapplicable HEAD verification and preserves the
   );
 });
 
+async function runProductionOpenSpecRecoverySequence(
+  steps: readonly { diagnostic: ReturnType<typeof buildStageDiagnostic>; head: string }[],
+) {
+  const implementationCi = DEFAULT_RECOVERY_POLICY["implementation-ci"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "implementation-ci": {
+        ...implementationCi,
+        per_strategy_bound: 1,
+        backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
+        repeated_evidence_limit: 8,
+      },
+    },
+  });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "pending") }));
+  let blockedLabelPresent = false;
+  let currentHead = steps[0]?.head ?? "";
+  let dispatchCount = 0;
+  let rerunClears = 0;
+  let repairCalls = 0;
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return {
+        state: "open",
+        labels: ["pipeline:pre-merge", ...(blockedLabelPresent ? ["blocked"] : [])],
+      };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: currentHead, merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "fail" }];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: currentHead };
+    },
+    async baseBranchContainsSha() {
+      return false;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    const step = steps[Math.min(dispatchCount, steps.length - 1)]!;
+    currentHead = step.head;
+    blockedLabelPresent = true;
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_recoverable",
+      evidence: { pr_number: 12, pipeline_run_id: `advance-${dispatchCount}` },
+      diagnostic: step.diagnostic,
+    };
+  };
+  const executeRecovery = realExecuteRecovery({
+    ...DEFAULT_CONFIG,
+    repo: "acme/widgets",
+    repo_dir: "/repo",
+    base_branch: "main",
+  }, {
+    getIssueDetail: async () => ({
+      number: 100,
+      state: "open",
+      title: "fixture",
+      body: "",
+      labels: blockedLabelPresent ? ["blocked"] : [],
+      milestone: null,
+      comments: [],
+    }),
+    clearBlocked: async () => {
+      rerunClears++;
+      blockedLabelPresent = false;
+    },
+    getOnDiskForIssue: async () => null,
+    repairPipelineItem: async () => {
+      repairCalls++;
+      return { succeeded: false, evidence: "OpenSpec tasks still incomplete" };
+    },
+  });
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  for (const _step of steps) {
+    await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+  }
+  return {
+    ledger: await readLedger(deps, "run-1"),
+    dispatchCount,
+    rerunClears,
+    repairCalls,
+  };
+}
+
+test("coarse recovery does not cross an intervening authoritative blocker invariant", async () => {
+  const head = "d".repeat(40);
+  const result = await runProductionOpenSpecRecoverySequence([
+    {
+      head,
+      diagnostic: buildStageDiagnostic({
+        reasonCode: "implementation-ci",
+        blockerKind: "openspec-invalid",
+        reason: "pre-merge found incomplete OpenSpec tasks",
+        stage: "pre-merge",
+      }),
+    },
+    {
+      head,
+      diagnostic: buildStageDiagnostic({
+        reasonCode: "implementation-ci",
+        blockerKind: "build-failed",
+        reason: "implementation build failed",
+        stage: "implementing",
+      }),
+    },
+    {
+      head,
+      diagnostic: buildStageDiagnostic({
+        reasonCode: "implementation-ci",
+        blockerKind: "openspec-invalid",
+        reason: "coarse current blocker attestation",
+      }),
+    },
+  ]);
+
+  assert.equal(result.dispatchCount, 3);
+  assert.equal(result.rerunClears, 3, "the coarse blocker starts fresh after the intervening invariant");
+  assert.equal(result.repairCalls, 0, "the old OpenSpec episode cursor must not be resurrected");
+});
+
+test("coarse recovery does not borrow an authoritative identity without current-candidate episode evidence", async () => {
+  const result = await runProductionOpenSpecRecoverySequence([
+    {
+      head: "e".repeat(40),
+      diagnostic: buildStageDiagnostic({
+        reasonCode: "implementation-ci",
+        blockerKind: "openspec-invalid",
+        reason: "pre-merge found incomplete OpenSpec tasks",
+        stage: "pre-merge",
+      }),
+    },
+    {
+      head: "f".repeat(40),
+      diagnostic: buildStageDiagnostic({
+        reasonCode: "implementation-ci",
+        blockerKind: "openspec-invalid",
+        reason: "coarse blocker after candidate movement",
+      }),
+    },
+  ]);
+  const reruns = result.ledger.recovery_attempts.filter((attempt) => attempt.action === "rerun_ci");
+
+  assert.equal(result.dispatchCount, 2);
+  assert.equal(result.rerunClears, 2);
+  assert.equal(result.repairCalls, 0);
+  assert.equal(reruns.length, 2);
+  assert.notEqual(reruns[0]?.candidate_epoch, reruns[1]?.candidate_epoch);
+  assert.notEqual(reruns[0]?.evidence_identity, reruns[1]?.evidence_identity);
+});
+
 test("production recovery keeps applicable no-commits HEAD verification and its failure budget", async () => {
   const implementationCi = DEFAULT_RECOVERY_POLICY["implementation-ci"];
   const contract = testContract({

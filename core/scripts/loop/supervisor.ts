@@ -732,6 +732,12 @@ function persistedRecoveryEvidence(item: LoopItemLedgerEntry): PersistedRecovery
   return parsePersistedRecoveryEvidence(blocked?.evidence);
 }
 
+function isCoarseImplementationAttestation(diagnostic: StageDiagnostic): boolean {
+  if (diagnostic.reason_code !== "implementation-ci" || diagnostic.detail.stage?.trim()) return false;
+  const { blocker_kind: _blockerKind, reason: _reason, stage: _stage, ...qualifiers } = diagnostic.detail;
+  return Object.values(qualifiers).every((value) => value === undefined);
+}
+
 /**
  * A transport fallback can omit the stage while reporting the same unresolved
  * implementation blocker. Resume only the most recent authoritative invariant
@@ -750,29 +756,37 @@ function recoveryProgressIdentityForBlockedItem(
   }));
   if (
     item.blocked_theme !== "implementation-ci" ||
-    persisted.diagnostic.detail.stage?.trim() ||
-    persisted.diagnostic.reason_code !== "implementation-ci"
+    !isCoarseImplementationAttestation(persisted.diagnostic)
   ) {
     return directIdentity;
   }
-
-  const { blocker_kind: _blockerKind, reason: _reason, stage: _stage, ...qualifiers } =
-    persisted.diagnostic.detail;
-  if (Object.values(qualifiers).some((value) => value !== undefined)) return directIdentity;
 
   const blockerKind = persisted.diagnostic.detail.blocker_kind;
   const priorBlocked = item.history.filter((entry) => entry.to === "blocked" && entry.evidence);
   priorBlocked.pop(); // The latest blocked entry supplied `persisted` above.
   for (const entry of priorBlocked.reverse()) {
     const prior = parsePersistedRecoveryEvidence(entry.evidence);
-    if (!prior || !prior.diagnostic.detail.stage?.trim()) continue;
+    if (!prior) return directIdentity;
     const projection = projectStageDiagnostic(prior.diagnostic);
+    if (isCoarseImplementationAttestation(prior.diagnostic)) {
+      if (
+        projection.disposition !== "recover" ||
+        projection.blockerClass !== "implementation-ci" ||
+        prior.diagnostic.detail.blocker_kind !== blockerKind
+      ) {
+        return directIdentity;
+      }
+      continue;
+    }
+    // The first non-coarse diagnostic is the nearest authoritative invariant
+    // boundary. Never scan past it to resurrect an older matching episode.
     if (
       projection.disposition !== "recover" ||
       projection.blockerClass !== "implementation-ci" ||
-      prior.diagnostic.detail.blocker_kind !== blockerKind
+      prior.diagnostic.detail.blocker_kind !== blockerKind ||
+      !prior.diagnostic.detail.stage?.trim()
     ) {
-      continue;
+      return directIdentity;
     }
     const priorIdentity = fingerprintEvidence(recoveryProgressEvidence({
       blockerClass: "implementation-ci",
@@ -785,6 +799,7 @@ function recoveryProgressIdentityForBlockedItem(
         attempt.evidence_identity === priorIdentity &&
         attemptBelongsToCandidateEpoch(attempt, candidateEpoch),
     );
+    if (episodeAttempts.length === 0) return directIdentity;
     const resolved = episodeAttempts.some(
       (attempt) => attempt.outcome === "recovered" && !recoveryRecipeOnlyProvesRedispatch(attempt.action),
     );
