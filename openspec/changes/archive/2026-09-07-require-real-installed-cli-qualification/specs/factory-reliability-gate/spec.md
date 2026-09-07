@@ -88,7 +88,7 @@ Ship FRG unique-operation scoring SHALL collect unique-operation attempts and #1
 - **THEN** those rows SHALL feed #1333 `covered_lifecycle_classes` through the existing binder
 - **AND** helper stamps and pack labels SHALL NOT populate that coverage
 
-#### Scenario: In-flight ship #1333 rows may come from a complete candidate-tree inventory
+#### Scenario: In-flight ship inventory alone receives no executed coverage
 
 - **WHEN** in-flight ship FRG scoring runs for candidate SHA `C`
 - **AND** durable executed matrix rows bound to `C` are absent from host run artifacts
