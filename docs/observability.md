@@ -10,6 +10,8 @@ Explicitly opt in per repository in `.github/pipeline.yml`:
 ```yaml
 observability:
   enabled: true
+  traffic_class: real
+  execution_purpose: operational
   exporter:
     type: file
     directory: ~/.local/state/agent-pipeline/observability
@@ -25,6 +27,16 @@ pipeline export. `pipeline config validate` checks this configuration, and
 `pipeline config schema` describes its fields. The loaded configuration is
 passed to CLI invocations, their retries/fallbacks, and direct API executors;
 there is no per-invocation YAML reparse.
+
+`traffic_class` is `real` (default), `synthetic`, or `unknown`.
+`execution_purpose` is `operational` (default), `test`, `evaluation`,
+`verification`, or `unknown`. These are independent: an evaluation that makes
+paid provider requests is **real/evaluation**. A mocked fixture is
+**synthetic/test**; its fake tokens/cost never leave the pipeline exporter.
+Purpose alone never removes real provider usage from accounting. Node's test
+workers veto the default filesystem exporter even with enabled fixture YAML;
+unit/integration tests must inject an isolated I/O seam. This veto cannot enable
+the feature, and does not apply to ordinary CLI evaluation runs.
 
 Every completed invocation already recorded as `stage_accounting` writes one
 event to `<directory>/inbox/`. This includes tracked CLI and direct API stages
@@ -86,6 +98,46 @@ and (when known) `PIPELINE_REPO` carry runtime identity, not feature configurati
 `AI_OBSERVABILITY_ACCOUNTING_OWNER=pipeline` communicate ownership; the earlier
 `AGENT_OBSERVABILITY_*` identity aliases remain for consumer compatibility.
 Existing Herdr integrations are unaffected.
+
+## Fleet semantics, metadata version 2
+
+The file envelope remains `schema_version: 1`; additive metadata records
+`telemetry_schema_version: 2`. Invocation aggregates explicitly carry
+`record_grain=invocation_aggregate`, an authoritative accounting role,
+`timing_quality=aggregate`, traffic class/purpose, and an attempt identity.
+Available token buckets are not proof of exhaustive source accounting;
+`usage_completeness=unknown` remains explicit. Never count these aggregate rows
+as individual provider requests. Synthetic aggregates are lifecycle-only and
+supplementary, without usage or cost.
+
+`job_session_id` joins invocations and physical resumed runs using the existing
+immutable `logical_operation_id` when available; otherwise it uses the physical
+run ID. Native session IDs and accounting event IDs remain unchanged. Consumers
+may build a shared job session without rewriting historical trace identity.
+
+Ordinary advance runs project durable `run_start`, `stage_start`,
+`stage_complete`, and `run_complete` evidence into cost-free lifecycle records.
+Advance-only train runs also export their run lifecycle. CLI invocations export
+a cost-free `invocation_start` before spawn, then their final aggregate. A start
+is evidence of admission, not proof that work is still running; no heartbeats
+or active-job guarantee is supplied. Merge-authorized train admission is not
+changed by this instrumentation. Its run lifecycle is not yet wired to this
+optional exporter.
+
+Lifecycle metadata includes `telemetry_event`, `lifecycle_phase`, known final
+state/outcome, and stage attempt identity. Completed stages have measured timing
+only when their matching start was observed in the same dispatcher. A resumed
+completion without that evidence has unknown timing/attempt identity. No retry
+ordinal is invented. Unknown/unrecognized outcomes stay unknown. Lifecycle
+export runs only after durable source-event delivery; failure never changes
+the stage outcome or source durability result.
+
+Direct HTTP executors retain actual response status, retry count and rate-limit
+evidence on failures as well as successes. Bounded failure categories distinguish
+authentication, quota exhaustion, rate limiting, provider unavailability,
+timeouts, cancellation, other errors, and unknowns. CLI stderr is not parsed or
+exported to guess an HTTP status. This identifies known failures, not remaining
+quota or provider invoice balances.
 
 ## Disable, migrate, or roll back
 

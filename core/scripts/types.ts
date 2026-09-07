@@ -1100,6 +1100,9 @@ export interface PlanningFactsConfig {
 /** Provider-neutral, metadata-only usage telemetry configured in pipeline.yml. */
 export interface ObservabilityConfig {
   enabled: boolean;
+  /** Real paid tests/evaluations are real traffic, not mocked fixtures. */
+  traffic_class?: "real" | "synthetic" | "unknown";
+  execution_purpose?: "operational" | "test" | "evaluation" | "verification" | "unknown";
   exporter: {
     type: "file";
     /** Absolute or ~/ path; the exporter owns inbox/ and context/ below it. */
@@ -2314,6 +2317,8 @@ export interface StageAccountingRecord {
   request_id?: string | null;
   finish_reason?: string | null;
   retry_count?: number | null;
+  /** Observed HTTP response status; never parsed from arbitrary stderr. */
+  http_status?: number | null;
   rate_limited?: boolean | null;
   effort_support?: string | null;
   /** The exact request payload sent — resolved model, transmitted params,

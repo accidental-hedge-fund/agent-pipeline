@@ -987,6 +987,8 @@ const PartialConfigSchema = z.object({
   observability: z
     .object({
       enabled: z.boolean().optional().describe("When true, export metadata-only stage usage and native-session correlation to the configured local file spool. Default false; no environment override. No prompts, outputs, credentials, or network delivery."),
+      traffic_class: z.enum(["real", "synthetic", "unknown"]).optional().describe("Traffic evidence: real provider work, mocked synthetic fixtures, or unknown. Defaults to real. Synthetic records never export usage or cost. Real paid tests/evaluations remain real."),
+      execution_purpose: z.enum(["operational", "test", "evaluation", "verification", "unknown"]).optional().describe("Purpose independent of traffic reality. Defaults to operational; evaluation/test can make genuine paid provider requests."),
       exporter: z
         .object({
           type: z.literal("file").optional().describe("Provider-neutral exporter type. Only file is supported; an independent collector may forward the spool to any backend."),
@@ -2361,6 +2363,8 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     },
     observability: {
       enabled: fileConfig.observability?.enabled ?? DEFAULT_CONFIG.observability.enabled,
+      ...(fileConfig.observability?.traffic_class ? { traffic_class: fileConfig.observability.traffic_class } : {}),
+      ...(fileConfig.observability?.execution_purpose ? { execution_purpose: fileConfig.observability.execution_purpose } : {}),
       exporter: {
         type: fileConfig.observability?.exporter?.type ?? DEFAULT_CONFIG.observability.exporter.type,
         directory: fileConfig.observability?.exporter?.directory ?? DEFAULT_CONFIG.observability.exporter.directory,
@@ -4211,6 +4215,8 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       : [
         "# observability: # SECURITY: opt-in metadata-only local usage export; no backend dependency or network delivery from the pipeline",
         `#   enabled: ${yamlScalar(observability.enabled)} # ${sd("observability.enabled", "enable metadata-only usage export; disabled by default, configured only here")}`,
+        "#   # traffic_class: real # optional: real, synthetic, unknown; synthetic omits usage/cost",
+        "#   # execution_purpose: operational # optional: operational, test, evaluation, verification, unknown",
         `#   exporter: # ${sd("observability.exporter", "provider-neutral local exporter")}`,
         `#     type: ${yamlScalar(observability.exporter.type)} # ${sd("observability.exporter.type", "file exporter; a separate collector owns backend delivery")}`,
         `#     directory: ${yamlScalar(observability.exporter.directory)} # ${sd("observability.exporter.directory", "absolute or ~/ spool root containing inbox/ and context/")}`,

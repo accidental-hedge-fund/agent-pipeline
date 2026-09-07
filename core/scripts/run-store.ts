@@ -1051,6 +1051,8 @@ export function writeHealthForOperatorSurface(
 // ---------------------------------------------------------------------------
 
 export interface RunStoreDeps {
+  /** Opt-in projection of durable run/stage evidence; not a delivery authority. */
+  observabilitySink?: (runDir: string, event: RunEvent) => Promise<void>;
   /** Optional local-only export; injected test deps perform no ambient I/O. */
   accountingSink?: (runDir: string, record: StageAccountingRecord, config?: ObservabilityConfig) => Promise<void>;
   readFile: (p: string) => Promise<string>;
@@ -2011,6 +2013,10 @@ export async function appendEvent(
   const eventsPath = path.join(runDir, "events.jsonl");
   const hasSink = deps.eventSink !== undefined;
   const exclusive = hasSink && deps.eventSinkMode === "exclusive";
+  const observe = async () => {
+    try { await deps.observabilitySink?.(runDir, event); }
+    catch (error) { console.warn(`[pipeline] observability lifecycle failed (non-fatal): ${(error as Error).message}`); }
+  };
 
   if (deps.summaryEvents) {
     deps.summaryEvents.push(event);
@@ -2077,6 +2083,7 @@ export async function appendEvent(
     }
 
     if (!sinkFailed) {
+      await observe();
       return true; // exclusive happy path: sink-only, no local write
     }
 
@@ -2091,6 +2098,7 @@ export async function appendEvent(
         exclusiveFallbackSucceeded: local.ok,
       },
     );
+    if (local.ok) await observe();
     return local.ok;
   }
 
@@ -2130,6 +2138,7 @@ export async function appendEvent(
     // Local succeeded; still surface sink loss in write-health.
     await recordFailure(`event sink delivery failed: ${sinkError}`);
   }
+  await observe();
   return true;
 }
 

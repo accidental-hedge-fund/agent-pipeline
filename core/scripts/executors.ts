@@ -650,6 +650,7 @@ export async function invokeExternalExecutor(
   let result: HarnessResult;
   let retryCount = 0;
   let rateLimited = false;
+  let httpStatus: number | null = null;
   try {
     let res: Response;
     for (;;) {
@@ -669,6 +670,7 @@ export async function invokeExternalExecutor(
       break;
     }
     const duration = (Date.now() - started) / 1000;
+    httpStatus = res!.status;
     if (!res!.ok) {
       result = toHarnessResult(name, definition, {
         success: false,
@@ -754,8 +756,9 @@ export async function invokeExternalExecutor(
       upstreamProvider: provenance?.upstream_provider ?? null,
       requestId: provenance?.request_id ?? null,
       finishReason: provenance?.finish_reason ?? null,
-      retryCount: provenance?.retry_count ?? null,
-      rateLimited: provenance?.rate_limited ?? null,
+      retryCount: provenance?.retry_count ?? retryCount,
+      httpStatus,
+      rateLimited: provenance?.rate_limited ?? rateLimited,
       requestedEffort: provenance?.requested_effort ?? null,
       resolvedEffort: provenance?.resolved_effort ?? null,
       effortSupport: provenance?.effort_support ?? null,

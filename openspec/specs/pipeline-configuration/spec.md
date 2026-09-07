@@ -1044,3 +1044,21 @@ An unknown key under `planning_facts` or under a provider entry SHALL be rejecte
 
 - **WHEN** two providers both declare fact id `alembic_head`
 - **THEN** `resolveConfig()` SHALL throw a parse error identifying the duplicate fact id
+The observability exporter SHALL distinguish `traffic_class` (`real`, `synthetic`,
+`unknown`) from `execution_purpose` (`operational`, `test`, `evaluation`,
+`verification`, `unknown`). Defaults SHALL be real/operational. Synthetic
+records SHALL omit usage and cost. Ordinary paid evaluation traffic SHALL
+retain its accounting. Node test workers SHALL NOT use the default telemetry
+filesystem I/O; telemetry tests SHALL inject an isolated I/O seam.
+
+#### Scenario: Real evaluation is not a mocked fixture
+
+- **WHEN** pipeline.yml enables real traffic with evaluation purpose
+- **THEN** the exporter SHALL retain observed usage and cost
+- **AND** synthetic/test fixture records SHALL carry no usage or cost
+
+#### Scenario: Enrolled test host does not leak fixtures
+
+- **WHEN** a Node test worker inherits an enrolled real HOME and enabled YAML
+- **THEN** default telemetry I/O SHALL remain disabled
+- **AND** injected in-memory telemetry tests SHALL remain possible

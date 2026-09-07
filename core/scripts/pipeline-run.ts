@@ -100,6 +100,7 @@ import {
   type RunCompleteStopReason,
   type TerminalLogTee,
 } from "./run-store.ts";
+import { createLifecycleObservationSink } from "./observability.ts";
 import {
   applyTrustedVerificationPolicy,
   testCommandFromPackageJson,
@@ -1734,6 +1735,7 @@ export async function runAdvance(
     const runStoreDeps: RunStoreDeps = {
       ...defaultRunStoreDeps,
       ...eventSinkDeps,
+      observabilitySink: createLifecycleObservationSink(cfg.observability),
       // summaryEvents (#343): in-memory accumulator so finalizeRun can enrich
       // summary.json from events delivered this run. Only needed in exclusive
       // sink mode, where events.jsonl is never written (see run-store.ts

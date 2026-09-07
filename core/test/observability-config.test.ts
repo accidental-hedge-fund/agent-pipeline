@@ -113,6 +113,8 @@ for (const [label, config, field] of [
   ["newline directory", { exporter: { directory: "/spool\nextra" } }, "directory"],
   ["NUL directory", { exporter: { directory: "/spool\0extra" } }, "directory"],
   ["wrong enabled type", { enabled: "true" }, "enabled"],
+  ["invalid traffic class", { traffic_class: "paid" }, "traffic_class"],
+  ["invalid execution purpose", { execution_purpose: "whatever" }, "execution_purpose"],
   ["unsupported exporter", { exporter: { type: "langfuse" } }, "type"],
   ["unknown root key", { endpoint: "https://example.invalid" }, "endpoint"],
   ["unknown exporter key", { exporter: { api_key: "not-a-secret" } }, "api_key"],
@@ -123,6 +125,14 @@ for (const [label, config, field] of [
     assert.ok(result.diagnostics.some((item) => `${item.path} ${item.message}`.includes(field)), JSON.stringify(result.diagnostics));
   });
 }
+
+test("real evaluation and synthetic fixture classifications resolve from pipeline.yml only", () => {
+  const config = resolve("observability:\n  enabled: true\n  traffic_class: real\n  execution_purpose: evaluation\n");
+  assert.equal(config.observability.traffic_class, "real");
+  assert.equal(config.observability.execution_purpose, "evaluation");
+  const result = validateConfig("/fake-repo", deps("observability:\n  traffic_class: synthetic\n  execution_purpose: test\n"));
+  assert.equal(result.valid, true, JSON.stringify(result.diagnostics));
+});
 
 test("observability schema and init template document all settings and disabled defaults", () => {
   const schema = generateConfigSchema() as any;
@@ -135,6 +145,8 @@ test("observability schema and init template document all settings and disabled 
   const commented = template.split("\n\n").find((part) => part.startsWith("# observability:"));
   assert.ok(commented);
   assert.match(commented, /SECURITY:/);
+  assert.match(commented, /traffic_class: real/);
+  assert.match(commented, /execution_purpose: operational/);
   const active = commented.split("\n").map((line) => line.replace(/^# ?/, "")).join("\n");
   assert.deepEqual((yaml.load(active) as any).observability, DEFAULT_CONFIG.observability);
   assert.equal(validateConfig("/fake-repo", deps(active)).valid, true);

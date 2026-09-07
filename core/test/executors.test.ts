@@ -52,6 +52,35 @@ test("stage API dispatch threads its loaded observability config to accounting, 
   }
 });
 
+test("failed HTTP executor exports actual quota/rate-limit status without response or request content", async () => {
+  for (const status of [402, 429]) {
+    const events: any[] = [];
+    const runStoreDeps = {
+      appendFile: async () => {},
+      accountingSink: async (_dir, record, config) => { events.push(accountingObservation(record, {}, config)); },
+    } as RunStoreDeps;
+    const assignment = resolveStageExecutor(baseCfg(), "review-1")!;
+    let requests = 0;
+    const result = await invokeExternalExecutor("review-1", assignment, "PRIVATE REQUEST", {
+      timeoutSec: 5,
+      pipelineConfig: { observability: { ...DEFAULT_CONFIG.observability, enabled: true } },
+      accounting: { runDir: "/repo/runs/run-1", issue: 42, stage: "review-1", runStoreDeps },
+    }, {
+      fetchImpl: (async () => { requests++; return fakeResponse({ error: "PRIVATE PROVIDER RESPONSE" }, status); }) as typeof fetch,
+      sleepImpl: async () => {},
+    });
+    assert.equal(result.success, false);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].metadata.status_code, status);
+    assert.equal(events[0].metadata.failure_class, status === 402 ? "quota_exhausted" : "rate_limit");
+    assert.equal(events[0].metadata.retry_count, requests - 1);
+    assert.equal(events[0].metadata.usage_completeness, "unknown");
+    assert.ok(!("usage" in events[0]));
+    assert.ok(!("cost_usd" in events[0]));
+    assert.doesNotMatch(JSON.stringify(events), /PRIVATE/);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Stage-set invariants (#314 task 2.4) — types are stripped at runtime, so the
 // single-sourced relationship between MODEL_INVOKING_STAGES,

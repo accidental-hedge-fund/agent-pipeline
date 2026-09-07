@@ -1265,6 +1265,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       orderedIssues: ordered,
       selector,
       store: deps.runStore,
+      observability: opts.pipelineConfig?.observability,
       now: deps.now,
       logicalOperationId: outerLogicalOperationId,
     });

@@ -194,7 +194,7 @@ test("invoke(): resolved YAML policy controls both pre-spawn context and complet
     });
     assert.equal(result.success, true);
     assert.equal(result.stdout, enabled ? "fixture-invocation" : "none");
-    assert.equal([...files.keys()].filter((p) => p.includes("/inbox/")).length, enabled ? 1 : 0);
+    assert.equal([...files.keys()].filter((p) => p.includes("/inbox/")).length, enabled ? 2 : 0);
     assert.equal([...files.keys()].filter((p) => p.includes("/context/")).length, enabled ? 1 : 0);
     assert.doesNotMatch(JSON.stringify([...files.values()]), /PRIVATE PROMPT/);
   }
