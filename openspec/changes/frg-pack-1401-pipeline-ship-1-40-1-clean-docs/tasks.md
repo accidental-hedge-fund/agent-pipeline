@@ -9,5 +9,5 @@
 
 ## 3. Repository verification
 
-- [ ] 3.1 Run `npm run ci` from the repository root and verify the complete gate passes.
-- [ ] 3.2 Inspect the final diff and verify implementation changes are limited to the exact run-scoped fixture and test paths plus this issue's OpenSpec change.
+- [x] 3.1 Run `npm run ci` from the repository root and verify the complete gate passes.
+- [x] 3.2 Inspect the final diff and verify implementation changes are limited to the exact run-scoped fixture and test paths plus this issue's OpenSpec change.
