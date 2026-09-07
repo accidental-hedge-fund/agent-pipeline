@@ -1945,6 +1945,33 @@ test("CLI: 'pipeline release 42' (numeric) exits non-zero with ambiguity message
   );
 });
 
+test("CLI: candidate-bound release dry-run rejects before any git mutation (#1540)", () => {
+  const repoDir = makeTempRepo();
+  const marker = path.join(repoDir, "git-called");
+  const binDir = path.join(repoDir, "bin");
+  fs.mkdirSync(binDir);
+  const gitPath = path.join(binDir, "git");
+  fs.writeFileSync(gitPath, `#!/bin/sh\n: > '${marker}'\nexit 99\n`);
+  fs.chmodSync(gitPath, 0o755);
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      PIPELINE_SCRIPT,
+      "release",
+      "1.40.1",
+      "--dry-run",
+      "--packed-candidate",
+      "a".repeat(40),
+    ],
+    { cwd: repoDir, encoding: "utf8", env: { ...process.env, PATH: binDir } },
+  );
+  assert.notEqual(result.status, 0);
+  const combined = (result.stdout ?? "") + (result.stderr ?? "");
+  assert.match(combined, /--dry-run cannot be combined with --packed-candidate/);
+  assert.equal(fs.existsSync(marker), false, "candidate-bound dry-run must not invoke git");
+});
+
 test("CLI: 'pipeline release ensure-tag' without version and oid exits non-zero", () => {
   const result = spawnSync(
     process.execPath,

@@ -2242,6 +2242,21 @@ test("ship release checkout advances the current worktree branch to the exact FR
     }),
     /origin\/main moved after FRG/,
   );
+
+  for (const failedCommand of ["remote get-url origin", "fetch origin main"]) {
+    const attemptedMutations: string[] = [];
+    await assert.rejects(
+      alignReleaseCheckoutToCandidate("main", head, async (args) => {
+        const command = args.join(" ");
+        if (command === failedCommand) throw new Error(`${failedCommand} unavailable`);
+        if (command === "remote get-url origin") return "git@example.invalid:repo.git";
+        if (command.startsWith("merge ")) attemptedMutations.push(command);
+        return "";
+      }),
+      new RegExp(failedCommand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    );
+    assert.deepEqual(attemptedMutations, [], `${failedCommand} failure must precede branch mutation`);
+  }
 });
 
 test("production ship adapter wires multi-item advanceWave, not N×single (review 2 b09c0a25)", () => {

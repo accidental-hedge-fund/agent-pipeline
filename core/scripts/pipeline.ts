@@ -5033,6 +5033,12 @@ async function main(): Promise<void> {
           `  Finish:  pipeline release finish <pr>`,
       );
       process.exit(2);
+    } else if (opts.dryRun && typeof opts.packedCandidate === "string") {
+      console.error(
+        "pipeline release: --dry-run cannot be combined with --packed-candidate; " +
+          "candidate-bound release preparation requires exact-checkout alignment.",
+      );
+      process.exit(2);
     }
   }
 

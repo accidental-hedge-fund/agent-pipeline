@@ -523,14 +523,8 @@ export async function alignReleaseCheckoutToCandidate(
   git: (args: string[]) => Promise<string>,
 ): Promise<void> {
   const candidate = requireOid(candidateHeadOid, "ship release candidate");
-  let hasOrigin = false;
-  try {
-    hasOrigin = (await git(["remote", "get-url", "origin"])).trim().length > 0;
-  } catch {
-    // A caller may provide an isolated checkout with an explicit origin/<base>
-    // tracking ref but no configured network remote (for example, a Git proof).
-  }
-  if (hasOrigin) await git(["fetch", "origin", baseBranch]);
+  await git(["remote", "get-url", "origin"]);
+  await git(["fetch", "origin", baseBranch]);
   const originHead = requireOid(
     await git(["rev-parse", "--verify", `origin/${baseBranch}`]),
     "ship release origin head",
