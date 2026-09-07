@@ -96,14 +96,19 @@ export function isFrgHybridV1PolicyId(id: string): boolean {
   return id === FRG_HYBRID_PILOT_POLICY_ID;
 }
 
-function semverAtMost(left: string, right: string): boolean {
-  if (!/^\d+\.\d+\.\d+$/.test(left) || !/^\d+\.\d+\.\d+$/.test(right)) return false;
+function compareSemver(left: string, right: string): number | null {
+  if (!/^\d+\.\d+\.\d+$/.test(left) || !/^\d+\.\d+\.\d+$/.test(right)) return null;
   const l = left.split(".").map(Number);
   const r = right.split(".").map(Number);
   for (let i = 0; i < 3; i++) {
-    if (l[i]! !== r[i]!) return l[i]! < r[i]!;
+    if (l[i]! !== r[i]!) return l[i]! < r[i]! ? -1 : 1;
   }
-  return true;
+  return 0;
+}
+
+function semverAtMost(left: string, right: string): boolean {
+  const comparison = compareSemver(left, right);
+  return comparison !== null && comparison <= 0;
 }
 
 /**
@@ -164,12 +169,9 @@ export function expectedHybridLayerAProbeIds(
 
 /** True when `version` is strictly after the 1.33.0 hybrid-v1 pin. */
 export function isPostHybridPilotVersion(version: string | undefined): boolean {
-  if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) return false;
-  const [maj, min, pat] = version.split(".").map(Number);
-  const [pMaj, pMin, pPat] = FRG_HYBRID_PILOT_VERSION.split(".").map(Number);
-  if (maj !== pMaj) return (maj ?? 0) > (pMaj ?? 0);
-  if (min !== pMin) return (min ?? 0) > (pMin ?? 0);
-  return (pat ?? 0) > (pPat ?? 0);
+  if (typeof version !== "string") return false;
+  const comparison = compareSemver(version, FRG_HYBRID_PILOT_VERSION);
+  return comparison !== null && comparison > 0;
 }
 
 /**

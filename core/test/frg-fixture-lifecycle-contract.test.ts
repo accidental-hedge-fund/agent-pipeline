@@ -115,47 +115,48 @@ test("real FRG fixture render separates pre-archive work from controller lifecyc
 
 test("rendered fixtures traverse ordinary admission and carry the lifecycle partition into planning review", async () => {
   const pack = await loadFrgPack();
-  const [issue] = renderFrgPackIssues(pack, {
+  const rendered = renderFrgPackIssues(pack, {
     release_version: RELEASE,
     pack_run_id: PACK_RUN,
   });
-  assert.ok(issue);
+  for (const [index, issue] of rendered.entries()) {
+    const deps = admissionDeps({
+      title: issue.title,
+      body: issue.body,
+      inspectPrompt: (prompt) => {
+        assert.ok(prompt.includes(issue.body), "ordinary admission receives the complete rendered body");
+        assert.match(prompt, /synthetic clean-path conformance fixture/i);
+        assert.match(prompt, /shared classifier,[\s\S]*recovery recipe, gate, or[\s\S]*controller/i);
+        return "ready";
+      },
+    });
+    const issueNumber = 1479 + index;
+    const admitted = await evaluateIssueReadiness(cfg(), issueNumber, { deps, dryRun: true });
+    assert.equal(admitted.kind, "ready", `${issue.provenance.template_id}: ${JSON.stringify(admitted)}`);
+    assert.equal(deps.invokeCount, 1, "factory-gate labels do not bypass ordinary admission");
 
-  const deps = admissionDeps({
-    title: issue.title,
-    body: issue.body,
-    inspectPrompt: (prompt) => {
-      assert.ok(prompt.includes(issue.body), "ordinary admission receives the complete rendered body");
-      assert.match(prompt, /synthetic clean-path conformance fixture/i);
-      assert.match(prompt, /shared classifier,[\s\S]*recovery recipe, gate, or[\s\S]*controller/i);
-      return "ready";
-    },
-  });
-  const admitted = await evaluateIssueReadiness(cfg(), 1479, { deps, dryRun: true });
-  assert.equal(admitted.kind, "ready", JSON.stringify(admitted));
-  assert.equal(deps.invokeCount, 1, "factory-gate labels do not bypass ordinary admission");
+    const planning = buildPlanningOpenspecPrompt({
+      cfg: cfg(),
+      issueNumber,
+      title: issue.title,
+      body: issue.body,
+      pipelineRunId: `run-${issue.provenance.template_id}`,
+    });
+    assert.match(planning, /## Controller-owned lifecycle evidence/);
+    assert.match(planning, /must not be copied into `tasks\.md`/i);
 
-  const planning = buildPlanningOpenspecPrompt({
-    cfg: cfg(),
-    issueNumber: 1479,
-    title: issue.title,
-    body: issue.body,
-    pipelineRunId: "run-contract",
-  });
-  assert.match(planning, /## Controller-owned lifecycle evidence/);
-  assert.match(planning, /must not be copied into `tasks\.md`/i);
-
-  const review = buildPlanReviewPrompt({
-    cfg: cfg(),
-    issueNumber: 1479,
-    title: issue.title,
-    body: issue.body,
-    plan: "Implement only the declared run-scoped fixture and test.",
-    reviewer: "codex",
-    implementer: "codex",
-  });
-  assert.match(review, /## Controller-owned lifecycle evidence/);
-  assert.match(review, /must not be copied into `tasks\.md`/i);
+    const review = buildPlanReviewPrompt({
+      cfg: cfg(),
+      issueNumber,
+      title: issue.title,
+      body: issue.body,
+      plan: "Implement only the declared run-scoped fixture and test.",
+      reviewer: "codex",
+      implementer: "codex",
+    });
+    assert.match(review, /## Controller-owned lifecycle evidence/);
+    assert.match(review, /must not be copied into `tasks\.md`/i);
+  }
 });
 
 test("factory labels do not admit an incomplete production self-host repair", async () => {
