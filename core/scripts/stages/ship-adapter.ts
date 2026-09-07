@@ -9,7 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { resolveEngineCommitSha } from "../engine-attribution.ts";
 import {
   parseExactGitSha,
@@ -53,7 +53,9 @@ import {
   FACTORY_RELEASE_REQUEST_KIND,
   defaultResolveShipPathFromRun,
   isPostPilotReleaseVersion,
+  parseFactoryReleasePrepareRequest,
   unsignedDigestBindingMismatch,
+  type FactoryReleasePrepareRequest,
   type FactoryReleaseUnsignedDigestBinding,
 } from "../factory-release-prepare.ts";
 import { resolveReleaseConfig } from "../config.ts";
@@ -2022,12 +2024,58 @@ async function resolveCandidateFactoryReleaseRequestPath(
 
 export function persistedShipFactoryReleaseRequestPath(
   intent: ShipIntent,
+  train: ShipTrainEvidence,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   return path.join(
     path.dirname(shipStatePaths(shipKey(intent), env).status_file),
-    "factory-release-prepare-request.json",
+    "factory-release-prepare-requests",
+    `${requireOid(train.integrated_head_oid, "ship integrated candidate")}.json`,
   );
+}
+
+function assertPersistedShipFactoryReleaseRequestMatches(
+  raw: unknown,
+  expected: FactoryReleasePrepareRequest,
+  dest: string,
+): void {
+  let actual: FactoryReleasePrepareRequest;
+  try {
+    actual = parseFactoryReleasePrepareRequest(raw);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`ship FRG: invalid persisted factory-release request at ${dest}: ${detail}`);
+  }
+  if (!isDeepStrictEqual(actual, expected)) {
+    throw new Error(
+      `ship FRG: persisted factory-release request does not match the current ship candidate at ${dest}`,
+    );
+  }
+}
+
+async function writeShipFactoryReleaseRequestAtomic(
+  dest: string,
+  request: FactoryReleasePrepareRequest,
+): Promise<void> {
+  await fs.mkdir(path.dirname(dest), { recursive: true, mode: 0o700 });
+  const temporary = path.join(
+    path.dirname(dest),
+    `.${path.basename(dest)}.${randomUUID()}.tmp`,
+  );
+  try {
+    const handle = await fs.open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(request, null, 2)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    // Same-directory hard-link publication is atomic and refuses replacement,
+    // keeping each candidate-scoped request immutable after first publication.
+    await fs.link(temporary, dest);
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
 }
 
 export async function persistShipFactoryReleaseRequest(
@@ -2035,13 +2083,7 @@ export async function persistShipFactoryReleaseRequest(
   train: ShipTrainEvidence,
   opts: { repoDir: string; env: NodeJS.ProcessEnv },
 ): Promise<string> {
-  const dest = persistedShipFactoryReleaseRequestPath(intent, opts.env);
-  try {
-    const existing = await fs.readFile(dest, "utf8");
-    if (existing.trim()) return dest;
-  } catch {
-    // Write a fresh request for this ship key.
-  }
+  const dest = persistedShipFactoryReleaseRequestPath(intent, train, opts.env);
   const manifestPath = path.join(
     opts.repoDir,
     "core",
@@ -2065,7 +2107,7 @@ export async function persistShipFactoryReleaseRequest(
   } catch {
     throw new Error(`ship FRG: factory-release request manifest is not JSON: ${manifestPath}`);
   }
-  const request = {
+  const request = parseFactoryReleasePrepareRequest({
     schema_version: 1,
     kind: FACTORY_RELEASE_REQUEST_KIND,
     action_id: `pipeline-ship-${intent.version}`,
@@ -2078,9 +2120,28 @@ export async function persistShipFactoryReleaseRequest(
       pack_id: packId,
       sha256: createHash("sha256").update(raw).digest("hex"),
     },
-  };
-  await fs.mkdir(path.dirname(dest), { recursive: true, mode: 0o700 });
-  await fs.writeFile(dest, `${JSON.stringify(request, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  });
+  try {
+    const existing = await fs.readFile(dest, "utf8");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(existing);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`ship FRG: invalid persisted factory-release request JSON at ${dest}: ${detail}`);
+    }
+    assertPersistedShipFactoryReleaseRequestMatches(parsed, request, dest);
+    return dest;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  try {
+    await writeShipFactoryReleaseRequestAtomic(dest, request);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  const persisted = JSON.parse(await fs.readFile(dest, "utf8")) as unknown;
+  assertPersistedShipFactoryReleaseRequestMatches(persisted, request, dest);
   return dest;
 }
 
@@ -2286,9 +2347,10 @@ export async function runEnsureAnnotatedReleaseTagCli(
 }
 
 /**
- * Pin process stays the coordinator. When pin SHA ≠ candidate SHA, leaf
+ * Pin process stays the coordinator. FRG always runs the guarded candidate
+ * prepare/qualification leaf. When pin SHA ≠ candidate SHA, the other
  * post-train verbs spawn the candidate launcher instead of in-process pin
- * runRelease / prepare / ensureAnnotatedReleaseTag. Tag is `release ensure-tag`.
+ * runRelease / ensureAnnotatedReleaseTag. Tag is `release ensure-tag`.
  * Recursion is impossible: argv is never `ship --milestone` or `train`.
  */
 export function bindCandidateShipEndOperations(
@@ -2328,10 +2390,6 @@ export function bindCandidateShipEndOperations(
         train.integrated_head_oid,
         "ship.frg-prepare-observe",
       );
-      if (!shouldSpawn(train.integrated_head_oid)) {
-        await pinOps.runFrgPack?.(intent, train);
-        return;
-      }
       const requestPath = await resolveCandidateFactoryReleaseRequestPath(ctx, intent, train);
       const attempts = ctx.frgWaitAttempts ?? FRG_WAIT_ATTEMPTS;
       let attempt = 0;
