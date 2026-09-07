@@ -1443,6 +1443,50 @@ test("runSupervisorCycle: a rejected concurrent dispatch is durably classified f
   assert.equal(terminal.cooling?.reason, "strategy_cursor_exhausted");
 });
 
+test("runSupervisorCycle preserves a failed dispatch response diagnostic for recovery", async () => {
+  const enginePolicy = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-engine-defect": {
+        ...enginePolicy,
+        recipes: ["restart_workflow_engine"],
+      },
+    },
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "nested advance child exited with code 1",
+    stage: "loop-dispatch",
+  });
+  let recoveryDiagnostic: ReturnType<typeof buildStageDiagnostic> | null = null;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "failed",
+    evidence: { pr_number: null, pipeline_run_id: "advance-failed" },
+    diagnostic,
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    recoveryDiagnostic = input.diagnostic;
+    return { succeeded: false, evidence: "restart did not recover", error: "still failed" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle(
+    { store: deps, observe: fakeObserveDeps().deps, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.deepEqual(recoveryDiagnostic, diagnostic);
+});
+
 test("serialized dispatch rejection enters bounded recovery and redispatches the same item", async () => {
   const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
   const ledger = testLedger({ "100": itemEntry("100", "pending") });

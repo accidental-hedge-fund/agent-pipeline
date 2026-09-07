@@ -3,6 +3,7 @@
 // and free-form blocker prose never grant human-authority status.
 
 import { createHash } from "node:crypto";
+import { constants as osConstants } from "node:os";
 import {
   PRE_MERGE_OFFRAMP_CLASSES,
   isPreMergeOfframpClass,
@@ -88,6 +89,37 @@ export interface StageDiagnosticDetail {
     pr_head?: string | null;
     blocker_code?: string;
   };
+  /** Structured process-boundary evidence from the durable loop dispatcher. */
+  process_exit?: {
+    kind: "nested_advance_child";
+    code: number | null;
+    signal: string | null;
+    store_initialized: boolean;
+  };
+}
+
+export type NestedAdvanceProcessExit = NonNullable<StageDiagnosticDetail["process_exit"]>;
+
+const PROCESS_SIGNAL_NAMES: ReadonlySet<string> = new Set(Object.keys(osConstants.signals));
+
+/** Validate the complete process-exit shape before it can influence recovery. */
+export function isNestedAdvanceProcessExit(value: unknown): value is NestedAdvanceProcessExit {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<NestedAdvanceProcessExit>;
+  const hasNonzeroCode =
+    typeof candidate.code === "number" &&
+    Number.isFinite(candidate.code) &&
+    Number.isInteger(candidate.code) &&
+    candidate.code > 0 &&
+    candidate.code <= 255;
+  const hasSignal =
+    typeof candidate.signal === "string" && PROCESS_SIGNAL_NAMES.has(candidate.signal);
+  return (
+    candidate.kind === "nested_advance_child" &&
+    typeof candidate.store_initialized === "boolean" &&
+    ((hasNonzeroCode && candidate.signal === null) ||
+      (candidate.code === null && hasSignal))
+  );
 }
 
 export interface StageDiagnostic {
@@ -216,6 +248,7 @@ function evidenceKeyFor(
     preflight_reason_code: detail.preflight_reason_code ?? null,
     preflight_intervention_kind: detail.preflight_intervention_kind ?? null,
     evidence_ordering: detail.evidence_ordering ?? null,
+    process_exit: detail.process_exit ?? null,
   });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
@@ -299,6 +332,9 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
   const authorityEvidence = detail && typeof detail === "object"
     ? (detail as Partial<StageDiagnosticDetail>).authority_evidence
     : undefined;
+  const processExit = detail && typeof detail === "object"
+    ? (detail as Partial<StageDiagnosticDetail>).process_exit
+    : undefined;
   const validAuthorityEvidence =
     Array.isArray(authorityEvidence) &&
     authorityEvidence.length > 0 &&
@@ -319,7 +355,12 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
     detail.reason.trim().length === 0 ||
     (detail.stage !== undefined &&
       (typeof detail.stage !== "string" || detail.stage.trim().length === 0)) ||
-    (detail.offramp_class !== undefined && !isPreMergeOfframpClass(detail.offramp_class))
+    (detail.offramp_class !== undefined && !isPreMergeOfframpClass(detail.offramp_class)) ||
+    (processExit !== undefined &&
+      (!isNestedAdvanceProcessExit(processExit) ||
+        detail.blocker_kind !== "harness-failure" ||
+        detail.stage !== "loop-dispatch" ||
+        candidate.reason_code !== "workflow-engine-defect"))
   ) {
     return {
       blockerClass: "workflow-engine-defect",
@@ -414,6 +455,7 @@ export function buildStageDiagnostic(input: {
   preflightReasonCode?: "environment-auth" | "capability-refusal";
   preflightInterventionKind?: "auth-tooling-preflight-failure";
   evidenceOrdering?: StageDiagnosticDetail["evidence_ordering"];
+  processExit?: StageDiagnosticDetail["process_exit"];
 }): StageDiagnostic {
   const detail: StageDiagnosticDetail = {
     blocker_kind: input.blockerKind,
@@ -430,6 +472,7 @@ export function buildStageDiagnostic(input: {
       ? { preflight_intervention_kind: input.preflightInterventionKind }
       : {}),
     ...(input.evidenceOrdering !== undefined ? { evidence_ordering: input.evidenceOrdering } : {}),
+    ...(input.processExit !== undefined ? { process_exit: input.processExit } : {}),
   };
   const reasonCode = input.reasonCode ?? reasonCodeFor(input.blockerKind, input.offrampClass);
   const diagnostic: StageDiagnostic = {

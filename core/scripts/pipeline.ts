@@ -1715,7 +1715,28 @@ export function realDispatchItem(
         : null;
 
     let startLinkage: Promise<void> = Promise.resolve();
+    let startLinkageFailed = false;
+    let startLinkageError: unknown;
     let storeReady = false;
+    let childTermination: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    const terminationDiagnostic = (): StageDiagnostic | undefined => {
+      if (!childTermination) return undefined;
+      const { code, signal } = childTermination;
+      if (!(typeof code === "number" && code > 0) && signal === null) return undefined;
+      const terminationText = signal ? `signal ${signal}` : `code ${String(code)}`;
+      return buildStageDiagnostic({
+        reasonCode: "workflow-engine-defect",
+        blockerKind: "harness-failure",
+        reason: `nested advance child exited with ${terminationText}`,
+        stage: "loop-dispatch",
+        processExit: {
+          kind: "nested_advance_child",
+          code,
+          signal,
+          store_initialized: storeReady,
+        },
+      });
+    };
     const confirmStoreReady = (): boolean => {
       if (!pin || storeReady) return storeReady;
       if (!eventsPathExistsFn(pin.events_path)) return false;
@@ -1723,7 +1744,15 @@ export function realDispatchItem(
       if (hooks?.onAdvanceLinked) {
         startLinkage = Promise.resolve(
           hooks.onAdvanceLinked(buildStartLinkagePayload(request.item_id, pin)),
-        ).then(() => undefined);
+        )
+          .then(() => undefined)
+          .catch((err: unknown) => {
+            // Observe immediately so a rejection cannot become unhandled while
+            // the child is still running. It is surfaced after child exit unless
+            // abnormal process evidence must remain available to recovery.
+            startLinkageFailed = true;
+            startLinkageError = err;
+          });
       }
       return true;
     };
@@ -1786,8 +1815,9 @@ export function realDispatchItem(
             reject(err);
           }
         });
-        child.on("exit", () => {
+        child.on("exit", (code, signal) => {
           stopPoll();
+          childTermination = { code, signal };
           // Final confirmation: child may have created the store just before exit,
           // or fakes may only emit `exit` (no `spawn`). Never publish start
           // linkage / events_path without this check.
@@ -1819,6 +1849,7 @@ export function realDispatchItem(
     // Linkage write errors must surface separately from spawn failure — when
     // the store was confirmed, a failed append is not a "no store" path.
     await startLinkage;
+    if (startLinkageFailed && !terminationDiagnostic()) throw startLinkageError;
 
     let outcome: LoopExecutionResponse["outcome"] = "failed";
     let diagnostic: StageDiagnostic | undefined;
@@ -1894,6 +1925,9 @@ export function realDispatchItem(
       }
       diagnostic = resolution.diagnostic ?? undefined;
       outcome = classifyDispatchOutcome(detail, diagnostic, eventsTextForClassify);
+      if (outcome === "failed" && !diagnostic) {
+        diagnostic = terminationDiagnostic();
+      }
       // Pure capacity is ops admission, not a product block: clear the label so
       // re-admission after a slot frees does not thrash on an already-blocked
       // early-exit (#718). Clear MUST succeed before capacity_wait is safe for a
@@ -1923,6 +1957,10 @@ export function realDispatchItem(
       prNumber = pr ?? null;
     } catch {
       outcome = "failed";
+      // Observation failure is not contrary evidence. Retain the process fact
+      // already observed at the child boundary so recovery does not collapse
+      // back to an unexplained generic failure.
+      diagnostic ??= terminationDiagnostic();
     }
 
     return {
