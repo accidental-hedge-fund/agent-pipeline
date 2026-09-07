@@ -45,6 +45,7 @@ test("real candidate launcher produces complete parent-observed qualification", 
   assert.ok(artifact.proofs.some((proof) => proof.operation === "candidate-core-suite"));
   assert.ok(artifact.proofs.some((proof) => proof.operation === "adapter-contract-suite"));
   assert.ok(artifact.proofs.some((proof) => proof.operation === "host-conformance-suite"));
+  assert.ok(artifact.proofs.some((proof) => proof.operation === "frg-detached-startup-suite"));
   assert.ok(
     artifact.proofs
       .filter((proof) => !proof.operation.endsWith("-suite"))
@@ -87,13 +88,38 @@ test("re-digested unsafe or uncorrelated proof is rejected", () => {
       candidateProof.operation !== "drive" &&
       candidateProof.operation !== "candidate-core-suite" &&
       candidateProof.operation !== "adapter-contract-suite" &&
-      candidateProof.operation !== "host-conformance-suite",
+      candidateProof.operation !== "host-conformance-suite" &&
+      candidateProof.operation !== "frg-detached-startup-suite",
   );
   assert.notEqual(omittedIndex, -1);
   missingRoute.proofs.splice(omittedIndex, 1);
   const { digest_sha256: _missingRouteDigest, ...missingRouteUnsigned } = missingRoute;
   missingRoute.digest_sha256 = installedCliQualificationArtifactDigest(missingRouteUnsigned);
   assert.equal(parseInstalledCliQualificationArtifact(missingRoute, candidate), null);
+
+  const missingDetachedStartup = structuredClone(artifact);
+  missingDetachedStartup.proofs = missingDetachedStartup.proofs.filter(
+    (candidateProof) => candidateProof.operation !== "frg-detached-startup-suite",
+  );
+  const { digest_sha256: _missingDetachedDigest, ...missingDetachedUnsigned } =
+    missingDetachedStartup;
+  missingDetachedStartup.digest_sha256 = installedCliQualificationArtifactDigest(
+    missingDetachedUnsigned,
+  );
+  assert.equal(parseInstalledCliQualificationArtifact(missingDetachedStartup, candidate), null);
+
+  const forgedDetachedStartup = structuredClone(artifact);
+  const detachedProof = forgedDetachedStartup.proofs.find(
+    (candidateProof) => candidateProof.operation === "frg-detached-startup-suite",
+  );
+  assert.ok(detachedProof);
+  detachedProof.argv[2] = path.join(root, "untrusted-detached-startup.test.mjs");
+  const { digest_sha256: _forgedDetachedDigest, ...forgedDetachedUnsigned } =
+    forgedDetachedStartup;
+  forgedDetachedStartup.digest_sha256 = installedCliQualificationArtifactDigest(
+    forgedDetachedUnsigned,
+  );
+  assert.equal(parseInstalledCliQualificationArtifact(forgedDetachedStartup, candidate), null);
 
   const forgedArgv = structuredClone(artifact);
   const routeProof = forgedArgv.proofs.find((candidateProof) => candidateProof.operation === "drive");

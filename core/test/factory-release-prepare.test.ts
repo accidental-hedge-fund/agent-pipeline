@@ -2881,6 +2881,16 @@ function capturingCandidateSpawn(captured: {
   };
 }
 
+function testOutputDeps(raw = "") {
+  return {
+    openOutput: async () => ({
+      fd: 91,
+      close: async () => {},
+      read: async () => raw,
+    }),
+  };
+}
+
 function validHandoff(loopRunId: string, sha = CANDIDATE) {
   return {
     schema_version: "1",
@@ -2904,6 +2914,7 @@ function validHandoff(loopRunId: string, sha = CANDIDATE) {
 function spawnDepsForHandoff(loopRunId: string, captured: Parameters<typeof capturingCandidateSpawn>[0]) {
   const invocation = testInvocation(loopRunId);
   return {
+    ...testOutputDeps(),
     spawn: capturingCandidateSpawn(captured),
     env: dirtyFrgSigningEnv(),
     fileExists: () => true,
@@ -3031,6 +3042,187 @@ test("resume spawn strips FRG signing vars from the candidate loop environment",
   ]);
 });
 
+test("resume observes a verified predecessor handoff until the spawned child publishes (#1546)", async () => {
+  const captured: { killed: number; leasePid?: number } = { killed: 0 };
+  const child = new EventEmitter() as EventEmitter & {
+    unref: () => void;
+    kill: () => boolean;
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+    pid: number;
+  };
+  child.pid = 4242;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.unref = () => {};
+  child.kill = () => {
+    captured.killed += 1;
+    queueMicrotask(() => child.emit("exit", null, "SIGTERM"));
+    return true;
+  };
+  let reads = 0;
+  let supervisorReads = 0;
+  const handoffFor = (pid: number) => ({
+    ...validHandoff("loop-predecessor-handoff"),
+    supervisor: { ...validHandoff("loop-predecessor-handoff").supervisor, pid },
+  });
+  const result = await defaultResumeBoundPackLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-predecessor-handoff",
+      candidateInvocation: testInvocation("loop-predecessor-handoff"),
+      candidateEnv: testCandidateEnv(),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      ...testOutputDeps(),
+      spawn: (() => {
+        queueMicrotask(() => child.emit("spawn"));
+        return child;
+      }) as never,
+      env: { PATH: "/usr/bin" },
+      fileExists: () => true,
+      readHandoff: async () => {
+        reads += 1;
+        return handoffFor(reads < 3 ? 2037814 : child.pid);
+      },
+      readSupervisor: async () => {
+        supervisorReads += 1;
+        return handoffFor(supervisorReads === 1 ? 2037814 : child.pid).supervisor;
+      },
+      realpath: (p: string) => p,
+      storeRunDir: "/state/runs/loop-predecessor-handoff",
+      sleep: async () => {},
+      now: () => new Date("2026-09-07T22:00:00.000Z"),
+    },
+    (owner) => {
+      captured.leasePid = owner.pid;
+      return true;
+    },
+  );
+  assert.equal(result.dispatch_state, "dispatched");
+  assert.equal(reads, 3, "old handoff + new supervisor must remain an observed publication transition");
+  assert.equal(captured.killed, 0);
+  assert.equal(captured.leasePid, child.pid);
+});
+
+test("resume predecessor timeout cleans up its owned replacement child (#1546)", async () => {
+  let clock = Date.parse("2026-09-07T22:00:00.000Z");
+  let kills = 0;
+  const child = new EventEmitter() as EventEmitter & {
+    unref: () => void;
+    kill: () => boolean;
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+    pid: number;
+  };
+  child.pid = 4242;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.unref = () => {};
+  child.kill = () => {
+    kills += 1;
+    queueMicrotask(() => child.emit("exit", null, "SIGTERM"));
+    return true;
+  };
+  const predecessor = {
+    ...validHandoff("loop-predecessor-timeout"),
+    supervisor: { ...validHandoff("loop-predecessor-timeout").supervisor, pid: 2037814 },
+  };
+  const result = await defaultResumeBoundPackLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-predecessor-timeout",
+      candidateInvocation: testInvocation("loop-predecessor-timeout"),
+      candidateEnv: testCandidateEnv(),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      ...testOutputDeps(),
+      spawn: (() => {
+        queueMicrotask(() => child.emit("spawn"));
+        return child;
+      }) as never,
+      env: { PATH: "/usr/bin" },
+      fileExists: () => true,
+      readHandoff: async () => predecessor,
+      readSupervisor: async () => predecessor.supervisor,
+      realpath: (p: string) => p,
+      storeRunDir: "/state/runs/loop-predecessor-timeout",
+      sleep: async (ms) => { clock += ms; },
+      now: () => new Date(clock),
+      observationMs: 100,
+    },
+  );
+  assert.equal(result.dispatch_state, "failed");
+  assert.match(result.last_error ?? "", /observation_expired/);
+  assert.equal(kills, 1);
+});
+
+test("resume rejects malformed, wrong-candidate, and unexpected owner handoffs (#1546)", async () => {
+  for (const mode of ["malformed", "wrong-candidate", "unexpected-owner"] as const) {
+    let spawned = false;
+    let reads = 0;
+    let killed = 0;
+    const child = new EventEmitter() as EventEmitter & {
+      unref: () => void;
+      kill: () => boolean;
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      pid: number;
+    };
+    child.pid = 4242;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.unref = () => {};
+    child.kill = () => {
+      killed += 1;
+      queueMicrotask(() => child.emit("exit", null, "SIGTERM"));
+      return true;
+    };
+    const unexpected = {
+      ...validHandoff(`loop-resume-${mode}`),
+      supervisor: { ...validHandoff(`loop-resume-${mode}`).supervisor, pid: 2037814 },
+    };
+    await defaultResumeBoundPackLoop(
+      {
+        repoDir: "/repo",
+        loop_run_id: `loop-resume-${mode}`,
+        candidateInvocation: testInvocation(`loop-resume-${mode}`),
+        candidateEnv: testCandidateEnv(),
+        requestCandidateSha: CANDIDATE,
+      },
+      {
+        ...testOutputDeps(),
+        spawn: (() => {
+          spawned = true;
+          queueMicrotask(() => child.emit("spawn"));
+          return child;
+        }) as never,
+        env: { PATH: "/usr/bin" },
+        fileExists: () => true,
+        readHandoff: async () => {
+          reads += 1;
+          if (mode === "unexpected-owner" && reads === 1) return null;
+          if (mode === "malformed") return {};
+          if (mode === "wrong-candidate") {
+            return { ...validHandoff(`loop-resume-${mode}`), candidate_sha: "f".repeat(40) };
+          }
+          return unexpected;
+        },
+        readSupervisor: async () => unexpected.supervisor,
+        realpath: (p: string) => p,
+        storeRunDir: `/state/runs/loop-resume-${mode}`,
+      },
+    ).then((result) => {
+      assert.equal(result.dispatch_state, "failed");
+      assert.match(result.last_error ?? "", /handoff_mismatch|supervisor_pid_mismatch/);
+    });
+    assert.equal(spawned, mode === "unexpected-owner");
+    assert.equal(killed, mode === "unexpected-owner" ? 1 : 0);
+  }
+});
+
 test("pack-loop spawn execs the candidate launcher, not PATH pipeline, when PIPELINE_BIN is unset (#1296)", async () => {
   const captured: { command?: string; args?: readonly string[]; env?: NodeJS.ProcessEnv; stdio?: unknown } = {};
   const invocation = freezeCandidateInvocation({
@@ -3131,6 +3323,9 @@ test("pre-handoff child exit 1 persists failed and surfaces stderr", async () =>
       requestCandidateSha: CANDIDATE,
     },
     {
+      ...testOutputDeps(
+        'recovery policy for "workflow-engine-defect" names a recipe outside the permitted recovery-recipe catalogue\n',
+      ),
       spawn: childFactory as never,
       env: { PATH: "/usr/bin" },
       fileExists: () => true,
@@ -3166,6 +3361,7 @@ test("OS spawn throw leaves dispatch_state bound", async () => {
       requestCandidateSha: CANDIDATE,
     },
     {
+      ...testOutputDeps(),
       spawn: () => {
         throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" });
       },
@@ -3212,7 +3408,6 @@ test("handoff supervisor PID must equal the spawned detached child PID (#1503)",
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.pid = 77;
-  queueMicrotask(() => child.emit("spawn"));
   const result = await defaultSpawnCandidateLoop(
     {
       repoDir: "/repo",
@@ -3222,7 +3417,11 @@ test("handoff supervisor PID must equal the spawned detached child PID (#1503)",
       requestCandidateSha: CANDIDATE,
     },
     {
-      spawn: (() => child) as never,
+      ...testOutputDeps(),
+      spawn: (() => {
+        queueMicrotask(() => child.emit("spawn"));
+        return child;
+      }) as never,
       env: { PATH: "/usr/bin" },
       fileExists: () => true,
       readHandoff: async () => validHandoff("loop-supervisor-pid-mismatch"),
@@ -3235,6 +3434,45 @@ test("handoff supervisor PID must equal the spawned detached child PID (#1503)",
   );
   assert.equal(result.dispatch_state, "failed");
   assert.match(result.last_error ?? "", /supervisor_pid_mismatch/);
+});
+
+test("detached pack loop owns a private durable output sink after prepare exits (#1547)", async () => {
+  const captured: {
+    outputPath?: string;
+    outputMode?: number;
+    closed: number;
+    stdio?: unknown;
+  } = { closed: 0 };
+  const deps = spawnDepsForHandoff("loop-durable-output", captured);
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-durable-output",
+      candidateInvocation: deps.invocation,
+      candidateEnv: testCandidateEnv(),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      ...deps,
+      openOutput: async (outputPath, mode) => {
+        captured.outputPath = outputPath;
+        captured.outputMode = mode;
+        return {
+          fd: 91,
+          close: async () => {
+            captured.closed += 1;
+          },
+          read: async () => "",
+        };
+      },
+    },
+  );
+
+  assert.equal(result.dispatch_state, "dispatched");
+  assert.equal(captured.outputPath, "/state/runs/loop-durable-output/pack-loop-output.log");
+  assert.equal(captured.outputMode, 0o600);
+  assert.deepEqual(captured.stdio, ["ignore", 91, 91]);
+  assert.equal(captured.closed, 1, "prepare closes its descriptor after the detached child inherits it");
 });
 
 test("malformed handoff stops a still-running child before return", async () => {
@@ -3287,6 +3525,7 @@ test("malformed handoff stops a still-running child before return", async () => 
       requestCandidateSha: CANDIDATE,
     },
     {
+      ...testOutputDeps(),
       spawn: childFactory as never,
       env: { PATH: "/usr/bin" },
       fileExists: () => true,
@@ -3333,7 +3572,6 @@ test("candidate lease handoff failure stops the attached child before return (#1
   child.stdout.destroy = () => {};
   child.stderr.destroy = () => {};
   child.pid = 4242;
-  queueMicrotask(() => child.emit("spawn"));
   const result = await defaultSpawnCandidateLoop(
     {
       repoDir: "/repo",
@@ -3343,7 +3581,11 @@ test("candidate lease handoff failure stops the attached child before return (#1
       requestCandidateSha: CANDIDATE,
     },
     {
-      spawn: (() => child) as never,
+      ...testOutputDeps(),
+      spawn: (() => {
+        queueMicrotask(() => child.emit("spawn"));
+        return child;
+      }) as never,
       env: { PATH: "/usr/bin" },
       fileExists: () => true,
       readHandoff: async () => validHandoff("loop-lease-handoff-failure"),
@@ -3470,6 +3712,7 @@ test("resume OS accept persists starting so a later invoke does not spawn a seco
         throw new Error("must not dispatch a second pack");
       },
       spawnDeps: {
+        ...testOutputDeps(),
         spawn: spawnResumeChild as never,
         fileExists: () => true,
         readHandoff: async () => null,

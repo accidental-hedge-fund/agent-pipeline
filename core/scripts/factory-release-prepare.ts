@@ -25,7 +25,7 @@ import { existsSync, realpathSync as fsRealpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import {
   artifactSubdir,
   FACTORY_RELEASE_ARTIFACT,
@@ -88,6 +88,7 @@ import {
   probePackLoopLiveness,
   type PackLoopLivenessStatus,
 } from "./loop/pack-loop-liveness.ts";
+import type { DurableLoopRunHandoff } from "./loop/handoff.ts";
 import { parseExactGitSha } from "./ship-end-identity.ts";
 import {
   qualificationArtifactPath,
@@ -2313,7 +2314,7 @@ export type CandidateLoopSpawn = (
   options: {
     cwd?: string;
     detached?: boolean;
-    stdio?: "ignore" | Array<"ignore" | "pipe">;
+    stdio?: "ignore" | Array<"ignore" | number>;
     env?: NodeJS.ProcessEnv;
   },
 ) => CandidateLoopChild;
@@ -2438,14 +2439,6 @@ class BoundedStreamBuffer {
   }
 }
 
-function drainChildPipes(child: CandidateLoopChild): { stdout: BoundedStreamBuffer; stderr: BoundedStreamBuffer } {
-  const stdout = new BoundedStreamBuffer();
-  const stderr = new BoundedStreamBuffer();
-  child.stdout?.on("data", (chunk) => stdout.push(chunk));
-  child.stderr?.on("data", (chunk) => stderr.push(chunk));
-  return { stdout, stderr };
-}
-
 const PACK_LOOP_FAILED_CHILD_SETTLE_MS = 1_000;
 
 /** Stop a still-running child whose dispatch already failed closed. */
@@ -2509,7 +2502,7 @@ export function validateDurablePackLoopHandoff(input: {
   loopRunId: string;
   candidateSha: string;
   storeRunDir: string;
-  supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null;
+  supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown; token?: unknown } | null;
   realpath?: (p: string) => string;
 }): { ok: true } | { ok: false; error: string } {
   if (!isDurableLoopRunHandoff(input.handoff)) {
@@ -2533,7 +2526,8 @@ export function validateDurablePackLoopHandoff(input: {
     !sup ||
     sup.pid !== input.handoff.supervisor.pid ||
     sup.boot_id !== input.handoff.supervisor.boot_id ||
-    sup.started_at !== input.handoff.supervisor.started_at
+    sup.started_at !== input.handoff.supervisor.started_at ||
+    sup.token !== input.handoff.supervisor.token
   ) {
     return { ok: false, error: "pack-loop handoff supervisor identity mismatch" };
   }
@@ -2547,13 +2541,24 @@ export interface SpawnCandidateLoopDeps {
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   readHandoff?: (loopRunId: string) => Promise<unknown | null>;
-  readSupervisor?: (loopRunId: string) => Promise<{ pid?: unknown; boot_id?: unknown; started_at?: unknown } | null>;
+  readSupervisor?: (loopRunId: string) => Promise<{
+    pid?: unknown;
+    boot_id?: unknown;
+    started_at?: unknown;
+    token?: unknown;
+  } | null>;
   realpath?: (p: string) => string;
   writeFile?: (p: string, body: string, mode?: number) => Promise<void>;
   evidencePath?: string;
   observationMs?: number;
   onAccepted?: (info: { pid?: number; observation_deadline: string }) => Promise<void>;
   storeRunDir?: string;
+  /** Open a private append sink; `read` returns only output from this spawn attempt. */
+  openOutput?: (p: string, mode: number) => Promise<{
+    fd: number;
+    close: () => Promise<void>;
+    read: () => Promise<string>;
+  }>;
 }
 
 function defaultFileExistsSync(p: string): boolean {
@@ -2564,7 +2569,7 @@ function defaultFileExistsSync(p: string): boolean {
   }
 }
 
-export async function defaultSpawnCandidateLoop(
+async function spawnCandidateLoopWithPredecessor(
   args: {
     repoDir: string;
     loop_run_id: string;
@@ -2574,6 +2579,15 @@ export async function defaultSpawnCandidateLoop(
   },
   deps: SpawnCandidateLoopDeps = {},
   handoffCandidateLease?: (owner: { pid: number; starttime: string | null }) => boolean,
+  verifiedPredecessor?: {
+    handoff: DurableLoopRunHandoff;
+    supervisor: {
+      pid?: unknown;
+      boot_id?: unknown;
+      started_at?: unknown;
+      token?: unknown;
+    };
+  },
 ): Promise<PackLoopSpawnResult> {
   const sourceEnv = deps.env ?? process.env;
   const now = deps.now ?? (() => new Date());
@@ -2590,15 +2604,68 @@ export async function defaultSpawnCandidateLoop(
   const spawnImpl = deps.spawn ?? ((await import("node:child_process")).spawn as unknown as CandidateLoopSpawn);
   const childEnv = sanitizeCandidateLoopEnv({ ...sourceEnv, ...args.candidateEnv });
   childEnv[PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV] = invocation.candidateSha;
+  const store = defaultLoopStoreDeps(sourceEnv);
+  const storeRunDir = deps.storeRunDir ?? runDir(store, args.loop_run_id);
+  const outputPath = path.join(storeRunDir, "pack-loop-output.log");
+  const openOutput = deps.openOutput ?? (async (p: string, mode: number) => {
+    const handle = await fs.open(p, "a", mode);
+    try {
+      await handle.chmod(mode);
+      const attemptOffset = (await handle.stat()).size;
+      return {
+        fd: handle.fd,
+        close: () => handle.close(),
+        read: async () => {
+          const reader = await fs.open(p, "r");
+          try {
+            const end = (await reader.stat()).size;
+            const length = Math.max(0, end - attemptOffset);
+            const headLength = Math.min(length, PACK_LOOP_STDERR_HEAD_BYTES);
+            const tailLength = Math.min(
+              Math.max(0, length - headLength),
+              PACK_LOOP_STDERR_TAIL_BYTES,
+            );
+            const head = Buffer.alloc(headLength);
+            const tail = Buffer.alloc(tailLength);
+            if (headLength > 0) await reader.read(head, 0, headLength, attemptOffset);
+            if (tailLength > 0) await reader.read(tail, 0, tailLength, end - tailLength);
+            return length > headLength + tailLength
+              ? `${head.toString("utf8")}\n...[truncated]...\n${tail.toString("utf8")}`
+              : Buffer.concat([head, tail]).toString("utf8");
+          } finally {
+            await reader.close();
+          }
+        },
+      };
+    } catch (err) {
+      await handle.close().catch(() => {});
+      throw err;
+    }
+  });
+  let durableOutput: Awaited<ReturnType<typeof openOutput>>;
+  try {
+    durableOutput = await openOutput(outputPath, 0o600);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "output_open_failed";
+    return {
+      dispatch_state: "bound",
+      last_error: formatPackLoopLastError({
+        errorCode: String(code),
+        excerpt: (err as Error).message,
+      }),
+      spawn_attempt: { error_code: String(code), at: isoNow(now()) },
+    };
+  }
   let child: CandidateLoopChild;
   try {
     child = spawnImpl(invocation.executable, invocation.argv, {
       cwd: args.repoDir,
       detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", durableOutput.fd, durableOutput.fd],
       env: childEnv,
     });
   } catch (err) {
+    await durableOutput?.close().catch(() => {});
     const code = (err as NodeJS.ErrnoException).code ?? "spawn_throw";
     return {
       dispatch_state: "bound",
@@ -2609,7 +2676,7 @@ export async function defaultSpawnCandidateLoop(
       spawn_attempt: { error_code: String(code), at: isoNow(now()) },
     };
   }
-  const pipes = drainChildPipes(child);
+  const output = { read: durableOutput.read };
   let exitCode: number | null | undefined;
   child.once?.("exit", (code) => {
     exitCode = code;
@@ -2621,14 +2688,30 @@ export async function defaultSpawnCandidateLoop(
   try {
     await started;
   } catch (err) {
+    await durableOutput?.close().catch(() => {});
     const code = (err as NodeJS.ErrnoException).code ?? "spawn_error";
+    const captured = await readPackLoopOutput(output);
     return {
       dispatch_state: "bound",
       last_error: formatPackLoopLastError({
         errorCode: String(code),
-        excerpt: redactPackLoopExcerpt(`${(err as Error).message}\n${pipes.stderr.text()}`),
+        excerpt: redactPackLoopExcerpt(`${(err as Error).message}\n${captured}`),
       }),
       spawn_attempt: { error_code: String(code), at: isoNow(now()) },
+    };
+  }
+  try {
+    await durableOutput?.close();
+  } catch (err) {
+    const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+    await stopFailedPackLoopChild(child, false, sleep);
+    return {
+      dispatch_state: "bound",
+      last_error: formatPackLoopLastError({
+        errorCode: "output_close_failed",
+        excerpt: (err as Error).message,
+      }),
+      spawn_attempt: { error_code: "output_close_failed", at: isoNow(now()) },
     };
   }
   const deadlineMs = packLoopStartupObservationMs(deps.observationMs);
@@ -2637,8 +2720,6 @@ export async function defaultSpawnCandidateLoop(
     await deps.onAccepted({ pid: child.pid, observation_deadline: deadline });
   }
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const store = defaultLoopStoreDeps(sourceEnv);
-  const storeRunDir = deps.storeRunDir ?? runDir(store, args.loop_run_id);
   const evidencePath =
     deps.evidencePath ?? path.join(storeRunDir, "pack-loop-stderr.txt");
   const readHandoff =
@@ -2657,7 +2738,12 @@ export async function defaultSpawnCandidateLoop(
       handoff = null;
     }
     if (handoff) {
-      let supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null = null;
+      let supervisor: {
+        pid?: unknown;
+        boot_id?: unknown;
+        started_at?: unknown;
+        token?: unknown;
+      } | null = null;
       try {
         supervisor = await readSupervisor(args.loop_run_id);
       } catch {
@@ -2681,7 +2767,7 @@ export async function defaultSpawnCandidateLoop(
           !handoffCandidateLease({ pid: supervisorPid, starttime: null })
         ) {
           await stopFailedPackLoopChild(child, exitCode !== undefined, sleep);
-          const excerpt = await finishStderrEvidence(deps, evidencePath, pipes);
+          const excerpt = await finishStderrEvidence(deps, evidencePath, output);
           return {
             dispatch_state: "failed",
             pid: supervisorPid,
@@ -2708,8 +2794,41 @@ export async function defaultSpawnCandidateLoop(
           spawn_attempt: { pid: supervisorPid, at: isoNow(now()) },
         };
       }
+      if (verifiedPredecessor) {
+        const observedPredecessor = isDeepStrictEqual(
+          supervisor,
+          verifiedPredecessor.supervisor,
+        );
+        const retainedPredecessorHandoff = isDeepStrictEqual(
+          handoff,
+          verifiedPredecessor.handoff,
+        );
+        const observedSpawnedChild =
+          supervisorPid === child.pid &&
+          typeof supervisor?.boot_id === "string" &&
+          typeof supervisor?.started_at === "string" &&
+          typeof supervisor?.token === "string";
+        const newChildHandoff =
+          isDurableLoopRunHandoff(handoff) &&
+          handoff.supervisor.pid === child.pid &&
+          validateDurablePackLoopHandoff({
+            handoff,
+            loopRunId: args.loop_run_id,
+            candidateSha: invocation.candidateSha,
+            storeRunDir,
+            supervisor: handoff.supervisor,
+            realpath: deps.realpath,
+          }).ok;
+        if (
+          (retainedPredecessorHandoff && (observedPredecessor || observedSpawnedChild)) ||
+          (newChildHandoff && observedPredecessor)
+        ) {
+          await sleep(50);
+          continue;
+        }
+      }
       await stopFailedPackLoopChild(child, exitCode !== undefined, sleep);
-      const excerpt = await finishStderrEvidence(deps, evidencePath, pipes);
+      const excerpt = await finishStderrEvidence(deps, evidencePath, output);
       return {
         dispatch_state: "failed",
         pid: child.pid,
@@ -2726,9 +2845,9 @@ export async function defaultSpawnCandidateLoop(
     }
     await sleep(50);
   }
-  const excerpt = await finishStderrEvidence(deps, evidencePath, pipes);
-  child.unref?.();
+  const excerpt = await finishStderrEvidence(deps, evidencePath, output);
   if (exitCode !== undefined) {
+    child.unref?.();
     return {
       dispatch_state: "failed",
       pid: child.pid,
@@ -2742,6 +2861,7 @@ export async function defaultSpawnCandidateLoop(
       spawn_attempt: { pid: child.pid, error_code: "pre_handoff_exit", at: isoNow(now()) },
     };
   }
+  await stopFailedPackLoopChild(child, false, sleep);
   return {
     dispatch_state: "failed",
     pid: child.pid,
@@ -2757,17 +2877,45 @@ export async function defaultSpawnCandidateLoop(
   };
 }
 
+export async function defaultSpawnCandidateLoop(
+  args: {
+    repoDir: string;
+    loop_run_id: string;
+    candidateInvocation?: CandidateInvocation;
+    requestCandidateSha?: string;
+    candidateEnv?: NodeJS.ProcessEnv;
+  },
+  deps: SpawnCandidateLoopDeps = {},
+  handoffCandidateLease?: (owner: { pid: number; starttime: string | null }) => boolean,
+): Promise<PackLoopSpawnResult> {
+  return spawnCandidateLoopWithPredecessor(args, deps, handoffCandidateLease);
+}
+
 async function finishStderrEvidence(
   deps: SpawnCandidateLoopDeps,
   evidencePath: string,
-  pipes: { stdout: BoundedStreamBuffer; stderr: BoundedStreamBuffer },
+  output: {
+    read: () => Promise<string>;
+  },
 ): Promise<{ excerpt: string; path?: string; writeError?: string }> {
-  const raw = pipes.stderr.text() || pipes.stdout.text();
+  const raw = await readPackLoopOutput(output);
   const excerpt = redactPackLoopExcerpt(raw);
   if (!deps.writeFile) return { excerpt };
   const written = await persistPackLoopStderrEvidence(deps.writeFile, evidencePath, raw);
   if ("writeError" in written) return { excerpt, writeError: written.writeError };
   return { excerpt, path: written.path };
+}
+
+async function readPackLoopOutput(output: {
+  read: () => Promise<string>;
+}): Promise<string> {
+  try {
+    const bounded = new BoundedStreamBuffer();
+    bounded.push(await output.read());
+    return bounded.text();
+  } catch {
+    return "";
+  }
 }
 
 export async function defaultResumeBoundPackLoop(
@@ -2781,7 +2929,77 @@ export async function defaultResumeBoundPackLoop(
   deps: SpawnCandidateLoopDeps = {},
   handoffCandidateLease?: (owner: { pid: number; starttime: string | null }) => boolean,
 ): Promise<PackLoopSpawnResult> {
-  return defaultSpawnCandidateLoop(args, deps, handoffCandidateLease);
+  const sourceEnv = deps.env ?? process.env;
+  const fileExists = deps.fileExists ?? defaultFileExistsSync;
+  const requestSha = args.requestCandidateSha ?? args.candidateInvocation?.candidateSha ?? "";
+  const invocation = assertCandidateInvocation(args.candidateInvocation, requestSha, fileExists);
+  if (!hasCandidateProcessGuardEnv(args.candidateEnv)) {
+    return defaultSpawnCandidateLoop(args, deps, handoffCandidateLease);
+  }
+  const store = defaultLoopStoreDeps(sourceEnv);
+  const storeRunDir = deps.storeRunDir ?? runDir(store, args.loop_run_id);
+  const readHandoff = deps.readHandoff ?? ((id: string) => readLoopRunHandoff(store, id));
+  const readSupervisor = deps.readSupervisor ?? ((id: string) => readSupervisorProcess(store, id));
+  let priorHandoff: unknown | null;
+  try {
+    priorHandoff = await readHandoff(args.loop_run_id);
+  } catch (err) {
+    return {
+      dispatch_state: "failed",
+      last_error: formatPackLoopLastError({
+        errorCode: "handoff_mismatch",
+        excerpt: `predecessor handoff unreadable: ${(err as Error).message}`,
+      }),
+      spawn_attempt: { error_code: "handoff_mismatch", at: isoNow(deps.now?.() ?? new Date()) },
+    };
+  }
+  let predecessor: {
+    handoff: DurableLoopRunHandoff;
+    supervisor: NonNullable<Awaited<ReturnType<typeof readSupervisor>>>;
+  } | undefined;
+  if (priorHandoff) {
+    let priorSupervisor: Awaited<ReturnType<typeof readSupervisor>>;
+    try {
+      priorSupervisor = await readSupervisor(args.loop_run_id);
+    } catch (err) {
+      return {
+        dispatch_state: "failed",
+        last_error: formatPackLoopLastError({
+          errorCode: "handoff_mismatch",
+          excerpt: `predecessor supervisor unreadable: ${(err as Error).message}`,
+        }),
+        spawn_attempt: { error_code: "handoff_mismatch", at: isoNow(deps.now?.() ?? new Date()) },
+      };
+    }
+    const valid = validateDurablePackLoopHandoff({
+      handoff: priorHandoff,
+      loopRunId: args.loop_run_id,
+      candidateSha: invocation.candidateSha,
+      storeRunDir,
+      supervisor: priorSupervisor,
+      realpath: deps.realpath,
+    });
+    if (!valid.ok) {
+      return {
+        dispatch_state: "failed",
+        last_error: formatPackLoopLastError({
+          errorCode: "handoff_mismatch",
+          excerpt: valid.error,
+        }),
+        spawn_attempt: { error_code: "handoff_mismatch", at: isoNow(deps.now?.() ?? new Date()) },
+      };
+    }
+    predecessor = {
+      handoff: priorHandoff,
+      supervisor: priorSupervisor!,
+    };
+  }
+  return spawnCandidateLoopWithPredecessor(
+    args,
+    deps,
+    handoffCandidateLease,
+    predecessor,
+  );
 }
 
 /** Resume uses a fresh exact-candidate proof; a stored launcher identity alone never authorizes spawn. */
@@ -2945,7 +3163,12 @@ async function readStartingHandoffArtifact(
       handoff = JSON.parse(await ctx.readFile(p));
     }
   }
-  let supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null = null;
+  let supervisor: {
+    pid?: unknown;
+    boot_id?: unknown;
+    started_at?: unknown;
+    token?: unknown;
+  } | null = null;
   if (opts.spawnDeps?.readSupervisor) {
     supervisor = await opts.spawnDeps.readSupervisor(loopRunId);
   } else {
@@ -2976,7 +3199,15 @@ async function reconcileStartingDurableHandoff(input: {
   const invocation = restoreInvocation(input.binding, input.loopRunId, input.request);
   const candidateSha = invocation?.candidateSha ?? input.request.integrated_candidate.git_sha;
   const storeRunDir = input.opts.spawnDeps?.storeRunDir ?? runDir(defaultLoopStoreDeps(), input.loopRunId);
-  let evidence: { handoff: unknown | null; supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null };
+  let evidence: {
+    handoff: unknown | null;
+    supervisor: {
+      pid?: unknown;
+      boot_id?: unknown;
+      started_at?: unknown;
+      token?: unknown;
+    } | null;
+  };
   try {
     evidence = await readStartingHandoffArtifact(input.loopRunId, input.ctx, input.opts, storeRunDir);
   } catch (err) {
