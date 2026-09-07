@@ -123,10 +123,10 @@ import {
   type StageDiagnostic,
 } from "../stage-diagnostic.ts";
 import {
-  filterRecipesForHarnessBackgroundWait,
-  filterRecipesForNeverStartedPreflight,
-} from "../harness-adapters/background-job-lifecycle.ts";
-import { filterRecipesForWorkflowEngineDiagnostic } from "../rebind-tester-evidence-after-pr.ts";
+  recoveryProgressEvidence,
+  recoveryRecipeOnlyProvesRedispatch,
+  recoveryRecipeApplicability,
+} from "./recovery-applicability.ts";
 import {
   evaluateRunFatalResumeEligibility,
   formatRunFatalResumeRefusal,
@@ -708,11 +708,10 @@ function serializeRecoveryEvidence(
   } satisfies PersistedRecoveryEvidence);
 }
 
-function persistedRecoveryEvidence(item: LoopItemLedgerEntry): PersistedRecoveryEvidence | null {
-  const blocked = [...item.history].reverse().find((entry) => entry.to === "blocked" && entry.evidence);
-  if (!blocked?.evidence) return null;
+function parsePersistedRecoveryEvidence(evidence: string | undefined): PersistedRecoveryEvidence | null {
+  if (!evidence) return null;
   try {
-    const parsed = JSON.parse(blocked.evidence) as Partial<PersistedRecoveryEvidence>;
+    const parsed = JSON.parse(evidence) as Partial<PersistedRecoveryEvidence>;
     if (
       parsed.schema !== LOOP_RECOVERY_EVIDENCE_SCHEMA ||
       projectStageDiagnostic(parsed.diagnostic).disposition === "protocol_failure" ||
@@ -726,6 +725,87 @@ function persistedRecoveryEvidence(item: LoopItemLedgerEntry): PersistedRecovery
   } catch {
     return null;
   }
+}
+
+function persistedRecoveryEvidence(item: LoopItemLedgerEntry): PersistedRecoveryEvidence | null {
+  const blocked = [...item.history].reverse().find((entry) => entry.to === "blocked" && entry.evidence);
+  return parsePersistedRecoveryEvidence(blocked?.evidence);
+}
+
+function isCoarseImplementationAttestation(diagnostic: StageDiagnostic): boolean {
+  if (diagnostic.reason_code !== "implementation-ci" || diagnostic.detail.stage?.trim()) return false;
+  const { blocker_kind: _blockerKind, reason: _reason, stage: _stage, ...qualifiers } = diagnostic.detail;
+  return Object.values(qualifiers).every((value) => value === undefined);
+}
+
+/**
+ * A transport fallback can omit the stage while reporting the same unresolved
+ * implementation blocker. Resume only the most recent authoritative invariant
+ * recorded for this candidate. Explicit stages always define their own identity,
+ * and a substantively recovered episode is not reopened by a coarse envelope.
+ */
+function recoveryProgressIdentityForBlockedItem(
+  item: LoopItemLedgerEntry,
+  attempts: readonly LoopRecoveryAttempt[],
+  persisted: PersistedRecoveryEvidence,
+  candidateEpoch: string,
+): string {
+  const directIdentity = fingerprintEvidence(recoveryProgressEvidence({
+    blockerClass: item.blocked_theme as DurableBlockerClass,
+    diagnostic: persisted.diagnostic,
+  }));
+  if (
+    item.blocked_theme !== "implementation-ci" ||
+    !isCoarseImplementationAttestation(persisted.diagnostic)
+  ) {
+    return directIdentity;
+  }
+
+  const blockerKind = persisted.diagnostic.detail.blocker_kind;
+  const priorBlocked = item.history.filter((entry) => entry.to === "blocked" && entry.evidence);
+  priorBlocked.pop(); // The latest blocked entry supplied `persisted` above.
+  for (const entry of priorBlocked.reverse()) {
+    const prior = parsePersistedRecoveryEvidence(entry.evidence);
+    if (!prior) return directIdentity;
+    const projection = projectStageDiagnostic(prior.diagnostic);
+    if (isCoarseImplementationAttestation(prior.diagnostic)) {
+      if (
+        projection.disposition !== "recover" ||
+        projection.blockerClass !== "implementation-ci" ||
+        prior.diagnostic.detail.blocker_kind !== blockerKind
+      ) {
+        return directIdentity;
+      }
+      continue;
+    }
+    // The first non-coarse diagnostic is the nearest authoritative invariant
+    // boundary. Never scan past it to resurrect an older matching episode.
+    if (
+      projection.disposition !== "recover" ||
+      projection.blockerClass !== "implementation-ci" ||
+      prior.diagnostic.detail.blocker_kind !== blockerKind ||
+      !prior.diagnostic.detail.stage?.trim()
+    ) {
+      return directIdentity;
+    }
+    const priorIdentity = fingerprintEvidence(recoveryProgressEvidence({
+      blockerClass: "implementation-ci",
+      diagnostic: prior.diagnostic,
+    }));
+    const episodeAttempts = attempts.filter(
+      (attempt) =>
+        attempt.item_id === item.id &&
+        attempt.class === "implementation-ci" &&
+        attempt.evidence_identity === priorIdentity &&
+        attemptBelongsToCandidateEpoch(attempt, candidateEpoch),
+    );
+    if (episodeAttempts.length === 0) return directIdentity;
+    const resolved = episodeAttempts.some(
+      (attempt) => attempt.outcome === "recovered" && !recoveryRecipeOnlyProvesRedispatch(attempt.action),
+    );
+    return resolved ? directIdentity : priorIdentity;
+  }
+  return directIdentity;
 }
 
 function engineDefectDiagnostic(reason: string): StageDiagnostic {
@@ -1036,11 +1116,19 @@ async function executeBlockedRecovery(
   }
 
   const currentEpoch = observedCandidateEpoch(item);
+  const progressEvidenceIdentity = recoveryProgressIdentityForBlockedItem(
+    item,
+    ledger.recovery_attempts,
+    persisted,
+    currentEpoch,
+  );
   let matchingAttempts = ledger.recovery_attempts.filter(
     (attempt) =>
       attempt.item_id === itemId &&
       attempt.class === item.blocked_theme &&
-      attempt.evidence_fingerprint === item.evidence_fingerprint,
+      ((attempt.evidence_identity === progressEvidenceIdentity &&
+        attemptBelongsToCandidateEpoch(attempt, currentEpoch)) ||
+        attempt.evidence_fingerprint === item.evidence_fingerprint),
   );
   const staleStarted = matchingAttempts.filter(
     (attempt) =>
@@ -1073,7 +1161,9 @@ async function executeBlockedRecovery(
       (attempt) =>
         attempt.item_id === itemId &&
         attempt.class === item.blocked_theme &&
-        attempt.evidence_fingerprint === item.evidence_fingerprint,
+        ((attempt.evidence_identity === progressEvidenceIdentity &&
+          attemptBelongsToCandidateEpoch(attempt, currentEpoch)) ||
+          attempt.evidence_fingerprint === item.evidence_fingerprint),
     );
   }
   let attempt = [...matchingAttempts].reverse().find((candidate) => candidate.outcome === "started");
@@ -1122,18 +1212,7 @@ async function executeBlockedRecovery(
       return { ledger, attempted: false };
     }
     const hasCandidateHead = Boolean(item.last_verified_identity?.head_sha.trim());
-    const reasonFiltered =
-      persisted.diagnostic.reason_code === "harness-background-wait"
-        ? filterRecipesForHarnessBackgroundWait(policy.recipes)
-        : policy.recipes;
     const preflightNeverStarted = persisted.diagnostic.detail.preflight_failed === true;
-    const neverStartedFiltered = preflightNeverStarted
-      ? filterRecipesForNeverStartedPreflight(reasonFiltered)
-      : reasonFiltered;
-    const diagnosticFiltered =
-      item.blocked_theme === "workflow-engine-defect"
-        ? filterRecipesForWorkflowEngineDiagnostic(neverStartedFiltered, persisted.diagnostic)
-        : neverStartedFiltered;
     const candidateIdentity = recoveryCandidateIdentity(
       contract,
       item,
@@ -1142,20 +1221,22 @@ async function executeBlockedRecovery(
     );
     const candidateEpoch = recoveryEpisodeCandidateEpoch(
       item,
-      candidateIdentity.replace(/\|attempt=\d+$/i, ""),
+      candidateIdentity.replace(/\|advance=.*$/i, ""),
     );
     const episodeKey = {
       operation: "loop_recovery",
       invariant: item.blocked_theme,
       candidate_epoch: candidateEpoch,
-      evidence_identity: item.evidence_fingerprint ?? "",
+      evidence_identity: progressEvidenceIdentity,
     };
     let episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, episodeKey) ?? emptyEpisode(episodeKey, deps.store.now().toISOString());
     const isApplicable = (recipe: RecoveryRecipe): boolean => {
-      if (!diagnosticFiltered.includes(recipe)) return false;
-      if (recipe === "verify_head_goal" && !hasCandidateHead) return false;
-      if (recipe === "repair_pipeline_item" && !hasCandidateHead) return false;
-      return true;
+      return recoveryRecipeApplicability({
+        action: recipe,
+        blockerClass: item.blocked_theme!,
+        diagnostic: persisted.diagnostic,
+        candidateHeadPresent: hasCandidateHead,
+      }).applicable;
     };
     const lastMatching = matchingAttempts[matchingAttempts.length - 1];
     const preferRepairAfterFindingsPrep =
@@ -1188,18 +1269,17 @@ async function executeBlockedRecovery(
         candidateIdentity,
         candidateEpoch,
         invariant: item.blocked_theme,
+        evidenceIdentity: progressEvidenceIdentity,
         skipInapplicable: true,
       });
       ledger = skipResult.ledger;
     }
     if (selected.kind === "exhausted") {
-      if (preflightNeverStarted && neverStartedFiltered.length === 0) {
+      if (preflightNeverStarted && policy.recipes.every((recipe) => !isApplicable(recipe))) {
         await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
           item_id: itemId,
           reason: "inapplicable_recipes",
-          skipped_recipes: reasonFiltered.filter(
-            (recipe) => !neverStartedFiltered.includes(recipe),
-          ),
+          skipped_recipes: policy.recipes,
         }).catch(() => {});
         return { ledger, attempted: false };
       }
@@ -1236,6 +1316,7 @@ async function executeBlockedRecovery(
       candidateIdentity,
       candidateEpoch,
       invariant: item.blocked_theme,
+      evidenceIdentity: progressEvidenceIdentity,
     });
     ledger = started.ledger;
     attempt = started.attempt;
@@ -1403,7 +1484,11 @@ async function executeBlockedRecovery(
     evidence: execution.evidence,
     error: execution.error ?? null,
     candidate_head: execution.candidateHead ?? null,
-    postcondition: execution.succeeded ? "verified" : "failed",
+    postcondition: execution.succeeded
+      ? recoveryRecipeOnlyProvesRedispatch(attempt.action) ? "redispatch_admissible" : "verified"
+      : "failed",
+    resolved_original_invariant: execution.succeeded &&
+      !recoveryRecipeOnlyProvesRedispatch(attempt.action),
   });
 
   const beforeCompletion = await readLedger(deps.store, runId, token);

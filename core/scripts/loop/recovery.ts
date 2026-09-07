@@ -699,6 +699,8 @@ export interface StartRecoveryAttemptInput extends RecoveryActionInput {
   invariant?: string;
   /** Candidate epoch. Defaults to candidate identity without an attempt ordinal. */
   candidateEpoch?: string;
+  /** Stage-invariant progress identity. Defaults to the exact evidence fingerprint. */
+  evidenceIdentity?: string;
   /** When true, persist an inapplicable skip without charging the strategy bound. */
   skipInapplicable?: boolean;
 }
@@ -812,7 +814,7 @@ export async function startRecoveryAttempt(
     operation: input.operation,
     invariant: input.invariant ?? blockerClass,
     candidateEpoch,
-    evidenceIdentity: evidenceFingerprint,
+    evidenceIdentity: input.evidenceIdentity?.trim() || evidenceFingerprint,
   });
   let episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, episodeKey) ?? emptyEpisode(episodeKey, time);
   const attemptId = recoveryAttemptId({
