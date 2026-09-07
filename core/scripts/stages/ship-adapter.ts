@@ -30,6 +30,7 @@ import {
   type PresentFrgAttestorCredentialDeps,
 } from "../ship-end-candidate.ts";
 import {
+  FRG_PACK_MANIFEST,
   observeReleaseEligibleFrgEvidence,
   shipMissingFrgDiagnostic,
   validateFrgEvidenceSnapshotForTag,
@@ -40,6 +41,7 @@ import {
 } from "../factory-reliability-gate.ts";
 import {
   FRG_HYBRID_PILOT_VERSION,
+  FRG_HYBRID_V2_MANIFEST_SHA256,
   isFrgHybridV1PolicyId,
   isFrgHybridV2PolicyId,
 } from "../frg-pack-observations.ts";
@@ -2003,23 +2005,80 @@ async function resolveCandidateFactoryReleaseRequestPath(
   intent: ShipIntent,
   train: ShipTrainEvidence,
 ): Promise<string> {
+  let requestPath: string;
   const provided = ctx.factoryReleaseRequestPath?.trim();
   if (provided) {
     if (!path.isAbsolute(provided)) {
       throw new Error("ship FRG: factory-release prepare request path must be absolute");
     }
-    return provided;
-  }
-  if (typeof ctx.resolveFactoryReleaseRequestPath === "function") {
+    requestPath = provided;
+  } else if (typeof ctx.resolveFactoryReleaseRequestPath === "function") {
     const resolved = String(await ctx.resolveFactoryReleaseRequestPath(intent, train) ?? "").trim();
     if (!resolved || !path.isAbsolute(resolved)) {
       throw new Error("ship FRG: resolved factory-release prepare request path must be absolute");
     }
-    return resolved;
+    requestPath = resolved;
+  } else {
+    throw new Error(
+      "ship FRG: missing factory-release prepare request path; will not skip candidate factory-release prepare",
+    );
   }
-  throw new Error(
-    "ship FRG: missing factory-release prepare request path; will not skip candidate factory-release prepare",
-  );
+  await validateResolvedFactoryReleaseRequest(ctx, requestPath, intent, train);
+  return requestPath;
+}
+
+async function validateResolvedFactoryReleaseRequest(
+  ctx: CandidateShipEndContext,
+  requestPath: string,
+  intent: ShipIntent,
+  train: ShipTrainEvidence,
+): Promise<void> {
+  const loaded = await resolveTextFile(requestPath, ctx.readTextFile);
+  if (loaded.status !== "ok") {
+    throw new Error(
+      `ship FRG: factory-release prepare request is ${loaded.status} at ${requestPath}`,
+    );
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(loaded.text);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`ship FRG: factory-release prepare request JSON is invalid at ${requestPath}: ${detail}`);
+  }
+  let request: FactoryReleasePrepareRequest;
+  try {
+    request = parseFactoryReleasePrepareRequest(raw);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`ship FRG: invalid factory-release prepare request at ${requestPath}: ${detail}`);
+  }
+  if (request.repository !== intent.repository.toLowerCase()) {
+    throw new Error("ship FRG: factory-release request repository does not match the current ship");
+  }
+  if (request.base_branch !== intent.base_branch) {
+    throw new Error("ship FRG: factory-release request base branch does not match the current ship");
+  }
+  if (request.target_version !== intent.version) {
+    throw new Error("ship FRG: factory-release request target version does not match the current ship");
+  }
+  if (request.milestone !== undefined && request.milestone !== intent.milestone) {
+    throw new Error("ship FRG: factory-release request milestone does not match the current ship");
+  }
+  if (
+    request.integrated_candidate.git_sha !==
+      requireOid(train.integrated_head_oid, "ship integrated candidate")
+  ) {
+    throw new Error(
+      "ship FRG: factory-release request integrated candidate does not match the current ship train",
+    );
+  }
+  if (
+    request.frg_manifest.pack_id !== FRG_PACK_MANIFEST.pack_id ||
+    request.frg_manifest.sha256 !== FRG_HYBRID_V2_MANIFEST_SHA256
+  ) {
+    throw new Error("ship FRG: factory-release request pack identity does not match the current FRG pack");
+  }
 }
 
 export function persistedShipFactoryReleaseRequestPath(
@@ -2386,11 +2445,11 @@ export function bindCandidateShipEndOperations(
   return {
     ...pinOps,
     async runFrgPack(intent, train) {
+      const requestPath = await resolveCandidateFactoryReleaseRequestPath(ctx, intent, train);
       const engine = await requireCandidate(
         train.integrated_head_oid,
         "ship.frg-prepare-observe",
       );
-      const requestPath = await resolveCandidateFactoryReleaseRequestPath(ctx, intent, train);
       const attempts = ctx.frgWaitAttempts ?? FRG_WAIT_ATTEMPTS;
       let attempt = 0;
       let attestedCheckpointKey: string | null = null;

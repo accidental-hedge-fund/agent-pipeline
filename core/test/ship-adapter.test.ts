@@ -82,6 +82,7 @@ import {
 import {
   collectFrgPackObservations,
   FRG_HYBRID_PILOT_POLICY_ID,
+  FRG_HYBRID_V2_MANIFEST_SHA256,
   FRG_HYBRID_V2_POLICY_ID,
   loadFrgPack,
   renderFrgPackIssues,
@@ -2328,6 +2329,7 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
     env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     nodeBin: "/usr/bin/node",
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     resolveCandidate: resolveTestCandidate,
     spawn: async (argv, env) => {
       spawned.push(argv);
@@ -2397,6 +2399,7 @@ test("unresolvable candidate stops ship before FRG and leaves train evidence", a
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     resolveCandidate: async () => ({ ok: false, error: "no checkout at candidate SHA" }),
     spawn: async () => {
       throw new Error("spawn must not run");
@@ -2435,6 +2438,7 @@ test("unready candidate stops ship before leaf spawn and keeps train evidence (#
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     resolveCandidate: async () => {
       await Promise.resolve();
       prepareReturned = true;
@@ -2479,6 +2483,7 @@ test("no leaf spawn until resolve-and-prepare returns a ready root (#1344)", asy
     env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     nodeBin: "/usr/bin/node",
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     resolveCandidate: async (_sha, consumer) => {
       await Promise.resolve();
       ready = true;
@@ -2552,6 +2557,7 @@ test("matching pin SHA still runs the guarded candidate factory-release prepare 
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
@@ -2581,6 +2587,7 @@ test("in_progress prepare re-invokes prepare and does not factory-gate until eli
     repoDir: "/repo",
     env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     frgWaitAttempts: 5,
     delay: async () => {},
     resolveCandidate: resolveTestCandidate,
@@ -2639,6 +2646,7 @@ test("repeated FRG prepare polling uses the observer route while release mutatio
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     delay: async () => {},
     isBoundPackLoopLive: async () => true,
     resolveCandidate: async (_sha, consumer) => {
@@ -2702,6 +2710,7 @@ test("in_progress prepare within wait budget does not invoke factory-gate", asyn
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     frgWaitAttempts: 2,
     delay: async () => {},
     isBoundPackLoopLive: async () => false,
@@ -2818,6 +2827,7 @@ test("live in_progress at cap keeps re-invoking prepare (#1150)", async () => {
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     frgWaitAttempts: 2,
     delay: async () => {},
     isBoundPackLoopLive: async () => true,
@@ -2856,6 +2866,7 @@ test("unknown liveness at cap keeps re-invoking prepare (#1150)", async () => {
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     frgWaitAttempts: 2,
     delay: async () => {},
     isBoundPackLoopLive: async () => "unknown",
@@ -2891,6 +2902,7 @@ test("dead-loop in_progress at cap still throws resume-to-retry (#1150)", async 
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     frgWaitAttempts: 2,
     delay: async () => {},
     isBoundPackLoopLive: async () => false,
@@ -3179,6 +3191,7 @@ test("empty or malformed ledger stop at cap keeps re-invoking prepare (#1150)", 
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     frgWaitAttempts: 2,
     delay: async () => {},
     onFrgWaitTick: (tick) => {
@@ -3226,6 +3239,7 @@ test("missing or mismatched ledger identity at cap keeps re-invoking prepare (#1
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     frgWaitAttempts: 2,
     delay: async () => {},
     onFrgWaitTick: (tick) => {
@@ -3317,9 +3331,108 @@ function shipPrepareRequest(): FactoryReleasePrepareRequest {
     target_version: intent.version,
     integrated_candidate: { git_sha: head, version: "1.33.0" },
     production_pin: { version: "1.33.0", tag: "v1.33.0", git_sha: PIN_SHA },
-    frg_manifest: { pack_id: "factory-gate-v1", sha256: "a".repeat(64) },
+    frg_manifest: { pack_id: "factory-gate-v1", sha256: FRG_HYBRID_V2_MANIFEST_SHA256 },
   };
 }
+
+function validShipRequestText(p: string): string | null {
+  if (
+    p === "/abs/req.json" ||
+    p.endsWith("factory-release-prepare-request.json")
+  ) {
+    return JSON.stringify(shipPrepareRequest());
+  }
+  return null;
+}
+
+test("explicit OLD-candidate factory-release request fails before prepare spawn (#1527)", async () => {
+  const requestPath = "/external/old-request.json";
+  const oldRequest = {
+    ...shipPrepareRequest(),
+    integrated_candidate: { git_sha: "f".repeat(40), version: "1.33.0" },
+  };
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: requestPath,
+    readTextFile: (p) => p === requestPath ? JSON.stringify(oldRequest) : null,
+    resolveCandidate: resolveTestCandidate,
+    spawn: async (argv) => {
+      spawned.push(argv);
+      return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+    },
+  });
+
+  await assert.rejects(bound.runFrgPack!(intent, train), /integrated candidate.*current ship train/);
+  assert.deepEqual(spawned, []);
+});
+
+test("resolver-returned OLD-candidate factory-release request fails before prepare spawn (#1527)", async () => {
+  const requestPath = "/external/resolved-old-request.json";
+  const oldRequest = {
+    ...shipPrepareRequest(),
+    integrated_candidate: { git_sha: "f".repeat(40), version: "1.33.0" },
+  };
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    resolveFactoryReleaseRequestPath: async () => requestPath,
+    readTextFile: (p) => p === requestPath ? JSON.stringify(oldRequest) : null,
+    resolveCandidate: resolveTestCandidate,
+    spawn: async (argv) => {
+      spawned.push(argv);
+      return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+    },
+  });
+
+  await assert.rejects(bound.runFrgPack!(intent, train), /integrated candidate.*current ship train/);
+  assert.deepEqual(spawned, []);
+});
+
+test("malformed external factory-release request fails before prepare spawn (#1527)", async () => {
+  const requestPath = "/external/malformed-request.json";
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: requestPath,
+    readTextFile: (p) => p === requestPath ? "{not-json" : null,
+    resolveCandidate: resolveTestCandidate,
+    spawn: async (argv) => {
+      spawned.push(argv);
+      return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+    },
+  });
+
+  await assert.rejects(bound.runFrgPack!(intent, train), /request JSON.*invalid/);
+  assert.deepEqual(spawned, []);
+});
+
+test("valid external factory-release request reaches guarded prepare spawn (#1527)", async () => {
+  const requestPath = "/external/current-request.json";
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: requestPath,
+    readTextFile: (p) => p === requestPath ? JSON.stringify(shipPrepareRequest()) : null,
+    resolveCandidate: resolveTestCandidate,
+    spawn: async (argv) => {
+      spawned.push(argv);
+      return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+    },
+  });
+
+  await bound.runFrgPack!(intent, train);
+  assert.equal(spawned.length, 1);
+  assert.ok(spawned[0]!.includes(requestPath));
+});
 
 async function shipHybridFromRunEvidence(opts: {
   unsigned: FactoryReleaseFrgPayload;
@@ -3457,6 +3570,7 @@ test("candidate FRG pack re-invokes the same prepare request after factory-gate 
     repoDir: "/repo",
     env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     factoryReleaseRequestPath: requestPath,
+    readTextFile: validShipRequestText,
     frgWaitAttempts: 4,
     delay: async () => {},
     resolveCandidate: resolveTestCandidate,
@@ -3531,6 +3645,7 @@ test("runFrgPack fails closed after one attest when observe stays rejected (#129
     repoDir: "/repo",
     env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     factoryReleaseRequestPath: requestPath,
+    readTextFile: validShipRequestText,
     frgWaitAttempts: 8,
     delay: async () => {},
     resolveCandidate: resolveTestCandidate,
@@ -3576,6 +3691,7 @@ test("changed unsigned checkpoint resets the attest allowance (#1295)", async ()
     repoDir: "/repo",
     env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     frgWaitAttempts: 4,
     delay: async () => {},
     resolveCandidate: resolveTestCandidate,
@@ -3623,6 +3739,7 @@ test("injected request resolver supplies the persisted prepare path when option 
     repoDir: "/repo",
     env: {},
     resolveFactoryReleaseRequestPath: async () => "/state/ships/ship-key/factory-release-prepare-request.json",
+    readTextFile: validShipRequestText,
     resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
@@ -3729,6 +3846,7 @@ test("in-engine HMAC children present KEY_FILE as KEY and prepare stays uncreden
       },
     },
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     resolveCandidate: resolveTestCandidate,
     spawn: async (argv, env) => {
       const verb = argv.includes("factory-gate")
@@ -3793,6 +3911,7 @@ test("in-engine HMAC-verify does not spawn without a credential (#1181)", async 
     repoDir: "/repo",
     env: {},
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
@@ -3832,6 +3951,7 @@ test("in-engine HMAC-verify does not spawn on unreadable KEY_FILE (#1181)", asyn
       },
     },
     factoryReleaseRequestPath: "/abs/req.json",
+    readTextFile: validShipRequestText,
     resolveCandidate: resolveTestCandidate,
     spawn: async (argv) => {
       spawned.push(argv);
@@ -4560,7 +4680,10 @@ test("persistShipFactoryReleaseRequest fails closed on malformed or mismatched c
   fs.mkdirSync(manifestDir, { recursive: true });
   fs.writeFileSync(
     path.join(manifestDir, "manifest.json"),
-    JSON.stringify({ pack_id: "factory-gate-v1" }),
+    fs.readFileSync(
+      path.join(__dirname, "../scripts/frg-packs/factory-gate-v1/manifest.json"),
+      "utf8",
+    ),
   );
   try {
     const requestPath = await persistShipFactoryReleaseRequest(intent, train, { repoDir, env });
@@ -4599,7 +4722,10 @@ test("OLD to NEW train persistence dispatches the NEW candidate request and pres
   fs.mkdirSync(manifestDir, { recursive: true });
   fs.writeFileSync(
     path.join(manifestDir, "manifest.json"),
-    JSON.stringify({ pack_id: "factory-gate-v1" }),
+    fs.readFileSync(
+      path.join(__dirname, "../scripts/frg-packs/factory-gate-v1/manifest.json"),
+      "utf8",
+    ),
   );
   try {
     const oldPath = await persistShipFactoryReleaseRequest(intent, oldTrain, { repoDir, env });
