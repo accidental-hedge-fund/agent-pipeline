@@ -270,6 +270,106 @@ test("ship adapter reconciliation projects only externally observed typed truth"
   assert.deepEqual(result.promotion, promotion);
 });
 
+const advancedHead = "f".repeat(40);
+const trainMergeOids = new Map([
+  [10, "1".repeat(40)],
+  [11, "2".repeat(40)],
+]);
+
+function realTrainReconciliationObserver(baseTip: string): ShipAdapterOperations["observeTrain"] {
+  return (observedIntent, plannedIssues, candidateHeadOid) =>
+    observeTrainEvidence(observedIntent, plannedIssues, {
+      getPrForIssueAnyState: async (issue) => issue + 100,
+      ghPrView: async (pr) => ({
+        state: "MERGED",
+        mergedAt: "2026-08-10T10:00:00.000Z",
+        mergeCommit: { oid: trainMergeOids.get(pr - 100) },
+      }),
+      observeBase: async () => baseTip,
+      isAncestor: async (ancestor, descendant) =>
+        ancestor === descendant ||
+        (ancestor === head && descendant === advancedHead) ||
+        ([...trainMergeOids.values()].includes(ancestor) &&
+          (descendant === head || descendant === advancedHead)),
+      now: () => new Date("2026-08-10T13:00:00.000Z"),
+    }, candidateHeadOid);
+}
+
+test("pre-FRG reconciliation keeps unchanged current-base train evidence idempotently (#1527)", async () => {
+  const saved = checkpoint({ train });
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeTrain: realTrainReconciliationObserver(head),
+    observeFrg: async () => null,
+  }), { state });
+
+  const result = await deps.reconcile(intent, saved);
+
+  assert.strictEqual(result.train, saved.train);
+  assert.equal(result.train?.integrated_head_oid, head);
+  assert.equal(result.frg, null);
+});
+
+test("pre-FRG reconciliation rebinds completed train to the current advanced base (#1527)", async () => {
+  const saved = checkpoint({
+    train,
+    frg_pack: {
+      version: intent.version,
+      complete: true,
+      loop_run_id: "stale-loop",
+      pack_id: "factory-gate-v1",
+      candidate_head_oid: head,
+    },
+  });
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeTrain: realTrainReconciliationObserver(advancedHead),
+    observeFrg: async () => null,
+  }), { state });
+
+  const result = await deps.reconcile(intent, saved);
+
+  assert.notStrictEqual(result.train, saved.train);
+  assert.equal(result.train?.integrated_head_oid, advancedHead);
+  assert.equal(result.frg_pack, null);
+  assert.equal(result.frg, null);
+  assert.equal(result.release, null);
+});
+
+test("post-FRG reconciliation preserves the qualified and released historical candidate (#1527)", async () => {
+  const savedPack = {
+    version: intent.version,
+    complete: true as const,
+    loop_run_id: "loop-1",
+    pack_id: "factory-gate-v1",
+    candidate_head_oid: head,
+  };
+  const savedFrg = {
+    version: intent.version,
+    pass: true as const,
+    loop_run_id: "loop-1",
+    frg_run_id: "frg-1",
+    candidate_head_oid: head,
+  };
+  const saved = checkpoint({
+    train,
+    frg_pack: savedPack,
+    frg: savedFrg,
+    release,
+  });
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeTrain: realTrainReconciliationObserver(advancedHead),
+    observeFrg: async () => frg,
+    observeRelease: async () => ({ prepare: release, finish: null }),
+  }), { state });
+
+  const result = await deps.reconcile(intent, saved);
+
+  assert.strictEqual(result.train, saved.train);
+  assert.strictEqual(result.frg_pack, saved.frg_pack);
+  assert.strictEqual(result.frg, saved.frg);
+  assert.strictEqual(result.release, saved.release);
+  assert.equal(result.train?.integrated_head_oid, head);
+});
+
 test("reconciliation projects origin tag before GitHub Release publication (#1331)", async () => {
   const deps = shipCoordinatorDepsFromOperations(operations({
     observePublication: async () => null,

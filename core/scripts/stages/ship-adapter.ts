@@ -717,10 +717,11 @@ export function shipCoordinatorDepsFromOperations(
     async reconcile(intent, checkpoint) {
       const progress = emptyProgress();
       if (!checkpoint.train_plan) return progress;
+      const preserveQualifiedCandidate = checkpoint.frg !== null || checkpoint.release !== null;
       const train = await operations.observeTrain(
         intent,
         checkpoint.train_plan.ordered_issues,
-        checkpoint.train?.integrated_head_oid,
+        preserveQualifiedCandidate ? checkpoint.train?.integrated_head_oid : undefined,
       );
       if (!train) return progress;
       // Retain useful local identity only after live integration truth proves
