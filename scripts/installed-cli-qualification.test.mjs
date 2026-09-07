@@ -32,7 +32,7 @@ test("real candidate launcher produces complete parent-observed qualification", 
     candidateSha: candidate,
     launcherPath: launcher,
     repoDir: root,
-    nodePath: "/usr/bin/node",
+    nodePath: process.execPath,
     timeoutMs: 100,
     now: () => new Date("2026-09-07T01:00:00.000Z"),
   });
@@ -127,13 +127,13 @@ test("closed probe rejects relative, malformed, route-mismatched, and credential
     };
     writeFileSync(fixturePath, JSON.stringify(valid));
     const invoke = (args, extraEnv = {}) =>
-      spawnSync("/usr/bin/node", [launcher, ...args], {
+      spawnSync(process.execPath, [launcher, ...args], {
         cwd: fixtureRoot,
         encoding: "utf8",
         env: {
           PATH: process.env.PATH,
           HOME: fixtureRoot,
-          AGENT_PIPELINE_NODE: "/usr/bin/node",
+          AGENT_PIPELINE_NODE: process.execPath,
           ...extraEnv,
         },
       });

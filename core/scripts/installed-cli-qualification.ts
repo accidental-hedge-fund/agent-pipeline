@@ -450,7 +450,7 @@ function safeQualificationEnv(base: NodeJS.ProcessEnv, safeHome?: string): NodeJ
     PATH: base.PATH,
     HOME: safeHome,
     TMPDIR: base.TMPDIR,
-    AGENT_PIPELINE_NODE: base.AGENT_PIPELINE_NODE ?? "/usr/bin/node",
+    AGENT_PIPELINE_NODE: base.AGENT_PIPELINE_NODE ?? process.execPath,
     NODE_NO_WARNINGS: "1",
   };
 }
