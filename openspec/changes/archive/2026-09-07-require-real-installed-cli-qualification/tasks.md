@@ -13,5 +13,5 @@
 ## 3. Product gates
 
 - [x] 3.1 Wire deterministic qualification into normal CI and verify the staged installed launcher is actually spawned
-- [ ] 3.2 Regenerate host skills and verify `node scripts/build.mjs --check`, strict OpenSpec validation, and `CI=1 npm run ci` pass
-- [ ] 3.3 Run independent standards/spec review, address findings, and archive the completed OpenSpec change before merge
+- [x] 3.2 Regenerate host skills and verify `node scripts/build.mjs --check`, strict OpenSpec validation, and `CI=1 npm run ci` pass
+- [x] 3.3 Run independent standards/spec review, address findings, and archive the completed OpenSpec change before merge
