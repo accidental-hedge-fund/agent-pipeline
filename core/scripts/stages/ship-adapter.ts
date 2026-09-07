@@ -135,6 +135,8 @@ const RELEASE_WAIT_MS = 10_000;
 const FRG_WAIT_ATTEMPTS = 120;
 const FRG_WAIT_MS = 10_000;
 const SAFE_LOOP_RUN_ID = /^[A-Za-z0-9._-]+$/;
+const CANDIDATE_FRG_MANIFEST_REL =
+  "core/scripts/frg-packs/factory-gate-v1/manifest.json";
 const TERMINAL_LOOP_EVENT_KINDS = new Set([
   "loop_run_complete",
   "loop_run_stopped",
@@ -259,6 +261,7 @@ export interface RealShipCoordinatorDepsOptions {
   resolveFactoryReleaseRequestPath?(
     intent: ShipIntent,
     train: ShipTrainEvidence,
+    candidate: CandidateEngine,
   ): Promise<string>;
 }
 
@@ -1522,6 +1525,7 @@ export interface CandidateShipEndContext {
   resolveFactoryReleaseRequestPath?(
     intent: ShipIntent,
     train: ShipTrainEvidence,
+    candidate: CandidateEngine,
   ): Promise<string>;
   resolveCandidate(sha: string, consumer: CandidateEngineConsumer): Promise<CandidateEngineResult>;
   spawn(
@@ -2005,6 +2009,7 @@ async function resolveCandidateFactoryReleaseRequestPath(
   ctx: CandidateShipEndContext,
   intent: ShipIntent,
   train: ShipTrainEvidence,
+  candidate: CandidateEngine,
 ): Promise<string> {
   let requestPath: string;
   const provided = ctx.factoryReleaseRequestPath?.trim();
@@ -2014,7 +2019,9 @@ async function resolveCandidateFactoryReleaseRequestPath(
     }
     requestPath = provided;
   } else if (typeof ctx.resolveFactoryReleaseRequestPath === "function") {
-    const resolved = String(await ctx.resolveFactoryReleaseRequestPath(intent, train) ?? "").trim();
+    const resolved = String(
+      await ctx.resolveFactoryReleaseRequestPath(intent, train, candidate) ?? "",
+    ).trim();
     if (!resolved || !path.isAbsolute(resolved)) {
       throw new Error("ship FRG: resolved factory-release prepare request path must be absolute");
     }
@@ -2145,23 +2152,39 @@ async function writeShipFactoryReleaseRequestAtomic(
 export async function persistShipFactoryReleaseRequest(
   intent: ShipIntent,
   train: ShipTrainEvidence,
-  opts: { repoDir: string; env: NodeJS.ProcessEnv },
+  opts: {
+    candidate: Pick<CandidateEngine, "engineRoot" | "commitSha">;
+    env: NodeJS.ProcessEnv;
+    showCandidateBlob?: (
+      candidate: Pick<CandidateEngine, "engineRoot" | "commitSha">,
+      relPath: string,
+    ) => Promise<Buffer | null>;
+  },
 ): Promise<string> {
   const dest = persistedShipFactoryReleaseRequestPath(intent, train, opts.env);
-  const manifestPath = path.join(
-    opts.repoDir,
-    "core",
-    "scripts",
-    "frg-packs",
-    "factory-gate-v1",
-    "manifest.json",
-  );
-  let raw: Buffer;
-  try {
-    raw = await fs.readFile(manifestPath);
-  } catch {
+  const candidateSha = requireOid(train.integrated_head_oid, "ship integrated candidate");
+  if (parseExactGitSha(opts.candidate.commitSha) !== candidateSha) {
     throw new Error(
-      `ship FRG: cannot write factory-release request; manifest missing at ${manifestPath}`,
+      "ship FRG: cannot write factory-release request; resolved candidate does not match the current ship train",
+    );
+  }
+  const showCandidateBlob = opts.showCandidateBlob ?? (async (candidate, relPath) => {
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["-C", candidate.engineRoot, "show", `${candidate.commitSha}:${relPath}`],
+        { encoding: null, timeout: 15_000, maxBuffer: 20 * 1024 * 1024 },
+      );
+      return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+    } catch {
+      return null;
+    }
+  });
+  const raw = await showCandidateBlob(opts.candidate, CANDIDATE_FRG_MANIFEST_REL);
+  if (!raw) {
+    throw new Error(
+      `ship FRG: cannot write factory-release request; exact-candidate manifest missing or unreadable ` +
+        `at ${candidateSha}:${CANDIDATE_FRG_MANIFEST_REL}`,
     );
   }
   let packId = "factory-gate-v1";
@@ -2169,7 +2192,10 @@ export async function persistShipFactoryReleaseRequest(
     const pack = JSON.parse(raw.toString("utf8")) as { pack_id?: unknown };
     if (typeof pack.pack_id === "string" && pack.pack_id.trim()) packId = pack.pack_id.trim();
   } catch {
-    throw new Error(`ship FRG: factory-release request manifest is not JSON: ${manifestPath}`);
+    throw new Error(
+      `ship FRG: factory-release request manifest is not JSON: ` +
+        `${candidateSha}:${CANDIDATE_FRG_MANIFEST_REL}`,
+    );
   }
   const request = parseFactoryReleasePrepareRequest({
     schema_version: 1,
@@ -2450,10 +2476,15 @@ export function bindCandidateShipEndOperations(
   return {
     ...pinOps,
     async runFrgPack(intent, train) {
-      const requestPath = await resolveCandidateFactoryReleaseRequestPath(ctx, intent, train);
       const engine = await requireCandidate(
         train.integrated_head_oid,
         "ship.frg-prepare-observe",
+      );
+      const requestPath = await resolveCandidateFactoryReleaseRequestPath(
+        ctx,
+        intent,
+        train,
+        engine,
       );
       const attempts = ctx.frgWaitAttempts ?? FRG_WAIT_ATTEMPTS;
       let attempt = 0;
@@ -2840,7 +2871,7 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
     factoryReleaseRequestPath: opts.factoryReleaseRequestPath,
     resolveFactoryReleaseRequestPath:
       opts.resolveFactoryReleaseRequestPath ??
-      ((intent, train) => persistShipFactoryReleaseRequest(intent, train, { repoDir: opts.repoDir, env })),
+      ((intent, train, candidate) => persistShipFactoryReleaseRequest(intent, train, { candidate, env })),
     resolveCandidate: resolve,
     spawn,
     ...(opts.spawnEnsureTag ? { spawnEnsureTag: opts.spawnEnsureTag } : {}),
