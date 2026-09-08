@@ -1102,6 +1102,7 @@ export async function runTestGate(
     // so tasks/todo.md never folds into product history.
     const headAfterFix = await gitHeadFn(wtPath);
     let salvageFailureReason: string | undefined;
+    let salvagedProductWork = false;
     if (headBefore && headAfterFix === headBefore && (await gitDirtyFn(wtPath))) {
       const porcelain = await gitStatusPorcelainFn(wtPath);
       const dirtyPaths = parsePorcelainPaths(porcelain);
@@ -1131,6 +1132,7 @@ export async function runTestGate(
                   : {},
               );
         salvageFailureReason = salvageResult.failureReason;
+        salvagedProductWork = salvageResult.salvaged;
       }
     }
 
@@ -1169,8 +1171,26 @@ export async function runTestGate(
       }
     }
 
-    // Verify the test-fix commit message format (#68).
-    if (fixHeadBefore) {
+    // A successful harness invocation may legitimately discover that the
+    // candidate itself needs no change (for example, a transient integration
+    // assertion passes on retry). Preserve that candidate and let the command
+    // rerun prove the outcome; requiring a commit here encourages an empty,
+    // unpublished head that cannot bind Tester evidence to the PR (#1562).
+    // Any HEAD movement remains on the existing commit/trailer/build path.
+    // Salvage can advance HEAD after the first post-harness observation. Re-read
+    // only in that case so salvaged product work cannot enter the no-change
+    // exception or skip its commit/build checks.
+    const candidateHeadAfterFix = salvagedProductWork
+      ? await gitHeadFn(wtPath)
+      : headAfterFix;
+    const noChangeCandidate = Boolean(
+      headBefore && candidateHeadAfterFix === headBefore,
+    );
+
+    // Verify the test-fix commit message format (#68). The clean unchanged-HEAD
+    // case has no commit range to verify; its authority comes only from the
+    // observed retry below exiting zero.
+    if (fixHeadBefore && !noChangeCandidate) {
       const commitCheck = await verifyTestFixFn(wtPath, fixHeadBefore);
       if (!commitCheck.ok) {
         return finish(
@@ -1194,7 +1214,7 @@ export async function runTestGate(
     // required Issue: and Pipeline-Run: traceability trailers. Skipped when
     // headBefore is empty (git unavailable in this environment) or when the
     // harness produced no new commits (messages list is empty).
-    if (headBefore) {
+    if (headBefore && !noChangeCandidate) {
       const newMessages = await gitCommitMessagesFn(wtPath, headBefore);
       const trailerErr = validateCommitTrailers(newMessages, issueNumber, pipelineRunId);
       if (trailerErr) {
@@ -1216,7 +1236,8 @@ export async function runTestGate(
     // artifact changes from a declared build_command into that commit. A no-op
     // when cfg.build_command is unset or the attempt produced no new commit.
     const buildDeps = deps.buildSideEffects ?? {};
-    const buildAttemptHead = headBefore && headAfterFix !== headBefore ? headAfterFix : null;
+    const buildAttemptHead =
+      headBefore && candidateHeadAfterFix !== headBefore ? candidateHeadAfterFix : null;
     if (cfg.build_command && buildAttemptHead) {
       const buildResult = await includeBuildArtifacts(wtPath, cfg.build_command, buildDeps);
       if (buildResult.ran && !buildResult.ok) {

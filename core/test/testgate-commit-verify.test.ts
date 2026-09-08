@@ -9,6 +9,15 @@ import {
   runTestGate,
   type TestGateDeps,
 } from "../scripts/testgate.ts";
+import {
+  observeTesterImplementationRole,
+  rebindTesterEvidenceAfterPr,
+} from "../scripts/rebind-tester-evidence-after-pr.ts";
+import {
+  testerEvidencePath,
+  type TesterEvidence,
+  type TesterEvidenceIoDeps,
+} from "../scripts/tester-evidence.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { VerifyDeps, VerifyResult } from "../scripts/verify-harness-commits.ts";
@@ -153,4 +162,105 @@ test("runTestGate: verifyTestFix passes → gate continues normally (4.6)", asyn
   const result = await runTestGate(baseCfg(), 42, "/wt", deps);
   assert.equal(result.skipped, false);
   assert.equal(result.passed, true);
+});
+
+test("clean no-change retry preserves the PR candidate through Tester rebind (#1562)", async () => {
+  const candidate = "a".repeat(40);
+  const runDir = "/runs/1562-current";
+  const files = new Map<string, string>();
+  const io: TesterEvidenceIoDeps = {
+    readFile: async (filePath) => {
+      const value = files.get(filePath);
+      if (value === undefined) {
+        const error = new Error(`ENOENT: ${filePath}`) as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      }
+      return value;
+    },
+    writeFile: async (filePath, value) => { files.set(filePath, value); },
+    rename: async (from, to) => {
+      const value = files.get(from);
+      if (value === undefined) throw new Error(`ENOENT: ${from}`);
+      files.set(to, value);
+      files.delete(from);
+    },
+    mkdir: async () => {},
+  };
+
+  // This is the real pre-fix contradiction: the commit verifier rejects the
+  // empty range even though the unchanged candidate can pass on rerun.
+  const emptyRange = await enforceTestFixCommitFormat(
+    1562,
+    "/wt",
+    candidate,
+    msgsDeps([]),
+  );
+  assert.equal(emptyRange.ok, false);
+
+  let testRuns = 0;
+  let verifierCalls = 0;
+  let persisted: TesterEvidence | null = null;
+  const gate = await runTestGate(
+    { ...baseCfg(), test_gate: { ...baseCfg().test_gate, max_attempts: 1 } },
+    1562,
+    "/wt",
+    {
+      runTests: async () => testRuns++ === 0
+        ? { passed: false, output: "transient integration assertion", durationSec: 0.1, toolingError: false }
+        : { passed: true, output: "ok", durationSec: 0.1, toolingError: false },
+      invoke: async () => okInvoke(),
+      gitHead: async () => candidate,
+      gitDirty: async () => false,
+      verifyTestFix: async (wtPath, headBefore) => {
+        verifierCalls++;
+        return enforceTestFixCommitFormat(1562, wtPath, headBefore, msgsDeps([]));
+      },
+      gitCommitMessages: async () => {
+        throw new Error("clean no-change retry has no commit range");
+      },
+      writeTesterEvidence: async (_dest, evidence) => {
+        persisted = evidence;
+        files.set(testerEvidencePath(runDir), `${JSON.stringify(evidence, null, 2)}\n`);
+        return { ok: true };
+      },
+      resolvePinnedEngineIdentity: () => null,
+    },
+    "1562/2026-09-08T16:20:43Z",
+    "test-gate",
+    undefined,
+    runDir,
+  );
+
+  assert.equal(gate.passed, true);
+  assert.equal(gate.attempts, 1);
+  assert.equal(testRuns, 2, "the unchanged candidate must still pass a fresh rerun");
+  assert.equal(verifierCalls, 0, "the empty commit range is exempt only on clean unchanged HEAD");
+  assert.equal(gate.persist?.candidate_sha, candidate);
+  assert.equal(persisted?.candidate_sha, candidate);
+
+  const rebound = await rebindTesterEvidenceAfterPr({
+    cfg: baseCfg(),
+    issueNumber: 1562,
+    stage: "design-gate",
+    runDir,
+    prNumber: 99,
+    prHeadSha: candidate,
+    pushedHeadSha: candidate,
+    pushedPrNumber: 99,
+    trustedSurface: {
+      outcome: "passthrough",
+      candidate_sha: candidate,
+      effective_verifier_hash: "b".repeat(64),
+    },
+    domain: "acme",
+    engineFingerprint: "c".repeat(64),
+    io,
+  });
+  assert.equal(rebound.ok, true);
+  if (!rebound.ok) return;
+  assert.equal(rebound.candidateSha, candidate);
+  assert.equal(rebound.suiteCommandInvoked, false);
+  assert.equal(rebound.evidence?.candidate_sha, candidate);
+  assert.ok(observeTesterImplementationRole(rebound.evidence, candidate, 99));
 });

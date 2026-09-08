@@ -1215,6 +1215,7 @@ test("gate (regression / #20, trailer enforcement): fix harness creates commit w
   // The harness "succeeds" and leaves a clean tree, but the commit it produced
   // has no Issue: or Pipeline-Run: trailers. The gate must block.
   let invoked = 0;
+  let headReads = 0;
   const out = await runTestGate(
     cfgWith({}),
     1,
@@ -1226,7 +1227,7 @@ test("gate (regression / #20, trailer enforcement): fix harness creates commit w
         invoked++;
         return okInvoke();
       },
-      gitHead: async () => "head-before",
+      gitHead: async () => headReads++ < 2 ? "head-before" : "head-after",
       gitDirty: async () => false,
       verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => ["fix: correct the test\n\nNo trailers here."],
@@ -1288,6 +1289,7 @@ test("gate (regression / #20, trailer enforcement): no new commits after fix →
 test("gate (regression / #20, trailer enforcement): multiple fix commits, one missing trailers → blocked", async () => {
   // Two commits: the first compliant, the second not. Gate must block.
   let invoked = 0;
+  let headReads = 0;
   const out = await runTestGate(
     cfgWith({}),
     1,
@@ -1299,7 +1301,7 @@ test("gate (regression / #20, trailer enforcement): multiple fix commits, one mi
         invoked++;
         return okInvoke();
       },
-      gitHead: async () => "head-before",
+      gitHead: async () => headReads++ < 2 ? "head-before" : "head-after",
       gitDirty: async () => false,
       verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [
@@ -1632,8 +1634,9 @@ test("gate (#131): salvaged but tests still fail → blocked with the test-gate 
   assert.match(out.blockReason ?? "", /FAIL: 1 test failed/);
 });
 
-test("gate (#131): clean worktree with no commit → salvage not attempted, no-commit block unchanged", async () => {
+test("gate (#131/#1562): clean no-change retries remain bounded when tests keep failing", async () => {
   const salvageCalls: string[] = [];
+  let verifierCalls = 0;
   const out = await runTestGate(
     cfgWith({}),
     42,
@@ -1648,20 +1651,25 @@ test("gate (#131): clean worktree with no commit → salvage not attempted, no-c
         salvageCalls.push(stageLabel);
         return { salvaged: true };
       },
-      // Real format gate over an empty range → the existing no-commit block.
-      verifyTestFix: (wt, hb) =>
-        enforceTestFixCommitFormat(42, wt, hb, {
+      // The real format gate would reject this empty range, but the clean
+      // unchanged-candidate path must not invoke it.
+      verifyTestFix: (wt, hb) => {
+        verifierCalls++;
+        return enforceTestFixCommitFormat(42, wt, hb, {
           gitMessages: async () => [],
           gitDiffFiles: async () => [],
           gitDirtyFiles: async () => [],
-        }),
+        });
+      },
       gitCommitMessages: async () => [],
     },
     "42/2026-06-12T18:14:44Z",
   );
   assert.equal(salvageCalls.length, 0, "clean worktree must not attempt salvage");
   assert.equal(out.passed, false);
-  assert.match(out.blockReason ?? "", /No commits found in the range/);
+  assert.equal(out.attempts, 3);
+  assert.equal(verifierCalls, 0, "unchanged clean attempts skip the empty commit-range verifier");
+  assert.match(out.blockReason ?? "", /FAIL: 1 test failed/);
 });
 
 test("gate (#131): harness committed AND left dirt → salvage not attempted, dirty block unchanged", async () => {

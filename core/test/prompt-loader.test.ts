@@ -909,6 +909,22 @@ test("test_fix prompt: instructs the trailers with substituted issue + run id (#
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
+test("test_fix prompt: separates material commits from clean no-change retries (#1562)", () => {
+  const out = buildTestFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 1562,
+    command: "npm run ci",
+    attempt: 1,
+    maxAttempts: 3,
+    output: "transient integration failure",
+    pipelineRunId: "1562/2026-09-08T16:20:43Z",
+  });
+  assert.match(out, /If you make material product changes, commit ALL of them/);
+  assert.match(out, /leave HEAD\s+unchanged/);
+  assert.match(out, /Do NOT manufacture an empty\s+commit/);
+  assert.match(out, /gate will verify the clean worktree and re-run the command itself/);
+});
+
 test("test_fix prompt: large failure output is truncated", () => {
   const out = buildTestFixPrompt({
     cfg: dummyConfig(),
