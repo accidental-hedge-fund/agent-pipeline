@@ -86,7 +86,7 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   "factory-gate": {
     summary:
-      "Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags). Unique-operation SLOs read the control-host run store bound to the scored candidate; an in-flight ship is not missing ship coverage for that pack",
+      "Release-path verification consumes one observer-owned exact-candidate result for the explicit clean-docs/clean-openspec pair (never merges or tags). The score/from-run flags remain a legacy caller surface until dependency-checked retirement; scores, HMACs, qualification matrices, and public hashes do not satisfy the exact-pair verifier",
     usage:
       "factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass]",
     documented: true,
@@ -94,7 +94,7 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   "factory-release": {
     summary:
-      "Durable post-pilot FRG generation + prepare-only release handoff (in_progress → awaiting_frg_attestation → complete; never merges/tags). Structural eligibility names unique-operation SLO or binding failure; HMAC stays required on tag/promote",
+      "Legacy prepare-only release handoff retained for later dependency-checked retirement. Package-2 FRG proof is the release-owned exact-candidate pair result with explicit external waits and cleanup debt; this command never merges/tags",
     usage:
       "factory-release prepare --request <absolute-off-repo-request.json> --json",
     documented: true,

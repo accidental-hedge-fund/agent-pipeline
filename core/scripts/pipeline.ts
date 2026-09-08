@@ -204,6 +204,7 @@ import {
   reportPapercuts,
   papercutsEnabled,
   realPapercutDeps,
+  autoFileAllowed,
   autoFileDurableRunBlockers,
   realAutoFileDeps,
 } from "./stages/papercut.ts";
@@ -3554,7 +3555,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     // resolved config, wrapped so a failure here can never alter the drive
     // result (driveSupervisor's own onDriveEnd call site already swallows any
     // throw — this catch is belt-and-braces).
-    onDriveEnd: cfg.durable_runs.auto_file
+    onDriveEnd: autoFileAllowed() && cfg.durable_runs.auto_file
       ? async () => {
         await autoFileDurableRunBlockers(
           {

@@ -70,6 +70,18 @@ import {
   type HybridV2FromRunArgs,
 } from "./frg-hybrid-v2-from-run.ts";
 import { resolveStateHome } from "./loop/store.ts";
+import {
+  verifyExactCandidateFrgResult,
+  type ExactCandidateFrgRecord,
+} from "./exact-candidate-frg.ts";
+
+/** Package-2 release-path verifier. Legacy score artifacts are not inputs. */
+export function verifyReleasePathExactCandidateFrg(
+  value: unknown,
+  expected: { epoch_id: string; candidate_sha: string },
+): ExactCandidateFrgRecord {
+  return verifyExactCandidateFrgResult(value, expected);
+}
 
 // ---------------------------------------------------------------------------
 // Schema + thresholds

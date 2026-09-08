@@ -1,7 +1,9 @@
 # FRG pack checklist (operator)
 
-**Goal:** diagnose or manually produce `.agent-pipeline/frg/<X.Y.Z>/latest.json`
-when Pipeline ship status identifies FRG evidence as the blocking input.
+**Goal:** diagnose the exact-candidate pair result under
+`.agent-pipeline/frg/exact-pair/<epoch>.json`. The score/HMAC steps below are a
+legacy caller checklist pending package-4 retirement; they cannot satisfy the
+package-2 exact-pair verifier.
 
 **Authoritative runbook:** [factory-reliability-gate-runbook.md](../factory-reliability-gate-runbook.md)  
 If this checklist conflicts with the runbook, **the runbook wins**.
@@ -17,6 +19,9 @@ If this checklist conflicts with the runbook, **the runbook wins**.
 - [ ] `pipeline doctor --json` green enough to run pack loops
 - [ ] `gh` auth OK; `ALLOW_MERGE=1` only if the pack may open/close synthetic PRs
 - [ ] Product backlog train (if any) is already done or orthogonal — **do not** use a product work-list train run as `--from-run`
+- [ ] Candidate is the freshly observed exact `origin/main` SHA and its prepared
+      root supplies the launcher, manifest, templates, and nested lockfile
+- [ ] Intended pair is durably bound as exactly `clean-docs` + `clean-openspec`
 
 ## 1. Fixed pack selector (not product backlog)
 
@@ -41,13 +46,14 @@ cd "$REPO_DIR"
 # One item:
 pipeline single <pack-issue>
 
-# Multi-item:
-pipeline loop --label factory-gate
-# or: pipeline loop --milestone factory-gate
+# Exact-pair multi-item run (the runner supplies the recorded numbers):
+pipeline loop <clean-docs-issue> <clean-openspec-issue> --engine-track candidate
 ```
 
 - [ ] Record **loop run id** from handoff JSON /  
-  `~/.local/state/agent-pipeline/loop/runs/loop-*`
+      `~/.local/state/agent-pipeline/loop/runs/loop-*`
+- [ ] Do not use a broad label selector, merge either fixture, create a third
+      issue, or launch a replacement pair after a non-pass
 
 ## 3. Score FRG for the version
 
