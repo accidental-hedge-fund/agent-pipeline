@@ -19,6 +19,7 @@ import {
   type TesterEvidenceIoDeps,
 } from "../scripts/tester-evidence.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
+import type { RunStoreDeps } from "../scripts/run-store.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { VerifyDeps, VerifyResult } from "../scripts/verify-harness-commits.ts";
 
@@ -138,6 +139,50 @@ function okInvoke(): HarnessResult {
   return { success: true, stdout: "", stderr: "", exit_code: 0, duration: 1, timed_out: false };
 }
 
+function memoryTesterDeps(): {
+  files: Map<string, string>;
+  io: TesterEvidenceIoDeps;
+  runStoreDeps: RunStoreDeps;
+} {
+  const files = new Map<string, string>();
+  const readFile = async (filePath: string): Promise<string> => {
+    const value = files.get(filePath);
+    if (value === undefined) {
+      const error = new Error(`ENOENT: ${filePath}`) as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    }
+    return value;
+  };
+  const writeFile = async (filePath: string, value: string): Promise<void> => {
+    files.set(filePath, value);
+  };
+  const appendFile = async (filePath: string, value: string): Promise<void> => {
+    files.set(filePath, (files.get(filePath) ?? "") + value);
+  };
+  const rename = async (from: string, to: string): Promise<void> => {
+    const value = files.get(from);
+    if (value === undefined) throw new Error(`ENOENT: ${from}`);
+    files.set(to, value);
+    files.delete(from);
+  };
+  const mkdir = async (): Promise<void> => {};
+  return {
+    files,
+    io: { readFile, writeFile, appendFile, rename, mkdir },
+    runStoreDeps: {
+      readFile,
+      writeFile,
+      appendFile,
+      rename,
+      mkdir,
+      readdir: async () => [],
+      stat: async () => ({ mtime: new Date(0) }),
+      accountingSink: async () => {},
+    },
+  };
+}
+
 test("runTestGate: verifyTestFix blocks → gate returns blocked with reason (4.5)", async () => {
   let head = "sha-before";
   const deps: TestGateDeps = {
@@ -190,26 +235,7 @@ test("runTestGate: verifyTestFix passes → gate continues normally (4.6)", asyn
 test("clean no-change retry preserves the PR candidate through Tester rebind (#1562)", async () => {
   const candidate = "a".repeat(40);
   const runDir = "/runs/1562-current";
-  const files = new Map<string, string>();
-  const io: TesterEvidenceIoDeps = {
-    readFile: async (filePath) => {
-      const value = files.get(filePath);
-      if (value === undefined) {
-        const error = new Error(`ENOENT: ${filePath}`) as NodeJS.ErrnoException;
-        error.code = "ENOENT";
-        throw error;
-      }
-      return value;
-    },
-    writeFile: async (filePath, value) => { files.set(filePath, value); },
-    rename: async (from, to) => {
-      const value = files.get(from);
-      if (value === undefined) throw new Error(`ENOENT: ${from}`);
-      files.set(to, value);
-      files.delete(from);
-    },
-    mkdir: async () => {},
-  };
+  const { files, io, runStoreDeps } = memoryTesterDeps();
 
   // This is the real pre-fix contradiction: the commit verifier rejects the
   // empty range even though the unchanged candidate can pass on rerun.
@@ -253,6 +279,7 @@ test("clean no-change retry preserves the PR candidate through Tester rebind (#1
     "test-gate",
     undefined,
     runDir,
+    runStoreDeps,
   );
 
   assert.equal(gate.passed, true);
@@ -325,6 +352,7 @@ test("HEAD movement during a clean retry blocks without passed Tester evidence (
   let currentHead = candidate;
   let testRuns = 0;
   let persisted: TesterEvidence | null = null;
+  const { runStoreDeps } = memoryTesterDeps();
 
   const gate = await runTestGate(
     { ...baseCfg(), test_gate: { ...baseCfg().test_gate, max_attempts: 1 } },
@@ -355,6 +383,7 @@ test("HEAD movement during a clean retry blocks without passed Tester evidence (
     "test-gate",
     undefined,
     "/runs/1562-moved-during-retry",
+    runStoreDeps,
   );
 
   assert.equal(gate.passed, false);
@@ -362,6 +391,58 @@ test("HEAD movement during a clean retry blocks without passed Tester evidence (
   assert.equal(testRuns, 2);
   assert.equal(persisted?.candidate_sha, movedHead);
   assert.equal(persisted?.overall_status, "unavailable");
+});
+
+test("post-rerun HEAD movement blocks before passed Tester evidence persistence (#1562)", async () => {
+  const candidate = "a".repeat(40);
+  const movedHead = "b".repeat(40);
+  let currentHead = candidate;
+  let testRuns = 0;
+  let movedDuringPostRerunDirt = false;
+  let persisted: TesterEvidence | null = null;
+  const { runStoreDeps } = memoryTesterDeps();
+
+  const gate = await runTestGate(
+    { ...baseCfg(), test_gate: { ...baseCfg().test_gate, max_attempts: 1 } },
+    1562,
+    "/wt",
+    {
+      runTests: async () => ({
+        passed: ++testRuns === 2,
+        output: testRuns === 1 ? "FAIL" : "ok",
+        durationSec: 0.1,
+        toolingError: false,
+      }),
+      invoke: async () => okInvoke(),
+      gitHead: async () => currentHead,
+      gitDirty: async () => {
+        if (testRuns === 2) {
+          currentHead = movedHead;
+          movedDuringPostRerunDirt = true;
+        }
+        return false;
+      },
+      verifyTestFix: async () => {
+        throw new Error("clean no-change retry must not enter commit verification");
+      },
+      writeTesterEvidence: async (_dest, evidence) => {
+        persisted = evidence;
+        return { ok: true };
+      },
+      resolvePinnedEngineIdentity: () => null,
+    },
+    "1562/2026-09-08T17:23:07Z",
+    "test-gate",
+    undefined,
+    "/runs/1562-moved-before-persistence",
+    runStoreDeps,
+  );
+
+  assert.equal(testRuns, 2);
+  assert.equal(movedDuringPostRerunDirt, true);
+  assert.equal(gate.passed, false);
+  assert.match(gate.blockReason ?? "", /candidate moved before clean no-change evidence persistence/);
+  assert.notEqual(persisted?.overall_status, "passed");
 });
 
 test("formatted empty test-fix commit cannot produce passed Tester evidence (#1562 review 1)", async () => {
@@ -374,6 +455,7 @@ test("formatted empty test-fix commit cannot produce passed Tester evidence (#15
   let headReads = 0;
   let testRuns = 0;
   let persisted: TesterEvidence | null = null;
+  const { runStoreDeps } = memoryTesterDeps();
 
   const gate = await runTestGate(
     { ...baseCfg(), test_gate: { ...baseCfg().test_gate, max_attempts: 1 } },
@@ -402,6 +484,7 @@ test("formatted empty test-fix commit cannot produce passed Tester evidence (#15
     "test-gate",
     undefined,
     "/runs/1562-empty-commit",
+    runStoreDeps,
   );
 
   assert.equal(gate.passed, false);
