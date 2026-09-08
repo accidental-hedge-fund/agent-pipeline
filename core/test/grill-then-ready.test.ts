@@ -9,6 +9,7 @@ import {
   extractSpecCore,
   parseDecisionsFromBody,
   parseDecisionsArtifact,
+  renderDecisionsSection,
   applyReviewerVerdicts,
   implementerSelfAccepted,
   makeNode,
@@ -92,7 +93,7 @@ import {
 import { runTriage, TriageReadyError, type TriageDeps } from "../scripts/stages/triage.ts";
 import { COMMAND_REGISTRY, validateFlags } from "../scripts/command-registry.ts";
 import { buildCmd, maxPositionalsFor } from "../scripts/pipeline.ts";
-import { sha256Prefixed } from "../scripts/grill-hash.ts";
+import { canonicalJson, sha256Hex, sha256Prefixed } from "../scripts/grill-hash.ts";
 import { buildGrillImplementerPrompt, buildGrillReviewerPrompt } from "../scripts/prompts/index.ts";
 import type { GrillReadySnapshot } from "../scripts/grill-ready.ts";
 
@@ -326,6 +327,237 @@ test("grill: valid artifact embeds, parses, and render matches", () => {
     assert.equal(parsed.artifact.nodes.length, 5);
     assert.equal(extractSpecCore(body).includes("Do the thing"), true);
   }
+});
+
+test("grill: repeated authority evidence is stored once and round-trips through the body artifact", () => {
+  const spec = "## Summary\nKeep this unrelated specification text.\n";
+  const sharedEvidence = "e".repeat(25_000);
+  const nodes = Array.from({ length: 11 }, (_, i) => {
+    const node = makeNode({
+      id: `authority-${i}`,
+      question: `Who authorizes operation ${i}?`,
+      recommendation: `Obtain authority ${i}`,
+      class: "merge-release",
+    });
+    return {
+      ...node,
+      typed_request: "AuthorityRequest" as const,
+      rationale: `Protected operation ${i}`,
+      alternatives: [],
+      risk: "high",
+      evidence: [sharedEvidence],
+      authority_request: {
+        eligible_actor: "authenticated-github-actor",
+        repository: "acme/repo",
+        operation: `operation-${i}`,
+        scope: "merge-release",
+        candidate_epoch: null,
+        evidence: [sharedEvidence],
+        expiry: "2026-09-09T00:00:00.000Z",
+        grant: null,
+      },
+    };
+  });
+  const art = artifact(nodes, spec);
+
+  const body = embedDecisionsInBody(spec, art);
+
+  assert.ok(body.length <= 65_536, `body length ${body.length} exceeds GitHub's supported issue-body ceiling`);
+  assert.equal(body.split(sharedEvidence).length - 1, 1, "shared evidence content is persisted once");
+  assert.match(body, /Keep this unrelated specification text/);
+  const parsed = parseDecisionsFromBody(body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) {
+    assert.deepEqual(parsed.artifact, art);
+    assert.equal(parsed.artifact.nodes[7]!.authority_request!.evidence[0], sharedEvidence);
+    assert.equal(nodeDefinitionDigest(parsed.artifact.nodes[7]!), nodeDefinitionDigest(nodes[7]!));
+  }
+});
+
+test("grill: genuinely unique oversized evidence fails before publication", () => {
+  const spec = "## Summary\nUnique evidence cannot be discarded.\n";
+  const nodes = Array.from({ length: 3 }, (_, i) => ({
+    ...makeNode({
+      id: `unique-${i}`,
+      question: `Question ${i}?`,
+      recommendation: `Recommendation ${i}`,
+      class: "test-evidence",
+    }),
+    rationale: `Rationale ${i}`,
+    alternatives: [],
+    risk: "low",
+    evidence: [String(i).repeat(25_000)],
+  }));
+
+  assert.throws(
+    () => embedDecisionsInBody(spec, artifact(nodes, spec)),
+    /issue body exceeds.*65,536/i,
+  );
+});
+
+test("grill: evidence catalog references reject content tampering even with a recomputed public body digest", () => {
+  const spec = "## Summary\nTamper check.\n";
+  const evidence = "shared evidence ".repeat(200);
+  const nodes = ["one", "two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "test-evidence" }),
+    rationale: id,
+    alternatives: [],
+    risk: "low",
+    evidence: [evidence],
+  }));
+  const body = embedDecisionsInBody(spec, artifact(nodes, spec));
+  const payloadMatch = body.match(/```pipeline-decisions-v1\n([\s\S]*?)\n```/);
+  assert.ok(payloadMatch);
+  const originalPayload = payloadMatch[1]!;
+  const tamperedPayload = originalPayload.replace(evidence, `${evidence}tampered`);
+  assert.notEqual(tamperedPayload, originalPayload);
+  const tamperedBody = body
+    .replace(originalPayload, tamperedPayload)
+    .replace(sha256Hex(originalPayload), sha256Hex(tamperedPayload));
+
+  const parsed = parseDecisionsFromBody(tamperedBody);
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) {
+    assert.equal(parsed.code, "digest_mismatch");
+    assert.match(parsed.reason, /evidence catalog digest/);
+  }
+});
+
+test("grill: evidence catalog rejects a tampered reference with a recomputed public body digest", () => {
+  const spec = "## Summary\nReference tamper check.\n";
+  const evidence = "shared evidence ".repeat(200);
+  const nodes = ["one", "two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "test-evidence" }),
+    rationale: id,
+    alternatives: [],
+    risk: "low",
+    evidence: [evidence],
+  }));
+  const body = embedDecisionsInBody(spec, artifact(nodes, spec));
+  const payloadMatch = body.match(/```pipeline-decisions-v1\n([\s\S]*?)\n```/);
+  assert.ok(payloadMatch);
+  const originalPayload = payloadMatch[1]!;
+  const wire = JSON.parse(originalPayload) as {
+    nodes: Array<{ evidence: Array<{ evidence_ref: string }> }>;
+  };
+  wire.nodes[0]!.evidence[0]!.evidence_ref = `sha256:${"f".repeat(64)}`;
+  const tamperedPayload = canonicalJson(wire);
+  const tamperedBody = body
+    .replace(originalPayload, tamperedPayload)
+    .replace(sha256Hex(originalPayload), sha256Hex(tamperedPayload));
+
+  const parsed = parseDecisionsFromBody(tamperedBody);
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) {
+    assert.equal(parsed.code, "invalid_shape");
+    assert.match(parsed.reason, /references missing evidence/);
+  }
+});
+
+test("grill: tiny repeated evidence stays inline when references would increase body size", () => {
+  const spec = "## Summary\nSmall evidence.\n";
+  const nodes = ["one", "two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "test-evidence" }),
+    rationale: id,
+    alternatives: [],
+    risk: "low",
+    evidence: ["x"],
+  }));
+
+  const body = embedDecisionsInBody(spec, artifact(nodes, spec));
+  assert.doesNotMatch(body, /evidence_catalog/);
+  assert.match(body, /\*\*Evidence:\*\* x/);
+});
+
+test("grill: legacy inline-evidence artifacts and rendered sections remain readable", () => {
+  const spec = "## Summary\nLegacy artifact.\n";
+  const evidence = "legacy shared evidence";
+  const nodes = ["legacy-one", "legacy-two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "test-evidence" }),
+    rationale: id,
+    alternatives: [],
+    risk: "low",
+    evidence: [evidence],
+  }));
+  const art = artifact(nodes, spec);
+  const payload = canonicalJson(art);
+  const legacyBody = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(payload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${payload}\n\`\`\``,
+    "",
+    renderDecisionsSection(art).trimEnd(),
+    "",
+  ].join("\n");
+
+  const parsed = parseDecisionsFromBody(legacyBody);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) assert.deepEqual(parsed.artifact, art);
+});
+
+test("grill: hash-bound handoff materialization consumes compact evidence artifacts", () => {
+  const spec = "## Summary\nAuthenticated handoff.\n";
+  const evidence = "authority evidence ".repeat(500);
+  const nodes = ["authority-one", "authority-two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "merge-release" }),
+    rationale: id,
+    alternatives: [],
+    risk: "high",
+    evidence: [evidence],
+  }));
+  const art = artifact(nodes, spec);
+  const body = embedDecisionsInBody(spec, art);
+  const handoff = handoffForNode(nodes[0]!);
+  const bodyDigest = sha256Prefixed(body);
+  handoff.scope.content_hashes![0] = bodyDigest;
+  handoff.declaration_identity = handoff.declaration_identity!
+    .replace(`:${"a".repeat(64)}:`, `:${bodyDigest.slice("sha256:".length)}:`);
+
+  const result = materializeGrillNode({ liveBody: body, handoff, answerText: "approved" });
+  assert.equal(result.ok, true, result.ok ? "" : result.reason);
+  if (result.ok) {
+    assert.equal(result.artifact.nodes[0]!.provenance.reference, `handoff:${handoff.handoff_id}`);
+    assert.equal(result.artifact.nodes[0]!.evidence![0], evidence);
+    const reparsed = parseDecisionsFromBody(result.body);
+    assert.equal(reparsed.ok, true, reparsed.ok ? "" : reparsed.reason);
+  }
+});
+
+test("grill: ready validation consumes a compact evidence artifact", () => {
+  const title = "T";
+  const spec = "## Summary\nCompact ready artifact.\n";
+  const evidence = "ready evidence ".repeat(300);
+  const nodes = ["ready-one", "ready-two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "test-evidence" }),
+    resolution: "resolved" as const,
+    provenance: {
+      settled_by: "auto-accept" as const,
+      reference: null,
+      reviewer_verdict: null,
+      reviewer_reason: null,
+      eligibility_reason: NON_AUTHORITY_ELIGIBILITY_REASON,
+    },
+    rationale: id,
+    alternatives: [],
+    risk: "low",
+    evidence: [evidence],
+  }));
+  const art = artifact(nodes, spec, title);
+  const body = embedDecisionsInBody(spec, art);
+
+  const ready = validateDecisionsForReady({
+    title,
+    body,
+    fingerprint: art.fingerprint,
+    contextMd: "**Grill**:\nA one-shot intake interview.\n",
+    integrationBaseSha: art.fingerprint.integration_base_sha,
+    handoffs: [],
+    comments: [],
+    frontier: frontierFor(body, art),
+  });
+  assert.equal(ready.ok, true, ready.ok ? "" : ready.reason);
+  if (ready.ok) assert.equal(ready.artifact.nodes[1]!.evidence![0], evidence);
 });
 
 test("grill: unknown schema version fails closed", () => {
