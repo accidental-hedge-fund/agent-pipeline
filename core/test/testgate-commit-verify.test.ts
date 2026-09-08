@@ -445,6 +445,54 @@ test("post-rerun HEAD movement blocks before passed Tester evidence persistence 
   assert.notEqual(persisted?.overall_status, "passed");
 });
 
+test("HEAD movement during no-change evidence write invalidates passed evidence (#1562 review 2)", async () => {
+  const candidate = "a".repeat(40);
+  const movedHead = "b".repeat(40);
+  let currentHead = candidate;
+  let testRuns = 0;
+  let writes = 0;
+  let persisted: TesterEvidence | null = null;
+  const { runStoreDeps } = memoryTesterDeps();
+
+  const gate = await runTestGate(
+    { ...baseCfg(), test_gate: { ...baseCfg().test_gate, max_attempts: 1 } },
+    1562,
+    "/wt",
+    {
+      runTests: async () => ({
+        passed: ++testRuns === 2,
+        output: testRuns === 1 ? "FAIL" : "ok",
+        durationSec: 0.1,
+        toolingError: false,
+      }),
+      invoke: async () => okInvoke(),
+      gitHead: async () => currentHead,
+      gitDirty: async () => false,
+      verifyTestFix: async () => {
+        throw new Error("clean no-change retry must not enter commit verification");
+      },
+      writeTesterEvidence: async (_dest, evidence) => {
+        writes++;
+        persisted = evidence;
+        if (writes === 1) currentHead = movedHead;
+        return { ok: true };
+      },
+      resolvePinnedEngineIdentity: () => null,
+    },
+    "1562/2026-09-08T19:00:55Z",
+    "test-gate",
+    undefined,
+    "/runs/1562-moved-during-persistence",
+    runStoreDeps,
+  );
+
+  assert.equal(gate.passed, false);
+  assert.match(gate.blockReason ?? "", /candidate moved during clean no-change evidence persistence/);
+  assert.equal(gate.persist?.ok, false);
+  assert.equal(writes, 2, "the passed write must be replaced with unavailable evidence");
+  assert.equal(persisted?.overall_status, "unavailable");
+});
+
 test("formatted empty test-fix commit cannot produce passed Tester evidence (#1562 review 1)", async () => {
   const candidate = "a".repeat(40);
   const emptyCommit = "b".repeat(40);

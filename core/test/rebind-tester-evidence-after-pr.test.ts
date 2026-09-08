@@ -841,6 +841,7 @@ async function driveDesignGateAdvance(opts: {
   prHeadSha?: string | null;
   prHeadSequence?: string[];
   worktreeHead?: string | null;
+  worktreeHeadAfterRebind?: string | null;
   worktreeHeadAfter?: string | null;
   worktreeHeadAfterDispatch?: Array<string | null>;
   prHeadAfterDispatch?: Array<string | null>;
@@ -1022,8 +1023,13 @@ async function driveDesignGateAdvance(opts: {
     testerIo: io,
     rebindTesterEvidenceAfterPr: async (input) => {
       rebindCalls.push(input);
-      if (opts.rebind) return opts.rebind(input);
-      return rebindTesterEvidenceAfterPr(input);
+      const result = opts.rebind
+        ? await opts.rebind(input)
+        : await rebindTesterEvidenceAfterPr(input);
+      if (opts.worktreeHeadAfterRebind !== undefined) {
+        currentWorktreeHead = opts.worktreeHeadAfterRebind;
+      }
+      return result;
     },
     setBlocked: (async (_c, _n, reason, _stage, kind) => {
       setBlocked.push({ reason, kind });
@@ -1244,6 +1250,27 @@ test("runAdvance fail-closes when PR head disagrees with the pushed head", async
     (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
       ?.detail?.evidence_ordering?.blocker_code,
     "tester_rebind_pr_head_mismatch",
+  );
+});
+
+test("runAdvance fail-closes when the worktree candidate moves before consumer dispatch (#1562 review 2)", async () => {
+  const driven = await driveDesignGateAdvance({
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    worktreeHeadAfterRebind: SHA_B,
+    rebind: async () => ({
+      ok: true,
+      action: "bind",
+      candidateSha: SHA_S,
+      evidence: boundPassedAt(SHA_S),
+      suiteCommandInvoked: false,
+    }),
+  });
+
+  assert.equal(driven.dispatchCalls, 0);
+  assert.ok(
+    driven.setBlocked.some((row) => /dispatch worktree HEAD.*disagrees with bound candidate/.test(row.reason)),
   );
 });
 

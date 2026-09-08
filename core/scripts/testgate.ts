@@ -384,7 +384,7 @@ export async function runTestGate(
       includeLastCommand?: boolean;
       candidateSha?: string;
     },
-  ): Promise<TesterProducerPersistObservation> => {
+  ): Promise<TesterProducerPersistObservation & { candidateTransitionReason?: string }> => {
     if (!runDir) {
       return { ok: true, candidate_sha: null };
     }
@@ -500,6 +500,47 @@ export async function runTestGate(
             }),
       });
       const writeFn = deps.writeTesterEvidence ?? writeTesterEvidence;
+      const candidateTransitionReason = async (): Promise<string | null> => {
+        if (!opts.candidateSha) return null;
+        let observedHead: string | null = null;
+        try {
+          observedHead = normalizeCandidateSha(
+            await (deps.gitHead ?? defaultGitHead)(wtPath),
+          );
+        } catch {
+          observedHead = null;
+        }
+        return observedHead === pinned
+          ? null
+          : "Test-fix candidate moved during clean no-change evidence persistence; " +
+              `expected HEAD ${pinned}, observed ${observedHead ?? "unavailable"}.`;
+      };
+      const persistUnavailableAfterTransition = async (
+        reason: string,
+      ): Promise<TesterProducerPersistObservation & { candidateTransitionReason: string }> => {
+        const invalidated = await writeFn(
+          runDir,
+          {
+            ...evidence,
+            overall_status: "unavailable",
+            overall_reason: reason,
+          },
+          { maxArtifactChars, runStoreDeps },
+        );
+        return {
+          ok: false,
+          candidate_sha: candidateSha,
+          code: "persist_write_failed",
+          error: invalidated.ok
+            ? reason
+            : `${reason} ${boundExcerpt(invalidated.error ?? "Tester evidence invalidation write failed", 500)}`,
+          candidateTransitionReason: reason,
+        };
+      };
+      const beforeWriteTransition = await candidateTransitionReason();
+      if (beforeWriteTransition) {
+        return persistUnavailableAfterTransition(beforeWriteTransition);
+      }
       const write = await writeFn(runDir, evidence, {
         maxArtifactChars,
         runStoreDeps,
@@ -515,6 +556,10 @@ export async function runTestGate(
           code: "persist_write_failed",
           error,
         };
+      }
+      const afterWriteTransition = await candidateTransitionReason();
+      if (afterWriteTransition) {
+        return persistUnavailableAfterTransition(afterWriteTransition);
       }
       return { ok: true, candidate_sha: candidateSha };
     } catch (err) {
@@ -567,7 +612,17 @@ export async function runTestGate(
         };
       }
     }
-    const persist = await recordEvidence(finalGate, finalEvidence);
+    const { candidateTransitionReason, ...persist } = await recordEvidence(
+      finalGate,
+      finalEvidence,
+    );
+    if (candidateTransitionReason) {
+      finalGate = {
+        ...finalGate,
+        passed: false,
+        blockReason: candidateTransitionReason,
+      };
+    }
     return {
       ...finalGate,
       recorded_required_exit_0: recordedRequiredExit0(),
