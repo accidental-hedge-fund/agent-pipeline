@@ -36,7 +36,7 @@ export const FRG_HYBRID_V2_PRE_FIXTURE_CONTRACT_MAX_VERSION = "1.40.0";
  * `loadFrgPack().manifest_sha256`.
  */
 export const FRG_HYBRID_V2_MANIFEST_SHA256 =
-  "346624a8b5447f7ddcb14d2ad94b35f7e3f34024175c7a98f50c99d6bfa3d7f4";
+  "85cde3f140718fe7bdcd4dddacb596ef3d5e2c8a5adaadb768c200165ac88085";
 /**
  * Frozen historical hybrid-v1 Layer A probe ids.
  * Decode `factory-gate-v1-hybrid-v1` / 1.33.0 evidence only.
@@ -643,6 +643,20 @@ function checkedReleaseVersion(value: unknown, field: string): string {
   return result;
 }
 
+const OPENSPEC_CHANGE_ID_MAX_CHARS = 200;
+
+function frgOpenSpecChangeId(packRunId: string, templateId: string): string {
+  const normalizedRunId = packRunId
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  const value = `frg-${normalizedRunId}-${templateId}`;
+  if (value.length <= OPENSPEC_CHANGE_ID_MAX_CHARS) return value;
+  const suffix = `-${sha256(`${packRunId}\0${templateId}`).slice(0, 16)}`;
+  return `${value.slice(0, OPENSPEC_CHANGE_ID_MAX_CHARS - suffix.length).replace(/-+$/g, "")}${suffix}`;
+}
+
 function replaceTemplate(source: string, values: Readonly<Record<string, string>>, field: string): string {
   let result = source;
   for (const [key, value] of Object.entries(values)) result = result.replaceAll(`{{${key}}}`, value);
@@ -679,6 +693,7 @@ export function renderFrgPackIssues(
       manifest_sha256: pack.manifest_sha256,
       release_version: releaseVersion,
       pack_run_id: packRunId,
+      openspec_change_id: frgOpenSpecChangeId(packRunId, template.id),
       template_id: template.id,
       template_sha256: template.sha256,
     };

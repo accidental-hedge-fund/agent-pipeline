@@ -200,14 +200,14 @@
       "id": "clean-docs",
       "title": "test(frg): {{release_version}} {{pack_run_id}} clean docs path",
       "file": "templates/clean-docs.md",
-      "sha256": "8ad1e53ba55670519c97847c1c572e1d954777bb119fbdeac75e6e98b1e4927c",
+      "sha256": "48baa528442b7e35af877fba41fe657c1aed59517b37793f39e21abadb56387d",
       "clean_path": true
     },
     {
       "id": "clean-openspec",
       "title": "test(frg): {{release_version}} {{pack_run_id}} clean OpenSpec path",
       "file": "templates/clean-openspec.md",
-      "sha256": "dbcec22e7d9092a74a0655ca77bf90112105a392d5655f495dab371f8b2a3f7d",
+      "sha256": "65df91ffbc22bae72a0ec7f0628717ff19ce9c5042b20aac1c24a2952c5eb3c1",
       "clean_path": true
     }
   ],
