@@ -746,16 +746,22 @@ export async function grillOneIssue(
     key,
   });
   persistGrillFrontier(deps.repoDir, frontier, deps.keyDeps ?? defaultGrillProposalKeyDeps);
-  const currentHandoffs = await listHandoffs(
+  const superseded = await supersedeStaleGrillHandoffs(
     deps.repoDir,
-    { issue: issueNumber },
+    {
+      issueNumber,
+      artifact,
+      proposedBody: newBody,
+      frontierFp,
+      currentHandoffs: handoffResult.created,
+    },
     deps.handoffStore,
   );
-  await supersedeStaleGrillHandoffs(
-    deps.repoDir,
-    { issueNumber, artifact, proposedBody: newBody, frontierFp, currentHandoffs },
-    deps.handoffStore,
-  );
+  if (!superseded.ok) {
+    state.status = "failed";
+    state.error = `handoff supersede failed: ${superseded.reason}`;
+    return state;
+  }
 
   const applied = await deps.getIssue(issueNumber);
   const appliedBody = applied?.body ?? newBody;

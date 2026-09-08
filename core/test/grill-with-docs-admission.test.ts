@@ -44,7 +44,7 @@ import { buildCmd, maxPositionalsFor } from "../scripts/pipeline.ts";
 import { planningTreatmentFromConfig } from "../scripts/grill-issue.ts";
 import { evaluateIssueReadiness } from "../scripts/issue-readiness.ts";
 import type { GrillProposalKeyDeps } from "../scripts/grill-proposal.ts";
-import type { HandoffStoreDeps } from "../scripts/human-question-handoff.ts";
+import { listHandoffs, type HandoffStoreDeps } from "../scripts/human-question-handoff.ts";
 import { makeNode } from "../scripts/grill-decisions.ts";
 import { IssueBodyPublicationError } from "../scripts/issue-body-publisher.ts";
 
@@ -1148,6 +1148,92 @@ test("grill: publication failure stays waiting under the admitted operation and 
   assert.equal(resumed.issues["10"]?.logical_operation_id, logicalOperationId);
   assert.notEqual(resumed.issues["10"]?.status, "failed");
   assert.equal(observations.length, 1, "successful resume must not mint/report a replacement operation");
+});
+
+test("grill: changed authority definition on publication resume supersedes only the stale binding", async () => {
+  const world: FakeWorld = {
+    issues: new Map([[10, openIssue(10)]]),
+    bodies: [],
+    labelsWritten: [],
+    labelsRemoved: [],
+    implementerCalls: [],
+    gitWrites: [],
+    docsPrs: [],
+    callLog: [],
+    milestoneMembers: [],
+    labelMembers: new Map(),
+  };
+  const store = memoryStore();
+  const handoffStore = memoryHandoffStore();
+  const deps = makeDeps(world, store);
+  deps.handoffStore = handoffStore;
+  const outputFor = (question: string) => implementerJson({
+    nodes: [
+      autoSettleNodeJson("merge-release", {
+        question,
+        recommendation: `Obtain authority for ${question}`,
+      }),
+    ],
+  });
+  let implementerAttempt = 0;
+  deps.runImplementer = async (prompt) => {
+    world.implementerCalls.push(prompt);
+    implementerAttempt += 1;
+    return {
+      success: true,
+      output: outputFor(implementerAttempt === 1 ? "Original authority boundary?" : "Refined authority boundary?"),
+    };
+  };
+  let publicationAttempt = 0;
+  deps.updateIssueBody = async (n, body) => {
+    publicationAttempt += 1;
+    if (publicationAttempt === 1) {
+      throw new IssueBodyPublicationError({
+        acknowledged: false,
+        kind: "spawn_failure",
+        diagnostic: "injected publication failure",
+        exitCode: null,
+      });
+    }
+    world.bodies.push(body);
+    const current = world.issues.get(n);
+    if (current) world.issues.set(n, { ...current, body });
+  };
+
+  const firstCode = await runGrill({ issue: 10 }, deps);
+  assert.equal(firstCode, 0);
+  const ledgerPath = [...store.files.keys()].find((p) => p.endsWith("/ledger.json"));
+  assert.ok(ledgerPath);
+  const firstLedger = JSON.parse(store.files.get(ledgerPath!)!) as { run_id: string };
+  const afterFailure = await listHandoffs("/tmp/repo", { issue: 10 }, handoffStore);
+  assert.ok(afterFailure.length > 0);
+  assert.equal(
+    afterFailure.every((handoff) => handoff.status === "pending"),
+    true,
+    "failed publication must not supersede unverified bindings",
+  );
+  const failedPublicationIds = new Set(afterFailure.map((handoff) => handoff.handoff_id));
+
+  const resumedCode = await runGrill({ resume: firstLedger.run_id }, deps);
+  assert.equal(resumedCode, 0);
+  const afterResume = await listHandoffs("/tmp/repo", { issue: 10 }, handoffStore);
+  const oldBinding = afterResume.find((handoff) => handoff.question === "Original authority boundary?");
+  const newBinding = afterResume.find((handoff) => handoff.question === "Refined authority boundary?");
+  assert.ok(oldBinding);
+  assert.ok(newBinding);
+  assert.equal(oldBinding.status, "superseded");
+  assert.equal(oldBinding.superseded_by, newBinding.handoff_id);
+  assert.equal(newBinding.status, "pending");
+  assert.equal(newBinding.superseded_by, null);
+  assert.equal(
+    afterResume
+      .filter((handoff) => failedPublicationIds.has(handoff.handoff_id))
+      .every((handoff) => handoff.status === "superseded"),
+    true,
+  );
+  assert.equal(world.labelsWritten.some(({ label }) => label === "pipeline:ready"), false);
+  const resumed = await loadGrillLedger(store, firstLedger.run_id);
+  assert.equal(resumed.issues["10"]?.status, "waiting", "a current authority request remains unresolved");
 });
 
 test("grill: two issues settling the same term open one docs PR", async () => {
