@@ -6336,6 +6336,211 @@ test("tester evidence-ordering diagnostic skips scratch/publish and claims rebin
   );
 });
 
+test("linked child events refine coarse evidence and reach an unspent strategy after class budget zero (#1568)", async () => {
+  const enginePolicy = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-engine-defect": {
+        ...enginePolicy,
+        backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
+      },
+    },
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const prHead = "b".repeat(40);
+  const coarse = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "loop transport failed",
+    stage: "loop-supervisor",
+  });
+  const precise = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "tester_rebind_pr_head_unobservable",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      blocker_code: "tester_rebind_pr_head_unobservable",
+      subject_omitted_because_unobservable: true,
+      pr_head: prHead,
+    },
+  });
+  let dispatchCount = 0;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    if (dispatchCount > 1) {
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "abandoned",
+        evidence: { pr_number: 99, pipeline_run_id: "advance-100-resumed" },
+      };
+    }
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_recoverable",
+      evidence: {
+        pr_number: 99,
+        pipeline_run_id: "advance-100",
+        events_path: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      },
+      diagnostic: coarse,
+    };
+  };
+  const actions: string[] = [];
+  const linkedReads: number[] = [];
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    actions.push(input.action);
+    return input.action === "rebind_tester_evidence_after_pr"
+      ? { succeeded: true, evidence: "rebound exact Tester evidence" }
+      : { succeeded: false, evidence: "scratch absent", error: "scratch absent" };
+  };
+  const observe = fakeObserveDeps({
+    async getLocalHead() {
+      return { branch: "pipeline/100-x", sha: prHead };
+    },
+  }).deps;
+  const supervisorDeps: SupervisorDeps = {
+    store: deps,
+    observe,
+    dispatchItem,
+    executeRecovery,
+    repoDir: "/repo",
+    readAdvanceEvents: async (eventsPath) => {
+      assert.equal(eventsPath, "/repo/.agent-pipeline/runs/advance-100/events.jsonl");
+      linkedReads.push(actions.length);
+      if (actions.length < 2) return [];
+      return [{
+        type: "blocker_set",
+        run_id: "advance-100",
+        issue: 100,
+        blocker_kind: "harness-failure",
+        reason: precise.detail.reason,
+        stage: precise.detail.stage,
+        diagnostic: precise,
+      } as never];
+    },
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle(supervisorDeps, "run-1", token, "claude");
+  await runSupervisorCycle(supervisorDeps, "run-1", token, "claude");
+  const spent = await readLedger(deps, "run-1");
+  assert.equal(spent.items["100"]!.recovery_budgets_remaining["workflow-engine-defect"], 0);
+  assert.deepEqual(actions, ["unlink_engine_scratch", "unlink_engine_scratch"]);
+  const episodeId = spent.recovery_attempts[0]!.episode_id;
+
+  await runSupervisorCycle(supervisorDeps, "run-1", token, "claude");
+  const repaired = await readLedger(deps, "run-1");
+  assert.ok(dispatchCount >= 1, "the original linked advance remains the diagnostic authority");
+  assert.ok(linkedReads.includes(2), `expected recovery linked-event read after two attempts, got ${linkedReads}`);
+  assert.deepEqual(actions, [
+    "unlink_engine_scratch",
+    "unlink_engine_scratch",
+    "rebind_tester_evidence_after_pr",
+  ]);
+  assert.equal(repaired.recovery_attempts.at(-1)?.episode_id, episodeId);
+  assert.equal(
+    repaired.recovery_attempts.filter(
+      (attempt) => attempt.action === "unlink_engine_scratch" && attempt.outcome !== "skipped",
+    ).length,
+    2,
+  );
+});
+
+test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1568)", async () => {
+  const head = "c".repeat(40);
+  const precise = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "tester_rebind_pr_head_unobservable",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      pr_head: head,
+    },
+  });
+  const terminalEvent = {
+    type: "blocker_set",
+    run_id: "advance-100",
+    issue: 100,
+    blocker_kind: "harness-failure",
+    reason: precise.detail.reason,
+    stage: precise.detail.stage,
+    diagnostic: precise,
+  } as never;
+  const cases = [
+    { name: "missing", eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl", events: [] },
+    { name: "malformed", eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl", events: null as never },
+    { name: "arbitrary path", eventsPath: "/tmp/advance-100/events.jsonl", events: [terminalEvent], expectRead: false },
+    {
+      name: "run mismatch",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...terminalEvent, run_id: "another-run" } as never],
+    },
+    {
+      name: "item mismatch",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...terminalEvent, issue: 999 } as never],
+    },
+    {
+      name: "non-terminal",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ type: "stage_started", run_id: "advance-100", issue: 100 } as never],
+    },
+  ];
+
+  for (const candidate of cases) {
+    const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+    const ledger = testLedger({ "100": itemEntry("100", "pending") });
+    const { deps } = await setup(contract, ledger);
+    const actions: string[] = [];
+    let readCount = 0;
+    const { token } = await acquireLock(deps, "run-1", "claude");
+    await runSupervisorCycle({
+      store: deps,
+      observe: fakeObserveDeps({ async getLocalHead() { return { branch: "pipeline/100-x", sha: head }; } }).deps,
+      repoDir: "/repo",
+      readAdvanceEvents: async () => {
+        readCount++;
+        return candidate.events;
+      },
+      dispatchItem: async (request) => ({
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "blocked_recoverable",
+        evidence: { pr_number: 99, pipeline_run_id: "advance-100", events_path: candidate.eventsPath },
+        diagnostic: buildStageDiagnostic({
+          reasonCode: "workflow-engine-defect",
+          blockerKind: "harness-failure",
+          reason: "coarse transport evidence",
+          stage: "loop-supervisor",
+        }),
+      }),
+      executeRecovery: async (input) => {
+        actions.push(input.action);
+        return { succeeded: false, evidence: "failed", error: "failed" };
+      },
+    }, "run-1", token, "claude");
+
+    assert.equal(actions.includes("rebind_tester_evidence_after_pr"), false, candidate.name);
+    assert.equal(actions[0], "unlink_engine_scratch", candidate.name);
+    assert.equal(readCount, candidate.expectRead === false ? 0 : 1, candidate.name);
+  }
+});
+
 test("inapplicable never-started preflight recipes are not recovery exhaustion", async () => {
   const engineDefect = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
   const contract = testContract({

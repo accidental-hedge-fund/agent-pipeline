@@ -49,6 +49,7 @@ export interface AdvanceStageEvent {
   round?: number;
   at?: string;
   outcome?: string;
+  [key: string]: unknown;
 }
 
 /** Result of mapping one advance event onto the current projection. */

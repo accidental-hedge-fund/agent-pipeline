@@ -608,3 +608,75 @@ test("runPlanningPhases: missing proposal.md on a resolved id blocks without com
   assert.equal(revisionCalls, 0, "invokeRevision must not run");
   assert.deepEqual(reviewPrompts, [], "GitHub comment must not become plan text");
 });
+
+test("runPlanningPhases: applied OpenSpec refinement supplies the authoritative implementation input (#1568)", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let deltas = LIVING_DELTAS;
+  const implementationPrompts: string[] = [];
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => deltas,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = "Authoritative refined proposal PIN-1568";
+          tasks = "- [ ] authoritative refined task PIN-1568";
+          deltas = "#### spec.md\n\nRefined requirement PIN-1568 SHALL hold.";
+          return revisionOkResult;
+        }
+        implementationPrompts.push(prompt);
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(implementationPrompts.length, 1);
+  assert.match(implementationPrompts[0]!, /Authoritative refined proposal PIN-1568/);
+  assert.match(implementationPrompts[0]!, /authoritative refined task PIN-1568/);
+  assert.match(implementationPrompts[0]!, /Refined requirement PIN-1568 SHALL hold/);
+  assert.doesNotMatch(implementationPrompts[0]!, /- \[ \] original task/);
+});
+
+test("runPlanningPhases: acknowledged but unapplied OpenSpec refinement blocks before implementation (#1568)", async () => {
+  let blocked: { reason: string; tag: string } | undefined;
+  let implementationCalls = 0;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], livingFileInjects());
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+        blocked = { reason, tag };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (!prompt.includes("Original implementation plan:")) implementationCalls++;
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.tag, "openspec-invalid");
+  assert.match(blocked?.reason ?? "", /acknowledged.*unchanged/i);
+  assert.equal(implementationCalls, 0);
+});

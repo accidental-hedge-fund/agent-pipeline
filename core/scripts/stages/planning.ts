@@ -399,6 +399,11 @@ export interface PlanningPhaseHooks {
     | { ok: false; reason: string; tag: BlockerKind }
   >;
 
+  /** Capture the authoritative artifact immediately before plan revision. */
+  captureRevisionBaseline?(wt: { path: string }): Promise<
+    { ok: true } | { ok: false; reason: string; tag: BlockerKind }
+  >;
+
   /** Build the PR body from the plan excerpt and harness names. */
   buildPrBody(
     cfg: PipelineConfig,
@@ -1175,6 +1180,15 @@ export async function runPlanningPhases(
       );
       recordRevisionSalvage(outcome);
     };
+
+    if (hooks.captureRevisionBaseline) {
+      const baseline = await hooks.captureRevisionBaseline(wt);
+      if (!baseline.ok) {
+        await doSetBlocked(cfg, issueNumber, baseline.reason, "plan-review", baseline.tag);
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+        return blockedOutcome(baseline.reason, baseline.tag);
+      }
+    }
 
     const headBeforeInitial = (
       await doGitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
@@ -2080,6 +2094,23 @@ export function makeOpenspecPlanningHooks(
   const validateItem = inject.validateItem ?? openspec.validateItem;
   const readChangeFile = inject.readChangeFile ?? openspec.readChangeFile;
   const readSpecDeltas = inject.readSpecDeltas ?? openspec.readSpecDeltas;
+  type AuthoritativeArtifact = {
+    proposal: string;
+    tasks: string;
+    specContext: string;
+  };
+  let revisionBaseline: AuthoritativeArtifact | null = null;
+  let validatedArtifact: AuthoritativeArtifact | null = null;
+
+  const readAuthoritativeArtifact = (wtPath: string): AuthoritativeArtifact | null => {
+    const proposal = readChangeFile(wtPath, changeId, "proposal.md")?.trim() ?? "";
+    if (!proposal) return null;
+    return {
+      proposal,
+      tasks: readChangeFile(wtPath, changeId, "tasks.md")?.trim() ?? "",
+      specContext: readSpecDeltas(wtPath, changeId),
+    };
+  };
 
   const restoreChangeIdIfEmpty = (
     wtPath: string,
@@ -2345,6 +2376,29 @@ export function makeOpenspecPlanningHooks(
       return { ok: true };
     },
 
+    async captureRevisionBaseline(wt) {
+      const restored = restoreChangeIdIfEmpty(wt.path);
+      if (!restored.ok) return { ok: false, reason: restored.reason, tag: "openspec-invalid" };
+      try {
+        revisionBaseline = readAuthoritativeArtifact(wt.path);
+      } catch (err) {
+        revisionBaseline = null;
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` could not be read before revision: ${err instanceof Error ? err.message : String(err)}`,
+          tag: "openspec-invalid",
+        };
+      }
+      if (!revisionBaseline) {
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` has no readable proposal.md before revision`,
+          tag: "openspec-invalid",
+        };
+      }
+      return { ok: true };
+    },
+
     async revalidateArtifact(wt, _revisionStdout) {
       const restored = restoreChangeIdIfEmpty(wt.path);
       if (!restored.ok) {
@@ -2362,11 +2416,35 @@ export function makeOpenspecPlanningHooks(
           tag: "openspec-invalid",
         };
       }
-      const revisedProposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || _revisionStdout;
+      let revised: AuthoritativeArtifact | null;
+      try {
+        revised = readAuthoritativeArtifact(wt.path);
+      } catch (err) {
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` could not be reread after revision: ${err instanceof Error ? err.message : String(err)}`,
+          tag: "openspec-invalid",
+        };
+      }
+      if (!revised) {
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` has no readable proposal.md after revision`,
+          tag: "openspec-invalid",
+        };
+      }
+      if (revisionBaseline && JSON.stringify(revised) === JSON.stringify(revisionBaseline)) {
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` was acknowledged but its authoritative proposal, tasks, and spec deltas were unchanged`,
+          tag: "openspec-invalid",
+        };
+      }
+      validatedArtifact = revised;
       return {
         ok: true,
-        updatedPlanText: revisedProposal,
-        updatedSpecContext: openspec.readSpecDeltas(wt.path, changeId),
+        updatedPlanText: revised.proposal,
+        updatedSpecContext: revised.specContext,
       };
     },
 
@@ -2408,8 +2486,9 @@ export function makeOpenspecPlanningHooks(
       // Strip the "_OpenSpec change `id` — proposal.md_\n\n" prefix that was added by authorArtifact.
       // The actual proposal text is what follows the header line; for the impl plan we need
       // just the raw proposal without the markdown prefix.
-      const proposal = revisedPlanText.replace(/^_OpenSpec change `[^`]+` — proposal\.md_\n\n/, "");
-      const tasks = openspec.readChangeFile(wt.path, changeId, "tasks.md")?.trim() ?? "";
+      const current = validatedArtifact ?? readAuthoritativeArtifact(wt.path);
+      const proposal = current?.proposal ?? revisedPlanText.replace(/^_OpenSpec change `[^`]+` — proposal\.md_\n\n/, "");
+      const tasks = current?.tasks ?? "";
       return (
         `Implement OpenSpec change \`${changeId}\`. Work through the checklist in ` +
         `\`openspec/changes/${changeId}/tasks.md\`, keep that change folder committed, and satisfy its spec deltas.\n\n` +

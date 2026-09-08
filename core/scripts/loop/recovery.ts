@@ -34,12 +34,14 @@ import { resolveLogicalOperationId } from "../logical-operation.ts";
 import {
   applyClaimToEpisode,
   assertRecoveryEpisodeFields,
+  attemptBelongsToCandidateEpoch,
   attachEpisodeFields,
   buildCoolingRecord,
   emptyEpisode,
   normalizeEvidenceIdentity,
   perStrategyBound,
   resumeEpisodeFromAttempts,
+  selectNextApplicableStrategy,
   stampEpisodeNextEligibleAt,
   type RecoveryEpisodeKey,
 } from "./recovery-episodes.ts";
@@ -52,6 +54,8 @@ import {
   lifecycleAllowsRecoveryRecipe,
   typedRequestFromOwnedItems,
 } from "../recovery-lifecycle-ownership.ts";
+import { projectStageDiagnostic, type StageDiagnostic } from "../stage-diagnostic.ts";
+import { recoveryRecipeApplicability } from "./recovery-applicability.ts";
 
 // ---------------------------------------------------------------------------
 // Recovery policy compilation — fail closed.
@@ -1209,9 +1213,57 @@ export function independentlyRecoverableBlockedItems(
       if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle, entry)) return false;
       const policy = contract.recovery_policy[entry.blocked_theme];
       if (!policy || policy.terminal_outcome === "human_authority") return false;
-      const remaining = entry.recovery_budgets_remaining[entry.blocked_theme] ?? policy.retry_budget;
-      if (remaining <= 0) return false;
       if ((entry.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit) return false;
+      const attempts = ledger.recovery_attempts.filter(
+        (attempt) =>
+          attempt.item_id === entry.id &&
+          attempt.class === entry.blocked_theme &&
+          attempt.outcome !== "superseded",
+      );
+      const identity = entry.last_verified_identity;
+      const candidateEpoch = identity && Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")
+        ? identity.logical_candidate_epoch?.trim() || identity.head_sha.trim()
+        : identity?.head_sha.trim() ?? "";
+      const currentAttempts = candidateEpoch
+        ? attempts.filter((attempt) => attemptBelongsToCandidateEpoch(attempt, candidateEpoch))
+        : attempts;
+      const latest = currentAttempts[currentAttempts.length - 1];
+      const episode = latest?.invariant && latest.candidate_epoch && latest.evidence_identity
+        ? resumeEpisodeFromAttempts(ledger.recovery_attempts, {
+            operation: latest.operation ?? "loop_recovery",
+            invariant: latest.invariant,
+            candidate_epoch: latest.candidate_epoch,
+            evidence_identity: latest.evidence_identity,
+          })
+        : null;
+      let diagnostic: StageDiagnostic | null = null;
+      const blocked = [...entry.history].reverse().find((history) => history.to === "blocked" && history.evidence);
+      if (blocked?.evidence) {
+        try {
+          const parsed = JSON.parse(blocked.evidence) as { diagnostic?: unknown };
+          if (projectStageDiagnostic(parsed.diagnostic).disposition !== "protocol_failure") {
+            diagnostic = parsed.diagnostic as StageDiagnostic;
+          }
+        } catch {
+          diagnostic = null;
+        }
+      }
+      const selected = selectNextApplicableStrategy({
+        recipes: policy.recipes,
+        cursor: episode?.strategy_cursor ?? 0,
+        attemptsPerStrategy: episode?.attempts_per_strategy ?? {},
+        strategyBound: (recipe) => perStrategyBound(policy, recipe),
+        isApplicable: (recipe) =>
+          diagnostic
+            ? recoveryRecipeApplicability({
+                action: recipe,
+                blockerClass: entry.blocked_theme as DurableBlockerClass,
+                diagnostic,
+                candidateHeadPresent: Boolean(entry.last_verified_identity?.head_sha.trim()),
+              }).applicable
+            : true,
+      });
+      if (selected.kind === "exhausted") return false;
       const deps = dependsOn.get(i.id) ?? [];
       return !deps.some((d) => blockedIds.has(d));
     })

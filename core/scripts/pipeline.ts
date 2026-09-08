@@ -1867,6 +1867,28 @@ export function realDispatchItem(
     let outcome: LoopExecutionResponse["outcome"] = "failed";
     let diagnostic: StageDiagnostic | undefined;
     let prNumber: number | null = null;
+    let eventsTextForClassify: string | null = null;
+    let writeHealthHint: { failure_count: number; worst_criticality?: string | null; last_error?: string | null; last_event_type?: string | null } | null = null;
+    if (pin && storeReady) {
+      eventsTextForClassify = readEventsTextFn(pin.events_path);
+      const whRaw = readWriteHealthTextFn(pin.events_path);
+      if (whRaw != null && whRaw !== "") {
+        const parsed = parseWriteHealthText(whRaw);
+        if (isElevatedWriteHealth(parsed)) {
+          writeHealthHint = {
+            failure_count: parsed.failure_count,
+            worst_criticality: parsed.worst_criticality,
+            last_error: parsed.last_error,
+            last_event_type: parsed.last_event_type,
+          };
+        }
+      }
+    }
+    let resolution = lastStageDiagnosticFromEventsJsonl(
+      eventsTextForClassify ?? "",
+      writeHealthHint,
+    );
+    diagnostic = resolution.diagnostic ?? undefined;
     try {
       const detail = await getIssueDetailFn(cfg, issueNumber);
       // Prefer the advance run's last blocker_set diagnostic. When the fresh
@@ -1876,29 +1898,6 @@ export function realDispatchItem(
       // blocker kind — capacity, mechanical, or human — so the re-dispatch is
       // classified by its true blocker class instead of cascading into a
       // protocol failure the supervisor treats as an engine defect.
-      let eventsTextForClassify: string | null = null;
-      let writeHealthHint: { failure_count: number; worst_criticality?: string | null; last_error?: string | null; last_event_type?: string | null } | null = null;
-      if (pin && storeReady) {
-        eventsTextForClassify = readEventsTextFn(pin.events_path);
-        const whRaw = readWriteHealthTextFn(pin.events_path);
-        if (whRaw != null && whRaw !== "") {
-          // Corrupt/unreadable write-health is fail-safe elevated (#633 review):
-          // never treat a present-but-broken artifact as healthy/absent.
-          const parsed = parseWriteHealthText(whRaw);
-          if (isElevatedWriteHealth(parsed)) {
-            writeHealthHint = {
-              failure_count: parsed.failure_count,
-              worst_criticality: parsed.worst_criticality,
-              last_error: parsed.last_error,
-              last_event_type: parsed.last_event_type,
-            };
-          }
-        }
-      }
-      let resolution = lastStageDiagnosticFromEventsJsonl(
-        eventsTextForClassify ?? "",
-        writeHealthHint,
-      );
       // Compatibility for early-exits before a fresh run-store event: only the
       // authenticated, current blocked-label incarnation may supply this
       // structural fallback. Comment prose is never read or transported.
@@ -1936,7 +1935,7 @@ export function realDispatchItem(
           };
         }
       }
-      diagnostic = resolution.diagnostic ?? undefined;
+      diagnostic = resolution.diagnostic ?? diagnostic;
       outcome = classifyDispatchOutcome(detail, diagnostic, eventsTextForClassify);
       if (outcome === "failed" && !diagnostic) {
         diagnostic = terminationDiagnostic();
@@ -1968,12 +1967,25 @@ export function realDispatchItem(
       }
       const pr = await getPrForIssueFn(cfg, issueNumber).catch(() => null);
       prNumber = pr ?? null;
-    } catch {
+    } catch (err) {
       outcome = "failed";
       // Observation failure is not contrary evidence. Retain the process fact
       // already observed at the child boundary so recovery does not collapse
       // back to an unexplained generic failure.
       diagnostic ??= terminationDiagnostic();
+      if (diagnostic) {
+        diagnostic = {
+          ...diagnostic,
+          detail: {
+            ...diagnostic.detail,
+            observation_uncertainty: {
+              observer: "forge",
+              operation: "issue_pr_refresh",
+              reason: err instanceof Error ? err.message : String(err),
+            },
+          },
+        };
+      }
     }
 
     return {

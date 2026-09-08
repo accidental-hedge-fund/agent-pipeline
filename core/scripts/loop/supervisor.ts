@@ -10,6 +10,7 @@
 // access in unit tests.
 
 import { readFile as defaultReadFile } from "node:fs/promises";
+import path from "node:path";
 import {
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
@@ -119,6 +120,7 @@ import {
 import {
   isCurrentHumanAuthorityDiagnostic,
   projectStageDiagnostic,
+  lastStageDiagnosticFromEventsJsonl,
   stageDiagnosticFromBlockerSet,
   type StageDiagnostic,
 } from "../stage-diagnostic.ts";
@@ -732,6 +734,69 @@ function persistedRecoveryEvidence(item: LoopItemLedgerEntry): PersistedRecovery
   return parsePersistedRecoveryEvidence(blocked?.evidence);
 }
 
+async function refineRecoveryEvidenceFromLinkedAdvance(
+  deps: SupervisorDeps,
+  item: LoopItemLedgerEntry,
+  persisted: PersistedRecoveryEvidence,
+): Promise<PersistedRecoveryEvidence> {
+  const linkedRunId = item.advance_run_id ?? persisted.transport.pipeline_run_id;
+  const eventsPath = persisted.transport.events_path?.trim() ?? "";
+  const normalizedEventsPath = path.normalize(eventsPath);
+  const runDirectory = path.dirname(normalizedEventsPath);
+  const canonicalLocation =
+    path.basename(normalizedEventsPath) === "events.jsonl" &&
+    path.basename(runDirectory) === linkedRunId &&
+    path.basename(path.dirname(runDirectory)) === "runs" &&
+    path.basename(path.dirname(path.dirname(runDirectory))) === ".agent-pipeline";
+  if (
+    !deps.readAdvanceEvents ||
+    !linkedRunId ||
+    !path.isAbsolute(eventsPath) ||
+    !canonicalLocation ||
+    (item.advance_run_id !== undefined && persisted.transport.pipeline_run_id !== item.advance_run_id) ||
+    persisted.diagnostic.detail.evidence_ordering
+  ) {
+    return persisted;
+  }
+  let events: AdvanceStageEvent[];
+  try {
+    events = await deps.readAdvanceEvents(eventsPath);
+  } catch {
+    return persisted;
+  }
+  if (!Array.isArray(events) || events.length === 0) return persisted;
+  for (const event of events) {
+    const candidate = event as AdvanceStageEvent & {
+      run_id?: unknown;
+      pipeline_run_id?: unknown;
+      issue?: unknown;
+      item_id?: unknown;
+    };
+    if (
+      (candidate.run_id !== undefined && candidate.run_id !== linkedRunId) ||
+      (candidate.pipeline_run_id !== undefined && candidate.pipeline_run_id !== linkedRunId) ||
+      (candidate.issue !== undefined && String(candidate.issue) !== item.id) ||
+      (candidate.item_id !== undefined && String(candidate.item_id) !== item.id)
+    ) {
+      return persisted;
+    }
+  }
+  const resolution = lastStageDiagnosticFromEventsJsonl(
+    events.map((event) => JSON.stringify(event)).join("\n"),
+  );
+  const precise = resolution.diagnostic;
+  const ordering = precise?.detail.evidence_ordering;
+  if (!precise || !ordering || ordering.kind !== "tester_rebind_after_pr") return persisted;
+  const observedHead = item.last_verified_identity?.head_sha.trim().toLowerCase() ?? "";
+  const diagnosticHead = ordering.pr_head?.trim().toLowerCase() ?? "";
+  if (!observedHead || !diagnosticHead || observedHead !== diagnosticHead) return persisted;
+  const projection = projectStageDiagnostic(precise);
+  if (projection.disposition !== "recover" || projection.blockerClass !== item.blocked_theme) {
+    return persisted;
+  }
+  return { ...persisted, diagnostic: precise };
+}
+
 function isCoarseImplementationAttestation(diagnostic: StageDiagnostic): boolean {
   if (diagnostic.reason_code !== "implementation-ci" || diagnostic.detail.stage?.trim()) return false;
   const { blocker_kind: _blockerKind, reason: _reason, stage: _stage, ...qualifiers } = diagnostic.detail;
@@ -993,8 +1058,9 @@ async function executeBlockedRecovery(
   if (!item || item.state !== "blocked" || !item.blocked_theme) {
     return { ledger, attempted: false };
   }
-  const persisted = persistedRecoveryEvidence(item);
+  let persisted = persistedRecoveryEvidence(item);
   if (!persisted) return { ledger, attempted: false };
+  const episodePersisted = persisted;
   const projection = projectStageDiagnostic(persisted.diagnostic);
   if (projection.disposition !== "recover" || projection.blockerClass !== item.blocked_theme) {
     ledger = await stopForRecoveryPreflight(
@@ -1115,11 +1181,13 @@ async function executeBlockedRecovery(
     }
   }
 
+  persisted = await refineRecoveryEvidenceFromLinkedAdvance(deps, item, persisted);
+
   const currentEpoch = observedCandidateEpoch(item);
   const progressEvidenceIdentity = recoveryProgressIdentityForBlockedItem(
     item,
     ledger.recovery_attempts,
-    persisted,
+    episodePersisted,
     currentEpoch,
   );
   let matchingAttempts = ledger.recovery_attempts.filter(
