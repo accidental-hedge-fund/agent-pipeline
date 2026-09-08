@@ -188,6 +188,42 @@ test("issue rendering is deterministic and binds the exact v1.33.0 run", async (
   }
 });
 
+test("rendered fixture OpenSpec change IDs satisfy the OpenSpec naming contract (#1551)", async () => {
+  const pack = await loadFrgPack();
+  for (const packRunId of [
+    "pack-1401-pipeline-ship-1.40.1",
+    "frg-pack-run-a",
+    "FRG_RUN:A.B",
+    "a".repeat(256),
+  ]) {
+    const rendered = renderFrgPackIssues(pack, {
+      release_version: "1.40.1",
+      pack_run_id: packRunId,
+    });
+    for (const issue of rendered) {
+      const changeIds = [...issue.body.matchAll(/openspec\/changes\/([^/]+)\//g)]
+        .map((match) => match[1]);
+      assert.ok(changeIds.length > 0, `${issue.provenance.template_id} declares its exact OpenSpec path`);
+      assert.equal(new Set(changeIds).size, 1, "every mention uses one exact change ID");
+      assert.match(changeIds[0]!, /^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+      assert.ok(changeIds[0]!.length <= 200);
+
+      if (packRunId === "pack-1401-pipeline-ship-1.40.1") {
+        assert.equal(
+          changeIds[0],
+          `frg-pack-1401-pipeline-ship-1-40-1-${issue.provenance.template_id}`,
+        );
+      }
+
+      assert.equal(issue.provenance.pack_run_id, packRunId);
+      assert.match(issue.title, new RegExp(packRunId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.ok(issue.body.includes(`pack_run_id=${packRunId}`));
+      assert.ok(issue.body.includes(`core/test/fixtures/frg/${packRunId}/`));
+      assert.ok(issue.body.includes(`core/test/frg-${packRunId}-${issue.provenance.template_id}.test.ts`));
+    }
+  }
+});
+
 test("collector derives outcomes from candidate-bound records and rejects caller claims", async () => {
   const pack = await loadFrgPack();
   const bundle = makeEvidenceBundle(pack);

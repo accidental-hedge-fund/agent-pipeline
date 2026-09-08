@@ -26,7 +26,7 @@ The product diff is limited to these exact run-scoped paths:
 
 - `core/test/fixtures/frg/{{pack_run_id}}/clean-docs.json`
 - `core/test/frg-{{pack_run_id}}-clean-docs.test.ts`
-- `openspec/changes/frg-{{pack_run_id}}-clean-docs/` when OpenSpec planning is
+- `openspec/changes/{{openspec_change_id}}/` when OpenSpec planning is
   enabled
 
 Create the JSON fixture with `release_version` exactly `{{release_version}}`.

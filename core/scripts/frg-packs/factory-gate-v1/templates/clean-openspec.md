@@ -28,7 +28,7 @@ issue-owned OpenSpec change created by planning:
 
 - `core/test/fixtures/frg/{{pack_run_id}}/clean-openspec.json`
 - `core/test/frg-{{pack_run_id}}-clean-openspec.test.ts`
-- `openspec/changes/frg-{{pack_run_id}}-clean-openspec/`
+- `openspec/changes/{{openspec_change_id}}/`
 
 Create the JSON fixture with `release_version` exactly `{{release_version}}`.
 Create the executable Node unit test at the exact path above. It must read only
