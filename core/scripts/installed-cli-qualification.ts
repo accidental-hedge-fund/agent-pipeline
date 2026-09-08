@@ -396,6 +396,21 @@ function suiteProofArgvMatches(
     actualNames.every((name, index) => name === expectedTestNames[index]);
 }
 
+function detachedStartupProofArgvMatches(
+  proof: InstalledCliProcessProof,
+  stagedLauncher: string,
+): boolean {
+  const expected = path.join(
+    path.dirname(path.dirname(stagedLauncher)),
+    "scripts",
+    "frg-detached-startup.test.mjs",
+  );
+  return proof.argv.length === 3 &&
+    proof.argv[0] === "--test" &&
+    proof.argv[1] === "--test-isolation=none" &&
+    proof.argv[2] === expected;
+}
+
 function directProcessObservationPassed(
   fault: MatrixFaultState,
   result: SpawnSyncReturns<string>,
@@ -558,7 +573,7 @@ export function parseInstalledCliQualificationArtifact(
   const operationCells = installedCells();
   const stagedLauncher = stagedLauncherFromProofs(typedProofs);
   if (!stagedLauncher) return null;
-  const expectedProofCount = requiredMatrixOperations().length * (PROCESS_FAULTS.size + 1) + 3;
+  const expectedProofCount = requiredMatrixOperations().length * (PROCESS_FAULTS.size + 1) + 4;
   if (typedProofs.length !== expectedProofCount) return null;
   const routeProofs = typedProofs.filter((proof) => requiredMatrixOperations().includes(proof.operation));
   if (new Set(routeProofs.map((proof) => proof.argv[3])).size !== routeProofs.length) return null;
@@ -661,6 +676,18 @@ export function parseInstalledCliQualificationArtifact(
       )
     ) return null;
   }
+  const detachedStartupProofs = typedProofs.filter(
+    (proof) => proof.operation === "frg-detached-startup-suite",
+  );
+  if (
+    detachedStartupProofs.length !== 1 ||
+    detachedStartupProofs[0]!.exit_code !== 0 ||
+    detachedStartupProofs[0]!.signal !== null ||
+    detachedStartupProofs[0]!.timed_out ||
+    detachedStartupProofs[0]!.cell_keys.length !== 0 ||
+    detachedStartupProofs[0]!.fault_states.length !== 0 ||
+    !detachedStartupProofArgvMatches(detachedStartupProofs[0]!, stagedLauncher)
+  ) return null;
   for (const row of o.rows) {
     const cell = expectedCells.find((candidate) => matrixCellKey(candidate) === matrixCellKey(row));
     if (!cell) return null;
@@ -925,6 +952,36 @@ export function runInstalledCliQualification(
           if (row.layer === layerSuite.layer) row.passed = false;
         }
       }
+    }
+    const detachedStartupArgv = [
+      "--test",
+      "--test-isolation=none",
+      path.join(candidateRoot, "scripts", "frg-detached-startup.test.mjs"),
+    ];
+    const detachedStartup = spawn(opts.nodePath ?? process.execPath, detachedStartupArgv, {
+      cwd: candidateRoot,
+      env: safeQualificationEnv(opts.env ?? process.env, safeHome),
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: TEST_SUITE_MAX_BUFFER_BYTES,
+    }) as SpawnSyncReturns<string>;
+    proofs.push(
+      proofFor(
+        "frg-detached-startup-suite",
+        [],
+        [],
+        detachedStartupArgv,
+        detachedStartup,
+      ),
+    );
+    if (
+      detachedStartup.status !== 0 ||
+      detachedStartup.signal !== null ||
+      detachedStartup.error
+    ) {
+      qualificationFailures.push(
+        `frg-detached-startup-suite(${processFailureSummary(detachedStartup)})`,
+      );
     }
     const suiteArgv = [
       "--test",
