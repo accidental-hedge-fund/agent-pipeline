@@ -41,7 +41,11 @@ conventions. Keep it in sync with `CLAUDE.md`.
 
 ## Build & test
 
-Run tests from `core/`: `node --test --experimental-strip-types test/*.test.ts`.
+Run tests from `core/`: `npm test`. For a direct single-file run, include the
+test-only observability preload:
+`node --import ./test/helpers/isolated-observability.ts --test --experimental-strip-types test/<name>.test.ts`.
+It captures synthetic inbox and invocation-context writes in memory; never run
+unit-test fixtures against the installed host telemetry exporter.
 Full gate from repo root: `npm run ci`.
 
 `npm run ci` also runs `openspec validate --all` when an `openspec/` directory is
