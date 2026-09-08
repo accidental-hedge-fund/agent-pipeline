@@ -178,12 +178,23 @@ test("issue rendering is deterministic and binds the exact v1.33.0 run", async (
   const input = { release_version: "1.33.0", pack_run_id: "frg-pack-run-a" };
   const first = renderFrgPackIssues(pack, input);
   assert.deepEqual(first, renderFrgPackIssues(pack, input));
+  assert.deepEqual(
+    pack.manifest.templates.map((template) => template.id),
+    ["clean-docs", "clean-openspec"],
+    "package 1 validates exactly the two existing manifest-owned templates",
+  );
   assert.equal(first.length, pack.manifest.minimum_fresh_issues);
   for (const issue of first) {
     assert.ok(issue.labels.includes("factory-gate"));
     assert.match(issue.body, /manifest_sha256=[0-9a-f]{64}/);
     assert.match(issue.body, /release_version=1\.33\.0/);
     assert.match(issue.body, /pack_run_id=frg-pack-run-a/);
+    assert.ok(issue.body.includes(
+      `core/test/fixtures/frg/frg-pack-run-a/${issue.provenance.template_id}.json`,
+    ));
+    assert.ok(issue.body.includes(
+      `core/test/frg-frg-pack-run-a-${issue.provenance.template_id}.test.ts`,
+    ));
     assert.doesNotMatch(issue.body, /{{[a-z0-9_]+}}/i);
   }
 });
@@ -194,6 +205,7 @@ test("rendered fixture OpenSpec change IDs satisfy the OpenSpec naming contract 
     "pack-1401-pipeline-ship-1.40.1",
     "frg-pack-run-a",
     "FRG_RUN:A.B",
+    "FRG___RUN:::A--B",
     "a".repeat(256),
   ]) {
     const rendered = renderFrgPackIssues(pack, {
@@ -221,6 +233,46 @@ test("rendered fixture OpenSpec change IDs satisfy the OpenSpec naming contract 
       assert.ok(issue.body.includes(`core/test/fixtures/frg/${packRunId}/`));
       assert.ok(issue.body.includes(`core/test/frg-${packRunId}-${issue.provenance.template_id}.test.ts`));
     }
+    const idsByTemplate = new Map(rendered.map((issue) => {
+      const changeId = issue.body.match(/openspec\/changes\/([^/]+)\//)?.[1];
+      assert.ok(changeId);
+      return [issue.provenance.template_id, changeId] as const;
+    }));
+    assert.notEqual(
+      idsByTemplate.get("clean-docs"),
+      idsByTemplate.get("clean-openspec"),
+      "normalization and truncation retain the template identity",
+    );
+  }
+});
+
+test("existing fake-issue templates keep implementer tasks separate from controller lifecycle (#1562)", async () => {
+  const pack = await loadFrgPack();
+  const rendered = renderFrgPackIssues(pack, {
+    release_version: "1.40.1",
+    pack_run_id: "pack-1401-pipeline-ship-1.40.1",
+  });
+
+  for (const issue of rendered) {
+    const implementerStart = issue.body.indexOf("## Implementer-owned work and verification");
+    const controllerStart = issue.body.indexOf("## Controller-owned lifecycle evidence");
+    const outOfScopeStart = issue.body.indexOf("## Out of scope");
+    assert.ok(implementerStart >= 0 && controllerStart > implementerStart);
+    assert.ok(outOfScopeStart > controllerStart);
+
+    const implementer = issue.body.slice(implementerStart, controllerStart);
+    const controller = issue.body.slice(controllerStart, outOfScopeStart);
+    assert.match(implementer, /Create the JSON fixture/);
+    assert.match(implementer, /Create the executable Node unit test/);
+    assert.match(implementer, /npm run ci/);
+    assert.doesNotMatch(implementer, /pipeline:ready-to-deploy|closes the pull request/);
+
+    assert.match(controller, /not implementer\s+checklist\s+items/);
+    assert.match(controller, /pre-merge archives?/);
+    assert.match(controller, /pipeline:ready-to-deploy/);
+    assert.match(controller, /closes the pull request and\s+issue without merge/);
+    assert.match(controller, /tasks\.md/);
+    assert.match(controller, /finish before the\s+pre-merge archive/);
   }
 });
 

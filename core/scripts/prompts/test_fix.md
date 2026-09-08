@@ -18,15 +18,19 @@ This is fix attempt {{attempt}} of {{max_attempts}}.
 2. Fix the code so that `{{command}}` passes. Prefer fixing the implementation
    over weakening or deleting tests — only change a test if it is genuinely wrong.
 3. Do NOT make unrelated changes.
-4. Commit ALL changes with message: `fix: resolve test/build failures (#{{issue_number}})`.
-   The gate re-runs the command after you finish and will NOT trust uncommitted
-   changes, so you must commit your fix. Append these two git trailers to the
+4. If you make material product changes, commit ALL of them with message:
+   `fix: resolve test/build failures (#{{issue_number}})`. The gate re-runs the
+   command after you finish and will NOT trust uncommitted product changes, so
+   every material fix must be committed. Append these two git trailers to the
    bottom of every commit message, after a blank line (standard git trailer
    format):
 
        Issue: #{{issue_number}}
        Pipeline-Run: {{pipeline_run_id}}
-5. If the failure genuinely cannot be resolved (it needs a product decision, or
+5. If `{{command}}` now passes without any material product change, leave HEAD
+   unchanged and report that clean no-change result. Do NOT manufacture an empty
+   commit. The gate will verify the clean worktree and re-run the command itself.
+6. If the failure genuinely cannot be resolved (it needs a product decision, or
    the command itself is misconfigured), explain the blocker clearly in your
    output instead of guessing.
 

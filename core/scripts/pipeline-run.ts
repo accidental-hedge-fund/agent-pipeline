@@ -3324,6 +3324,47 @@ export async function runAdvance(
             handoffPrNumber = confirmPrNumber;
             handoffPrHeadSha = confirmSha;
           }
+          const dispatchWt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(
+            cfg,
+            issueNumber,
+          ).catch(() => null);
+          if (dispatchWt) {
+            const gitFn: GitRunner = deps.gitInWorktree ?? gitInWorktree;
+            const dispatchWorktreeSha = normalizeCandidateSha(
+              (
+                await gitFn(dispatchWt.path, ["rev-parse", "HEAD"], {
+                  ignoreFailure: true,
+                })
+              ).stdout.trim(),
+            );
+            if (!dispatchWorktreeSha || dispatchWorktreeSha !== handoffPrHeadSha) {
+              const summary =
+                `tester rebind: dispatch worktree HEAD ${dispatchWorktreeSha ?? "unobservable"} ` +
+                `disagrees with bound candidate ${handoffPrHeadSha ?? "unobservable"}`;
+              return await failClosedRebind({
+                ok: false,
+                code: "tester_rebind_pr_head_mismatch",
+                summary,
+                candidateSha: handoffPrHeadSha,
+                evidence: rebind.evidence,
+                diagnostic: buildTesterRebindFailClosedDiagnostic({
+                  stage,
+                  code: "tester_rebind_pr_head_mismatch",
+                  summary,
+                  prHead: handoffPrHeadSha,
+                  trustedSurfaceOutcome: currentTrustedSurface?.outcome ?? null,
+                }),
+                blocker: {
+                  schema_version: 1,
+                  kind: "tester_rebind_blocker",
+                  code: "tester_rebind_pr_head_mismatch",
+                  candidate_sha: handoffPrHeadSha,
+                  pr: handoffPrNumber,
+                  summary,
+                },
+              });
+            }
+          }
           observerPrHeadBinding = {
             expectedPrHeadSha: () => handoffPrHeadSha,
             expectedPrNumber: () => handoffPrNumber,

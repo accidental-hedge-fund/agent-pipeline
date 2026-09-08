@@ -361,8 +361,8 @@ async function driveLaterStage(opts: DriveOpts): Promise<DriveResult> {
     rebindTesterEvidenceAfterPr: async () => ({
       ok: true,
       action: "already-bound",
-      candidateSha: opts.prHead ?? SHA_H,
-      evidence: { candidate_sha: opts.prHead ?? SHA_H } as never,
+      candidateSha: currentPrHead ?? SHA_H,
+      evidence: { candidate_sha: currentPrHead ?? SHA_H } as never,
       suiteCommandInvoked: false,
     }),
     transition: async (_cfg, _n, from, to, reason) => {
