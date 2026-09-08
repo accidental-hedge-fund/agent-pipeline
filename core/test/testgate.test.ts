@@ -80,7 +80,9 @@ function okInvoke(): HarnessResult {
 function cleanGitDeps(): Pick<TestGateDeps, "gitHead" | "gitDirty" | "verifyTestFix"> {
   let n = 0;
   return {
-    gitHead: async () => `head-${n++}`,
+    // Each attempt reads the same candidate twice before invoking the harness,
+    // then observes the harness-created commit on its third read.
+    gitHead: async () => `head-${Math.floor((n++ + 1) / 3)}`,
     gitDirty: async () => false,
     verifyTestFix: async () => ({ ok: true }),
   };
@@ -1339,7 +1341,7 @@ test("gate (#387, 5.5): declared build_command folds artifact into attempt commi
         return testRuns === 1 ? failResult : passResult;
       },
       invoke: async () => okInvoke(),
-      gitHead: async () => `head-${n++}`,
+      gitHead: async () => n++ < 2 ? "head-before" : "head-after",
       gitDirty: async () => false,
       verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [
@@ -1377,7 +1379,7 @@ test("gate (#387, 5.2 analog): no build_command declared → build runner never 
     detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
     runTests: async () => (testRuns++ === 0 ? failResult : passResult),
     invoke: async () => okInvoke(),
-    gitHead: async () => `head-${n++}`,
+    gitHead: async () => n++ < 2 ? "head-before" : "head-after",
     gitDirty: async () => false,
     verifyTestFix: async () => ({ ok: true }),
     gitCommitMessages: async () => [],
@@ -1403,7 +1405,7 @@ test("gate (#387, 5.3 analog): declared build_command fails → blocks with a di
         invoked++;
         return okInvoke();
       },
-      gitHead: async () => `head-${n++}`,
+      gitHead: async () => n++ < 2 ? "head-before" : "head-after",
       gitDirty: async () => false,
       verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [
@@ -1584,7 +1586,7 @@ test("gate (#521): clean/no-attempt salvage cases leave the dirty block reason u
       detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
       runTests: async () => failResult,
       invoke: async () => okInvoke(),
-      gitHead: async () => `h${head++}`, // HEAD advances: harness committed, salvage not attempted
+      gitHead: async () => head++ < 2 ? "h0" : "h1", // HEAD advances only after the harness runs
       gitDirty: async () => dirtyCalls++ > 0, // clean pre-gate, dirty after (leftover artifacts)
       verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [],
@@ -1684,7 +1686,7 @@ test("gate (#131): harness committed AND left dirt → salvage not attempted, di
       detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
       runTests: async () => failResult,
       invoke: async () => okInvoke(),
-      gitHead: async () => `h${head++}`, // HEAD advances: the harness committed
+      gitHead: async () => head++ < 2 ? "h0" : "h1", // HEAD advances only after the harness runs
       gitDirty: async () => dirtyCalls++ > 0, // clean pre-gate, dirty after the fix
       salvage: async (_wt, _issue, _run, stageLabel) => {
         salvageCalls.push(stageLabel);

@@ -382,6 +382,7 @@ export async function runTestGate(
       overallReason?: string;
       enabled: boolean;
       includeLastCommand?: boolean;
+      candidateSha?: string;
     },
   ): Promise<TesterProducerPersistObservation> => {
     if (!runDir) {
@@ -389,11 +390,13 @@ export async function runTestGate(
     }
     let pinned: string | null = null;
     try {
-      let candidateSha = "";
-      try {
-        candidateSha = await (deps.gitHead ?? defaultGitHead)(wtPath);
-      } catch {
-        candidateSha = "";
+      let candidateSha = opts.candidateSha ?? "";
+      if (!candidateSha) {
+        try {
+          candidateSha = await (deps.gitHead ?? defaultGitHead)(wtPath);
+        } catch {
+          candidateSha = "";
+        }
       }
       // Schema requires a full 40-char pin from worktree HEAD; never copy
       // trusted-surface's decision SHA (including the all-zero sentinel).
@@ -537,11 +540,36 @@ export async function runTestGate(
       overallReason?: string;
       enabled: boolean;
       includeLastCommand?: boolean;
+      candidateSha?: string;
     },
   ): Promise<TestGateResult> => {
-    const persist = await recordEvidence(gate, evidence);
+    let finalGate = gate;
+    let finalEvidence = evidence;
+    if (evidence.candidateSha) {
+      let observedHead: string | null = null;
+      try {
+        observedHead = normalizeCandidateSha(
+          await (deps.gitHead ?? defaultGitHead)(wtPath),
+        );
+      } catch {
+        observedHead = null;
+      }
+      if (observedHead !== normalizeCandidateSha(evidence.candidateSha)) {
+        const blockReason =
+          "Test-fix candidate moved before clean no-change evidence persistence; " +
+          `expected HEAD ${evidence.candidateSha}, observed ${observedHead ?? "unavailable"}.`;
+        finalGate = { ...gate, passed: false, blockReason };
+        finalEvidence = {
+          overallStatus: "unavailable",
+          overallReason: blockReason,
+          enabled: evidence.enabled,
+          includeLastCommand: evidence.includeLastCommand,
+        };
+      }
+    }
+    const persist = await recordEvidence(finalGate, finalEvidence);
     return {
-      ...gate,
+      ...finalGate,
       recorded_required_exit_0: recordedRequiredExit0(),
       required_command_exit_code: requiredExitCode(),
       persist,
@@ -972,6 +1000,20 @@ export async function runTestGate(
     });
     // Capture HEAD before the harness runs so we can inspect only its commits.
     const headBefore = await gitHeadFn(wtPath);
+    if (fixHeadBefore && headBefore !== fixHeadBefore) {
+      const blockReason =
+        "Test-fix candidate moved before the fix harness ran; " +
+        `expected HEAD ${fixHeadBefore}, observed ${headBefore}.`;
+      return finish(
+        { skipped: false, passed: false, attempts: attempt, blockReason },
+        {
+          overallStatus: "unavailable",
+          overallReason: blockReason,
+          enabled: true,
+          includeLastCommand: !!lastCmdForEvidence,
+        },
+      );
+    }
     const fixModel = cfg.models.fix;
     const invokeFix = () =>
       invokeFn(harness, wtPath, prompt, {
@@ -1185,7 +1227,7 @@ export async function runTestGate(
       ? await gitHeadFn(wtPath)
       : headAfterFix;
     const noChangeCandidate = Boolean(
-      headBefore && candidateHeadAfterFix === headBefore,
+      fixHeadBefore && candidateHeadAfterFix === fixHeadBefore,
     );
 
     // Verify the test-fix commit message format (#68). The clean unchanged-HEAD
@@ -1266,7 +1308,42 @@ export async function runTestGate(
       }
     }
 
+    if (noChangeCandidate) {
+      const headBeforeRetry = await gitHeadFn(wtPath);
+      if (headBeforeRetry !== fixHeadBefore) {
+        const blockReason =
+          "Test-fix candidate moved before the clean no-change retry; " +
+          `expected HEAD ${fixHeadBefore}, observed ${headBeforeRetry}.`;
+        return finish(
+          { skipped: false, passed: false, attempts: attempt, blockReason },
+          {
+            overallStatus: "unavailable",
+            overallReason: blockReason,
+            enabled: true,
+            includeLastCommand: !!lastCmdForEvidence,
+          },
+        );
+      }
+    }
+
     const retryRun = await runWithToolingRetries();
+    if (noChangeCandidate) {
+      const headAfterRetry = await gitHeadFn(wtPath);
+      if (headAfterRetry !== fixHeadBefore) {
+        const blockReason =
+          "Test-fix candidate moved during the clean no-change retry; " +
+          `expected HEAD ${fixHeadBefore}, observed ${headAfterRetry}.`;
+        return finish(
+          { skipped: false, passed: false, attempts: attempt, blockReason },
+          {
+            overallStatus: "unavailable",
+            overallReason: blockReason,
+            enabled: true,
+            includeLastCommand: true,
+          },
+        );
+      }
+    }
     if (retryRun.toolingExhausted) {
       console.log(
         `[pipeline] #${issueNumber}: test gate tooling failure persisted after ${MAX_TOOLING_RETRIES} retries; blocking`,
@@ -1320,6 +1397,7 @@ export async function runTestGate(
           overallStatus: "passed",
           enabled: true,
           includeLastCommand: true,
+          ...(noChangeCandidate ? { candidateSha: fixHeadBefore } : {}),
         },
       );
     }

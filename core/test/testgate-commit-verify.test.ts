@@ -139,12 +139,15 @@ function okInvoke(): HarnessResult {
 }
 
 test("runTestGate: verifyTestFix blocks → gate returns blocked with reason (4.5)", async () => {
-  let n = 0;
+  let head = "sha-before";
   const deps: TestGateDeps = {
-    invoke: async () => okInvoke(),
+    invoke: async () => {
+      head = "sha-after";
+      return okInvoke();
+    },
     runTests: async () => ({ passed: false, output: "FAIL", durationSec: 0.1 }),
     detectTestCommand: () => ({ cmd: "true", args: [] }),
-    gitHead: async () => `sha-${n++}`,
+    gitHead: async () => head,
     gitDirty: async () => false,
     verifyTestFix: async (): Promise<VerifyResult> => ({
       ok: false,
@@ -162,15 +165,19 @@ test("runTestGate: verifyTestFix blocks → gate returns blocked with reason (4.
 });
 
 test("runTestGate: verifyTestFix passes → gate continues normally (4.6)", async () => {
-  let n = 0;
+  let testRuns = 0;
+  let head = "sha-before";
   const deps: TestGateDeps = {
-    invoke: async () => okInvoke(),
+    invoke: async () => {
+      head = "sha-after";
+      return okInvoke();
+    },
     // fail first time so loop runs, then pass
-    runTests: async () => n++ === 0
+    runTests: async () => testRuns++ === 0
       ? { passed: false, output: "FAIL", durationSec: 0.1 }
       : { passed: true, output: "ok", durationSec: 0.1 },
     detectTestCommand: () => ({ cmd: "true", args: [] }),
-    gitHead: async () => `sha-${n}`,
+    gitHead: async () => head,
     gitDirty: async () => false,
     verifyTestFix: async (): Promise<VerifyResult> => ({ ok: true }),
   };
@@ -279,6 +286,82 @@ test("clean no-change retry preserves the PR candidate through Tester rebind (#1
   assert.equal(rebound.suiteCommandInvoked, false);
   assert.equal(rebound.evidence?.candidate_sha, candidate);
   assert.ok(observeTesterImplementationRole(rebound.evidence, candidate, 99));
+});
+
+test("HEAD movement before the test-fix harness cannot become a no-change retry (#1562 review 2)", async () => {
+  const candidate = "a".repeat(40);
+  const movedHead = "b".repeat(40);
+  let headReads = 0;
+  let harnessCalls = 0;
+  let testRuns = 0;
+
+  const gate = await runTestGate(
+    { ...baseCfg(), test_gate: { ...baseCfg().test_gate, max_attempts: 1 } },
+    1562,
+    "/wt",
+    {
+      runTests: async () => {
+        testRuns++;
+        return { passed: false, output: "FAIL", durationSec: 0.1, toolingError: false };
+      },
+      invoke: async () => {
+        harnessCalls++;
+        return okInvoke();
+      },
+      gitHead: async () => headReads++ === 0 ? candidate : movedHead,
+      gitDirty: async () => false,
+    },
+  );
+
+  assert.equal(gate.passed, false);
+  assert.match(gate.blockReason ?? "", /candidate moved before the fix harness ran/);
+  assert.equal(testRuns, 1, "movement must block before the retry command runs");
+  assert.equal(harnessCalls, 0, "movement before invocation is not harness-owned work");
+});
+
+test("HEAD movement during a clean retry blocks without passed Tester evidence (#1562 review 2)", async () => {
+  const candidate = "a".repeat(40);
+  const movedHead = "b".repeat(40);
+  let currentHead = candidate;
+  let testRuns = 0;
+  let persisted: TesterEvidence | null = null;
+
+  const gate = await runTestGate(
+    { ...baseCfg(), test_gate: { ...baseCfg().test_gate, max_attempts: 1 } },
+    1562,
+    "/wt",
+    {
+      runTests: async () => {
+        testRuns++;
+        if (testRuns === 1) {
+          return { passed: false, output: "FAIL", durationSec: 0.1, toolingError: false };
+        }
+        currentHead = movedHead;
+        return { passed: true, output: "ok", durationSec: 0.1, toolingError: false };
+      },
+      invoke: async () => okInvoke(),
+      gitHead: async () => currentHead,
+      gitDirty: async () => false,
+      verifyTestFix: async () => {
+        throw new Error("clean no-change retry must not enter commit verification");
+      },
+      writeTesterEvidence: async (_dest, evidence) => {
+        persisted = evidence;
+        return { ok: true };
+      },
+      resolvePinnedEngineIdentity: () => null,
+    },
+    "1562/2026-09-08T17:23:07Z",
+    "test-gate",
+    undefined,
+    "/runs/1562-moved-during-retry",
+  );
+
+  assert.equal(gate.passed, false);
+  assert.match(gate.blockReason ?? "", /candidate moved during the clean no-change retry/);
+  assert.equal(testRuns, 2);
+  assert.equal(persisted?.candidate_sha, movedHead);
+  assert.equal(persisted?.overall_status, "unavailable");
 });
 
 test("formatted empty test-fix commit cannot produce passed Tester evidence (#1562 review 1)", async () => {
