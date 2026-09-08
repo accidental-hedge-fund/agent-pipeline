@@ -22,10 +22,13 @@ import type { HarnessResult } from "../scripts/harness.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { VerifyDeps, VerifyResult } from "../scripts/verify-harness-commits.ts";
 
-function msgsDeps(messages: string[]): VerifyDeps {
+function msgsDeps(
+  messages: string[],
+  diffFiles: string[] = ["core/scripts/example.ts"],
+): VerifyDeps {
   return {
     gitMessages: async () => messages,
-    gitDiffFiles: async () => [],
+    gitDiffFiles: async () => diffFiles,
     gitDirtyFiles: async () => [],
   };
 }
@@ -74,6 +77,19 @@ test("test-fix format: empty range → blocked (harness produced nothing, findin
   const result = await enforceTestFixCommitFormat(42, "/wt", "abc", msgsDeps([]));
   assert.equal(result.ok, false);
   assert.ok("reason" in result && result.reason.includes("at least one commit"));
+});
+
+test("test-fix format: correctly formatted empty commit → blocked (#1562 review 1)", async () => {
+  const result = await enforceTestFixCommitFormat(
+    1562,
+    "/wt",
+    "abc",
+    msgsDeps([
+      "fix: resolve test/build failures (#1562)\n\nIssue: #1562\nPipeline-Run: 1562/run",
+    ], []),
+  );
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("no candidate-content changes"));
 });
 
 test("test-fix format: wrong issue number → blocked", async () => {
@@ -263,4 +279,50 @@ test("clean no-change retry preserves the PR candidate through Tester rebind (#1
   assert.equal(rebound.suiteCommandInvoked, false);
   assert.equal(rebound.evidence?.candidate_sha, candidate);
   assert.ok(observeTesterImplementationRole(rebound.evidence, candidate, 99));
+});
+
+test("formatted empty test-fix commit cannot produce passed Tester evidence (#1562 review 1)", async () => {
+  const candidate = "a".repeat(40);
+  const emptyCommit = "b".repeat(40);
+  const message =
+    "fix: resolve test/build failures (#1562)\n\n" +
+    "Issue: #1562\n" +
+    "Pipeline-Run: 1562/2026-09-08T17:23:07Z";
+  let headReads = 0;
+  let testRuns = 0;
+  let persisted: TesterEvidence | null = null;
+
+  const gate = await runTestGate(
+    { ...baseCfg(), test_gate: { ...baseCfg().test_gate, max_attempts: 1 } },
+    1562,
+    "/wt",
+    {
+      runTests: async () => {
+        testRuns++;
+        return testRuns === 1
+          ? { passed: false, output: "FAIL", durationSec: 0.1, toolingError: false }
+          : { passed: true, output: "ok", durationSec: 0.1, toolingError: false };
+      },
+      invoke: async () => okInvoke(),
+      gitHead: async () => headReads++ < 4 ? candidate : emptyCommit,
+      gitDirty: async () => false,
+      verifyTestFix: (wtPath, headBefore) =>
+        enforceTestFixCommitFormat(1562, wtPath, headBefore, msgsDeps([message], [])),
+      gitCommitMessages: async () => [message],
+      writeTesterEvidence: async (_dest, evidence) => {
+        persisted = evidence;
+        return { ok: true };
+      },
+      resolvePinnedEngineIdentity: () => null,
+    },
+    "1562/2026-09-08T17:23:07Z",
+    "test-gate",
+    undefined,
+    "/runs/1562-empty-commit",
+  );
+
+  assert.equal(gate.passed, false);
+  assert.match(gate.blockReason ?? "", /no candidate-content changes/);
+  assert.equal(testRuns, 1, "the empty candidate must block before the retry can pass");
+  assert.notEqual(persisted?.overall_status, "passed");
 });

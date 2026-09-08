@@ -304,6 +304,7 @@ export async function enforceTestFixCommitFormat(
         ),
         description: "Test-fix commit message does not match prescribed format",
       },
+      requireChangedFiles: true,
       // requireTrailers is intentionally absent here: trailer enforcement on
       // test-fix commits is handled separately by validateCommitTrailers in the
       // loop below (test_fix.md prescribes the Issue:/Pipeline-Run: trailers via

@@ -147,11 +147,12 @@ test("contract: salvaged fix-round commit passes the fix format gate via the pre
 
 test("contract: salvaged test-fix commit passes the test-fix format gate (bites)", async () => {
   const msg = buildSalvageCommitMessage(131, RUN_ID, testFixSalvageStageLabel(131));
-  const ok = await enforceTestFixCommitFormat(131, "/wt", "abc", msgsDeps([msg]));
+  const changedFiles = ["core/scripts/foo.ts"];
+  const ok = await enforceTestFixCommitFormat(131, "/wt", "abc", msgsDeps([msg], changedFiles));
   assert.equal(ok.ok, true);
 
   const bare = buildSalvageCommitMessage(131, RUN_ID, "test-fix");
-  const blocked = await enforceTestFixCommitFormat(131, "/wt", "abc", msgsDeps([bare]));
+  const blocked = await enforceTestFixCommitFormat(131, "/wt", "abc", msgsDeps([bare], changedFiles));
   assert.equal(blocked.ok, false);
 });
 

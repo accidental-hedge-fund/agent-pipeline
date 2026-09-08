@@ -6,6 +6,7 @@
 //   - issueNumber:    at least one new commit references #<N> in subject or body
 //   - messagePattern: at least one new commit subject/body matches the given pattern
 //   - requireTrailers: every new commit carries the listed Git trailer keys
+//   - requireChangedFiles: the commit range changes candidate content
 //   - docsOnly:       all changed files (committed + uncommitted) are documentation-only
 //
 // A `VerifyDeps` seam is accepted so tests can inject fake git outputs without
@@ -25,6 +26,8 @@ export interface VerifyConfig {
    * Per-commit check; fails on the first commit missing any required key.
    */
   requireTrailers?: string[];
+  /** Assert `headBefore..HEAD` contains at least one candidate-content change. */
+  requireChangedFiles?: boolean;
   /**
    * Assert all changed files (committed in `headBefore..HEAD` + uncommitted dirty
    * paths) are documentation-only — none may match the application-code deny-list.
@@ -238,6 +241,16 @@ export async function verifyHarnessCommits(
           }
         }
       }
+    }
+  }
+
+  if (config.requireChangedFiles) {
+    const diffFiles = await getDiffFiles(wtPath, headBefore);
+    if (diffFiles.length === 0) {
+      return {
+        ok: false,
+        reason: "Test-fix commit range contains no candidate-content changes",
+      };
     }
   }
 
