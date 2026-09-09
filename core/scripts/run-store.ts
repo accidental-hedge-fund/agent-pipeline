@@ -380,6 +380,10 @@ export interface TesterTargetedCheckEvent extends RunEventBase {
 export interface BlockerSetEvent extends RunEventBase {
   type: "blocker_set";
   reason: string;
+  /** Canonical producers stamp child linkage; legacy events may omit it. */
+  run_id?: string;
+  /** Canonical producers stamp child linkage; legacy events may omit it. */
+  issue?: number;
   /** Exact producer-authored diagnostic; legacy events may omit it. */
   diagnostic?: StageDiagnostic;
   /**

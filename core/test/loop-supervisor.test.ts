@@ -49,6 +49,8 @@ import { LOOP_EXECUTION_CONTRACT_SCHEMA, type LoopExecutionRequest, type LoopExe
 import { buildStageDiagnostic, projectStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 import { consultLifecycleRecord } from "../scripts/recovery-lifecycle-ownership.ts";
 import { realExecuteRecovery } from "../scripts/pipeline.ts";
+import { emitBlockedOutcomeEvents } from "../scripts/pipeline-run.ts";
+import type { RunStoreDeps } from "../scripts/run-store.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 
 const READY_LABEL = "pipeline:ready-to-deploy";
@@ -6374,6 +6376,23 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
       subject_omitted_because_unobservable: true,
     },
   });
+  const emittedBlocker = await emitBlockedOutcomeEvents(
+    "/persistent/repo/.agent-pipeline/runs/advance-100",
+    100,
+    "design-gate",
+    {
+      advanced: false,
+      status: "blocked",
+      reason: precise.detail.reason,
+      blockerKind: "harness-failure",
+      diagnostic: precise,
+    },
+    {} as RunStoreDeps,
+    {
+      randomUUID: () => "linked-offramp",
+      appendEvent: async () => true,
+    },
+  );
   let dispatchCount = 0;
   const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
     dispatchCount++;
@@ -6423,15 +6442,7 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
       assert.equal(eventsPath, "/persistent/repo/.agent-pipeline/runs/advance-100/events.jsonl");
       linkedReads.push(actions.length);
       if (actions.length < 2) return [];
-      return [{
-        type: "blocker_set",
-        run_id: "advance-100",
-        issue: 100,
-        blocker_kind: "harness-failure",
-        reason: precise.detail.reason,
-        stage: precise.detail.stage,
-        diagnostic: precise,
-      } as never];
+      return [emittedBlocker];
     },
   };
   const { token } = await acquireLock(deps, "run-1", "claude");
