@@ -499,6 +499,7 @@ export function renderDecisionsSection(
   options: {
     referenceSharedEvidence?: boolean;
     sharedEvidence?: ReadonlySet<string>;
+    referencedNodeEvidence?: ReadonlyMap<string, ReadonlySet<number>>;
   } = {},
 ): string {
   const lines: string[] = ["## Decisions", ""];
@@ -542,8 +543,9 @@ export function renderDecisionsSection(
       lines.push(`- **Risk:** ${escapeMd(node.risk)}`);
     }
     if (node.evidence && node.evidence.length > 0) {
-      lines.push(`- **Evidence:** ${node.evidence.map((e) => {
-        if (!repeated.has(e)) return escapeMd(e);
+      lines.push(`- **Evidence:** ${node.evidence.map((e, index) => {
+        const referencedOccurrence = options.referencedNodeEvidence?.get(node.id)?.has(index);
+        if (referencedOccurrence !== true && (options.referencedNodeEvidence || !repeated.has(e))) return escapeMd(e);
         const ref = sha256Prefixed(e);
         return `shared evidence ${ref}`;
       }).join("; ")}`);
@@ -716,7 +718,7 @@ export function parseDecisionsFromBody(body: string): ParseResult {
   } catch {
     return { ok: false, reason: "Decisions fence is not JSON", code: "invalid_json" };
   }
-  const persistedSharedEvidence = evidenceCatalogValues(parsed);
+  const persistedReferencedNodeEvidence = referencedNodeEvidence(parsed);
   const shape = parseDecisionsArtifact(parsed);
   if (!shape.ok) return shape;
   const rendered = renderDecisionsSection(shape.artifact, {
@@ -724,7 +726,7 @@ export function parseDecisionsFromBody(body: string): ParseResult {
     // contain a mixed catalog/inline selection that differs from today's
     // aggregate-optimal selector; expansion has already authenticated every
     // catalog value and rejected missing or unused references.
-    sharedEvidence: persistedSharedEvidence,
+    referencedNodeEvidence: persistedReferencedNodeEvidence,
   }).trim();
   const liveSection = extractDecisionsSection(body)?.trim();
   if (liveSection !== rendered) {
@@ -753,13 +755,30 @@ function hasEvidenceCatalog(raw: unknown): boolean {
     Object.prototype.hasOwnProperty.call(raw, "evidence_catalog");
 }
 
-function evidenceCatalogValues(raw: unknown): ReadonlySet<string> {
-  if (!hasEvidenceCatalog(raw)) return new Set<string>();
-  const catalog = (raw as Record<string, unknown>).evidence_catalog;
-  if (catalog === null || typeof catalog !== "object" || Array.isArray(catalog)) {
-    return new Set<string>();
+function referencedNodeEvidence(raw: unknown): ReadonlyMap<string, ReadonlySet<number>> {
+  const referenced = new Map<string, Set<number>>();
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return referenced;
+  const nodes = (raw as Record<string, unknown>).nodes;
+  if (!Array.isArray(nodes)) return referenced;
+  for (const nodeRaw of nodes) {
+    if (nodeRaw === null || typeof nodeRaw !== "object" || Array.isArray(nodeRaw)) continue;
+    const node = nodeRaw as Record<string, unknown>;
+    if (typeof node.id !== "string" || !Array.isArray(node.evidence)) continue;
+    for (const [index, value] of node.evidence.entries()) {
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        Object.keys(value).length === 1 &&
+        isSha256Prefixed((value as Record<string, unknown>).evidence_ref)
+      ) {
+        const indexes = referenced.get(node.id) ?? new Set<number>();
+        indexes.add(index);
+        referenced.set(node.id, indexes);
+      }
+    }
   }
-  return new Set(Object.values(catalog).filter((value): value is string => typeof value === "string"));
+  return referenced;
 }
 
 function expandEvidenceCatalog(raw: unknown): { ok: true; artifact: unknown } | ParseFailure {

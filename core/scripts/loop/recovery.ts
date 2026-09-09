@@ -52,7 +52,7 @@ import {
   typedRequestFromOwnedItems,
 } from "../recovery-lifecycle-ownership.ts";
 import { projectStageDiagnostic, type StageDiagnostic } from "../stage-diagnostic.ts";
-import { recoveryRecipeApplicability } from "./recovery-applicability.ts";
+import { recoveryProgressIdentity, recoveryRecipeApplicability } from "./recovery-applicability.ts";
 import {
   compileRecoveryPolicy,
   DEFAULT_RECOVERY_POLICY_INPUT,
@@ -905,40 +905,42 @@ export function independentlyRecoverableBlockedItems(
       if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle, entry)) return false;
       const policy = contract.recovery_policy[entry.blocked_theme];
       if (!policy || policy.terminal_outcome === "human_authority") return false;
-      const attempts = ledger.recovery_attempts.filter(
-        (attempt) =>
-          attempt.item_id === entry.id &&
-          attempt.class === entry.blocked_theme &&
-          attempt.outcome !== "superseded",
-      );
       const identity = entry.last_verified_identity;
       const candidateEpoch = identity && Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")
         ? identity.logical_candidate_epoch?.trim() || identity.head_sha.trim()
         : identity?.head_sha.trim() ?? "";
-      const currentAttempts = candidateEpoch
-        ? attempts.filter((attempt) => attemptBelongsToCandidateEpoch(attempt, candidateEpoch))
-        : attempts;
-      const latest = currentAttempts[currentAttempts.length - 1];
-      const episode = latest?.invariant && latest.candidate_epoch && latest.evidence_identity
-        ? resumeEpisodeFromAttempts(ledger.recovery_attempts, {
-            operation: latest.operation ?? "loop_recovery",
-            invariant: latest.invariant,
-            candidate_epoch: latest.candidate_epoch,
-            evidence_identity: latest.evidence_identity,
+      const diagnostics = entry.history
+        .filter((history) => history.to === "blocked" && history.evidence)
+        .map((history) => {
+          try {
+            const parsed = JSON.parse(history.evidence!) as { diagnostic?: unknown };
+            if (projectStageDiagnostic(parsed.diagnostic).disposition !== "protocol_failure") {
+              return parsed.diagnostic as StageDiagnostic;
+            }
+          } catch {
+            // A malformed historical entry is an invariant boundary.
+          }
+          return null;
+        });
+      const diagnostic = diagnostics[diagnostics.length - 1] ?? null;
+      const evidenceIdentity = diagnostic
+        ? recoveryProgressIdentity({
+            itemId: entry.id,
+            blockerClass: entry.blocked_theme,
+            diagnostic,
+            priorDiagnostics: diagnostics.slice(0, -1).reverse(),
+            attempts: ledger.recovery_attempts,
+            candidateEpoch,
           })
         : null;
-      let diagnostic: StageDiagnostic | null = null;
-      const blocked = [...entry.history].reverse().find((history) => history.to === "blocked" && history.evidence);
-      if (blocked?.evidence) {
-        try {
-          const parsed = JSON.parse(blocked.evidence) as { diagnostic?: unknown };
-          if (projectStageDiagnostic(parsed.diagnostic).disposition !== "protocol_failure") {
-            diagnostic = parsed.diagnostic as StageDiagnostic;
-          }
-        } catch {
-          diagnostic = null;
-        }
-      }
+      const episode = evidenceIdentity
+        ? resumeEpisodeFromAttempts(ledger.recovery_attempts, {
+            operation: "loop_recovery",
+            invariant: entry.blocked_theme,
+            candidate_epoch: candidateEpoch,
+            evidence_identity: evidenceIdentity,
+          })
+        : null;
       const selected = selectEligibleRecoveryStrategy({
         recipes: policy.recipes,
         cursor: episode?.strategy_cursor ?? 0,
