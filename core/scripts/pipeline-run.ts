@@ -3414,12 +3414,18 @@ export async function runAdvance(
                 !expected ||
                 (liveSha === expected && livePrNumber === handoffPrNumber)
               ) return;
-              let ownedMutation = false;
+              let ownedMutation = phase === "after" &&
+                consumerStageMayPushPrHead(stage) &&
+                liveSha !== null &&
+                lastPushedCandidate?.sha === liveSha &&
+                lastPushedCandidate.prNumber === livePrNumber;
               if (phase === "after" && consumerStageMayPushPrHead(stage) && liveSha) {
-                const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
-                  () => null,
-                );
-                if (wt) {
+                const wt = ownedMutation
+                  ? null
+                  : await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
+                    () => null,
+                  );
+                if (!ownedMutation && wt) {
                   const gitFn: GitRunner = deps.gitInWorktree ?? gitInWorktree;
                   const worktreeHead = normalizeCandidateSha(
                     (await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim(),
