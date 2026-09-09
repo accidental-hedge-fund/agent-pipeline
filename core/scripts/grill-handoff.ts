@@ -509,7 +509,16 @@ export function materializeGrillNode(input: {
     provenance: patchedNode.provenance,
   });
   const spec = extractSpecCore(input.liveBody);
-  const nextBody = embedDecisionsInBody(spec, artifact);
+  let nextBody: string;
+  try {
+    nextBody = embedDecisionsInBody(spec, artifact);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: (err as Error).message,
+      code: "invalid_artifact",
+    };
+  }
   return { ok: true, body: nextBody, wrote: true, artifact };
 }
 

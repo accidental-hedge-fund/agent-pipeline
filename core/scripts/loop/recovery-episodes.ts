@@ -76,6 +76,11 @@ export interface SelectStrategyInput {
   isApplicable: (recipe: RecoveryRecipe) => boolean;
 }
 
+export interface SelectEligibleStrategyInput extends SelectStrategyInput {
+  repeatedEvidenceCount: number;
+  repeatedEvidenceLimit: number;
+}
+
 export type SelectStrategyResult =
   | { kind: "claim"; action: RecoveryRecipe; cursor: number; skipped: RecoveryRecipe[] }
   | { kind: "exhausted"; skipped: RecoveryRecipe[] };
@@ -505,6 +510,24 @@ export function selectNextApplicableStrategy(input: SelectStrategyInput): Select
     return { kind: "claim", action: recipe, cursor, skipped };
   }
   return { kind: "exhausted", skipped };
+}
+
+/**
+ * Selects from the authoritative per-strategy episode cursor. Reproducing the
+ * same evidence up to its bound advances only the strategy that just ran; it
+ * never suppresses a later applicable strategy with remaining budget.
+ */
+export function selectEligibleRecoveryStrategy(input: SelectEligibleStrategyInput): SelectStrategyResult {
+  let cursor = Math.max(0, input.cursor);
+  const current = input.recipes[cursor];
+  if (
+    current &&
+    input.repeatedEvidenceCount >= input.repeatedEvidenceLimit &&
+    (input.attemptsPerStrategy[current] ?? 0) > 0
+  ) {
+    cursor += 1;
+  }
+  return selectNextApplicableStrategy({ ...input, cursor });
 }
 
 export function coolingDeadline(nowIso: string, backoff: RecoveryBackoff, generation: number): string {

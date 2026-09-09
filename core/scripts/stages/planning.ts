@@ -460,7 +460,7 @@ export interface PlanningPhaseHooks {
   /** Format-specific action the revision producer must perform before replying. */
   revisionPromptInstructions?(
     wt: { path: string },
-    options: { requireChange: boolean },
+    options: { requireChange: boolean; hasHumanFeedback: boolean },
   ): string;
 
   /**
@@ -1167,6 +1167,7 @@ export async function runPlanningPhases(
       contextSnapshot,
       revisionInstructions: hooks.revisionPromptInstructions?.(wt, {
         requireChange: revisionRequiresArtifactChange,
+        hasHumanFeedback: humanComments.length > 0,
       }),
     });
     const invokeRevisionOnce = async (prompt: string) =>
@@ -2587,7 +2588,14 @@ export function makeOpenspecPlanningHooks(
 
     revisionPromptInstructions(_wt, options) {
       const artifactPath = `openspec/changes/${changeId}`;
-      return options.requireChange
+      const acknowledgementInstruction = options.hasHumanFeedback
+        ? (
+            ` Write the genuine \`${HUMAN_FEEDBACK_ACK_HEADER}\` section to ` +
+            `\`${artifactPath}/proposal.md\` as well as returning it in your response; ` +
+            `the authoritative proposal must contain your acknowledgement after validation.`
+          )
+        : "";
+      return (options.requireChange
         ? (
             `Apply the accepted feedback by editing the authoritative OpenSpec artifacts ` +
             `\`${artifactPath}/proposal.md\`, \`${artifactPath}/tasks.md\`, and the relevant ` +
@@ -2599,7 +2607,7 @@ export function makeOpenspecPlanningHooks(
           `Review the authoritative OpenSpec artifacts under \`${artifactPath}/\`. ` +
           `If no accepted feedback requires a change, leave those files unchanged. ` +
           `Do not implement product code yet. Then return the final reviewed implementation plan in Markdown.`
-        );
+        )) + acknowledgementInstruction;
     },
 
     // Run plan revision in the issue worktree so the harness can update the

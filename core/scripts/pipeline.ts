@@ -3499,10 +3499,14 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     return { kind: "error", message: "no selector or --resume run id was provided" };
   }
 
+  const persistentRunStoreRepoDir = await resolveRunStoreRepoDir(cfg.repo_dir, gitInWorktree);
   const supervisorDeps: SupervisorDeps = {
     store,
     observe: defaultReconcileObserveDeps(cfg),
-    dispatchItem: realDispatchItem(cfg, input.engine, { childAdvance: input.childAdvance }),
+    dispatchItem: realDispatchItem(cfg, input.engine, {
+      childAdvance: input.childAdvance,
+      resolveRunStoreRepoDir: async () => persistentRunStoreRepoDir,
+    }),
     executeRecovery: realExecuteRecovery(cfg),
     recoverySleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     getChangedFiles: realGetChangedFiles(cfg),
@@ -3510,6 +3514,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     // domain-scoped issue-run lock + wrapper identity under
     // ~/.pipeline/runs/<domain>/<issue> (#770 review 2 finding 956d20df).
     repoDir: cfg.repo_dir,
+    runStoreRepoDir: persistentRunStoreRepoDir,
     lockDomain: cfg.domain,
     findWrapperPid: (issueNumber) =>
       findWrapperPidForIssue(issueNumber, { domain: cfg.domain }),

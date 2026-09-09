@@ -576,10 +576,19 @@ export async function runRefineSpecApply(
   }
   const bodyCheck = parseDecisionsFromBody(envelope.proposal.body);
   if (!bodyCheck.ok) return fail(deps, `proposal body is not a valid Decisions artifact: ${bodyCheck.reason}`, 2);
+  let publicationBody: string;
+  try {
+    publicationBody = embedDecisionsInBody(
+      extractSpecCore(envelope.proposal.body),
+      bodyCheck.artifact,
+    );
+  } catch (err) {
+    return fail(deps, `proposal body cannot be published: ${(err as Error).message}`, 2);
+  }
   const applyWalk = await walkDeclaredDependencyClosure(
     issueNumber,
     live.title,
-    envelope.proposal.body,
+    publicationBody,
     { fetchIssue: deps.fetchDependencyIssue },
   );
   const closureHash = hashDependencyClosure(applyWalk.record);
@@ -603,7 +612,7 @@ export async function runRefineSpecApply(
       repo: deps.repo,
       issueNumber,
       artifact: envelope.proposal.artifact,
-      proposedBody: envelope.proposal.body,
+      proposedBody: publicationBody,
       frontierFp: envelope.proposal.artifact.fingerprint.planning_treatment_sha256,
     },
     deps.handoffStore,
@@ -616,7 +625,7 @@ export async function runRefineSpecApply(
       issueGrillFrontier({
         repo: deps.repo,
         issue: issueNumber,
-        body: envelope.proposal.body,
+        body: publicationBody,
         artifact: bodyCheck.artifact,
         now: deps.now(),
         key,
@@ -627,7 +636,7 @@ export async function runRefineSpecApply(
     return fail(deps, `frontier persist failed: ${(err as Error).message}`, 2);
   }
   try {
-    await deps.updateIssueBody(issueNumber, envelope.proposal.body);
+    await deps.updateIssueBody(issueNumber, publicationBody);
   } catch (err) {
     return fail(deps, `GitHub body write failed: ${(err as Error).message}`, 1);
   }
@@ -636,7 +645,7 @@ export async function runRefineSpecApply(
     {
       issueNumber,
       artifact: envelope.proposal.artifact,
-      proposedBody: envelope.proposal.body,
+      proposedBody: publicationBody,
       frontierFp: envelope.proposal.artifact.fingerprint.planning_treatment_sha256,
       currentHandoffs: created.created,
     },

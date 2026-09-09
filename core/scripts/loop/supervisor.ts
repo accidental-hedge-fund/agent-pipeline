@@ -77,10 +77,11 @@ import {
   perStrategyBound,
   reconcileUncertainClaim,
   resumeEpisodeFromAttempts,
-  selectNextApplicableStrategy,
+  selectEligibleRecoveryStrategy,
   type SideEffectObserverResult,
 } from "./recovery-episodes.ts";
 import { resolveLogicalOperationId } from "../logical-operation.ts";
+import { runDirPath } from "../run-store.ts";
 import {
   bindLifecycleRecord,
   compatibilityStopRefusesItem,
@@ -348,6 +349,8 @@ export interface SupervisorDeps {
    * still runs when a real advance_run_id is known from linkage).
    */
   readAdvanceEvents?(eventsPath: string): Promise<AdvanceStageEvent[]>;
+  /** Persistent/common repository root that owns linked advance run stores. */
+  runStoreRepoDir?: string;
   /** Poll interval (ms) while observing advance stage events during dispatch wait. */
   stageProgressPollMs?: number;
   /** Injectable sleep for stage-progress polling (tests inject a no-op / immediate). */
@@ -739,21 +742,20 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
   item: LoopItemLedgerEntry,
   persisted: PersistedRecoveryEvidence,
 ): Promise<PersistedRecoveryEvidence> {
-  const linkedRunId = item.advance_run_id ?? persisted.transport.pipeline_run_id;
+  const linkedRunId = item.advance_run_id?.trim() ?? "";
   const eventsPath = persisted.transport.events_path?.trim() ?? "";
   const normalizedEventsPath = path.normalize(eventsPath);
-  const runDirectory = path.dirname(normalizedEventsPath);
-  const canonicalLocation =
-    path.basename(normalizedEventsPath) === "events.jsonl" &&
-    path.basename(runDirectory) === linkedRunId &&
-    path.basename(path.dirname(runDirectory)) === "runs" &&
-    path.basename(path.dirname(path.dirname(runDirectory))) === ".agent-pipeline";
+  const runStoreRepoDir = deps.runStoreRepoDir ?? deps.repoDir ?? "";
+  const canonicalEventsPath = runStoreRepoDir && linkedRunId
+    ? path.join(runDirPath(runStoreRepoDir, linkedRunId), "events.jsonl")
+    : "";
   if (
     !deps.readAdvanceEvents ||
     !linkedRunId ||
+    !path.isAbsolute(runStoreRepoDir) ||
     !path.isAbsolute(eventsPath) ||
-    !canonicalLocation ||
-    (item.advance_run_id !== undefined && persisted.transport.pipeline_run_id !== item.advance_run_id) ||
+    normalizedEventsPath !== path.normalize(canonicalEventsPath) ||
+    persisted.transport.pipeline_run_id !== linkedRunId ||
     persisted.diagnostic.detail.evidence_ordering
   ) {
     return persisted;
@@ -771,12 +773,20 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
       pipeline_run_id?: unknown;
       issue?: unknown;
       item_id?: unknown;
+      candidate_epoch?: unknown;
+      candidate_sha?: unknown;
     };
+    const currentHead = item.last_verified_identity?.head_sha.trim().toLowerCase() ?? "";
+    const currentEpoch = observedCandidateEpoch(item).toLowerCase();
     if (
       (candidate.run_id !== undefined && candidate.run_id !== linkedRunId) ||
       (candidate.pipeline_run_id !== undefined && candidate.pipeline_run_id !== linkedRunId) ||
       (candidate.issue !== undefined && String(candidate.issue) !== item.id) ||
-      (candidate.item_id !== undefined && String(candidate.item_id) !== item.id)
+      (candidate.item_id !== undefined && String(candidate.item_id) !== item.id) ||
+      (candidate.candidate_epoch !== undefined &&
+        String(candidate.candidate_epoch).trim().toLowerCase() !== currentEpoch) ||
+      (candidate.candidate_sha !== undefined &&
+        String(candidate.candidate_sha).trim().toLowerCase() !== currentHead)
     ) {
       return persisted;
     }
@@ -789,7 +799,13 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
   if (!precise || !ordering || ordering.kind !== "tester_rebind_after_pr") return persisted;
   const observedHead = item.last_verified_identity?.head_sha.trim().toLowerCase() ?? "";
   const diagnosticHead = ordering.pr_head?.trim().toLowerCase() ?? "";
-  if (!observedHead || !diagnosticHead || observedHead !== diagnosticHead) return persisted;
+  const candidateEpoch = observedCandidateEpoch(item);
+  if (
+    !observedHead ||
+    !candidateEpoch ||
+    (diagnosticHead && observedHead !== diagnosticHead) ||
+    (!diagnosticHead && ordering.subject_omitted_because_unobservable !== true)
+  ) return persisted;
   const projection = projectStageDiagnostic(precise);
   if (projection.disposition !== "recover" || projection.blockerClass !== item.blocked_theme) {
     return persisted;
@@ -1256,29 +1272,6 @@ async function executeBlockedRecovery(
       }).catch(() => {});
       return { ledger, attempted: false };
     }
-    // Repeated byte-identical evidence is bounded independently of the class
-    // retry budget: at `repeated_evidence_limit` advance the cursor or Cool
-    // rather than tight-looping the same strategy.
-    if ((item.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit) {
-      const time = deps.store.now().toISOString();
-      const cooling = buildCoolingRecord({
-        reason: "strategy_cursor_exhausted",
-        time,
-        nextEligibleAt: coolingDeadline(time, policy.backoff, item.repeated_evidence_count ?? 1),
-        itemId,
-        theme: item.blocked_theme,
-        candidateEpoch: currentEpoch,
-        historicalEvidence: "repeated_no_progress",
-      });
-      ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
-      await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
-        item_id: itemId,
-        reason: "repeated_evidence_limit",
-        repeated_evidence_count: item.repeated_evidence_count ?? 0,
-        limit: policy.repeated_evidence_limit,
-      }).catch(() => {});
-      return { ledger, attempted: false };
-    }
     const hasCandidateHead = Boolean(item.last_verified_identity?.head_sha.trim());
     const preflightNeverStarted = persisted.diagnostic.detail.preflight_failed === true;
     const candidateIdentity = recoveryCandidateIdentity(
@@ -1320,11 +1313,13 @@ async function executeBlockedRecovery(
           : undefined;
     const selected = forced
       ? { kind: "claim" as const, action: forced, cursor: Math.max(episode.strategy_cursor, policy.recipes.indexOf(forced)), skipped: [] as RecoveryRecipe[] }
-      : selectNextApplicableStrategy({
+      : selectEligibleRecoveryStrategy({
           recipes: policy.recipes,
           cursor: episode.strategy_cursor,
           attemptsPerStrategy: episode.attempts_per_strategy,
           strategyBound: (recipe) => perStrategyBound(policy, recipe),
+          repeatedEvidenceCount: item.repeated_evidence_count ?? 0,
+          repeatedEvidenceLimit: policy.repeated_evidence_limit,
           isApplicable,
         });
     for (const skipped of selected.skipped) {
@@ -1375,13 +1370,22 @@ async function executeBlockedRecovery(
       ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
       return { ledger, attempted: false };
     }
+    // Inapplicable-strategy skips are durable episode records. The executable
+    // claim must use the next sequence identity, not reuse the identity of a
+    // skip written immediately above.
+    const actionCandidateIdentity = recoveryCandidateIdentity(
+      contract,
+      item,
+      persisted.transport,
+      matchingAttempts.length + selected.skipped.length,
+    );
     const started = await startRecoveryAttempt(deps.store, contract, {
       runId,
       token,
       itemId,
       engine,
       action: selected.action,
-      candidateIdentity,
+      candidateIdentity: actionCandidateIdentity,
       candidateEpoch,
       invariant: item.blocked_theme,
       evidenceIdentity: progressEvidenceIdentity,
@@ -2562,24 +2566,42 @@ export async function runSupervisorCycle(
       ) return false;
       const policy = contract.recovery_policy[candidate.blocked_theme as DurableBlockerClass];
       if (!policy || policy.terminal_outcome === "human_authority") return false;
-      const episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, {
-        operation: "loop_recovery",
-        invariant: candidate.blocked_theme,
-        candidate_epoch: recoveryEpisodeCandidateEpoch(
-          candidate,
-          candidate.last_verified_identity?.head_sha.trim() || candidate.evidence_fingerprint || candidate.id,
-        ),
-        evidence_identity: candidate.evidence_fingerprint ?? "",
-      });
-      const repeated = (candidate.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit;
-      if (episode) {
-        const allStrategiesSpent = policy.recipes.every(
-          (recipe) => (episode.attempts_per_strategy[recipe] ?? 0) >= perStrategyBound(policy, recipe),
-        );
-        return allStrategiesSpent || repeated;
+      const attempts = ledger.recovery_attempts.filter(
+        (attempt) =>
+          attempt.item_id === candidate.id &&
+          attempt.class === candidate.blocked_theme &&
+          attempt.outcome !== "superseded",
+      );
+      const latest = attempts.at(-1);
+      const episode = latest?.invariant && latest.candidate_epoch && latest.evidence_identity
+        ? resumeEpisodeFromAttempts(ledger.recovery_attempts, {
+            operation: latest.operation ?? "loop_recovery",
+            invariant: latest.invariant,
+            candidate_epoch: latest.candidate_epoch,
+            evidence_identity: latest.evidence_identity,
+          })
+        : null;
+      if (!episode) {
+        return (candidate.recovery_budgets_remaining[candidate.blocked_theme] ?? policy.retry_budget) <= 0;
       }
-      const remaining = candidate.recovery_budgets_remaining[candidate.blocked_theme] ?? policy.retry_budget;
-      return remaining <= 0 || repeated;
+      const evidence = persistedRecoveryEvidence(candidate);
+      const selected = selectEligibleRecoveryStrategy({
+        recipes: policy.recipes,
+        cursor: episode.strategy_cursor,
+        attemptsPerStrategy: episode.attempts_per_strategy,
+        strategyBound: (recipe) => perStrategyBound(policy, recipe),
+        repeatedEvidenceCount: candidate.repeated_evidence_count ?? 0,
+        repeatedEvidenceLimit: policy.repeated_evidence_limit,
+        isApplicable: (recipe) => evidence
+          ? recoveryRecipeApplicability({
+            action: recipe,
+            blockerClass: candidate.blocked_theme as DurableBlockerClass,
+            diagnostic: evidence.diagnostic,
+            candidateHeadPresent: Boolean(candidate.last_verified_identity?.head_sha.trim()),
+          }).applicable
+          : true,
+      });
+      return selected.kind === "exhausted";
     });
     if (exhausted?.blocked_theme) {
       const time = deps.store.now().toISOString();

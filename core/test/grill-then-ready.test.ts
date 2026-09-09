@@ -524,6 +524,60 @@ test("grill: hash-bound handoff materialization consumes compact evidence artifa
   }
 });
 
+test("grill: oversized answer materialization returns a refusal before receipt, body, frontier, or sibling writes (#1568)", async () => {
+  const node = makeNode({
+    id: "scope",
+    question: "Is this scope authorized?",
+    recommendation: "Keep the bounded scope",
+    class: "scope",
+  });
+  const baseSpec = "## Summary\nKeep unrelated issue text.\n";
+  const baseArtifact = artifact([node], baseSpec);
+  const baseBody = embedDecisionsInBody(baseSpec, baseArtifact);
+  const paddedSpec = `${baseSpec}${"x".repeat(65_535 - baseBody.length)}`;
+  const paddedArtifact = artifact([node], paddedSpec);
+  const liveBody = embedDecisionsInBody(paddedSpec, paddedArtifact);
+  assert.equal(liveBody.length, 65_536);
+  const handoff = handoffForNode(paddedArtifact.nodes[0]!);
+  const bodyDigest = sha256Prefixed(liveBody);
+  handoff.scope.content_hashes![0] = bodyDigest;
+  handoff.declaration_identity = handoff.declaration_identity!
+    .replace(`:${"a".repeat(64)}:`, `:${bodyDigest.slice("sha256:".length)}:`);
+  let bodyWrites = 0;
+  let durableWrites = 0;
+  const baseKeyDeps = memoryKeyDeps();
+  const keyDeps: GrillProposalKeyDeps = {
+    ...baseKeyDeps,
+    writeFile: (path, data, options) => {
+      durableWrites++;
+      baseKeyDeps.writeFile(path, data, options);
+    },
+  };
+  const baseStore = memoryHandoffStore();
+  const handoffStore: HandoffStoreDeps = {
+    ...baseStore,
+    writeFile: async (path, data) => {
+      durableWrites++;
+      await baseStore.writeFile(path, data);
+    },
+  };
+
+  const result = await materializeGrillAnswer(handoff, "approved", {
+    getIssueBody: async () => liveBody,
+    updateIssueBody: async () => { bodyWrites++; },
+    repoDir: "/tmp/repo",
+    handoffStore,
+    keyDeps,
+    frontierKey: "test-key",
+    now: () => new Date("2026-01-01T00:00:01Z"),
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /issue body exceeds.*65,536/i);
+  assert.equal(bodyWrites, 0);
+  assert.equal(durableWrites, 0);
+});
+
 test("grill: ready validation consumes a compact evidence artifact", () => {
   const title = "T";
   const spec = "## Summary\nCompact ready artifact.\n";
@@ -1133,6 +1187,84 @@ test("grill: apply creates pending grill-authority handoffs; preview creates non
   });
   const listed = [...store.files.keys()].filter((k) => k.endsWith(".json") && !k.endsWith("audit.json"));
   assert.ok(listed.length >= 1, "apply should persist pending grill-authority handoffs");
+});
+
+test("grill: apply rejects a MAC-valid oversized Decisions body before durable mutations (#1568)", async () => {
+  const env = await signedPreview();
+  const spec = "## Summary\nUnique evidence cannot be discarded.\n";
+  const nodes = Array.from({ length: 3 }, (_, i) => ({
+    ...makeNode({
+      id: `unique-${i}`,
+      question: `Question ${i}?`,
+      recommendation: `Recommendation ${i}`,
+      class: "test-evidence",
+    }),
+    rationale: `Rationale ${i}`,
+    alternatives: [],
+    risk: "low" as const,
+    evidence: [String(i).repeat(25_000)],
+  }));
+  const oversizedArtifact = artifact(nodes, spec, env.input.title);
+  const payload = canonicalJson(oversizedArtifact);
+  const oversizedBody = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(payload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${payload}\n\`\`\``,
+    "",
+    renderDecisionsSection(oversizedArtifact).trimEnd(),
+    "",
+  ].join("\n");
+  assert.ok(oversizedBody.length > 65_536);
+  const { mac: _mac, ...unsigned } = env;
+  const signed = signGrillProposal({
+    ...unsigned,
+    proposal: {
+      ...unsigned.proposal,
+      body: oversizedBody,
+      artifact: oversizedArtifact,
+    },
+  }, "test-key");
+  let handoffWrites = 0;
+  const baseStore = memoryHandoffStore();
+  const handoffStore: HandoffStoreDeps = {
+    ...baseStore,
+    writeFile: async (path, data) => {
+      handoffWrites++;
+      await baseStore.writeFile(path, data);
+    },
+    appendFile: async (path, data) => {
+      handoffWrites++;
+      await baseStore.appendFile(path, data);
+    },
+  };
+  let frontierWrites = 0;
+  const baseKeyDeps = memoryKeyDeps();
+  const keyDeps: GrillProposalKeyDeps = {
+    ...baseKeyDeps,
+    writeFile: (path, data, options) => {
+      frontierWrites++;
+      baseKeyDeps.writeFile(path, data, options);
+    },
+  };
+  let nonceWrites = 0;
+
+  await withExit(async () => {
+    const deps = applyDeps(signed, {
+      handoffStore,
+      keyDeps,
+      nonceStore: {
+        isConsumed: () => false,
+        consume: () => { nonceWrites++; },
+      },
+    });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 2);
+    assert.equal(deps.bodies.length, 0);
+  });
+  assert.equal(handoffWrites, 0);
+  assert.equal(frontierWrites, 0);
+  assert.equal(nonceWrites, 0);
 });
 
 test("grill: apply writes body only and refuses challenge / drift / kill-switch", async () => {

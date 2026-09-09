@@ -29,6 +29,7 @@ import {
   readEvents,
   readLedger,
   readLock,
+  releaseLock,
   runDir,
   runEventsPath,
   writeLedger,
@@ -1441,8 +1442,8 @@ test("runSupervisorCycle: a rejected concurrent dispatch is durably classified f
   assert.equal(finalLedger.items["100"].evidence_fingerprint !== undefined, true);
   assert.equal(finalLedger.items["200"].state, "ready", "the successful sibling's outcome survives the sibling's rejected dispatch");
   const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
-  assert.equal(terminal.stop, null, "rejected dispatch exhaustion is Cooling");
-  assert.equal(terminal.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(terminal.stop, null, "a depleted class projection does not terminalize recovery");
+  assert.equal(terminal.cooling, undefined, "later per-strategy recovery remains eligible");
 });
 
 test("runSupervisorCycle preserves a failed dispatch response diagnostic for recovery", async () => {
@@ -2161,8 +2162,8 @@ test("regression (#568 review 2, finding 8bb189a0): a round-trip dispatch (backl
 
   assert.equal(cycle.stop, null, "the mechanical block is recorded before terminal promotion");
   const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
-  assert.equal(terminal.stop, null, "a round-trip transition remains an engine defect and cools rather than STOPping");
-  assert.equal(terminal.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(terminal.stop, null, "a round-trip transition remains an owned engine defect");
+  assert.equal(terminal.cooling, undefined, "unspent per-strategy recovery remains eligible");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
@@ -2233,7 +2234,7 @@ test("regression (#568 review 1, finding f09d500c): a real round-trip transition
   assert.equal(cycle.stop, null, "the mechanical block is recorded before terminal promotion");
   const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
   assert.equal(terminal.stop, null, "clock skew must never mask a real round-trip transition as a zero-transition no-op");
-  assert.equal(terminal.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(terminal.cooling, undefined, "unspent per-strategy recovery remains eligible");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
@@ -2774,8 +2775,10 @@ test("a failed budgeted recovery stays blocked and stops only after the action i
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].recovery_budgets_remaining["workflow-engine-defect"], 0);
-  assert.equal(finalLedger.recovery_attempts.every((a) => a.outcome === "failed"), true);
-  assert.equal(finalLedger.recovery_attempts.length, 2);
+  const chargedAttempts = finalLedger.recovery_attempts.filter((a) => a.outcome !== "skipped");
+  assert.equal(chargedAttempts.every((a) => a.outcome === "failed"), true);
+  assert.equal(chargedAttempts.length, recoveryActions.length);
+  assert.equal(recoveryActions.length, 10, "every applicable per-strategy bound is exhausted finitely");
 });
 
 test("an exhausted mechanical item cannot stop an independent sibling before that sibling runs", async () => {
@@ -2859,9 +2862,8 @@ test("an exhausted mechanical item cannot stop an independent sibling before tha
     token,
     "claude",
   );
-  assert.equal(terminalCycle.stop, null, "the exhausted item cools after sibling progress; it does not terminalize");
-  assert.equal(terminalCycle.cooling?.reason, "strategy_cursor_exhausted");
-  assert.equal(terminalCycle.cooling?.theme, "workflow-engine-defect");
+  assert.equal(terminalCycle.stop, null, "the mechanical item stays owned after sibling progress");
+  assert.equal(terminalCycle.cooling, undefined, "later per-strategy recovery remains eligible");
   assert.equal((await readLedger(deps, "run-1")).items["200"].state, "ready");
 });
 
@@ -6197,7 +6199,7 @@ test("regression (#787/#1333): a run_fatal class exhausted enters Cooling not a 
   assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
   assert.equal(result.cooling?.theme, "workflow-engine-defect");
   assert.equal(result.cooling?.historical_evidence, "recovery_exhausted");
-  assert.equal(recoveryCalls, 2);
+  assert.equal(recoveryCalls, 8, "all applicable per-strategy bounds are exhausted before Cooling");
 });
 
 test("typed production-preflight refusal does not claim scratch or dirt recipes", async () => {
@@ -6348,7 +6350,9 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
       },
     },
   });
-  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const ledger = testLedger({
+    "100": { ...itemEntry("100", "pending"), advance_run_id: "advance-100" },
+  });
   const { deps } = await setup(contract, ledger);
   const prHead = "b".repeat(40);
   const coarse = buildStageDiagnostic({
@@ -6368,7 +6372,6 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
       observed_role: "missing",
       blocker_code: "tester_rebind_pr_head_unobservable",
       subject_omitted_because_unobservable: true,
-      pr_head: prHead,
     },
   });
   let dispatchCount = 0;
@@ -6391,7 +6394,7 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
       evidence: {
         pr_number: 99,
         pipeline_run_id: "advance-100",
-        events_path: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+        events_path: "/persistent/repo/.agent-pipeline/runs/advance-100/events.jsonl",
       },
       diagnostic: coarse,
     };
@@ -6414,9 +6417,10 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
     observe,
     dispatchItem,
     executeRecovery,
-    repoDir: "/repo",
+    repoDir: "/operator/worktree",
+    runStoreRepoDir: "/persistent/repo",
     readAdvanceEvents: async (eventsPath) => {
-      assert.equal(eventsPath, "/repo/.agent-pipeline/runs/advance-100/events.jsonl");
+      assert.equal(eventsPath, "/persistent/repo/.agent-pipeline/runs/advance-100/events.jsonl");
       linkedReads.push(actions.length);
       if (actions.length < 2) return [];
       return [{
@@ -6457,6 +6461,107 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
   );
 });
 
+test("driveSupervisor continues after the failed checkpoint that depleted the legacy class projection (#1568)", async () => {
+  const enginePolicy = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-engine-defect": {
+        ...enginePolicy,
+        backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
+      },
+    },
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const head = "e".repeat(40);
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "the workflow engine failed after child completion",
+    stage: "loop-supervisor",
+  });
+  let dispatchCount = 0;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    return dispatchCount === 1
+      ? {
+          schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+          item_id: request.item_id,
+          run_id: request.run_id,
+          outcome: "blocked_recoverable",
+          evidence: { pr_number: 99, pipeline_run_id: "advance-100" },
+          diagnostic,
+        }
+      : {
+          schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+          item_id: request.item_id,
+          run_id: request.run_id,
+          outcome: "ready_to_deploy",
+          evidence: { pr_number: 99, pipeline_run_id: "advance-100-resumed" },
+        };
+  };
+  let published = false;
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: published ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return 99;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: head, merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return published ? [{ bucket: "pass" }] : [];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: head };
+    },
+  }).deps;
+  const actions: string[] = [];
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    actions.push(input.action);
+    if (input.action === "publish_unpublished_stage_commit") {
+      published = true;
+      return { succeeded: true, evidence: "the retained stage commit was published" };
+    }
+    return { succeeded: false, evidence: `${input.action} made no progress`, error: "no progress" };
+  };
+  const supervisorDeps: SupervisorDeps = { store: deps, observe, dispatchItem, executeRecovery };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  for (let cycle = 0; cycle < 4; cycle++) {
+    await runSupervisorCycle(supervisorDeps, "run-1", token, "claude");
+  }
+  const spent = await readLedger(deps, "run-1", token);
+  assert.deepEqual(actions, [
+    "unlink_engine_scratch",
+    "unlink_engine_scratch",
+    "checkpoint_owned_harness_dirt",
+    "checkpoint_owned_harness_dirt",
+  ]);
+  const episodeId = spent.recovery_attempts[0]!.episode_id;
+  spent.items["100"]!.repeated_evidence_count = 2;
+  spent.items["100"]!.recovery_budgets_remaining["workflow-engine-defect"] = 0;
+  await writeLedger(deps, spent, token);
+  await releaseLock(deps, "run-1", token);
+
+  const result = await driveSupervisor(supervisorDeps, { runId: "run-1", engine: "claude" });
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(result.allDone, true);
+  assert.deepEqual(actions.slice(4), ["publish_unpublished_stage_commit"]);
+  assert.equal(finalLedger.recovery_attempts.at(-1)?.episode_id, episodeId);
+  assert.equal(finalLedger.cooling, undefined);
+  assert.equal(finalLedger.stop, null);
+  assert.equal(
+    finalLedger.recovery_attempts.filter((attempt) => attempt.outcome !== "skipped").length,
+    5,
+    "prior attempts are retained without refunding or replacing the episode",
+  );
+});
+
 test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1568)", async () => {
   const head = "c".repeat(40);
   const precise = buildStageDiagnostic({
@@ -6468,6 +6573,8 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
       kind: "tester_rebind_after_pr",
       required_role: "implementation",
       observed_role: "missing",
+      blocker_code: "tester_rebind_pr_head_unobservable",
+      subject_omitted_because_unobservable: true,
       pr_head: head,
     },
   });
@@ -6480,10 +6587,36 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
     stage: precise.detail.stage,
     diagnostic: precise,
   } as never;
+  const headMismatchDiagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "tester_rebind_pr_head_unobservable",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      blocker_code: "tester_rebind_pr_head_unobservable",
+      subject_omitted_because_unobservable: true,
+      pr_head: "d".repeat(40),
+    },
+  });
   const cases = [
     { name: "missing", eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl", events: [] },
     { name: "malformed", eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl", events: null as never },
     { name: "arbitrary path", eventsPath: "/tmp/advance-100/events.jsonl", events: [terminalEvent], expectRead: false },
+    {
+      name: "foreign prefix",
+      eventsPath: "/foreign/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [terminalEvent],
+      expectRead: false,
+    },
+    {
+      name: "operator worktree root",
+      eventsPath: "/repo/.worktrees/operator/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [terminalEvent],
+      expectRead: false,
+    },
     {
       name: "run mismatch",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
@@ -6495,6 +6628,16 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
       events: [{ ...terminalEvent, issue: 999 } as never],
     },
     {
+      name: "candidate mismatch",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...terminalEvent, candidate_epoch: "d".repeat(40) } as never],
+    },
+    {
+      name: "explicit head mismatch",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...terminalEvent, diagnostic: headMismatchDiagnostic } as never],
+    },
+    {
       name: "non-terminal",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
       events: [{ type: "stage_started", run_id: "advance-100", issue: 100 } as never],
@@ -6503,7 +6646,9 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
 
   for (const candidate of cases) {
     const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
-    const ledger = testLedger({ "100": itemEntry("100", "pending") });
+    const ledger = testLedger({
+      "100": { ...itemEntry("100", "pending"), advance_run_id: "advance-100" },
+    });
     const { deps } = await setup(contract, ledger);
     const actions: string[] = [];
     let readCount = 0;

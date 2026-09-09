@@ -657,6 +657,121 @@ test("runPlanningPhases: applied OpenSpec refinement supplies the authoritative 
   assert.doesNotMatch(implementationPrompts[0]!, /- \[ \] original task/);
 });
 
+test("runPlanningPhases: OpenSpec human-feedback acknowledgement is producer-authored in the stable proposal (#1568)", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  const revisionPrompts: string[] = [];
+  const implementationPrompts: string[] = [];
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      getIssueDetail: async () => ({
+        title: "Test issue",
+        body: "test body",
+        comments: [
+          { author: "bot", body: STALE_PLAN_COMMENT, createdAt: "2026-09-03T00:00:00Z" },
+          { author: "alice", body: "Keep the exact candidate assertion.", createdAt: "2026-09-03T00:01:00Z" },
+        ],
+        number: 42,
+        labels: [],
+        state: "open",
+      }),
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          revisionPrompts.push(prompt);
+          proposal = [
+            "Authoritative refined proposal with exact candidate assertion.",
+            "",
+            "## Human Feedback Acknowledgement",
+            "",
+            "- @alice: addressed — retained the exact candidate assertion.",
+          ].join("\n");
+          tasks = "- [ ] verify exact candidate assertion";
+          return revisionOkResult;
+        }
+        implementationPrompts.push(prompt);
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(revisionPrompts.length, 1);
+  assert.match(
+    revisionPrompts[0]!,
+    /write.*Human Feedback Acknowledgement.*proposal\.md/is,
+  );
+  assert.equal(implementationPrompts.length, 1);
+  assert.match(implementationPrompts[0]!, /@alice: addressed/);
+});
+
+test("runPlanningPhases: stdout-only OpenSpec human-feedback acknowledgement is rejected (#1568)", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let implementationCalls = 0;
+  let blocked: { reason: string; tag: string } | undefined;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      getIssueDetail: async () => ({
+        title: "Test issue",
+        body: "test body",
+        comments: [
+          { author: "bot", body: STALE_PLAN_COMMENT, createdAt: "2026-09-03T00:00:00Z" },
+          { author: "alice", body: "Keep the exact candidate assertion.", createdAt: "2026-09-03T00:01:00Z" },
+        ],
+        number: 42,
+        labels: [],
+        state: "open",
+      }),
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+        blocked = { reason, tag };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = "Authoritative refined proposal without a durable acknowledgement.";
+          tasks = "- [ ] verify exact candidate assertion";
+          return revisionOkResult;
+        }
+        implementationCalls++;
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.tag, "needs-human");
+  assert.match(blocked?.reason ?? "", /Human Feedback Acknowledgement/);
+  assert.equal(implementationCalls, 0);
+  assert.doesNotMatch(proposal, /Human Feedback Acknowledgement/);
+});
+
 test("makeOpenspecPlanningHooks: rejects an artifact bundle replaced during validation (#1568)", async () => {
   let proposal = "original proposal";
   let tasks = "- [ ] original";

@@ -37,6 +37,7 @@ import {
   reconcileUncertainClaim,
   recoveryEpisodeId,
   resumeEpisodeFromAttempts,
+  selectEligibleRecoveryStrategy,
   selectNextApplicableStrategy,
 } from "../scripts/loop/recovery-episodes.ts";
 import {
@@ -1390,6 +1391,28 @@ test("per-strategy bound uses retry_budget when per_strategy_bound is absent", (
     candidate_epoch: "e",
     evidence_identity: "f",
   }, "t").strategy_cursor, 0);
+});
+
+test("repeated evidence advances only the spent strategy and preserves a later unspent strategy (#1568)", () => {
+  const selected = selectEligibleRecoveryStrategy({
+    recipes: ["unlink_engine_scratch", "checkpoint_owned_harness_dirt", "restart_workflow_engine"],
+    cursor: 1,
+    attemptsPerStrategy: {
+      unlink_engine_scratch: 2,
+      checkpoint_owned_harness_dirt: 2,
+    },
+    strategyBound: () => 2,
+    isApplicable: () => true,
+    repeatedEvidenceCount: 2,
+    repeatedEvidenceLimit: 2,
+  });
+
+  assert.deepEqual(selected, {
+    kind: "claim",
+    action: "restart_workflow_engine",
+    cursor: 2,
+    skipped: [],
+  });
 });
 
 test("complete started claim after known_complete does not mint a second attempt", async () => {

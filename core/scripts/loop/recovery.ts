@@ -41,7 +41,7 @@ import {
   normalizeEvidenceIdentity,
   perStrategyBound,
   resumeEpisodeFromAttempts,
-  selectNextApplicableStrategy,
+  selectEligibleRecoveryStrategy,
   stampEpisodeNextEligibleAt,
   type RecoveryEpisodeKey,
 } from "./recovery-episodes.ts";
@@ -1213,7 +1213,6 @@ export function independentlyRecoverableBlockedItems(
       if (!lifecycleAllowsRecoveryRecipe(ledger.lifecycle, entry)) return false;
       const policy = contract.recovery_policy[entry.blocked_theme];
       if (!policy || policy.terminal_outcome === "human_authority") return false;
-      if ((entry.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit) return false;
       const attempts = ledger.recovery_attempts.filter(
         (attempt) =>
           attempt.item_id === entry.id &&
@@ -1248,11 +1247,13 @@ export function independentlyRecoverableBlockedItems(
           diagnostic = null;
         }
       }
-      const selected = selectNextApplicableStrategy({
+      const selected = selectEligibleRecoveryStrategy({
         recipes: policy.recipes,
         cursor: episode?.strategy_cursor ?? 0,
         attemptsPerStrategy: episode?.attempts_per_strategy ?? {},
         strategyBound: (recipe) => perStrategyBound(policy, recipe),
+        repeatedEvidenceCount: entry.repeated_evidence_count ?? 0,
+        repeatedEvidenceLimit: policy.repeated_evidence_limit,
         isApplicable: (recipe) =>
           diagnostic
             ? recoveryRecipeApplicability({

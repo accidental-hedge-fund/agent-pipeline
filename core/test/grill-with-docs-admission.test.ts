@@ -1091,6 +1091,71 @@ test("grill: mutating --issue writes Decisions once and replay is idempotent", a
   assert.equal(world.labelsWritten.some((w) => w.label === "pipeline:ready"), false);
 });
 
+test("grill: non-dry-run exported admission refuses unique oversize before body, label, handoff, or frontier writes (#1568)", async () => {
+  const world: FakeWorld = {
+    issues: new Map([[10, openIssue(10)]]),
+    bodies: [],
+    labelsWritten: [],
+    labelsRemoved: [],
+    implementerCalls: [],
+    gitWrites: [],
+    docsPrs: [],
+    callLog: [],
+    milestoneMembers: [],
+    labelMembers: new Map(),
+  };
+  const uniqueNodes = Array.from({ length: 20 }, (_, i) => ({
+    ...autoSettleNodeJson("interface-contract", {
+      id: `unique-${i}`,
+      question: `Question ${i}: ${String.fromCharCode(65 + i).repeat(1_900)}`,
+      recommendation: `Recommendation ${i}: ${String.fromCharCode(97 + i).repeat(1_900)}`,
+    }),
+  }));
+  let handoffWrites = 0;
+  const baseHandoffStore = memoryHandoffStore();
+  const deps = makeDeps(
+    world,
+    memoryStore(),
+    implementerJson({
+      body: "## Summary\nKeep unrelated issue text.\n",
+      nodes: uniqueNodes,
+    }),
+  );
+  deps.handoffStore = {
+    ...baseHandoffStore,
+    writeFile: async (path, data) => {
+      handoffWrites++;
+      await baseHandoffStore.writeFile(path, data);
+    },
+    appendFile: async (path, data) => {
+      handoffWrites++;
+      await baseHandoffStore.appendFile(path, data);
+    },
+  };
+  let frontierWrites = 0;
+  const baseKeyDeps = memoryKeyDeps();
+  deps.keyDeps = {
+    ...baseKeyDeps,
+    writeFile: (path, data, options) => {
+      frontierWrites++;
+      baseKeyDeps.writeFile(path, data, options);
+    },
+  };
+
+  await assert.rejects(
+    () => grillOneIssue(10, deps, {
+      dryRun: false,
+      state: emptyLedger("run-oversize", [10]).issues["10"]!,
+    }),
+    /issue body exceeds.*65,536/i,
+  );
+  assert.deepEqual(world.bodies, []);
+  assert.deepEqual(world.labelsWritten, []);
+  assert.deepEqual(world.labelsRemoved, []);
+  assert.equal(handoffWrites, 0);
+  assert.equal(frontierWrites, 0);
+});
+
 test("grill: publication failure stays waiting under the admitted operation and resume replays it (#1454)", async () => {
   const world: FakeWorld = {
     issues: new Map([[10, openIssue(10)]]),
