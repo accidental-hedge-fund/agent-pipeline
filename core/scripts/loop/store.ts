@@ -45,6 +45,7 @@ import {
   quarantinePathFor,
   RECOVERY_EPISODE_REQUIRED_FIELDS,
 } from "./recovery-episodes.ts";
+import { effectiveRecoveryPolicyForLedgerValidation } from "./recovery-policy-compat.ts";
 
 export const PIPELINE_STATE_HOME_ENV = "AGENT_PIPELINE_STATE_HOME";
 
@@ -612,7 +613,11 @@ export async function readLedger(deps: LoopStoreDeps, runId: string, token?: str
   const dir = runDir(deps, runId);
   const contractText = await deps.readTextFile(contractPath(dir));
   const parsedContract = contractText === null ? undefined : parseJsonObject(contractText);
-  const recoveryPolicy = isLoopContractShape(parsedContract) ? parsedContract.recovery_policy : undefined;
+  const contractIsValid = isLoopContractShape(parsedContract);
+  const rawRecoveryPolicy = contractIsValid ? parsedContract.recovery_policy : undefined;
+  const recoveryPolicy = contractIsValid
+    ? effectiveRecoveryPolicyForLedgerValidation(rawRecoveryPolicy) ?? rawRecoveryPolicy
+    : undefined;
   const privateEpisode = await deps.readTextFile(path.join(dir, PRIVATE_EPISODE_SCHEMA_BASENAME));
   void privateEpisode;
   const text = await deps.readTextFile(ledgerPath(dir));
@@ -630,7 +635,7 @@ export async function readLedger(deps: LoopStoreDeps, runId: string, token?: str
 export async function writeLedger(deps: LoopStoreDeps, ledger: LoopLedger, token: string): Promise<void> {
   await requireToken(deps, ledger.run_id, token);
   const contract = await readContract(deps, ledger.run_id, token);
-  const recoveryPolicy = contract.recovery_policy;
+  const recoveryPolicy = effectiveRecoveryPolicyForLedgerValidation(contract.recovery_policy) ?? contract.recovery_policy;
   const dir = runDir(deps, ledger.run_id);
   const dest = ledgerPath(dir);
   const current = await deps.readTextFile(dest);

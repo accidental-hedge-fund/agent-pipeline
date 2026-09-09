@@ -6591,9 +6591,20 @@ test("driveSupervisor continues after the failed checkpoint that depleted the le
 });
 
 test("production recovery-authority reader rejects any malformed or non-object JSONL row (#1568)", async () => {
-  const runStart = JSON.stringify({ type: "run_start" });
-  const blocker = JSON.stringify({ type: "blocker_set" });
-  for (const badRow of ["not-json", "null", "[]", '"scalar"']) {
+  const runStart = JSON.stringify({ schema_version: 1, type: "run_start", at: "2026-09-08T19:56:18Z" });
+  const blocker = JSON.stringify({ schema_version: 1, type: "blocker_set", at: "2026-09-08T21:21:28.123Z" });
+  for (const badRow of [
+    "not-json",
+    "null",
+    "[]",
+    '"scalar"',
+    "{}",
+    JSON.stringify({ schema_version: 0, type: "stage_start", at: "2026-09-08T20:00:00Z" }),
+    JSON.stringify({ schema_version: "1", type: "stage_start", at: "2026-09-08T20:00:00Z" }),
+    JSON.stringify({ schema_version: 1, type: "", at: "2026-09-08T20:00:00Z" }),
+    JSON.stringify({ schema_version: 1, type: 42, at: "2026-09-08T20:00:00Z" }),
+    JSON.stringify({ schema_version: 1, type: "stage_start", at: "2026-09-08T20:00:00.12Z" }),
+  ]) {
     const events = await readRecoveryAuthorityAdvanceEvents(
       "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
       async () => `${runStart}\n${badRow}\n${blocker}\n`,
@@ -6612,6 +6623,19 @@ test("production recovery-authority reader rejects any malformed or non-object J
     )).length,
     2,
     "a complete object-only stream remains readable",
+  );
+  const stageAccounting = JSON.stringify({
+    schema_version: 7,
+    type: "stage_accounting",
+    at: "2026-09-08T20:00:00Z",
+  });
+  assert.equal(
+    (await readRecoveryAuthorityAdvanceEvents(
+      "/repo/events.jsonl",
+      async () => `${runStart}\n${stageAccounting}\n${blocker}\n`,
+    )).length,
+    3,
+    "a positive future schema version remains forward-compatible",
   );
 });
 

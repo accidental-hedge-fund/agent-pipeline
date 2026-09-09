@@ -66,6 +66,7 @@ import {
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
 import { blockItem, completeRecoveryAttempt, eligibleIndependentItems, fingerprintEvidence, hasContinuableIndependentSibling, persistOwnedCooling, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
+import { isCanonicalUtcEventTimestamp } from "./advance-event-envelope.ts";
 import {
   buildCoolingRecord,
   attemptBelongsToCandidateEpoch,
@@ -735,17 +736,6 @@ function parsePersistedRecoveryEvidence(evidence: string | undefined): Persisted
 function persistedRecoveryEvidence(item: LoopItemLedgerEntry): PersistedRecoveryEvidence | null {
   const blocked = [...item.history].reverse().find((entry) => entry.to === "blocked" && entry.evidence);
   return parsePersistedRecoveryEvidence(blocked?.evidence);
-}
-
-function isCanonicalUtcEventTimestamp(value: unknown): value is string {
-  if (
-    typeof value !== "string" ||
-    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)
-  ) return false;
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return false;
-  const canonical = new Date(timestamp).toISOString();
-  return value.includes(".") ? canonical === value : canonical.replace(".000Z", "Z") === value;
 }
 
 async function refineRecoveryEvidenceFromLinkedAdvance(

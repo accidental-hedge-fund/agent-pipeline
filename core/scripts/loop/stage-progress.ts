@@ -8,6 +8,7 @@
 
 import type { LoopItemLedgerEntry, LoopItemState, LoopLedger } from "./types.ts";
 import { appendEvent, readEvents, readLedger, writeLedger, type LoopStoreDeps } from "./store.ts";
+import { isCanonicalUtcEventTimestamp } from "./advance-event-envelope.ts";
 
 /** Stable loop event kind for whole-run stage-progress follow (#611). */
 export const LOOP_ITEM_STAGE_PROGRESS = "loop_item_stage_progress";
@@ -488,7 +489,16 @@ export function parseRecoveryAuthorityAdvanceEventsJsonl(text: string | null): A
     if (!line.trim()) continue;
     try {
       const parsed = JSON.parse(line) as unknown;
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        !Number.isInteger((parsed as Record<string, unknown>).schema_version) ||
+        ((parsed as Record<string, unknown>).schema_version as number) <= 0 ||
+        typeof (parsed as Record<string, unknown>).type !== "string" ||
+        ((parsed as Record<string, unknown>).type as string).trim().length === 0 ||
+        !isCanonicalUtcEventTimestamp((parsed as Record<string, unknown>).at)
+      ) return [];
       out.push(parsed as AdvanceStageEvent);
     } catch {
       return [];

@@ -12,14 +12,11 @@
 import * as crypto from "node:crypto";
 import {
   LoopError,
-  DURABLE_BLOCKER_CLASSES,
   isDurableBlockerClass,
-  isRecoveryRecipe,
   outstandingReadyItemIds,
   type DurableBlockerClass,
   type ExternalDependencyStatus,
   type RecoveryPolicy,
-  type RecoveryPolicyEntry,
   type RecoveryRecipe,
   type RecoveryAttemptOutcome,
   type LoopRecoveryAttempt,
@@ -56,302 +53,20 @@ import {
 } from "../recovery-lifecycle-ownership.ts";
 import { projectStageDiagnostic, type StageDiagnostic } from "../stage-diagnostic.ts";
 import { recoveryRecipeApplicability } from "./recovery-applicability.ts";
+import {
+  compileRecoveryPolicy,
+  DEFAULT_RECOVERY_POLICY_INPUT,
+  HUMAN_AUTHORITY_CLASSES,
+  normalizeRecoveryPolicyCompatibility,
+} from "./recovery-policy-compat.ts";
 
 // ---------------------------------------------------------------------------
-// Recovery policy compilation — fail closed.
-// ---------------------------------------------------------------------------
+// Recovery policy compilation is a dependency leaf shared with durable-store validation.
+export { compileRecoveryPolicy, HUMAN_AUTHORITY_CLASSES };
 
-/** Classes that never get an automated recipe — their policy entry's
- *  `terminal_outcome` must be `human_authority` with no recipes, reinforcing
- *  (not bypassing) the engine's merge/release/credential/deploy gates. */
-export const HUMAN_AUTHORITY_CLASSES: readonly DurableBlockerClass[] = ["missing-authority", "specification-decision"];
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Compiles and validates a recovery policy for {@link LoopContract.recovery_policy}.
- *  Refuses (LoopError "validation") a policy that omits any class, names an
- *  unknown class, names a recipe outside the closed {@link RECOVERY_RECIPES}
- *  catalogue, is otherwise malformed, or gives `missing-authority` /
- *  `specification-decision` anything but a no-recipe human-authority outcome.
- *  There is deliberately no default for a missing class — a gap fails
- *  compilation rather than defaulting to an open retry. */
-export function compileRecoveryPolicy(policy: unknown): RecoveryPolicy {
-  if (!isPlainObject(policy)) {
-    throw new LoopError("validation", "recovery policy must be an object mapping every DurableBlockerClass to a policy entry");
-  }
-
-  const unknownClasses = Object.keys(policy).filter((k) => !isDurableBlockerClass(k));
-  if (unknownClasses.length > 0) {
-    throw new LoopError("validation", `recovery policy names unknown blocker class(es): ${unknownClasses.join(", ")}`);
-  }
-
-  const compiled = {} as RecoveryPolicy;
-  for (const cls of DURABLE_BLOCKER_CLASSES) {
-    const entry = (policy as Record<string, unknown>)[cls];
-    if (!isPlainObject(entry)) {
-      throw new LoopError("validation", `recovery policy is missing an entry for blocker class "${cls}"`);
-    }
-    compiled[cls] = compileEntry(cls, entry);
-  }
-  return compiled;
-}
-
-function compileEntry(cls: DurableBlockerClass, entry: Record<string, unknown>): RecoveryPolicyEntry {
-  const recipes = entry.recipes;
-  if (!Array.isArray(recipes) || recipes.some((r) => !isRecoveryRecipe(r))) {
-    throw new LoopError(
-      "validation",
-      `recovery policy for "${cls}" names a recipe outside the permitted recovery-recipe catalogue`,
-    );
-  }
-  if (typeof entry.retry_budget !== "number" || !Number.isFinite(entry.retry_budget) || entry.retry_budget < 0) {
-    throw new LoopError("validation", `recovery policy for "${cls}" is missing a valid retry_budget`);
-  }
-  const backoff = entry.backoff;
-  if (
-    !isPlainObject(backoff) ||
-    typeof backoff.initial_seconds !== "number" ||
-    typeof backoff.multiplier !== "number" ||
-    typeof backoff.max_seconds !== "number"
-  ) {
-    throw new LoopError("validation", `recovery policy for "${cls}" is missing a valid backoff schedule`);
-  }
-  if (entry.terminal_outcome !== "retry" && entry.terminal_outcome !== "human_authority") {
-    throw new LoopError("validation", `recovery policy for "${cls}" is missing a valid terminal_outcome`);
-  }
-  if (typeof entry.run_fatal !== "boolean") {
-    throw new LoopError("validation", `recovery policy for "${cls}" is missing a valid run_fatal flag`);
-  }
-  if (
-    typeof entry.repeated_evidence_limit !== "number" ||
-    !Number.isFinite(entry.repeated_evidence_limit) ||
-    entry.repeated_evidence_limit < 1
-  ) {
-    throw new LoopError("validation", `recovery policy for "${cls}" is missing a valid repeated_evidence_limit`);
-  }
-  if (HUMAN_AUTHORITY_CLASSES.includes(cls) && (entry.terminal_outcome !== "human_authority" || recipes.length > 0)) {
-    throw new LoopError(
-      "validation",
-      `recovery policy for "${cls}" must route to a terminal human-authority outcome with no automated recipe`,
-    );
-  }
-  const compiled: RecoveryPolicyEntry = {
-    recipes: recipes as RecoveryRecipe[],
-    retry_budget: entry.retry_budget,
-    backoff: { initial_seconds: backoff.initial_seconds, multiplier: backoff.multiplier, max_seconds: backoff.max_seconds },
-    terminal_outcome: entry.terminal_outcome,
-    run_fatal: entry.run_fatal,
-    repeated_evidence_limit: entry.repeated_evidence_limit,
-  };
-  if (typeof entry.per_strategy_bound === "number" && Number.isFinite(entry.per_strategy_bound) && entry.per_strategy_bound >= 0) {
-    compiled.per_strategy_bound = entry.per_strategy_bound;
-  }
-  return compiled;
-}
-
-/** A reasonable default policy covering every class — used by `pipeline:loop`
- *  contract compilation when discovery supplies no override, and by tests as
- *  a ready-made fixture. Compiled (not hand-typed) so it is itself proof the
- *  validator accepts a real-shaped policy. */
-export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
-  "transient-rate-limit": {
-    recipes: ["wait_and_retry"],
-    retry_budget: 5,
-    backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 900 },
-    terminal_outcome: "retry",
-    run_fatal: false,
-    repeated_evidence_limit: 3,
-  },
-  "workflow-state": {
-    recipes: ["resync_workflow_state", "repair_pipeline_item"],
-    retry_budget: 3,
-    backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
-    terminal_outcome: "retry",
-    run_fatal: false,
-    repeated_evidence_limit: 2,
-  },
-  "implementation-ci": {
-    // #758: first deterministic recipe is shared HEAD goal-satisfaction
-    // (verify_head_goal) before model-repair — no model-repair budget when HEAD
-    // already satisfies the stage goal.
-    recipes: ["verify_head_goal", "rerun_ci", "repair_pipeline_item"],
-    retry_budget: 3,
-    backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 600 },
-    terminal_outcome: "retry",
-    run_fatal: false,
-    repeated_evidence_limit: 2,
-  },
-  "review-findings": {
-    // #1060: preparatory unlink of engine-owned scratch before implementer repair
-    // (same action as #1020 workflow-engine-defect, class-scoped prep semantics).
-    recipes: ["unlink_engine_scratch", "repair_pipeline_item"],
-    retry_budget: 3,
-    backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
-    terminal_outcome: "retry",
-    run_fatal: false,
-    repeated_evidence_limit: 2,
-  },
-  "environment-auth": {
-    recipes: ["verify_authentication"],
-    retry_budget: 2,
-    backoff: { initial_seconds: 10, multiplier: 2, max_seconds: 120 },
-    terminal_outcome: "retry",
-    run_fatal: true,
-    repeated_evidence_limit: 2,
-  },
-  "specification-decision": {
-    recipes: [],
-    retry_budget: 0,
-    backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
-    terminal_outcome: "human_authority",
-    run_fatal: true,
-    repeated_evidence_limit: 1,
-  },
-  "missing-authority": {
-    recipes: [],
-    retry_budget: 0,
-    backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
-    terminal_outcome: "human_authority",
-    run_fatal: true,
-    repeated_evidence_limit: 1,
-  },
-  "upstream-dependency": {
-    recipes: ["retry_upstream_check"],
-    retry_budget: 3,
-    backoff: { initial_seconds: 60, multiplier: 2, max_seconds: 1800 },
-    terminal_outcome: "retry",
-    run_fatal: false,
-    repeated_evidence_limit: 3,
-  },
-  "workflow-engine-defect": {
-    // #1020 / #1246 / #1272 / #1468: unlink scratch, then checkpoint owned leftovers,
-    // then publish an unpublished stage commit, then rebind Tester evidence after PR,
-    // then restart/repair. Publish is before implementer repair. Rebind is
-    // diagnostic-scoped (inapplicable for unrelated engine defects).
-    recipes: [
-      "unlink_engine_scratch",
-      "checkpoint_owned_harness_dirt",
-      "publish_unpublished_stage_commit",
-      "rebind_tester_evidence_after_pr",
-      "restart_workflow_engine",
-      "repair_pipeline_item",
-    ],
-    retry_budget: 2,
-    backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
-    terminal_outcome: "retry",
-    run_fatal: true,
-    repeated_evidence_limit: 2,
-  },
-});
-
-/** Exact stale defaults persisted by prior releases. These shapes are
- * migrated entry-by-entry so custom recipes/budgets/backoff remain untouched. */
-const STALE_DEFAULT_POLICY_ENTRIES: Partial<Record<DurableBlockerClass, readonly Record<string, unknown>[]>> = {
-  "workflow-state": [{
-    recipes: ["resync_workflow_state"], retry_budget: 3,
-    backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
-    terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
-  }],
-  "implementation-ci": [
-    {
-      recipes: ["rerun_ci"], retry_budget: 3,
-      backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 600 },
-      terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
-    },
-    // Pre-#758 default (no verify_head_goal first recipe).
-    {
-      recipes: ["rerun_ci", "repair_pipeline_item"], retry_budget: 3,
-      backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 600 },
-      terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
-    },
-  ],
-  "environment-auth": [{
-    recipes: ["reauthenticate"], retry_budget: 2,
-    backoff: { initial_seconds: 10, multiplier: 2, max_seconds: 120 },
-    terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 2,
-  }],
-  "workflow-engine-defect": [
-    {
-      recipes: ["restart_workflow_engine"], retry_budget: 1,
-      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
-      terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 1,
-    },
-    {
-      recipes: ["restart_workflow_engine", "repair_pipeline_item"], retry_budget: 1,
-      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
-      terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 1,
-    },
-    // Pre-#1020 default (no unlink_engine_scratch first recipe).
-    {
-      recipes: ["restart_workflow_engine", "repair_pipeline_item"], retry_budget: 2,
-      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
-      terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 2,
-    },
-    // Pre-#1246 default (unlink then restart/repair; no owned-leftover checkpoint).
-    {
-      recipes: ["unlink_engine_scratch", "restart_workflow_engine", "repair_pipeline_item"],
-      retry_budget: 2,
-      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
-      terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 2,
-    },
-    // Pre-#1272 default (unlink, checkpoint, restart/repair; no unpublished publish).
-    {
-      recipes: [
-        "unlink_engine_scratch",
-        "checkpoint_owned_harness_dirt",
-        "restart_workflow_engine",
-        "repair_pipeline_item",
-      ],
-      retry_budget: 2,
-      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
-      terminal_outcome: "retry",
-      run_fatal: true,
-      repeated_evidence_limit: 2,
-    },
-    // Pre-#1468 default (unlink, checkpoint, publish, restart/repair; no Tester rebind).
-    {
-      recipes: [
-        "unlink_engine_scratch",
-        "checkpoint_owned_harness_dirt",
-        "publish_unpublished_stage_commit",
-        "restart_workflow_engine",
-        "repair_pipeline_item",
-      ],
-      retry_budget: 2,
-      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
-      terminal_outcome: "retry",
-      run_fatal: true,
-      repeated_evidence_limit: 2,
-    },
-  ],
-  // Pre-#1060 default (repair-only; no preparatory unlink_engine_scratch).
-  "review-findings": [{
-    recipes: ["repair_pipeline_item"],
-    retry_budget: 3,
-    backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
-    terminal_outcome: "retry",
-    run_fatal: false,
-    repeated_evidence_limit: 2,
-  }],
-};
-
-function samePolicyEntry(left: unknown, right: unknown): boolean {
-  if (!isPlainObject(left) || !isPlainObject(right)) return false;
-  if (!Array.isArray(left.recipes) || !Array.isArray(right.recipes)) return false;
-  if (left.recipes.length !== right.recipes.length || left.recipes.some((recipe, i) => recipe !== right.recipes[i])) {
-    return false;
-  }
-  if (!isPlainObject(left.backoff) || !isPlainObject(right.backoff)) return false;
-  return left.retry_budget === right.retry_budget &&
-    left.terminal_outcome === right.terminal_outcome &&
-    left.run_fatal === right.run_fatal &&
-    left.repeated_evidence_limit === right.repeated_evidence_limit &&
-    left.backoff.initial_seconds === right.backoff.initial_seconds &&
-    left.backoff.multiplier === right.backoff.multiplier &&
-    left.backoff.max_seconds === right.backoff.max_seconds;
-}
+/** A reasonable default policy covering every class. Compiling the shared raw
+ * compatibility input keeps recovery selection and store validation in sync. */
+export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy(DEFAULT_RECOVERY_POLICY_INPUT);
 
 /** A run-contract shape accepted at real initialization time: every
  *  {@link LoopContract} field except `recovery_policy`, which is either the
@@ -393,37 +108,9 @@ export async function initRecoverableRun(
  *  exact stale defaults migrate entry-by-entry and custom entries survive. */
 export function upgradeContractForRecovery(contract: LoopContract): LoopContract {
   const policy = contract.recovery_policy;
-  if (policy === undefined) return { ...contract, recovery_policy: DEFAULT_RECOVERY_POLICY };
-  if (!isPlainObject(policy)) {
-    // Preserve fail-closed validation for malformed persisted contracts.
-    return { ...contract, recovery_policy: compileRecoveryPolicy(policy) };
-  }
-
-  let changed = false;
-  const migrated = { ...policy } as Record<string, unknown>;
-  for (const cls of DURABLE_BLOCKER_CLASSES) {
-    const entry = migrated[cls];
-    if (entry === undefined) {
-      migrated[cls] = DEFAULT_RECOVERY_POLICY[cls];
-      changed = true;
-      continue;
-    }
-    const staleDefaults = STALE_DEFAULT_POLICY_ENTRIES[cls] ?? [];
-    if (staleDefaults.some((staleDefault) => samePolicyEntry(entry, staleDefault))) {
-      migrated[cls] = DEFAULT_RECOVERY_POLICY[cls];
-      changed = true;
-      continue;
-    }
-    if (isPlainObject(entry) && Array.isArray(entry.recipes) && entry.recipes.includes("reauthenticate")) {
-      migrated[cls] = {
-        ...entry,
-        recipes: entry.recipes.map((recipe) => recipe === "reauthenticate" ? "verify_authentication" : recipe),
-      };
-      changed = true;
-    }
-  }
-  const compiled = compileRecoveryPolicy(migrated);
-  return changed ? { ...contract, recovery_policy: compiled } : contract;
+  const normalized = normalizeRecoveryPolicyCompatibility(policy);
+  const compiled = compileRecoveryPolicy(normalized);
+  return normalized === policy ? contract : { ...contract, recovery_policy: compiled };
 }
 
 /** Defaults `recovery_attempts` to `[]` when absent (a pre-#509 ledger has no

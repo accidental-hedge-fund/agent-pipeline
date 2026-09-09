@@ -4,6 +4,7 @@ import type { TreatmentFingerprint } from "./harness-adapters/treatment-fingerpr
 import { classifyContextProposals, recordRequiredContextHashes } from "./grill-context.ts";
 import {
   applyReviewerVerdicts,
+  artifactCanonicalJson,
   canonicalThinIssueNodes,
   DEPENDENCY_FACT_CODES,
   embedDecisionsInBody,
@@ -15,6 +16,7 @@ import {
   MAX_NODES,
   MAX_NODE_TEXT,
   parseDecisionsFromBody,
+  parseDecisionsArtifact,
   type ContextProposal,
   type DecisionNode,
   type DecisionsArtifact,
@@ -544,6 +546,10 @@ export async function runRefineSpecApply(
   const parsed = parseEnvelopeBytes(raw);
   if (!parsed.ok) return fail(deps, parsed.reason, 2);
   const envelope: GrillProposalEnvelope = parsed.envelope;
+  const proposalCheck = parseDecisionsArtifact(envelope.proposal.artifact);
+  if (!proposalCheck.ok) {
+    return fail(deps, `proposal artifact is not a valid Decisions artifact: ${proposalCheck.reason}`, 2);
+  }
   let key: string;
   try {
     key = resolveGrillProposalKey(deps.repoDir, deps.keyDeps ?? defaultGrillProposalKeyDeps, {
@@ -557,7 +563,21 @@ export async function runRefineSpecApply(
     issue: issueNumber,
   });
   if (!verified.ok) return fail(deps, verified.reason, 2);
-  if (hasReviewerChallenge(envelope.proposal.artifact.nodes)) {
+  const publicationBody = envelope.proposal.body;
+  if (publicationBody.length > MAX_ISSUE_BODY_LENGTH) {
+    return fail(
+      deps,
+      `proposal body exceeds supported 65,536-character limit (actual ${publicationBody.length})`,
+      2,
+    );
+  }
+  const bodyCheck = parseDecisionsFromBody(envelope.proposal.body);
+  if (!bodyCheck.ok) return fail(deps, `proposal body is not a valid Decisions artifact: ${bodyCheck.reason}`, 2);
+  if (artifactCanonicalJson(bodyCheck.artifact) !== artifactCanonicalJson(proposalCheck.artifact)) {
+    return fail(deps, "proposal artifact does not match the artifact embedded in proposal body", 2);
+  }
+  const artifact = bodyCheck.artifact;
+  if (hasReviewerChallenge(artifact.nodes)) {
     return fail(deps, "proposal contains a reviewer challenge", 2);
   }
   const nonceStore = deps.nonceStore ?? fileConsumedNonceStore(deps.repoDir, deps.keyDeps);
@@ -575,16 +595,6 @@ export async function runRefineSpecApply(
   if (live.title !== envelope.input.title || live.body !== envelope.input.body) {
     return fail(deps, "live title/body drifted from the proposal input", 2);
   }
-  const publicationBody = envelope.proposal.body;
-  if (publicationBody.length > MAX_ISSUE_BODY_LENGTH) {
-    return fail(
-      deps,
-      `proposal body exceeds supported 65,536-character limit (actual ${publicationBody.length})`,
-      2,
-    );
-  }
-  const bodyCheck = parseDecisionsFromBody(envelope.proposal.body);
-  if (!bodyCheck.ok) return fail(deps, `proposal body is not a valid Decisions artifact: ${bodyCheck.reason}`, 2);
   const applyWalk = await walkDeclaredDependencyClosure(
     issueNumber,
     live.title,
@@ -592,7 +602,7 @@ export async function runRefineSpecApply(
     { fetchIssue: deps.fetchDependencyIssue },
   );
   const closureHash = hashDependencyClosure(applyWalk.record);
-  if (closureHash !== envelope.proposal.artifact.fingerprint.dependency_closure_sha256) {
+  if (closureHash !== artifact.fingerprint.dependency_closure_sha256) {
     return fail(deps, "dependency-closure fingerprint mismatch", 2);
   }
   const blockingFacts = applyWalk.facts.filter((f) =>
@@ -611,9 +621,9 @@ export async function runRefineSpecApply(
       domain: deps.domain,
       repo: deps.repo,
       issueNumber,
-      artifact: envelope.proposal.artifact,
+      artifact,
       proposedBody: publicationBody,
-      frontierFp: envelope.proposal.artifact.fingerprint.planning_treatment_sha256,
+      frontierFp: artifact.fingerprint.planning_treatment_sha256,
     },
     deps.handoffStore,
   );
@@ -626,7 +636,7 @@ export async function runRefineSpecApply(
         repo: deps.repo,
         issue: issueNumber,
         body: publicationBody,
-        artifact: bodyCheck.artifact,
+        artifact,
         now: deps.now(),
         key,
       }),
@@ -644,9 +654,9 @@ export async function runRefineSpecApply(
     deps.repoDir,
     {
       issueNumber,
-      artifact: envelope.proposal.artifact,
+      artifact,
       proposedBody: publicationBody,
-      frontierFp: envelope.proposal.artifact.fingerprint.planning_treatment_sha256,
+      frontierFp: artifact.fingerprint.planning_treatment_sha256,
       currentHandoffs: created.created,
     },
     deps.handoffStore,

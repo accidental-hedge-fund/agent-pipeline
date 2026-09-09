@@ -1096,6 +1096,53 @@ test("persisted action outside the class policy is quarantined and cannot resume
   );
 });
 
+test("pre-#1468 policy keeps a newly selected Tester-rebind claim authoritative across fresh reads and replay", async () => {
+  const { deps } = fakeDeps();
+  const pre1468Policy = {
+    ...DEFAULT_RECOVERY_POLICY,
+    "workflow-engine-defect": {
+      recipes: [
+        "unlink_engine_scratch",
+        "checkpoint_owned_harness_dirt",
+        "publish_unpublished_stage_commit",
+        "restart_workflow_engine",
+        "repair_pipeline_item",
+      ],
+      retry_budget: 2,
+      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
+      terminal_outcome: "retry",
+      run_fatal: true,
+      repeated_evidence_limit: 2,
+    },
+  } as LoopContract["recovery_policy"];
+  const persistedContract = testContract({ recovery_policy: pre1468Policy });
+  await initRun(deps, persistedContract, testLedger());
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockItem(deps, persistedContract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "workflow-engine-defect", evidence: "Tester evidence predates the opened PR",
+  });
+  const input = {
+    runId: "run-1" as const,
+    token,
+    itemId: "100",
+    engine: "claude" as const,
+    action: "rebind_tester_evidence_after_pr" as const,
+    candidateIdentity: "head-abc:pr-1569",
+  };
+
+  const first = await startRecoveryAttempt(deps, persistedContract, input);
+  assert.equal(first.attempt.action, "rebind_tester_evidence_after_pr");
+  assert.equal(first.ledger.recovery_attempts.length, 1);
+  const fresh = await readLedger(deps, "run-1", token);
+  assert.equal(fresh.recovery_attempts.length, 1);
+  assert.equal(fresh.recovery_attempts[0]!.attempt_id, first.attempt.attempt_id);
+
+  const replay = await startRecoveryAttempt(deps, persistedContract, input);
+  assert.equal(replay.attempt.attempt_id, first.attempt.attempt_id);
+  assert.equal(replay.ledger.recovery_attempts.length, 1);
+});
+
 test("malformed nested policy entries quarantine without throwing and validation matches compiler numeric semantics", async () => {
   const fractionalPolicy = {
     ...DEFAULT_RECOVERY_POLICY,

@@ -1155,6 +1155,36 @@ test("upgradeContractForRecovery: adding review recovery preserves unrelated cus
   assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"], DEFAULT_RECOVERY_POLICY["workflow-engine-defect"]);
 });
 
+test("upgradeContractForRecovery: stale-shaped workflow policy with custom fields is not widened", () => {
+  const customPolicy = structuredClone(DEFAULT_RECOVERY_POLICY) as unknown as Record<string, unknown>;
+  const customWorkflowPolicy = {
+    recipes: [
+      "unlink_engine_scratch",
+      "checkpoint_owned_harness_dirt",
+      "publish_unpublished_stage_commit",
+      "restart_workflow_engine",
+      "repair_pipeline_item",
+    ],
+    retry_budget: 2,
+    backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
+    terminal_outcome: "retry",
+    run_fatal: true,
+    repeated_evidence_limit: 2,
+    per_strategy_bound: 1,
+    operator_note: "do not widen this custom policy",
+  };
+  customPolicy["workflow-engine-defect"] = customWorkflowPolicy;
+  const contract = {
+    ...testContract(),
+    recovery_policy: customPolicy,
+  } as unknown as LoopContract;
+
+  const upgraded = upgradeContractForRecovery(contract);
+
+  assert.equal(upgraded, contract);
+  assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"], customWorkflowPolicy);
+});
+
 test("upgradeContractForRecovery #1060: exact pre-#1060 repair-only review-findings migrates to unlink-then-repair", () => {
   const legacyPolicy = structuredClone(DEFAULT_RECOVERY_POLICY) as unknown as Record<string, unknown>;
   legacyPolicy["review-findings"] = {

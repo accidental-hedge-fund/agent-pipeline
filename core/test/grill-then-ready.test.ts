@@ -1428,6 +1428,79 @@ test("grill: apply writes body only and refuses challenge / drift / kill-switch"
   });
 });
 
+test("grill: apply rejects a signed mismatch between the envelope and body artifacts before mutations", async () => {
+  const env = await signedPreview();
+  const mismatched = structuredClone(env);
+  const bodyArtifact = structuredClone(env.proposal.artifact);
+  bodyArtifact.nodes[0]!.recommendation = "Reject untrusted input at the security boundary.";
+  bodyArtifact.nodes[0]!.input_digests = nodeInputDigests(bodyArtifact.nodes[0]!);
+  mismatched.proposal.body = embedDecisionsInBody(extractSpecCore(env.proposal.body), bodyArtifact);
+  const resigned = signGrillProposal(
+    (({ mac: _mac, ...unsigned }) => unsigned)(mismatched),
+    "test-key",
+  );
+  let handoffWrites = 0;
+  const baseStore = memoryHandoffStore();
+  const handoffStore: HandoffStoreDeps = {
+    ...baseStore,
+    writeFile: async (path, data) => {
+      handoffWrites++;
+      await baseStore.writeFile(path, data);
+    },
+    appendFile: async (path, data) => {
+      handoffWrites++;
+      await baseStore.appendFile(path, data);
+    },
+  };
+  let frontierWrites = 0;
+  const baseKeyDeps = memoryKeyDeps();
+  const keyDeps: GrillProposalKeyDeps = {
+    ...baseKeyDeps,
+    writeFile: (path, data, options) => {
+      frontierWrites++;
+      baseKeyDeps.writeFile(path, data, options);
+    },
+  };
+  let nonceWrites = 0;
+
+  const { err } = await capture(() => withExit(async () => {
+    const deps = applyDeps(resigned, {
+      handoffStore,
+      keyDeps,
+      nonceStore: {
+        isConsumed: () => false,
+        consume: () => { nonceWrites++; },
+      },
+      writeStderr: (text) => { process.stderr.write(text); },
+    });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 2);
+    assert.equal(deps.bodies.length, 0);
+  }));
+  assert.match(err, /proposal artifact does not match the artifact embedded in proposal body/);
+  assert.equal(handoffWrites, 0);
+  assert.equal(frontierWrites, 0);
+  assert.equal(nonceWrites, 0);
+});
+
+test("grill: apply fails closed on a MAC-valid malformed proposal artifact", async () => {
+  const env = await signedPreview();
+  const malformed = structuredClone(env) as unknown as Record<string, unknown>;
+  (malformed.proposal as Record<string, unknown>).artifact = {};
+  const resigned = signGrillProposal(
+    (({ mac: _mac, ...unsigned }) => unsigned)(malformed) as never,
+    "test-key",
+  );
+  const { err } = await capture(() => withExit(async () => {
+    const deps = applyDeps(resigned);
+    deps.writeStderr = (text) => { process.stderr.write(text); };
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 2);
+    assert.equal(deps.bodies.length, 0);
+  }));
+  assert.match(err, /proposal artifact is not a valid Decisions artifact/);
+});
+
 test("grill: apply refuses empty, dual, and positional proposal input", async () => {
   const env = await signedPreview();
   await withExit(async () => {
