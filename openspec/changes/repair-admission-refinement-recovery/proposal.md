@@ -1,6 +1,6 @@
 ## Why
 
-Three reproduced shared-boundary defects prevent ordinary Pipeline work from advancing reliably: repeated Decisions evidence can exceed GitHub's supported issue-body surface, an accepted OpenSpec refinement can validate and then be replaced by the unchanged proposal before implementation, and a forge observation outage can erase a completed child's precise diagnostic while legacy class-budget projection suppresses a later unspent recovery strategy. These are engine contract defects, so the repair must cover the next equivalent grill, OpenSpec, or recovery run rather than only the affected issue paths.
+Issue #1568 records three reproduced shared-boundary defects that prevent ordinary Pipeline work from advancing reliably: repeated Decisions evidence can exceed GitHub's supported issue-body surface, an accepted OpenSpec refinement can validate and then be replaced by the unchanged proposal before implementation, and a forge observation outage can erase a completed child's precise diagnostic while legacy class-budget projection suppresses a later unspent recovery strategy. These are engine contract defects, so the repair must cover the next equivalent grill, OpenSpec, or recovery run rather than only the affected issue paths.
 
 ## What Changes
 
