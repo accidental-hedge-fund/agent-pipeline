@@ -6454,7 +6454,22 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
         run_id: "advance-100",
         issue: 100,
         repo: "acme/widgets",
-      } as never, historicalBlocker as never];
+      } as never, historicalBlocker as never, {
+        schema_version: 1,
+        type: "run_complete",
+        at: "2026-09-08T21:21:28Z",
+        final_state: "design-gate",
+      } as never, {
+        schema_version: 1,
+        type: "gh_metrics_summary",
+        at: "2026-09-08T21:21:29Z",
+        call_count: 2,
+        total_ms: 10,
+        p50_ms: 4,
+        p95_ms: 6,
+        slowest_calls: [{ category: "issue", elapsed_ms: 6 }],
+        by_wrapper: { getIssue: 2 },
+      } as never];
     },
   };
   const { token } = await acquireLock(deps, "run-1", "claude");
@@ -6934,7 +6949,7 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
         schema_version: 1,
         type: "run_complete",
         at: "2026-09-08T21:22:00Z",
-        final_state: "blocked",
+        final_state: null,
       } as never],
     },
     {

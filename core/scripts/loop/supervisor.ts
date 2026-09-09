@@ -826,12 +826,27 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
       return typeof event.outcome === "string" && event.outcome.trim().length > 0;
     }
     if (event.type === "run_complete") {
+      return typeof event.final_state === "string" && event.final_state.trim().length > 0;
+    }
+    if (event.type === "gh_metrics_summary") {
+      const finiteNonNegative = (value: unknown): boolean =>
+        typeof value === "number" && Number.isFinite(value) && value >= 0;
       return (
-        typeof event.final_state === "string" &&
-        event.final_state.trim().length > 0 &&
-        typeof event.elapsed_ms === "number" &&
-        Number.isFinite(event.elapsed_ms) &&
-        event.elapsed_ms >= 0
+        finiteNonNegative(event.call_count) &&
+        finiteNonNegative(event.total_ms) &&
+        finiteNonNegative(event.p50_ms) &&
+        finiteNonNegative(event.p95_ms) &&
+        Array.isArray(event.slowest_calls) &&
+        event.slowest_calls.every((call) =>
+          typeof call === "object" &&
+          call !== null &&
+          typeof (call as Record<string, unknown>).category === "string" &&
+          finiteNonNegative((call as Record<string, unknown>).elapsed_ms)
+        ) &&
+        typeof event.by_wrapper === "object" &&
+        event.by_wrapper !== null &&
+        !Array.isArray(event.by_wrapper) &&
+        Object.values(event.by_wrapper).every(finiteNonNegative)
       );
     }
     return false;
