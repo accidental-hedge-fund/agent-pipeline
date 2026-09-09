@@ -45,7 +45,7 @@ const revisionOkResult: HarnessResult = {
 
 const planReviewNeedsRevision: HarnessResult = {
   success: true,
-  stdout: "## Plan Review Verdict\n\nNEEDS_REVISION. Expand the OpenSpec tasks.",
+  stdout: "## Plan Review Verdict\n\nNEEDS_REVISION\n\nExpand the OpenSpec tasks.",
   stderr: "",
   exit_code: 0,
   duration: 1,
@@ -614,6 +614,7 @@ test("runPlanningPhases: applied OpenSpec refinement supplies the authoritative 
   let tasks = "- [ ] original task";
   let deltas = LIVING_DELTAS;
   const implementationPrompts: string[] = [];
+  const revisionPrompts: string[] = [];
   const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
     listChangeDirs: () => ["fresh-change"],
     validateItem: async () => validItem(),
@@ -632,6 +633,7 @@ test("runPlanningPhases: applied OpenSpec refinement supplies the authoritative 
     eqBaseDeps({
       invoke: async (_h: string, _dir: string, prompt: string) => {
         if (prompt.includes("Original implementation plan:")) {
+          revisionPrompts.push(prompt);
           proposal = "Authoritative refined proposal PIN-1568";
           tasks = "- [ ] authoritative refined task PIN-1568";
           deltas = "#### spec.md\n\nRefined requirement PIN-1568 SHALL hold.";
@@ -644,11 +646,62 @@ test("runPlanningPhases: applied OpenSpec refinement supplies the authoritative 
   );
 
   assert.equal(result.advanced, true);
+  assert.equal(revisionPrompts.length, 1);
+  assert.match(revisionPrompts[0]!, /edit.*openspec\/changes\/fresh-change\/proposal\.md/is);
+  assert.match(revisionPrompts[0]!, /tasks\.md/);
+  assert.match(revisionPrompts[0]!, /specs\/\*\*\/\*\.md/);
   assert.equal(implementationPrompts.length, 1);
   assert.match(implementationPrompts[0]!, /Authoritative refined proposal PIN-1568/);
   assert.match(implementationPrompts[0]!, /authoritative refined task PIN-1568/);
   assert.match(implementationPrompts[0]!, /Refined requirement PIN-1568 SHALL hold/);
   assert.doesNotMatch(implementationPrompts[0]!, /- \[ \] original task/);
+});
+
+test("makeOpenspecPlanningHooks: rejects an artifact bundle replaced during validation (#1568)", async () => {
+  let proposal = "original proposal";
+  let tasks = "- [ ] original";
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    readChangeFile: (_dir, _change, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => "Requirement SHALL hold.",
+    validateItem: async () => {
+      proposal = "unvalidated replacement written during validation";
+      return validItem();
+    },
+  });
+
+  assert.equal((await hooks.captureRevisionBaseline!({ path: "/fake/wt" })).ok, true);
+  proposal = "valid revised proposal";
+  tasks = "- [ ] valid revised task";
+
+  const result = await hooks.revalidateArtifact({ path: "/fake/wt" }, "Acknowledged");
+  assert.equal(result.ok, false, "a bundle changed during validation must fail closed");
+  if (!result.ok) assert.match(result.reason, /changed during validation/i);
+});
+
+test("makeOpenspecPlanningHooks: buildImplPlan uses the same stable validated bundle (#1568)", async () => {
+  let proposal = "original proposal";
+  let tasks = "- [ ] original task";
+  let deltas = "Original requirement SHALL hold.";
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    readChangeFile: (_dir, _change, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => deltas,
+    validateItem: async () => validItem(),
+  });
+
+  assert.equal((await hooks.captureRevisionBaseline!({ path: "/fake/wt" })).ok, true);
+  proposal = "validated revised proposal";
+  tasks = "- [ ] validated revised task";
+  deltas = "Validated requirement SHALL hold.";
+  assert.equal((await hooks.revalidateArtifact({ path: "/fake/wt" }, "Acknowledged")).ok, true);
+
+  proposal = "later unvalidated proposal";
+  tasks = "- [ ] later unvalidated task";
+  const implPlan = await hooks.buildImplPlan({ path: "/fake/wt" }, "ignored");
+  assert.match(implPlan, /validated revised proposal/);
+  assert.match(implPlan, /validated revised task/);
+  assert.doesNotMatch(implPlan, /later unvalidated/);
 });
 
 test("runPlanningPhases: acknowledged but unapplied OpenSpec refinement blocks before implementation (#1568)", async () => {
@@ -679,4 +732,62 @@ test("runPlanningPhases: acknowledged but unapplied OpenSpec refinement blocks b
   assert.equal(blocked?.tag, "openspec-invalid");
   assert.match(blocked?.reason ?? "", /acknowledged.*unchanged/i);
   assert.equal(implementationCalls, 0);
+});
+
+test("runPlanningPhases: approved unchanged OpenSpec artifact remains valid (#1568)", async () => {
+  let implementationCalls = 0;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], livingFileInjects());
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      invokeReviewer: async () => ({
+        result: { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+        effectiveReviewer: "codex",
+        selfReview: false,
+      }),
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (!prompt.includes("Original implementation plan:")) implementationCalls++;
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(implementationCalls, 1);
+});
+
+test("runPlanningPhases: malformed approval cannot admit an unchanged OpenSpec artifact (#1568)", async () => {
+  let blocked: { reason: string; tag: string } | undefined;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], livingFileInjects());
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+        blocked = { reason, tag };
+      },
+      invokeReviewer: async () => ({
+        result: planReviewOk,
+        effectiveReviewer: "codex",
+        selfReview: false,
+      }),
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.tag, "openspec-invalid");
+  assert.match(blocked?.reason ?? "", /acknowledged.*unchanged/i);
 });

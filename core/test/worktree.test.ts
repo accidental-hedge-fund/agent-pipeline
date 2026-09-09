@@ -2254,36 +2254,26 @@ test("createWorktree: linked-merged-PR probe failure reclassifies unverifiable a
   assert.equal(removeCalled, false);
 });
 
-test("createWorktree: same-path local-only verification failure reuses the clean worktree (#1568)", async () => {
+test("createWorktree: local-only verification hard-failure (null) blocks reclaim (#622)", async () => {
   const cfg = makeCreateCfg();
   const rec = makeRec(42, "slug");
   let removeCalled = false;
-  let gitCalled = false;
-  let markerPath: string | null = null;
 
   const deps = makeReclaimSafetyDeps({
     listActive: async () => [rec],
     existsSync: (p) => p === rec.path,
     hasDirtyWorkdir: async () => false,
     hasLocalOnlyCommits: async () => null,
-    gitCmd: async () => {
-      gitCalled = true;
-      throw new Error("no git: reuse must not add or delete");
-    },
     removeWorktree: async () => {
       removeCalled = true;
     },
-    writeManagedMarker: async (p) => {
-      markerPath = p;
-    },
   });
 
-  const result = await createWorktree(cfg, 42, "slug", deps);
-  assert.equal(result.path, rec.path);
-  assert.equal(result.branch, rec.branch);
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "slug", deps),
+    /Cannot reclaim.*verification failed/i,
+  );
   assert.equal(removeCalled, false);
-  assert.equal(gitCalled, false, "reuse must not call git (no worktree add / branch delete)");
-  assert.equal(markerPath, rec.path);
 });
 
 test("createWorktree: clean managed worktree is reclaimed so create proceeds (#622)", async () => {

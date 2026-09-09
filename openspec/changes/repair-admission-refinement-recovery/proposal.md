@@ -7,7 +7,9 @@ Issue #1568 records three reproduced shared-boundary defects that prevent ordina
 - Represent identical Decisions evidence once in the embedded artifact and reference it from every applicable node and authority request, while preserving semantic round-trip compatibility with previously valid inline artifacts.
 - Refuse a Decisions publication before the GitHub mutation when the complete compacted issue body still exceeds the supported ceiling; never truncate unique evidence, discard nodes, or alter unrelated issue content.
 - Require a reviewer-accepted OpenSpec refinement to be applied to one coherent authoritative change, structurally revalidated, reread, and used to build the actual implementation input.
-- Reject unchanged, unapplied, incoherent, or invalid OpenSpec refinements instead of reporting success and falling back to the previously accepted proposal.
+- Tell the OpenSpec revision producer to edit the identified proposal, tasks, and relevant spec deltas, while preserving stdout-only revision behavior for freeform planning and allowing an approved OpenSpec artifact to remain unchanged.
+- Recompute advisory human-comment context on every planning invocation and carry eligible feedback from the prior plan into review, revision, and acknowledgement even after the replacement plan is posted; keep snapshot publication idempotent and pipeline comments excluded.
+- Reject unchanged or unapplied OpenSpec refinements when review or eligible human feedback requires substantive change, and reject incoherent or invalid refinements, instead of reporting success and falling back to the previously accepted proposal.
 - Parse completed child diagnostics independently from post-child forge refreshes, retain the most precise valid child diagnostic when that refresh fails, and record forge uncertainty without converting an unobservable gate into success.
 - At recovery time, use only the recorded linked advance identity and canonical run-store event location to recover a more precise terminal diagnostic when persisted transport evidence is coarse; missing, malformed, or mismatched observations remain fail-closed.
 - Make outer recovery eligibility agree with the existing Recovery Episode contract: applicable strategies with remaining per-strategy budget remain eligible even when the legacy class-budget projection is zero, while exhausted and inapplicable strategies remain bounded.
@@ -19,6 +21,9 @@ Issue #1568 records three reproduced shared-boundary defects that prevent ordina
 - [ ] A previously valid Decisions artifact with inline evidence parses and re-renders without semantic loss.
 - [ ] A body whose genuinely unique Decisions content remains over 65,536 characters is rejected before any issue-body publication attempt, with no truncation or omitted node.
 - [ ] A substantive reviewer-accepted OpenSpec refinement changes the validated authoritative artifact, and the exact refined artifact content is present in the implementation input.
+- [ ] The OpenSpec revision producer is explicitly instructed to edit the identified change files, freeform revision remains stdout-only, and an approved unchanged OpenSpec bundle remains valid.
+- [ ] A bundle replaced during structural validation is rejected before publication or implementation, and the same stable validated proposal/tasks/spec bundle supplies both handoffs.
+- [ ] On replan, eligible human feedback posted after an existing context snapshot reaches the author, reviewer, revision producer, and acknowledgement gate without posting a duplicate snapshot or elevating pipeline-generated comments.
 - [ ] An unchanged or unapplied refinement, and a refinement that leaves an incoherent or structurally invalid change, is rejected explicitly before implementation; the old proposal is not delivered as if revision succeeded.
 - [ ] When a child completes with `tester_rebind_pr_head_unobservable` and the following forge refresh throws, dispatch returns that precise diagnostic plus explicit independent forge-observation uncertainty; it does not report a pass or fabricate Tester binding.
 - [ ] A retained same-episode record containing coarse transport evidence, two spent `unlink_engine_scratch` attempts, and a zero legacy class budget can recover the precise diagnostic only from its matching linked advance events and select the unspent applicable `rebind_tester_evidence_after_pr` strategy without changing prior attempts or episode identity.
@@ -44,6 +49,6 @@ None.
 ## Impact
 
 - Admission rendering and parsing in `core/scripts/grill-decisions.ts` and injected renderer/ready tests.
-- OpenSpec revision acknowledgement, artifact validation/reread, and implementation-plan construction in `core/scripts/stages/planning.ts` and planning tests.
+- OpenSpec revision instructions, current feedback handoff, artifact validation/reread, and implementation-plan construction in `core/scripts/stages/planning.ts`, `core/scripts/prompts/plan_revision.md`, and planning tests.
 - Nested dispatch diagnostic transport in `core/scripts/pipeline.ts`, linked advance-event observation in `core/scripts/loop/supervisor.ts`, recovery applicability/eligibility in `core/scripts/loop/recovery.ts`, and their injected-I/O tests.
 - Generated host SKILL artifacts produced by `scripts/build.mjs`; no configuration, schema-version, external API, release, or merge-authority change.

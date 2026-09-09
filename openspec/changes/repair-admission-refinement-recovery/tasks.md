@@ -13,27 +13,28 @@
 
 ## 3. Bind Accepted OpenSpec Refinement to Implementation
 
-- [x] 3.1 Capture the authoritative OpenSpec artifact state around revision using existing change-id, worktree, file-read, and validation seams; verify a substantive accepted refinement must materially affect the identified change rather than merely satisfy `plan-revision.ack@1`.
-- [x] 3.2 Revalidate and reread the coherent proposal, tasks, and spec deltas after revision, then construct implementation input only from that validated authoritative state; verify the accepted refined content reaches the implementation prompt exactly and no prior-proposal/stdout fallback is used.
-- [x] 3.3 Return an explicit engine-owned OpenSpec failure for unchanged, unapplied, missing, incoherent, or structurally invalid refined artifacts; verify implementation does not start and the prior accepted plan is not posted or delivered as revised.
+- [x] 3.1 Supply format-specific revision instructions through the shared prompt seam; verify the actual OpenSpec caller tells the producer to edit the identified proposal, tasks, and relevant spec deltas, while freeform retains stdout-only revision behavior.
+- [x] 3.2 Read the complete proposal/tasks/spec bundle immediately before and after structural validation, reject intervening mutation, and cache that same stable validated bundle for revised-plan publication and implementation input.
+- [x] 3.3 Require material OpenSpec change only for reviewer-requested revision or eligible human feedback; reject acknowledged no-op/invalid required revisions while allowing an approved artifact with no pending feedback to remain unchanged.
 - [x] 3.4 Run the paired freeform planning tests and verify the non-OpenSpec stdout-based refinement path and existing authority/review gates remain unchanged.
+- [x] 3.5 Recompute capped and sanitized current human-comment context on every planning invocation; verify prior-plan feedback survives replacement-plan publication into author/reviewer/revision/acknowledgement, snapshot publication stays idempotent, and pipeline-generated comments remain excluded.
 
 ## 4. Preserve and Recover Precise Diagnostics
 
 - [x] 4.1 Reorder `realDispatchItem` observation so confirmed child events are parsed before fallible forge refreshes and retained independently; verify the injected forge-outage regression returns the precise child diagnostic plus explicit observation uncertainty without a gate pass or fabricated Tester binding.
-- [x] 4.2 At blocked recovery preflight, reuse `SupervisorDeps.readAdvanceEvents` to refine coarse persisted evidence from terminal linked events only when retained run ID, item, candidate, and canonical run-store location match; verify matching #1558-shaped evidence selects the Tester-rebind diagnostic without editing events or episode history.
-- [x] 4.3 Add negative linked-event tests for missing, malformed, arbitrary-path, run-mismatched, item-mismatched, and non-terminal streams; verify each remains fail-closed on persisted evidence and cannot confer Tester success or a replacement episode.
+- [ ] 4.2 At blocked recovery preflight, reuse `SupervisorDeps.readAdvanceEvents` to refine coarse persisted evidence from terminal linked events only when retained run ID, item, candidate, and canonical persistent run-store location match; close the remaining actual-#1558 gap where historical diagnostic evidence lacks `pr_head`, without editing events or episode history.
+- [ ] 4.3 Add negative linked-event tests for missing, malformed, arbitrary/foreign-prefix paths, run-mismatched, item-mismatched, and non-terminal streams; verify each remains fail-closed on persisted evidence and cannot confer Tester success or a replacement episode.
 
 ## 5. Align Recovery Admission with Per-Strategy Authority
 
-- [x] 5.1 Reuse or extract one pure Recovery Episode eligibility predicate covering lifecycle/Cooling, diagnostic applicability, cursor, attempts per strategy, and per-strategy bounds; verify both outer blocked-item eligibility and execution-time selection use it while class remaining budget stays compatibility-only.
-- [x] 5.2 Replay the retained coarse-to-precise same-episode case and verify `rebind_tester_evidence_after_pr` is claimable with its unspent bound despite zero class projection, while both prior scratch attempts and all budget accounting remain unchanged.
-- [x] 5.3 Add finite-boundary regressions proving exhausted strategies stay ineligible, inapplicable recipes remain skips, no applicable unspent strategy enters owned Cooling/wait, repeated evidence cannot tight-loop, and candidate/evidence episode identity is preserved.
+- [ ] 5.1 Reuse or extract one pure Recovery Episode eligibility predicate covering lifecycle/Cooling, diagnostic applicability, cursor, attempts per strategy, and per-strategy bounds; verify both outer blocked-item eligibility and execution-time selection use it while class remaining budget stays compatibility-only and post-action eligibility cannot project false Cooling.
+- [ ] 5.2 Replay the actual #1568 `driveSupervisor` retained outer episode-key case and verify it continues to the next applicable unspent strategy despite zero class projection, while prior attempts and all budget accounting remain unchanged; separately replay #1558's missing-head observation and verify that case selects `rebind_tester_evidence_after_pr`.
+- [ ] 5.3 Add finite-boundary and actual #1568 `driveSupervisor` post-action regressions proving exhausted strategies stay ineligible, inapplicable recipes remain skips, an applicable unspent strategy does not enter false Cooling, repeated evidence cannot tight-loop, and the retained outer candidate/evidence episode key is preserved.
 - [x] 5.4 Add a scheduler regression proving an independent sibling remains eligible to advance or recover while another item is Cooling or waiting.
 
 ## 6. Verify and Hand Off
 
-- [x] 6.1 Run the focused renderer, planning, dispatch, durable-classification, and recovery test files with Node's injected-I/O test harness; verify the original bounded reproductions pass and no test performs real network, git, or subprocess operations.
+- [ ] 6.1 Run the focused renderer, planning, dispatch, durable-classification, and recovery test files with Node's injected-I/O test harness; verify the original bounded reproductions pass and no test performs real network, git, or subprocess operations.
 - [x] 6.2 Run `node scripts/build.mjs` after all `core/` edits and verify `node scripts/build.mjs --check` reports every generated host SKILL fresh without creating or committing `plugin/`.
 - [x] 6.3 Run `npm run ci` from the repository root and verify core tests, host build freshness, install smoke, OpenSpec validation, conditional docs freshness, and scripts checks all pass.
 - [ ] 6.4 Complete ordinary independent Pipeline reviews and GitHub CI on the exact candidate and verify they are green; stop at ready-to-deploy because merge, release, tag, publication, installation, and deployment require separate authorization.

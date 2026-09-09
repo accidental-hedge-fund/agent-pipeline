@@ -26,7 +26,7 @@ Before the revised plan, output a `## Feedback Incorporated` section that lists 
 
 Every reviewer feedback item MUST appear as either `[ADDRESSED]` or `[DEFERRED]`. Do not omit items.
 
-Then return the final revised implementation plan in Markdown. Do not implement code yet.
+{{revision_instructions}}
 
 The revised plan MUST preserve or regenerate these two required sections — do not drop them even if the reviewer feedback did not address them:
 

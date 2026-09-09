@@ -47,6 +47,7 @@ import {
   ensembleSelfReviewBanner,
   formatEnsembleIdentityLine,
   invokeReviewEnsemble,
+  parsePlanReviewVerdictToken,
   type EnsembleInvocation,
 } from "../review-ensemble.ts";
 import { expandAutoEffort, resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
@@ -394,7 +395,11 @@ export interface PlanningPhaseHooks {
    * Re-validate and re-read the artifact after plan revision. Returns the
    * (potentially updated) planText and specContext.
    */
-  revalidateArtifact(wt: { path: string }, revisionStdout: string): Promise<
+  revalidateArtifact(
+    wt: { path: string },
+    revisionStdout: string,
+    options?: { requireChange: boolean },
+  ): Promise<
     | { ok: true; updatedPlanText: string; updatedSpecContext: string }
     | { ok: false; reason: string; tag: BlockerKind }
   >;
@@ -451,6 +456,12 @@ export interface PlanningPhaseHooks {
     deps: RunPlanningPhasesDeps,
     issueNumber?: number,
   ): Promise<HarnessResult>;
+
+  /** Format-specific action the revision producer must perform before replying. */
+  revisionPromptInstructions?(
+    wt: { path: string },
+    options: { requireChange: boolean },
+  ): string;
 
   /**
    * Bind living plan-review resume artifacts from the worktree. OpenSpec
@@ -838,7 +849,8 @@ export async function runPlanningPhases(
 
   // ---- Step 0b: pre-planning context snapshot (human comments) ----
   // Gathered after bootstrap so comments posted during the bootstrap window are included.
-  const contextSnapshot = await gatherContextSnapshot(cfg, issueNumber, body, deps);
+  const gatheredContext = await gatherContextSnapshot(cfg, issueNumber, body, deps);
+  const contextSnapshot = gatheredContext.rendered;
 
   if (resumePlanReview) {
     // #870: reuse the completed plan — do not re-invoke the planning harness.
@@ -1112,10 +1124,14 @@ export async function runPlanningPhases(
     // #26: re-fetch comments so any human feedback left on the posted plan
     // during the reviewer run flows into the revision alongside the reviewer's.
     const doGetIssueDetail = deps.getIssueDetail ?? getIssueDetail;
-    const humanComments = extractHumanPlanComments(
+    const currentHumanComments = extractHumanPlanComments(
       (await doGetIssueDetail(cfg, issueNumber)).comments,
       planComment,
     );
+    const humanComments = dedupeHumanPlanComments([
+      ...gatheredContext.priorPlanFeedback,
+      ...currentHumanComments,
+    ]);
 
     const revisionFacts = await observePlanningFactsForPhase(
       cfg,
@@ -1131,6 +1147,8 @@ export async function runPlanningPhases(
     }
     persistPlanningFactsArtifact(opts.runDir, "planning-fact-bundle.json", revisionFacts.bundle);
     lastPlanningFactsBaseSha = revisionFacts.bundle.integration_base_sha || lastPlanningFactsBaseSha;
+    const revisionRequiresArtifactChange =
+      parsePlanReviewVerdictToken(planReview) !== "APPROVE" || humanComments.length > 0;
     const revisionPrompt = buildPlanRevisionPrompt({
       cfg,
       issueNumber,
@@ -1146,6 +1164,10 @@ export async function runPlanningPhases(
       planningFactIdentityChange: identityChangePrevious
         ? { previous: identityChangePrevious }
         : undefined,
+      contextSnapshot,
+      revisionInstructions: hooks.revisionPromptInstructions?.(wt, {
+        requireChange: revisionRequiresArtifactChange,
+      }),
     });
     const invokeRevisionOnce = async (prompt: string) =>
       hooks.invokeRevision
@@ -1266,7 +1288,9 @@ export async function runPlanningPhases(
     boundPlanningFacts = revisionFacts.bundle;
 
     // Re-validate and re-read artifact after revision (OpenSpec re-reads proposal; freeform is a no-op).
-    const rv = await hooks.revalidateArtifact(wt, revisionResult.stdout.trim());
+    const rv = await hooks.revalidateArtifact(wt, revisionResult.stdout.trim(), {
+      requireChange: revisionRequiresArtifactChange,
+    });
     if (!rv.ok) {
       const reason = withRevisionSalvageFailure(rv.reason);
       await doSetBlocked(cfg, issueNumber, reason, "plan-review", rv.tag);
@@ -2399,12 +2423,29 @@ export function makeOpenspecPlanningHooks(
       return { ok: true };
     },
 
-    async revalidateArtifact(wt, _revisionStdout) {
+    async revalidateArtifact(wt, _revisionStdout, options) {
       const restored = restoreChangeIdIfEmpty(wt.path);
       if (!restored.ok) {
         return {
           ok: false,
           reason: restored.reason,
+          tag: "openspec-invalid",
+        };
+      }
+      let candidate: AuthoritativeArtifact | null;
+      try {
+        candidate = readAuthoritativeArtifact(wt.path);
+      } catch (err) {
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` could not be read before post-revision validation: ${err instanceof Error ? err.message : String(err)}`,
+          tag: "openspec-invalid",
+        };
+      }
+      if (!candidate) {
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` has no readable proposal.md after revision`,
           tag: "openspec-invalid",
         };
       }
@@ -2433,7 +2474,18 @@ export function makeOpenspecPlanningHooks(
           tag: "openspec-invalid",
         };
       }
-      if (revisionBaseline && JSON.stringify(revised) === JSON.stringify(revisionBaseline)) {
+      if (JSON.stringify(revised) !== JSON.stringify(candidate)) {
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` changed during validation; no stable validated artifact bundle is available`,
+          tag: "openspec-invalid",
+        };
+      }
+      if (
+        (options?.requireChange ?? true) &&
+        revisionBaseline &&
+        JSON.stringify(revised) === JSON.stringify(revisionBaseline)
+      ) {
         return {
           ok: false,
           reason: `OpenSpec change \`${changeId}\` was acknowledged but its authoritative proposal, tasks, and spec deltas were unchanged`,
@@ -2532,6 +2584,23 @@ export function makeOpenspecPlanningHooks(
     // Plan review must also run from wt.path so the reviewer can read the
     // just-authored openspec/changes/<id>/ files (proposal, design, tasks).
     planReviewCwd(wt) { return wt.path; },
+
+    revisionPromptInstructions(_wt, options) {
+      const artifactPath = `openspec/changes/${changeId}`;
+      return options.requireChange
+        ? (
+            `Apply the accepted feedback by editing the authoritative OpenSpec artifacts ` +
+            `\`${artifactPath}/proposal.md\`, \`${artifactPath}/tasks.md\`, and the relevant ` +
+            `\`${artifactPath}/specs/**/*.md\` files (plus \`${artifactPath}/design.md\` when needed for coherence). ` +
+            `Do not implement product code yet. Then return the final revised implementation plan in Markdown, ` +
+            `reflecting the authoritative files you edited.`
+          )
+        : (
+          `Review the authoritative OpenSpec artifacts under \`${artifactPath}/\`. ` +
+          `If no accepted feedback requires a change, leave those files unchanged. ` +
+          `Do not implement product code yet. Then return the final reviewed implementation plan in Markdown.`
+        );
+    },
 
     // Run plan revision in the issue worktree so the harness can update the
     // OpenSpec change files (proposal.md, spec deltas, tasks.md) in wt.path.
@@ -3659,7 +3728,10 @@ async function gatherContextSnapshot(
   issueNumber: number,
   body: string,
   deps: RunPlanningPhasesDeps,
-): Promise<string> {
+): Promise<{
+  rendered: string;
+  priorPlanFeedback: { author: string; body: string }[];
+}> {
   try {
     const doGetIssueDetail = deps.getIssueDetail ?? getIssueDetail;
     const doPostComment = deps.postComment ?? postComment;
@@ -3667,37 +3739,59 @@ async function gatherContextSnapshot(
     const detail = await doGetIssueDetail(cfg, issueNumber);
     const comments = detail.comments;
 
-    // Idempotent: skip if a Pre-Planning Context snapshot comment already exists.
-    // Use startsWith(header + '\n') to avoid matching the last30days comment
-    // (## Pre-Planning Context — last30days) which has different text after the header.
+    // Publication is idempotent, but prompt context is rebuilt on every planning
+    // invocation so feedback posted after an older snapshot reaches a replan.
+    // Use startsWith(header + '\n') to avoid matching the last30days comment.
     const existing = comments.find((c) =>
       c.body.trimStart().startsWith(PRE_PLANNING_CONTEXT_HEADER + '\n'),
     );
-    if (existing) {
-      // Re-use the body (strip the header) as the rendered block.
-      const stripped = existing.body.slice(PRE_PLANNING_CONTEXT_HEADER.length).trimStart();
-      return stripped;
-    }
 
     const maxChars = cfg.context_snapshot?.max_chars ?? CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT;
     const snapshot = buildContextSnapshot(comments, maxChars);
     const rendered = renderContextSnapshotBlock(snapshot);
 
-    if (!rendered) return '';
+    const priorPlan = [...comments].reverse().find((c) => {
+      const head = c.body.trimStart();
+      return head.startsWith("## Revised Implementation Plan") ||
+        head.startsWith("## Implementation Plan");
+    });
+    const priorPlanFeedback = priorPlan
+      ? extractHumanPlanComments(comments, priorPlan.body).filter((comment) =>
+          snapshot.entries.some((entry) =>
+            entry.author === comment.author && entry.body === comment.body
+          )
+        )
+      : [];
+
+    if (!rendered) return { rendered: "", priorPlanFeedback };
 
     const conflicts = detectConflicts(snapshot, body);
     const conflictBlock = renderConflictWarningBlock(conflicts);
 
-    const commentBody = `${PRE_PLANNING_CONTEXT_HEADER}\n\n${rendered}${conflictBlock}${footer(cfg)}`;
-    await doPostComment(cfg, issueNumber, commentBody);
-    console.log(`[pipeline] #${issueNumber}: pre-planning context snapshot posted (${snapshot.entries.length} human comment(s))`);
+    if (!existing) {
+      const commentBody = `${PRE_PLANNING_CONTEXT_HEADER}\n\n${rendered}${conflictBlock}${footer(cfg)}`;
+      await doPostComment(cfg, issueNumber, commentBody);
+      console.log(`[pipeline] #${issueNumber}: pre-planning context snapshot posted (${snapshot.entries.length} human comment(s))`);
+    }
 
-    return rendered + conflictBlock;
+    return { rendered: rendered + conflictBlock, priorPlanFeedback };
   } catch (err) {
     // Non-fatal: snapshot is advisory; don't block planning if this fails.
     console.warn(`[pipeline] #${issueNumber}: context snapshot collection failed (non-fatal): ${(err as Error).message}`);
-    return '';
+    return { rendered: "", priorPlanFeedback: [] };
   }
+}
+
+function dedupeHumanPlanComments(
+  comments: { author: string; body: string }[],
+): { author: string; body: string }[] {
+  const seen = new Set<string>();
+  return comments.filter((comment) => {
+    const key = `${comment.author}\u0000${comment.body}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function footer(cfg: PipelineConfig): string {

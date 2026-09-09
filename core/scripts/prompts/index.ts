@@ -225,6 +225,8 @@ export interface BuildPlanRevisionArgs extends BuildPlanArgs {
   humanFeedback?: string;
   /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
   specContext?: string;
+  /** Format-specific revision action. Freeform keeps the stdout-only default. */
+  revisionInstructions?: string;
 }
 
 export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
@@ -250,6 +252,9 @@ export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
       role: "reviser",
       previousIdentities: a.planningFactIdentityChange?.previous,
     }),
+    revision_instructions:
+      a.revisionInstructions?.trim() ||
+      "Then return the final revised implementation plan in Markdown. Do not implement code yet.",
   });
 }
 
