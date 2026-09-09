@@ -8,6 +8,8 @@ The revision producer SHALL receive format-specific instructions to edit the ide
 
 Every planning invocation SHALL build prompt context from the current capped and sanitized eligible human comments even when an older `Pre-Planning Context` comment already exists. Snapshot publication SHALL remain idempotent. Eligible feedback posted after the prior plan SHALL remain available to the reviewer, revision producer, and acknowledgement gate when the replan posts a replacement plan; pipeline-generated comments SHALL NOT be elevated as human feedback.
 
+When eligible human feedback exists, the OpenSpec revision producer SHALL place its genuine `## Human Feedback Acknowledgement` section in both its response and the authoritative `proposal.md`. The post-revalidation acknowledgement gate SHALL evaluate the stable validated proposal because that proposal supplies revised-plan publication and implementation input. An acknowledgement present only in discarded revision stdout SHALL NOT satisfy the gate. Pipeline SHALL NOT synthesize, copy, or infer an acknowledgement on the producer's behalf. Freeform revision SHALL retain its stdout-only acknowledgement contract.
+
 A required substantive refinement SHALL fail explicitly when it is unchanged or was not applied to the authoritative change. Any refinement SHALL fail when it conflicts across its proposal, tasks, or spec deltas, or fails structural validation. Pipeline SHALL NOT substitute the previously accepted proposal or revision stdout for a missing application while reporting refinement success. This requirement SHALL leave the freeform planning path unchanged.
 
 #### Scenario: Applied refinement reaches implementation
@@ -42,6 +44,22 @@ A required substantive refinement SHALL fail explicitly when it is unchanged or 
 - **AND** a replan posts a replacement implementation plan
 - **THEN** the current feedback SHALL reach the author, reviewer, revision producer, and acknowledgement gate
 - **AND** Pipeline SHALL NOT post a duplicate snapshot or treat pipeline-generated comments as human feedback
+
+#### Scenario: OpenSpec acknowledgement survives authoritative reread
+
+- **WHEN** eligible human feedback requires acknowledgement during an OpenSpec revision
+- **AND** the revision producer writes its genuine `## Human Feedback Acknowledgement` section to both stdout and the authoritative `proposal.md`
+- **AND** the proposal, tasks, and spec deltas form a stable valid bundle
+- **THEN** post-revalidation acknowledgement SHALL succeed against the authoritative proposal
+- **AND** the same proposal SHALL supply revised-plan publication and implementation input
+
+#### Scenario: Stdout-only OpenSpec acknowledgement fails
+
+- **WHEN** the revision producer returns a valid acknowledgement in stdout
+- **AND** the stable authoritative `proposal.md` omits that acknowledgement
+- **THEN** Pipeline SHALL reject the revision before revised-plan publication or implementation
+- **AND** SHALL NOT copy, synthesize, or infer the missing acknowledgement
+- **AND** the freeform stdout-only contract SHALL remain unchanged
 
 #### Scenario: Acknowledged but unapplied refinement fails
 

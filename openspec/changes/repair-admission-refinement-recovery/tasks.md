@@ -19,6 +19,7 @@
 - [x] 3.3 Require material OpenSpec change only for reviewer-requested revision or eligible human feedback; reject acknowledged no-op/invalid required revisions while allowing an approved artifact with no pending feedback to remain unchanged.
 - [x] 3.4 Run the paired freeform planning tests and verify the non-OpenSpec stdout-based refinement path and existing authority/review gates remain unchanged.
 - [x] 3.5 Recompute capped and sanitized current human-comment context on every planning invocation; verify prior-plan feedback survives replacement-plan publication into author/reviewer/revision/acknowledgement, snapshot publication stays idempotent, and pipeline-generated comments remain excluded.
+- [ ] 3.6 Close the OpenSpec acknowledgement producer/consumer gap: instruct the producer to persist its genuine `## Human Feedback Acknowledgement` in `proposal.md` as well as stdout when human feedback exists, and add a caller-level regression proving post-revalidation validation uses that stable producer-authored proposal; reject stdout-only acknowledgement without synthesizing or bypassing the gate, while preserving freeform stdout-only behavior.
 
 ## 4. Preserve and Recover Precise Diagnostics
 
@@ -35,7 +36,7 @@
 
 ## 6. Verify and Hand Off
 
-- [ ] 6.1 Run focused injected-I/O tests for `grill-with-docs-admission`, `grill-then-ready`, planning/prompt, dispatch, `loop-selector`, and `loop-supervisor`; run the retained #1558, #1568, and planning-snapshot replay commands against the candidate and verify no test performs real network, git, or subprocess operations.
+- [ ] 6.1 Run focused injected-I/O tests for `grill-with-docs-admission`, `grill-then-ready`, planning/prompt (including durable OpenSpec human-feedback acknowledgement), dispatch, `loop-selector`, and `loop-supervisor`; run the retained #1558, #1568, and planning-snapshot replay commands against the candidate and verify no test performs real network, git, or subprocess operations.
 - [ ] 6.2 Run `node scripts/build.mjs` after all remaining `core/` edits and verify `node scripts/build.mjs --check` reports every generated host SKILL fresh without creating or committing `plugin/`.
 - [ ] 6.3 Run `npm run ci` from the repository root after the remaining changes and verify core tests, host build freshness, install smoke, OpenSpec validation, conditional docs freshness, and scripts checks all pass.
 - [ ] 6.4 Complete ordinary independent Pipeline reviews and GitHub CI on the exact candidate and verify they are green; stop at ready-to-deploy because merge, release, tag, publication, installation, and deployment require separate authorization.
