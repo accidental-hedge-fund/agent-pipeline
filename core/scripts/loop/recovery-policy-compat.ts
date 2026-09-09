@@ -60,6 +60,12 @@ function compileEntry(cls: DurableBlockerClass, entry: Record<string, unknown>):
     throw new LoopError("validation", `recovery policy for "${cls}" is missing a valid run_fatal flag`);
   }
   if (
+    entry.per_strategy_bound !== undefined &&
+    (typeof entry.per_strategy_bound !== "number" || !Number.isInteger(entry.per_strategy_bound) || entry.per_strategy_bound < 0)
+  ) {
+    throw new LoopError("validation", `recovery policy for "${cls}" has an invalid per_strategy_bound`);
+  }
+  if (
     typeof entry.repeated_evidence_limit !== "number" ||
     !Number.isFinite(entry.repeated_evidence_limit) ||
     entry.repeated_evidence_limit < 1
@@ -80,7 +86,7 @@ function compileEntry(cls: DurableBlockerClass, entry: Record<string, unknown>):
     run_fatal: entry.run_fatal,
     repeated_evidence_limit: entry.repeated_evidence_limit,
   };
-  if (typeof entry.per_strategy_bound === "number" && Number.isFinite(entry.per_strategy_bound) && entry.per_strategy_bound >= 0) {
+  if (entry.per_strategy_bound !== undefined) {
     compiled.per_strategy_bound = entry.per_strategy_bound;
   }
   return compiled;

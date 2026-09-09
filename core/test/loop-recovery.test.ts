@@ -232,6 +232,40 @@ test("compileRecoveryPolicy: a malformed entry (missing terminal_outcome) fails 
   assert.throws(() => compileRecoveryPolicy(bad), /terminal_outcome/);
 });
 
+test("compileRecoveryPolicy: a supplied per_strategy_bound must be a finite non-negative integer", () => {
+  for (const perStrategyBound of ["1", -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const bad = {
+      ...DEFAULT_RECOVERY_POLICY,
+      "implementation-ci": {
+        ...DEFAULT_RECOVERY_POLICY["implementation-ci"],
+        per_strategy_bound: perStrategyBound,
+      },
+    };
+    assert.throws(() => compileRecoveryPolicy(bad), (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "validation");
+      assert.match(err.message, /implementation-ci.*per_strategy_bound/);
+      return true;
+    });
+  }
+});
+
+test("compileRecoveryPolicy: per_strategy_bound may be omitted, zero, or a positive integer", () => {
+  const omitted = compileRecoveryPolicy(DEFAULT_RECOVERY_POLICY);
+  assert.equal(omitted["implementation-ci"].per_strategy_bound, undefined);
+
+  for (const perStrategyBound of [0, 2]) {
+    const compiled = compileRecoveryPolicy({
+      ...DEFAULT_RECOVERY_POLICY,
+      "implementation-ci": {
+        ...DEFAULT_RECOVERY_POLICY["implementation-ci"],
+        per_strategy_bound: perStrategyBound,
+      },
+    });
+    assert.equal(compiled["implementation-ci"].per_strategy_bound, perStrategyBound);
+  }
+});
+
 test("compileRecoveryPolicy: missing-authority / specification-decision must route to human_authority with no recipes", () => {
   const bad = { ...DEFAULT_RECOVERY_POLICY, "missing-authority": { ...DEFAULT_RECOVERY_POLICY["missing-authority"], recipes: ["wait_and_retry"] } };
   assert.throws(() => compileRecoveryPolicy(bad), /human-authority/);
