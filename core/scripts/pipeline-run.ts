@@ -3188,17 +3188,32 @@ export async function runAdvance(
           existingTester.status === "ok" ? existingTester.evidence : null,
         );
         let pushedHeadSha = lastPushedCandidate?.sha ?? null;
-        const pushedPrNumber = lastPushedCandidate?.prNumber ?? null;
+        let pushedPrNumber = lastPushedCandidate?.prNumber ?? null;
+        const wtForPush = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
+          () => null,
+        );
+        const worktreeHeadSha = wtForPush
+          ? normalizeCandidateSha(
+            (await (deps.gitInWorktree ?? gitInWorktree)(
+              wtForPush.path,
+              ["rev-parse", "HEAD"],
+              { ignoreFailure: true },
+            )).stdout.trim(),
+          )
+          : null;
         if (!pushedHeadSha) {
-          const wtForPush = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
-            () => null,
-          );
-          if (wtForPush) {
-            const gitFn: GitRunner = deps.gitInWorktree ?? gitInWorktree;
-            pushedHeadSha = normalizeCandidateSha(
-              (await gitFn(wtForPush.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim(),
-            );
-          }
+          pushedHeadSha = worktreeHeadSha;
+        } else if (
+          pushedPrNumber === prNumber &&
+          worktreeHeadSha === handoffPrHeadSha &&
+          worktreeHeadSha !== pushedHeadSha
+        ) {
+          // A prior owned-successor handoff is only authoritative for that
+          // successor. If the same linked PR and managed worktree now agree on
+          // a newer exact head, bind the consumer to that current candidate.
+          pushedHeadSha = worktreeHeadSha;
+          pushedPrNumber = prNumber;
+          lastPushedCandidate = null;
         }
         const engineFp = pinnedEngine
           ? buildEngineFingerprint({

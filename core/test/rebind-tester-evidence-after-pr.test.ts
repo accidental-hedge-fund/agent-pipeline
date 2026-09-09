@@ -2263,6 +2263,46 @@ test("runAdvance trusts the authenticated pre-merge successor when its worktree 
   assert.equal(driven.setBlocked.length, 0);
 });
 
+test("runAdvance replaces a stale owned-successor handoff when the same PR and worktree agree on a newer head", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "pre-merge",
+    prNumber: 99,
+    prHeadSha: SHA_S,
+    worktreeHead: SHA_S,
+    worktreeHeadAfterDispatch: [SHA_C],
+    prHeadAfterDispatch: [SHA_C],
+    tester: boundPassed(),
+    rebind: ownedAwareRebind,
+    once: false,
+    dispatch: async (_cfg, _issue, stage, dispatchOpts) => {
+      if (stage === "pre-merge") {
+        dispatchOpts.onOwnedCandidateSuccessor?.({
+          prNumber: 99,
+          previousSha: SHA_S,
+          successorSha: SHA_B,
+        });
+        return {
+          advanced: true as const,
+          from: "pre-merge" as const,
+          to: "review-2" as const,
+          summary: "pre-merge autofix pushed a successor",
+        };
+      }
+      return {
+        advanced: false as const,
+        status: "waiting" as const,
+        reason: "stop after proving the newer candidate handoff",
+      };
+    },
+  });
+
+  const reviewRebind = driven.rebindCalls.findLast((call) => call.stage === "review-2");
+  assert.equal(reviewRebind?.prHeadSha, SHA_C);
+  assert.equal(reviewRebind?.pushedHeadSha, SHA_C);
+  assert.equal(reviewRebind?.pushedPrNumber, 99);
+  assert.equal(driven.setBlocked.length, 0);
+});
+
 function realAutofixConservativeDispatch(): {
   dispatch: NonNullable<AdvanceDeps["dispatch"]>;
   rounds: () => number;
