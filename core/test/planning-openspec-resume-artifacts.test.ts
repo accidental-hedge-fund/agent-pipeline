@@ -1203,6 +1203,59 @@ test("runPlanningPhases: same-harness self-review cannot authorize an exact-bund
   assert.match(blocked?.reason ?? "", /independent plan rereview/i);
 });
 
+test("runPlanningPhases: configured same-harness reviewer cannot authorize an exact-bundle refinement", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let reviewCalls = 0;
+  let blocked: { reason: string; tag: string } | undefined;
+  const cfg = {
+    ...eqCfg,
+    harnesses: { ...eqCfg.harnesses, implementer: "claude", reviewer: "claude" },
+  } as unknown as PipelineConfig;
+  const hooks = makeOpenspecPlanningHooks(cfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    cfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+        blocked = { reason, tag };
+      },
+      invokeReviewer: async () => {
+        reviewCalls += 1;
+        return {
+          result: reviewCalls === 1
+            ? planReviewNeedsRevision
+            : { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+          effectiveReviewer: "claude",
+          selfReview: false,
+        };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = `${LIVING_PROPOSAL}\n\nApplied the requested task expansion.`;
+          tasks = "- [ ] expanded implementation task";
+        }
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.tag, "openspec-invalid");
+  assert.match(blocked?.reason ?? "", /independent plan rereview/i);
+});
+
 test("runPlanningPhases: approved unchanged OpenSpec artifact remains valid (#1568)", async () => {
   let implementationCalls = 0;
   const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], livingFileInjects());

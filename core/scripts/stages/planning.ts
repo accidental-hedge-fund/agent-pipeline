@@ -1365,7 +1365,7 @@ export async function runPlanningPhases(
       ].join("\n");
       const rereview = await invokeConfiguredPlanReview(refinementReviewPrompt);
       const hasIndependentRereviewer =
-        !rereview.selfReview || (rereview.coverage?.counts.independent ?? 0) > 0;
+        (rereview.coverage?.counts.independent ?? (rereview.selfReview ? 0 : 1)) > 0;
       if (
         !hasIndependentRereviewer ||
         !rereview.result.success ||
