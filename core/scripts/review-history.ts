@@ -533,68 +533,40 @@ export function renderResolvedFindingVerification(
 // Durable delta-round counting (#483)
 // ---------------------------------------------------------------------------
 
-/** Return whether a delta-review artifact is bound to the exact candidate head. */
-export function deltaReviewTargetsCandidate(body: string, candidateSha: string): boolean {
-  const artifactSha = extractReviewArtifact(body)?.reviewedSha;
-  if (artifactSha) return artifactSha.toLowerCase() === candidateSha.toLowerCase();
+function deltaReviewCandidateSha(body: string): string | null {
+  const artifact = extractReviewArtifact(body);
+  if (artifact !== null) {
+    return /^[0-9a-f]{40}$/i.test(artifact.reviewedSha)
+      ? artifact.reviewedSha
+      : null;
+  }
   const matches = [...body.matchAll(/<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->/gi)];
-  return matches.at(-1)?.[1]?.toLowerCase() === candidateSha.toLowerCase();
+  return matches.at(-1)?.[1] ?? null;
 }
 
-function isDeltaCeilingComment(body: string): boolean {
-  return body.startsWith("## Pipeline: Pre-merge delta round ceiling reached") ||
-    body.startsWith("## Pipeline: Pre-merge delta round ceiling — findings demoted and deferred");
-}
+export type LatestDeltaReviewCandidate =
+  | { status: "none" }
+  | { status: "unknown" }
+  | { status: "known"; sha: string };
 
-/** Whether the latest durable delta ceiling belongs to a superseded candidate. */
-export function hasSupersededDeltaCeiling(
+/** Latest delta candidate under the same trust policy as durable round counting. */
+export function latestDeltaReviewCandidate(
   comments: { author: string | null; body: string }[],
-  opts: { actor: string | null; trustedOverrideActors?: string[]; candidateSha: string },
-): boolean {
-  if (opts.actor === null) return false;
+  opts: { actor: string | null; trustedOverrideActors?: string[] },
+): LatestDeltaReviewCandidate {
+  if (opts.actor === null) return { status: "none" };
   const trusted = new Set<string>(opts.trustedOverrideActors ?? []);
   trusted.add(opts.actor);
-  const trustedComments = comments.filter((c) => c.author !== null && trusted.has(c.author));
-  const ceiling = trustedComments
-    .filter((c) => isDeltaCeilingComment(c.body))
+  const latest = comments
+    .filter((c) =>
+      c.author !== null &&
+      trusted.has(c.author) &&
+      c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX)
+    )
     .at(-1);
-  if (!ceiling) return false;
-  const ceilingIndex = trustedComments.lastIndexOf(ceiling);
-  if (
-    trustedComments
-      .slice(ceilingIndex + 1)
-      .some((c) => c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX))
-  ) return false;
-  const bound = [...ceiling.body.matchAll(/<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->/gi)]
-    .at(-1)?.[1];
-  if (bound) return bound.toLowerCase() !== opts.candidateSha.toLowerCase();
-  // Backward compatibility for ceilings emitted before they carried a binding:
-  // the latest trusted delta artifact was the candidate that exhausted it.
-  const priorDelta = trustedComments
-    .filter((c) => c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX))
-    .at(-1);
-  return !!priorDelta && !deltaReviewTargetsCandidate(priorDelta.body, opts.candidateSha);
-}
-
-/** A post-ceiling delta was spent, then its candidate was superseded again. */
-export function hasSupersededPostCeilingDelta(
-  comments: { author: string | null; body: string }[],
-  opts: { actor: string | null; trustedOverrideActors?: string[]; candidateSha: string },
-): boolean {
-  if (opts.actor === null) return false;
-  const trusted = new Set<string>(opts.trustedOverrideActors ?? []);
-  trusted.add(opts.actor);
-  const trustedComments = comments.filter((c) => c.author !== null && trusted.has(c.author));
-  const ceilingIndex = trustedComments.findLastIndex((c) =>
-    isDeltaCeilingComment(c.body)
-  );
-  if (ceilingIndex < 0) return false;
-  const postCeilingDelta = trustedComments
-    .slice(ceilingIndex + 1)
-    .filter((c) => c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX))
-    .at(-1);
-  return !!postCeilingDelta &&
-    !deltaReviewTargetsCandidate(postCeilingDelta.body, opts.candidateSha);
+  if (!latest) return { status: "none" };
+  const sha = deltaReviewCandidateSha(latest.body);
+  return sha === null ? { status: "unknown" } : { status: "known", sha };
 }
 
 /**

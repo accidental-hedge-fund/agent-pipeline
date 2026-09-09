@@ -1,8 +1,9 @@
 // Pre-merge delta-round ceiling (#483): `review_policy.max_delta_rounds` caps
 // how many pre-merge delta reviews an item can run, counted durably from its
-// delta-review comment thread. At the ceiling, the reviewer seam is never
-// invoked; `ceiling_action` disposes of the outstanding blocking findings
-// instead. No real network/git/subprocess access — everything is a fake seam.
+// delta-review comment thread. The head that follows the cap-ending review gets
+// one fresh delta review; a later successor routes to bounded full review-2.
+// Otherwise `ceiling_action` disposes of the outstanding blocking findings.
+// No real network/git/subprocess access — everything is a fake seam.
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
@@ -12,7 +13,12 @@ import {
   type RunDeltaReviewFn,
   type ShaGateDeps,
 } from "../scripts/stages/pre_merge.ts";
-import { computeDiffHash, formatDeltaReviewComment } from "../scripts/stages/review.ts";
+import {
+  computeDiffHash,
+  encodeReviewArtifact,
+  extractReviewArtifact,
+  formatDeltaReviewComment,
+} from "../scripts/stages/review.ts";
 import { findingKey, partitionFindings } from "../scripts/review-policy.ts";
 import { buildPriorRoundDigest, settledFindings } from "../scripts/review-history.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
@@ -29,6 +35,7 @@ const SHA_2 = padSha("2");
 const SHA_3 = padSha("3");
 const SHA_4 = padSha("4");
 const SHA_HEAD = padSha("5");
+const SHA_NEXT = padSha("6");
 
 function diffFor(n: number): string {
   return `diff --git a/foo.ts b/foo.ts\n+const x = ${n};`;
@@ -43,7 +50,7 @@ const CRITICAL_FINDING: ReviewFinding = {
   body: "b", confidence: 0.95, recommendation: "validate before casting",
 };
 
-function deltaComment(sha: string, diffHash: string, blocking: ReviewFinding[] = []): string {
+function deltaComment(sha: string | undefined, diffHash: string, blocking: ReviewFinding[] = []): string {
   const verdict = {
     verdict: (blocking.length ? "needs-attention" : "approve") as "needs-attention" | "approve",
     summary: "s", findings: blocking, next_steps: [] as string[], commitSha: sha,
@@ -54,12 +61,15 @@ function deltaComment(sha: string, diffHash: string, blocking: ReviewFinding[] =
 
 /** Four prior trusted delta-review comments — rounds 1-3 approve, round 4
  *  carries `finalBlocking` as its blocking finding(s). */
-function fourPriorDeltaComments(finalBlocking: ReviewFinding[]): { author: string; body: string }[] {
+function fourPriorDeltaComments(
+  finalBlocking: ReviewFinding[],
+  finalSha: string | undefined = SHA_4,
+): { author: string; body: string }[] {
   return [
     { author: TEST_ACTOR, body: deltaComment(SHA_1, computeDiffHash(diffFor(1))) },
     { author: TEST_ACTOR, body: deltaComment(SHA_2, computeDiffHash(diffFor(2))) },
     { author: TEST_ACTOR, body: deltaComment(SHA_3, computeDiffHash(diffFor(3))) },
-    { author: TEST_ACTOR, body: deltaComment(SHA_4, computeDiffHash(diffFor(4)), finalBlocking) },
+    { author: TEST_ACTOR, body: deltaComment(finalSha, computeDiffHash(diffFor(4)), finalBlocking) },
   ];
 }
 
@@ -79,9 +89,18 @@ function makeDeps(opts: {
   getCommitDeltaDiff?: () => Promise<string>;
   priorCeilingSha?: string;
   postCeilingDeltaSha?: string;
+  headSha?: string;
+  finalDeltaSha?: string | null;
+  latestReviewSha?: string;
+  attemptPreMergeAutoFix?: ShaGateDeps["attemptPreMergeAutoFix"];
+  finalDeltaBody?: string;
 }): { deps: ShaGateDeps; rec: Rec; cfg: PipelineConfig } {
   const rec: Rec = { comments: [], transitions: [], blocked: [], createIssueCalls: [], addIssueCommentCalls: [] };
-  const comments = fourPriorDeltaComments(opts.finalBlocking);
+  const comments = fourPriorDeltaComments(
+    opts.finalBlocking,
+    opts.finalDeltaSha === null ? undefined : opts.finalDeltaSha,
+  );
+  if (opts.finalDeltaBody) comments[3] = { author: TEST_ACTOR, body: opts.finalDeltaBody };
   if (opts.priorCeilingSha) {
     comments.push({
       author: TEST_ACTOR,
@@ -96,6 +115,14 @@ function makeDeps(opts: {
       body: deltaComment(opts.postCeilingDeltaSha, computeDiffHash(diffFor(4)), opts.finalBlocking),
     });
   }
+  if (opts.latestReviewSha) {
+    comments.push({
+      author: TEST_ACTOR,
+      body:
+        "## Review 2 (Adversarial) — needs-attention\n" +
+        `<!-- reviewed-sha: ${opts.latestReviewSha} -->`,
+    });
+  }
   const cfg = {
     review_policy: {
       block_threshold: "low", min_confidence: 0,
@@ -107,8 +134,8 @@ function makeDeps(opts: {
 
   const deps: ShaGateDeps = {
     getIssueDetail: async () => ({ comments }) as Awaited<ReturnType<NonNullable<ShaGateDeps["getIssueDetail"]>>>,
-    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as Awaited<ReturnType<NonNullable<ShaGateDeps["getPrDetail"]>>>,
-    getPrCommits: async () => ([{ oid: SHA_HEAD, messageHeadline: "fix: address findings" }]) as Awaited<ReturnType<NonNullable<ShaGateDeps["getPrCommits"]>>>,
+    getPrDetail: async () => ({ head_sha: opts.headSha ?? SHA_HEAD }) as Awaited<ReturnType<NonNullable<ShaGateDeps["getPrDetail"]>>>,
+    getPrCommits: async () => ([{ oid: opts.headSha ?? SHA_HEAD, messageHeadline: "fix: address findings" }]) as Awaited<ReturnType<NonNullable<ShaGateDeps["getPrCommits"]>>>,
     getPrDiff: async () => diffFor(5),
     postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
     transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
@@ -127,6 +154,7 @@ function makeDeps(opts: {
     ...(opts.getCommitDeltaDiff && {
       getCommitDeltaDiff: async (_cfg, _n, _b, _h) => opts.getCommitDeltaDiff!(),
     }),
+    ...(opts.attemptPreMergeAutoFix && { attemptPreMergeAutoFix: opts.attemptPreMergeAutoFix }),
   };
   return { deps, rec, cfg };
 }
@@ -137,7 +165,7 @@ async function quiet(t: TestContext, fn: () => Promise<void>): Promise<void> {
   await fn();
 }
 
-test("enforceReviewShaGate: at the delta-round cap, the reviewer seam is never invoked", async (t) => {
+test("enforceReviewShaGate: at the delta-round cap on the reviewed head, the reviewer seam is never invoked", async (t) => {
   let reviewerCalls = 0;
   const runDeltaReview: RunDeltaReviewFn = async () => {
     reviewerCalls++;
@@ -145,6 +173,7 @@ test("enforceReviewShaGate: at the delta-round cap, the reviewer seam is never i
   };
   const { deps, cfg } = makeDeps({
     finalBlocking: [MEDIUM_FINDING], maxDeltaRounds: 4, ceilingAction: "park", runDeltaReview,
+    headSha: SHA_4,
   });
   await quiet(t, async () => {
     await enforceReviewShaGate(cfg, 483, 99, deps);
@@ -155,6 +184,7 @@ test("enforceReviewShaGate: at the delta-round cap, the reviewer seam is never i
 test("enforceReviewShaGate: ceiling_action park routes to review-findings with the unresolved-blocker punch list", async (t) => {
   const { deps, rec, cfg } = makeDeps({
     finalBlocking: [MEDIUM_FINDING], maxDeltaRounds: 4, ceilingAction: "park",
+    finalDeltaSha: SHA_HEAD, latestReviewSha: SHA_3,
   });
   let out;
   await quiet(t, async () => {
@@ -177,6 +207,7 @@ test("enforceReviewShaGate: ceiling_action park routes to review-findings with t
 test("enforceReviewShaGate: ceiling_action demote_and_advance demotes below-high findings and proceeds", async (t) => {
   const { deps, rec, cfg } = makeDeps({
     finalBlocking: [MEDIUM_FINDING], maxDeltaRounds: 4, ceilingAction: "demote_and_advance",
+    finalDeltaSha: SHA_HEAD, latestReviewSha: SHA_3,
   });
   let out;
   await quiet(t, async () => {
@@ -199,6 +230,7 @@ test("enforceReviewShaGate: ceiling_action demote_and_advance demotes below-high
 test("enforceReviewShaGate: a critical outstanding finding hard-parks even under demote_and_advance", async (t) => {
   const { deps, rec, cfg } = makeDeps({
     finalBlocking: [CRITICAL_FINDING], maxDeltaRounds: 4, ceilingAction: "demote_and_advance",
+    finalDeltaSha: SHA_HEAD, latestReviewSha: SHA_3,
   });
   let out;
   await quiet(t, async () => {
@@ -212,6 +244,7 @@ test("enforceReviewShaGate: a critical outstanding finding hard-parks even under
 test("enforceReviewShaGate: a critical outstanding finding hard-parks under park too", async (t) => {
   const { deps, cfg } = makeDeps({
     finalBlocking: [CRITICAL_FINDING], maxDeltaRounds: 4, ceilingAction: "park",
+    finalDeltaSha: SHA_HEAD, latestReviewSha: SHA_3,
   });
   let out;
   await quiet(t, async () => {
@@ -255,6 +288,173 @@ test("enforceReviewShaGate: a fixed successor gets reviewed after a superseded c
   assert.equal(reviewerCalls, 1, "stale exhausted history must not park the successor without review");
 });
 
+test("enforceReviewShaGate: a fixed successor gets one review after implicitly exhausting the cap", async (t) => {
+  let reviewerCalls = 0;
+  const { deps, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING],
+    maxDeltaRounds: 4,
+    ceilingAction: "park",
+    runDeltaReview: async () => {
+      reviewerCalls += 1;
+      return { verdict: "approve", findings: [], summary: "fixed" } as DeltaReviewResult;
+    },
+    getCommitDeltaDiff: async () => diffFor(5),
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfg, 483, 99, deps);
+  });
+  assert.equal(
+    reviewerCalls,
+    1,
+    "the successor of the fourth reviewed head must receive the one post-cap review",
+  );
+});
+
+test("enforceReviewShaGate: a malformed artifact candidate at the cap fails closed", async (t) => {
+  let reviewerCalls = 0;
+  const validBody = deltaComment(
+    SHA_4,
+    computeDiffHash(diffFor(4)),
+    [MEDIUM_FINDING],
+  );
+  const artifact = extractReviewArtifact(validBody);
+  assert.ok(artifact);
+  const malformedBody = validBody.replace(
+    /<!-- review-artifact: [A-Za-z0-9_-]+ -->/,
+    encodeReviewArtifact({ ...artifact, reviewedSha: "not-a-sha" }),
+  );
+  const { deps, rec, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING],
+    finalDeltaBody: malformedBody,
+    maxDeltaRounds: 4,
+    ceilingAction: "park",
+    runDeltaReview: async () => {
+      reviewerCalls += 1;
+      return { verdict: "approve", findings: [], summary: "must not run" } as DeltaReviewResult;
+    },
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 483, 99, deps);
+  });
+  assert.equal(reviewerCalls, 0, "malformed artifact identity must not mint a successor review");
+  assert.equal(out?.status, "blocked");
+  assert.match(out?.reason ?? "", /delta-round ceiling/);
+  assert.equal(rec.blocked.length, 1);
+});
+
+test("enforceReviewShaGate: a source-stale ceiling bound to the successor still grants its one review", async (t) => {
+  let reviewerCalls = 0;
+  const { deps, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING],
+    maxDeltaRounds: 4,
+    ceilingAction: "park",
+    priorCeilingSha: SHA_HEAD,
+    runDeltaReview: async () => {
+      reviewerCalls += 1;
+      return { verdict: "approve", findings: [], summary: "fixed" } as DeltaReviewResult;
+    },
+    getCommitDeltaDiff: async () => diffFor(5),
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfg, 483, 99, deps);
+  });
+  assert.equal(
+    reviewerCalls,
+    1,
+    "a ceiling sourced from the old reviewed head must not suppress the successor review",
+  );
+});
+
+test("enforceReviewShaGate: a review after a source-stale ceiling spends the reset", async (t) => {
+  let reviewerCalls = 0;
+  const { deps, rec, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING],
+    maxDeltaRounds: 4,
+    ceilingAction: "park",
+    priorCeilingSha: SHA_HEAD,
+    postCeilingDeltaSha: SHA_HEAD,
+    headSha: SHA_NEXT,
+    runDeltaReview: async () => {
+      reviewerCalls += 1;
+      return { verdict: "approve", findings: [], summary: "must not run" } as DeltaReviewResult;
+    },
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 483, 99, deps);
+  });
+  assert.equal(reviewerCalls, 0, "the next successor must not receive another delta review");
+  assert.deepEqual(out, {
+    advanced: true,
+    from: "pre-merge",
+    to: "review-2",
+    summary: "delta-review budget exhausted; superseding fix requires a fresh full review",
+  });
+  assert.deepEqual(rec.transitions.at(-1), { from: "pre-merge", to: "review-2" });
+});
+
+test("enforceReviewShaGate: a fifth delta without a ceiling spends the implicit reset", async (t) => {
+  let reviewerCalls = 0;
+  const { deps, rec, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING],
+    maxDeltaRounds: 4,
+    ceilingAction: "park",
+    postCeilingDeltaSha: SHA_HEAD,
+    headSha: SHA_NEXT,
+    runDeltaReview: async () => {
+      reviewerCalls += 1;
+      return { verdict: "approve", findings: [], summary: "must not run" } as DeltaReviewResult;
+    },
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 483, 99, deps);
+  });
+  assert.equal(reviewerCalls, 0, "the second successor must not receive another delta review");
+  assert.deepEqual(out, {
+    advanced: true,
+    from: "pre-merge",
+    to: "review-2",
+    summary: "delta-review budget exhausted; superseding fix requires a fresh full review",
+  });
+  assert.deepEqual(rec.transitions.at(-1), { from: "pre-merge", to: "review-2" });
+});
+
+test("enforceReviewShaGate: a post-cap review auto-fix successor routes to bounded full review", async (t) => {
+  let reviewerCalls = 0;
+  const { deps, rec, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING],
+    maxDeltaRounds: 4,
+    ceilingAction: "park",
+    runDeltaReview: async () => {
+      reviewerCalls += 1;
+      return {
+        verdict: "needs-attention",
+        findings: [CRITICAL_FINDING],
+        summary: "one fix remains",
+      } as DeltaReviewResult;
+    },
+    getCommitDeltaDiff: async () => diffFor(5),
+    attemptPreMergeAutoFix: async (_findings, _title, _body, claimAttempt) => {
+      assert.equal(await claimAttempt(), true);
+      return { status: "fix-committed", headSha: SHA_NEXT };
+    },
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 483, 99, deps);
+  });
+  assert.equal(reviewerCalls, 1, "the post-cap allowance is exactly one reviewer invocation");
+  assert.deepEqual(out, {
+    advanced: true,
+    from: "pre-merge",
+    to: "review-2",
+    summary: "delta-review budget exhausted; auto-fix successor requires a fresh full review",
+  });
+  assert.deepEqual(rec.transitions.at(-1), { from: "pre-merge", to: "review-2" });
+});
+
 test("enforceReviewShaGate: H1 ceiling then H2 delta then H3 fix routes to bounded full review", async (t) => {
   let reviewerCalls = 0;
   const { deps, rec, cfg } = makeDeps({
@@ -289,6 +489,7 @@ test("enforceReviewShaGate: hitting the delta-round ceiling never consumes max_a
   // max_adversarial_rounds is left at its default and never referenced.
   const { deps, cfg } = makeDeps({
     finalBlocking: [MEDIUM_FINDING], maxDeltaRounds: 4, ceilingAction: "park",
+    finalDeltaSha: SHA_HEAD, latestReviewSha: SHA_3,
   });
   (cfg.review_policy as unknown as { max_adversarial_rounds: number }).max_adversarial_rounds = 3;
   await quiet(t, async () => {
@@ -346,7 +547,7 @@ function fuseiqCore95PriorComments(): { author: string; body: string }[] {
   ];
 }
 
-test("fuseiq-core#95 replay: at the default cap, the fifth delta round is never reviewed", async (t) => {
+test("fuseiq-core#95 replay: the successor after the default cap receives one final delta review", async (t) => {
   let reviewerCalls = 0;
   const runDeltaReview: RunDeltaReviewFn = async () => {
     reviewerCalls++;
@@ -363,6 +564,7 @@ test("fuseiq-core#95 replay: at the default cap, the fifth delta round is never 
     getPrDetail: async () => ({ head_sha: SHA_HEAD }) as Awaited<ReturnType<NonNullable<ShaGateDeps["getPrDetail"]>>>,
     getPrCommits: async () => ([{ oid: SHA_HEAD, messageHeadline: "fix: address findings" }]) as Awaited<ReturnType<NonNullable<ShaGateDeps["getPrCommits"]>>>,
     getPrDiff: async () => diffFor(5),
+    getCommitDeltaDiff: async () => diffFor(5),
     postComment: async () => {},
     transition: async () => {},
     setBlocked: async () => {},
@@ -374,7 +576,7 @@ test("fuseiq-core#95 replay: at the default cap, the fifth delta round is never 
   await quiet(t, async () => {
     await enforceReviewShaGate(cfg, 95, 134, deps);
   });
-  assert.equal(reviewerCalls, 0, "the fifth round's reviewer invocation must never happen under the default cap");
+  assert.equal(reviewerCalls, 1, "the fixed successor receives the single post-cap review");
 });
 
 test("fuseiq-core#95 replay: round-5 findings, partitioned against the settled entries, land advisory (not blocking)", () => {

@@ -252,7 +252,7 @@ Before invoking the reviewer for a pre-merge delta round, `enforceReviewShaGate`
 - Under either setting, an outstanding blocking delta finding of severity `high` or `critical` SHALL hard-park the item at `needs-human`, mirroring the review-2 ceiling behavior.
 
 The comment the pipeline posts at the ceiling SHALL name the observed round count, the configured cap, and the applied `ceiling_action`. When the count is below the cap, behavior SHALL be unchanged from before this requirement.
-Both park and demote ceiling artifacts SHALL bind the candidate SHA and participate in the same one-successor reset rule.
+Both park and demote ceiling comments SHALL bind the candidate SHA for audit and evidence. Reset eligibility SHALL be derived solely from the latest trusted delta-review artifact's valid candidate SHA; a missing or malformed candidate binding SHALL fail closed and SHALL NOT reset the delta budget.
 
 When an item is in a fix stage and the managed worktree already equals the exact freshly resolved linked-PR head beyond the triggering review SHA, the pipeline SHALL skip the implementer invocation and validate that external repair through the normal commit, specification, build, test, and transition gates. A local-only or stale head SHALL NOT receive this bypass.
 
@@ -371,9 +371,10 @@ The test suite SHALL include a regression test replaying the observed five-delta
 
 #### Scenario: Replay asserts the loop is bounded and the round-5 findings are demoted
 
-- **WHEN** the five-round fixture history is replayed against the gate and the partitioner
-- **THEN** the fifth delta round SHALL NOT be invoked under the default `max_delta_rounds`
+- **WHEN** the four-round fixture history is replayed against a successor candidate and the partitioner
+- **THEN** the successor SHALL receive exactly one bounded fifth delta review under the default `max_delta_rounds`
 - **AND** the round-5 findings, when partitioned against the settled entries, SHALL land in the advisory partition
+- **AND** a separate same-candidate fixture SHALL prove the cap prevents an additional review at the configured ceiling
 
 ### Requirement: The pre-merge delta review SHALL carry a resolved-finding verification context
 

@@ -69,9 +69,8 @@ import {
 import {
   buildPriorRoundDigest,
   countDeltaRounds,
-  hasSupersededDeltaCeiling,
-  hasSupersededPostCeilingDelta,
   detectSuspectedChurn,
+  latestDeltaReviewCandidate,
   priorAdvisoryFindings,
   priorAdvisorySurfaceFiles,
   settledFindings,
@@ -1095,16 +1094,21 @@ export async function enforceReviewShaGate(
         trustedOverrideActors: cfg.trusted_override_actors,
       });
       const deltaRoundCap = cfg.review_policy.max_delta_rounds;
-      const staleCeilingReset = hasSupersededDeltaCeiling(detail.comments, {
+      const latestDeltaCandidate = latestDeltaReviewCandidate(detail.comments, {
         actor,
         trustedOverrideActors: cfg.trusted_override_actors,
-        candidateSha: head,
       });
-      const spentResetWasSuperseded = hasSupersededPostCeilingDelta(detail.comments, {
-        actor,
-        trustedOverrideActors: cfg.trusted_override_actors,
-        candidateSha: head,
-      });
+      const latestDeltaWasSuperseded = latestDeltaCandidate.status === "known" &&
+        latestDeltaCandidate.sha.toLowerCase() !== head.toLowerCase();
+      // Older runs could spend the final ordinary delta round without first
+      // persisting a ceiling comment.  The immediate successor still gets the
+      // contract's one fresh review.  A further successor must leave the delta
+      // path, so count exactly-at-cap separately from already-over-cap history.
+      const staleCeilingReset =
+        deltaRoundCount === deltaRoundCap && latestDeltaWasSuperseded;
+      const spentResetWasSuperseded =
+        deltaRoundCount > deltaRoundCap &&
+        latestDeltaWasSuperseded;
       if (deltaRoundCap > 0 && deltaRoundCount >= deltaRoundCap && spentResetWasSuperseded) {
         await transitionFn(cfg, issueNumber, "pre-merge", "review-2");
         return {
@@ -1673,6 +1677,15 @@ export async function enforceReviewShaGate(
                 previousSha: targetHead,
                 successorSha: fixRes.headSha,
               });
+              if (staleCeilingReset) {
+                await transitionFn(cfg, issueNumber, "pre-merge", "review-2");
+                return {
+                  advanced: true,
+                  from: "pre-merge",
+                  to: "review-2",
+                  summary: "delta-review budget exhausted; auto-fix successor requires a fresh full review",
+                };
+              }
             }
             const wasNoopClean = fixRes.status === "noop-clean";
             if (wasNoopClean) {
