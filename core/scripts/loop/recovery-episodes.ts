@@ -21,6 +21,9 @@ import {
   type RecoveryPolicyEntry,
   type RecoveryRecipe,
 } from "./types.ts";
+import { recoveryEpisodeId } from "./recovery-episode-id.ts";
+
+export { recoveryEpisodeId } from "./recovery-episode-id.ts";
 
 
 export const RECOVERY_EPISODE_REQUIRED_FIELDS = [
@@ -144,17 +147,6 @@ export function coolingIsStaleForNewCandidateEpoch(
   // raw observed HEAD. Compare them with the current raw HEAD so upgrading at
   // an internal-only tip does not invalidate an otherwise-current backoff.
   return !attemptBelongsToCandidateEpoch(owner, candidateHead.trim());
-}
-
-export function recoveryEpisodeId(key: RecoveryEpisodeKey): string {
-  const canonical = [
-    "pipeline-recovery-episode@1",
-    key.operation,
-    key.invariant,
-    key.candidate_epoch,
-    key.evidence_identity,
-  ].join("\0");
-  return crypto.createHash("sha256").update(canonical).digest("hex");
 }
 
 function isNonEmptyText(value: unknown): value is string {

@@ -8,6 +8,7 @@ import {
   type RecoveryPolicyEntry,
   type RecoveryRecipe,
 } from "./types.ts";
+import { recoveryEpisodeId } from "./recovery-episode-id.ts";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -250,27 +251,58 @@ export function normalizeRecoveryPolicyCompatibility(policy: unknown): unknown {
   return changed ? migrated : policy;
 }
 
-/** Rebase legacy episode cursors when the exact pre-#1468 workflow policy is
- * upgraded with the Tester-rebind strategy. The new strategy must remain
- * eligible, so cursors at or beyond its insertion point rewind to that point. */
-export function normalizeRecoveryLedgerCompatibility(value: unknown, policy: unknown): unknown {
-  if (!isPlainObject(value) || !Array.isArray(value.recovery_attempts) || !isPlainObject(policy)) {
+/** Restore the derived id on an otherwise complete legacy write-ahead claim.
+ * Under-specified or explicitly malformed records remain unchanged so store
+ * validation quarantines them instead of granting guessed ownership. */
+export function normalizeStartedRecoveryEpisodeIdentity(value: unknown): unknown {
+  if (!isPlainObject(value) || value.outcome !== "started" || value.episode_id !== undefined) {
     return value;
   }
-  const workflowEntry = policy["workflow-engine-defect"];
+  const evidenceIdentity = value.evidence_identity ?? value.evidence_fingerprint;
+  if (
+    typeof value.operation !== "string" || value.operation.trim().length === 0 ||
+    typeof value.invariant !== "string" || value.invariant.trim().length === 0 ||
+    typeof value.candidate_epoch !== "string" || value.candidate_epoch.trim().length === 0 ||
+    typeof evidenceIdentity !== "string" || evidenceIdentity.trim().length === 0
+  ) {
+    return value;
+  }
+  return {
+    ...value,
+    evidence_identity: evidenceIdentity,
+    episode_id: recoveryEpisodeId({
+      operation: value.operation,
+      invariant: value.invariant,
+      candidate_epoch: value.candidate_epoch,
+      evidence_identity: evidenceIdentity,
+    }),
+  };
+}
+
+/** Restore derivable legacy started-claim ids and rebase legacy episode
+ * cursors when the exact pre-#1468 workflow policy is upgraded with the
+ * Tester-rebind strategy. */
+export function normalizeRecoveryLedgerCompatibility(value: unknown, policy: unknown): unknown {
+  if (!isPlainObject(value) || !Array.isArray(value.recovery_attempts)) {
+    return value;
+  }
+  const workflowEntry = isPlainObject(policy) ? policy["workflow-engine-defect"] : undefined;
   const pre1468 = STALE_DEFAULT_POLICY_ENTRIES["workflow-engine-defect"]?.at(-1);
-  if (!pre1468 || !samePolicyEntry(workflowEntry, pre1468)) return value;
+  const rebaseLegacyCursor = Boolean(pre1468 && samePolicyEntry(workflowEntry, pre1468));
   let changed = false;
   const recoveryAttempts = value.recovery_attempts.map((attempt) => {
+    const identityNormalized = normalizeStartedRecoveryEpisodeIdentity(attempt);
+    if (identityNormalized !== attempt) changed = true;
     if (
-      !isPlainObject(attempt) ||
-      (attempt.class !== "workflow-engine-defect" && attempt.invariant !== "workflow-engine-defect") ||
-      typeof attempt.strategy_cursor !== "number" ||
-      !Number.isInteger(attempt.strategy_cursor) ||
-      attempt.strategy_cursor < 3
-    ) return attempt;
+      !rebaseLegacyCursor ||
+      !isPlainObject(identityNormalized) ||
+      (identityNormalized.class !== "workflow-engine-defect" && identityNormalized.invariant !== "workflow-engine-defect") ||
+      typeof identityNormalized.strategy_cursor !== "number" ||
+      !Number.isInteger(identityNormalized.strategy_cursor) ||
+      identityNormalized.strategy_cursor < 3
+    ) return identityNormalized;
     changed = true;
-    return { ...attempt, strategy_cursor: 3 };
+    return { ...identityNormalized, strategy_cursor: 3 };
   });
   return changed ? { ...value, recovery_attempts: recoveryAttempts } : value;
 }

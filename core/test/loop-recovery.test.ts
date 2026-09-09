@@ -25,6 +25,7 @@ import {
 } from "../scripts/loop/recovery.ts";
 import { mapLegacyThemeToBlockerClass } from "../scripts/loop/import.ts";
 import { admitLifecycleRecord, applyLifecycleTransition, deriveLifecycleState } from "../scripts/recovery-lifecycle-ownership.ts";
+import { recoveryEpisodeId } from "../scripts/loop/recovery-episodes.ts";
 import { initRun, readContract, readLedger, writeLedger, acquireLock, type LoopStoreDeps } from "../scripts/loop/store.ts";
 import {
   DURABLE_BLOCKER_CLASSES,
@@ -1467,6 +1468,46 @@ test("upgradeLedgerForRecovery: an unmapped legacy theme is left as-is rather th
   legacy.items["100"] = { ...legacy.items["100"], state: "blocked", blocked_theme: "something-nobody-ever-recorded" };
   const upgraded = upgradeLedgerForRecovery(legacy);
   assert.equal(upgraded.items["100"].blocked_theme, "something-nobody-ever-recorded");
+});
+
+test("upgradeLedgerForRecovery: reconstructs only a derivable legacy started attempt episode identity (#1568)", () => {
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-engine-defect",
+    candidate_epoch: "b".repeat(40),
+    evidence_identity: "exact-evidence-identity",
+  };
+  const attempt = {
+    attempt_id: "legacy-started",
+    seq: 0,
+    time: "2026-09-09T20:00:00.000Z",
+    item_id: "100",
+    class: "workflow-engine-defect" as const,
+    candidate_identity: `repo=acme/widgets|head=${key.candidate_epoch}`,
+    action: "rebind_tester_evidence_after_pr" as const,
+    actions: ["rebind_tester_evidence_after_pr" as const],
+    evidence_fingerprint: key.evidence_identity,
+    outcome: "started" as const,
+    budget_remaining: 0,
+    ...key,
+  };
+  const ledger = testLedger();
+  ledger.recovery_attempts = [attempt, {
+    ...attempt,
+    attempt_id: "under-specified-started",
+    seq: 1,
+    operation: undefined,
+    candidate_epoch: undefined,
+  }];
+
+  const upgraded = upgradeLedgerForRecovery(ledger);
+
+  assert.equal(upgraded.recovery_attempts[0]?.episode_id, recoveryEpisodeId(key));
+  assert.equal(
+    upgraded.recovery_attempts[1]?.episode_id,
+    undefined,
+    "an under-specified claim must not gain authority by guessed episode identity",
+  );
 });
 
 test("recoverItem: a pre-#509 contract and ledger (missing recovery_policy / recovery_attempts, legacy blocked_theme) resume without faulting", async () => {

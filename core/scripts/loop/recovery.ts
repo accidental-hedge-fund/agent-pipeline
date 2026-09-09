@@ -60,6 +60,7 @@ import {
   DEFAULT_RECOVERY_POLICY_INPUT,
   HUMAN_AUTHORITY_CLASSES,
   normalizeRecoveryPolicyCompatibility,
+  normalizeStartedRecoveryEpisodeIdentity,
 } from "./recovery-policy-compat.ts";
 
 // ---------------------------------------------------------------------------
@@ -141,27 +142,43 @@ export function upgradeLedgerForRecovery(ledger: LoopLedger): LoopLedger {
   }
   let attemptsChanged = !ledger.recovery_attempts;
   const recoveryAttempts = (ledger.recovery_attempts ?? []).map((attempt) => {
-    if (attempt.attempt_id && attempt.candidate_identity && attempt.action && typeof attempt.budget_remaining === "number") {
-      return attempt;
-    }
+    const hasCoreFields = Boolean(
+      attempt.attempt_id &&
+      attempt.candidate_identity &&
+      attempt.action &&
+      typeof attempt.budget_remaining === "number"
+    );
     const action = attempt.action ?? attempt.actions[0];
-    if (!action) return attempt;
+    if (!hasCoreFields && !action) return attempt;
     const candidateIdentity = attempt.candidate_identity ?? `legacy:${attempt.seq}`;
-    attemptsChanged = true;
-    return {
-      ...attempt,
-      attempt_id:
-        attempt.attempt_id ??
-        recoveryAttemptId({
-          itemId: attempt.item_id,
-          candidateIdentity,
-          evidenceFingerprint: attempt.evidence_fingerprint,
-          action,
-        }),
-      candidate_identity: candidateIdentity,
-      action,
-      budget_remaining: attempt.budget_remaining ?? 0,
-    };
+    let upgraded = hasCoreFields
+      ? attempt
+      : {
+          ...attempt,
+          attempt_id:
+            attempt.attempt_id ??
+            recoveryAttemptId({
+              itemId: attempt.item_id,
+              candidateIdentity,
+              evidenceFingerprint: attempt.evidence_fingerprint,
+              action: action!,
+            }),
+          candidate_identity: candidateIdentity,
+          action: action!,
+          budget_remaining: attempt.budget_remaining ?? 0,
+        };
+    if (!hasCoreFields) attemptsChanged = true;
+
+    // A pre-episode or reconstructed write-ahead claim may retain every exact
+    // episode key field while lacking only its derived id. Preserve that
+    // claim's in-flight ownership across a restart by restoring the same
+    // deterministic identity. Under-specified or already-malformed records
+    // remain non-authoritative; never infer an episode from item/candidate
+    // proximity alone.
+    const episodeNormalized = normalizeStartedRecoveryEpisodeIdentity(upgraded) as LoopRecoveryAttempt;
+    if (episodeNormalized !== upgraded) attemptsChanged = true;
+    upgraded = episodeNormalized;
+    return upgraded;
   });
   if (!itemsChanged && !attemptsChanged) return ledger;
   return { ...ledger, items, recovery_attempts: recoveryAttempts as LoopRecoveryAttempt[] };

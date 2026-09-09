@@ -644,6 +644,48 @@ export type RunEvent =
   | MaterialReworkEvent
   | PlanningLeverageSnapshotEvent;
 
+/** Exhaustive classification used by recovery readers: every currently known
+ * RunEvent is deliberately state/authority-bearing or passive/additive. */
+export const RUN_EVENT_RECOVERY_AUTHORITY_ROLE = {
+  run_start: "state",
+  run_complete: "state",
+  stage_start: "state",
+  stage_complete: "state",
+  pr_created: "state",
+  pr_updated: "state",
+  review_verdict: "state",
+  gate_result: "state",
+  tester_evidence: "state",
+  tester_targeted_check: "state",
+  blocker_set: "state",
+  blocker_cleared: "state",
+  harness_timeout: "state",
+  fix_harness_retry: "state",
+  harness_mutation_ownership: "state",
+  delta_round: "state",
+  delta_round_ceiling: "state",
+  candidate_epoch_restarted: "state",
+  worktree_created: "state",
+  worktree_removed: "state",
+  gh_metrics_summary: "passive",
+  stage_accounting: "passive",
+  ignored_artifact_warning: "passive",
+  papercut: "passive",
+  reversal_unacknowledged: "passive",
+  settled_alternative_reinstated: "passive",
+  settled_surface_unverified: "passive",
+  advisory_carry_forward: "passive",
+  delta_churn_suspected: "passive",
+  engine_drift: "passive",
+  human_intervention: "state",
+  correction_event: "state",
+  product_fault: "state",
+  planning_leverage_phase: "passive",
+  assumption_lineage: "passive",
+  material_rework: "passive",
+  planning_leverage_snapshot: "passive",
+} as const satisfies Record<RunEvent["type"], "state" | "passive">;
+
 // ---------------------------------------------------------------------------
 // Write-health (#633) — durable mid-run event-stream delivery failures
 // ---------------------------------------------------------------------------

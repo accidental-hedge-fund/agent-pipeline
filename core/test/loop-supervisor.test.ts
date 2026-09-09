@@ -6340,7 +6340,7 @@ test("tester evidence-ordering diagnostic skips scratch/publish and claims rebin
   );
 });
 
-test("linked child events refine coarse evidence and reach an unspent strategy after class budget zero (#1568)", async () => {
+test("linked child additive events preserve Tester-rebind recovery selection after class budget zero (#1568)", async () => {
   const enginePolicy = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
   const contract = testContract({
     items: [{ id: "100", depends_on: [] }],
@@ -6455,6 +6455,16 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
         issue: 100,
         repo: "acme/widgets",
       } as never, historicalBlocker as never, {
+        schema_version: 1,
+        type: "planning_leverage_phase",
+        at: "2026-09-08T21:21:27Z",
+        phase: "planning",
+        status: "complete",
+      } as never, {
+        schema_version: 7,
+        type: "stage_accounting",
+        at: "2026-09-08T21:21:27.500Z",
+      } as never, {
         schema_version: 1,
         type: "run_complete",
         at: "2026-09-08T21:21:28Z",
@@ -6934,15 +6944,6 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
       } as never],
     },
     {
-      name: "unknown future event after blocker",
-      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
-      events: [runStart, terminalEvent, {
-        schema_version: 7,
-        type: "future_terminal_signal",
-        at: "2026-09-08T21:22:00Z",
-      } as never],
-    },
-    {
       name: "no terminal run-complete after blocker",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
       events: [runStart, terminalEvent],
@@ -6955,6 +6956,52 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
         type: "loop_recovery_attempt",
         at: "2026-09-08T21:21:59Z",
         outcome: "bogus",
+      } as never, {
+        schema_version: 1,
+        type: "run_complete",
+        at: "2026-09-08T21:22:00Z",
+        final_state: "design-gate",
+      } as never],
+    },
+    {
+      name: "malformed additive tail event without a type",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent, {
+        schema_version: 1,
+        at: "2026-09-08T21:21:59Z",
+      } as never, {
+        schema_version: 1,
+        type: "run_complete",
+        at: "2026-09-08T21:22:00Z",
+        final_state: "design-gate",
+      } as never],
+    },
+    {
+      name: "post-blocker pr_updated mismatches the current PR head",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent, {
+        schema_version: 1,
+        type: "pr_updated",
+        at: "2026-09-08T21:21:59Z",
+        pr: 99,
+        head_sha: "d".repeat(40),
+      } as never, {
+        schema_version: 1,
+        type: "run_complete",
+        at: "2026-09-08T21:22:00Z",
+        final_state: "design-gate",
+      } as never],
+    },
+    {
+      name: "post-blocker review_verdict mismatches the current PR head",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent, {
+        schema_version: 1,
+        type: "review_verdict",
+        at: "2026-09-08T21:21:59Z",
+        round: 1,
+        sha: "d".repeat(40),
+        verdict: "approve",
       } as never, {
         schema_version: 1,
         type: "run_complete",
@@ -8253,6 +8300,82 @@ test("idle promotion ignores a started old-candidate attempt when the current ca
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.cooling?.candidate_epoch, currentHead);
   assert.equal(finalLedger.recovery_attempts[0]?.outcome, "started", "the old candidate claim remains non-authoritative");
+});
+
+test("idle promotion defers an exact current-candidate legacy started claim without episode_id (#1568)", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": {
+        ...workflowState,
+        recipes: ["resync_workflow_state"],
+        retry_budget: 1,
+        per_strategy_bound: 1,
+      },
+    },
+  });
+  const ledger = testLedger({ "100": blockedRecoveryItem("100") });
+  const { deps, files } = await setup(contract, ledger);
+  const currentHead = "b".repeat(40);
+  let failPostObservation = false;
+  let headReads = 0;
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:review-1"] };
+    },
+    async getLocalHead() {
+      if (failPostObservation && ++headReads === 3) {
+        throw new Error("post-action identity temporarily unavailable");
+      }
+      return { branch: "pipeline/100-fix", sha: currentHead };
+    },
+  }).deps;
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle({
+    store: deps,
+    observe,
+    dispatchItem: async () => { throw new Error("blocked item must not redispatch"); },
+    executeRecovery: async () => { throw new Error("backoff must defer execution"); },
+    recoverySleep: async () => {},
+  }, "run-1", token, "claude");
+
+  const legacyLedger = await readLedger(deps, "run-1", token);
+  assert.equal(legacyLedger.recovery_attempts[0]?.outcome, "started");
+  delete legacyLedger.recovery_attempts[0]!.episode_id;
+  const publishedLedger = [...files.keys()].find((key) => key.endsWith("/ledger.json"))!;
+  files.set(publishedLedger, JSON.stringify(legacyLedger, null, 2));
+
+  failPostObservation = true;
+  headReads = 0;
+  let recoveryCalls = 0;
+  const cycle = await runSupervisorCycle({
+    store: deps,
+    observe,
+    dispatchItem: async () => { throw new Error("blocked item must not redispatch"); },
+    executeRecovery: async () => {
+      recoveryCalls++;
+      return { succeeded: false, evidence: "recovery side effect outcome awaits observation", error: "not recovered" };
+    },
+  }, "run-1", token, "claude");
+
+  assert.equal(recoveryCalls, 1, "the restart replays the exact in-flight claim before idle promotion");
+  assert.equal(headReads, 3, "the post-action observation fails after reconciliation and preflight observation");
+  assert.equal(cycle.cooling, undefined, "the exact in-flight legacy claim must defer exhaustion");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.cooling, undefined);
+  assert.equal(
+    finalLedger.recovery_attempts[0]?.episode_id,
+    recoveryEpisodeId({
+      operation: legacyLedger.recovery_attempts[0]!.operation!,
+      invariant: legacyLedger.recovery_attempts[0]!.invariant!,
+      candidate_epoch: legacyLedger.recovery_attempts[0]!.candidate_epoch!,
+      evidence_identity: legacyLedger.recovery_attempts[0]!.evidence_identity!,
+    }),
+    "migration stamps the deterministic exact episode identity",
+  );
 });
 
 test("coexistence guard: the advance lock is acquired before the claim, held across the executor, and released even when the executor throws", async () => {

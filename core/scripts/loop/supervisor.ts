@@ -83,7 +83,7 @@ import {
   type SideEffectObserverResult,
 } from "./recovery-episodes.ts";
 import { resolveLogicalOperationId } from "../logical-operation.ts";
-import { runDirPath } from "../run-store.ts";
+import { RUN_EVENT_RECOVERY_AUTHORITY_ROLE, runDirPath } from "../run-store.ts";
 import {
   bindLifecycleRecord,
   compatibilityStopRefusesItem,
@@ -833,17 +833,114 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
         repo?: unknown;
       }>;
   if (runStarts.length !== 1 || runStartIndex >= finalBlockerIndex) return persisted;
+  const currentHead = item.last_verified_identity?.head_sha.trim().toLowerCase() ?? "";
+  const currentEpoch = observedCandidateEpoch(item).toLowerCase();
   const laterEvents = events.slice(finalBlockerIndex + 1) as Array<Record<string, unknown>>;
   const validKnownTail = laterEvents.every((event) => {
     if (
       typeof event !== "object" ||
       event === null ||
-      event.schema_version !== 1 ||
+      typeof event.schema_version !== "number" ||
+      !Number.isInteger(event.schema_version) ||
+      event.schema_version < 1 ||
+      typeof event.type !== "string" ||
+      event.type.trim().length === 0 ||
       !isCanonicalUtcEventTimestamp(event.at)
     ) return false;
+    const knownRole = Object.prototype.hasOwnProperty.call(RUN_EVENT_RECOVERY_AUTHORITY_ROLE, event.type)
+      ? RUN_EVENT_RECOVERY_AUTHORITY_ROLE[event.type as keyof typeof RUN_EVENT_RECOVERY_AUTHORITY_ROLE]
+      : undefined;
+    if (
+      (knownRole === "state" || event.type === "loop_recovery_attempt" || event.type === "recovery_result") &&
+      event.schema_version !== 1
+    ) return false;
+    if (event.type === "run_start" || event.type === "blocker_set") return false;
     if (event.type === "blocker_cleared") return true;
     if (event.type === "stage_start") {
       return typeof event.stage === "string" && event.stage.trim().length > 0;
+    }
+    if (event.type === "stage_complete") {
+      return (
+        typeof event.stage === "string" && event.stage.trim().length > 0 &&
+        typeof event.outcome === "string" && event.outcome.trim().length > 0
+      );
+    }
+    if (event.type === "pr_created" || event.type === "pr_updated") {
+      if (typeof event.pr !== "number" || !Number.isInteger(event.pr) || event.pr <= 0) return false;
+      if (persisted.transport.pr_number !== null && event.pr !== persisted.transport.pr_number) return false;
+      for (const [field, expected] of [
+        ["head_sha", currentHead],
+        ["candidate_sha", currentHead],
+        ["candidate_epoch", currentEpoch],
+      ] as const) {
+        if (event[field] === undefined) continue;
+        if (
+          typeof event[field] !== "string" ||
+          !/^[0-9a-f]{40}$/i.test(event[field].trim()) ||
+          event[field].trim().toLowerCase() !== expected
+        ) return false;
+      }
+      return true;
+    }
+    if (event.type === "candidate_epoch_restarted") {
+      return (
+        typeof event.from_sha === "string" && /^[0-9a-f]{40}$/i.test(event.from_sha.trim()) &&
+        typeof event.to_sha === "string" && /^[0-9a-f]{40}$/i.test(event.to_sha.trim()) &&
+        event.to_sha.trim().toLowerCase() === currentHead
+      );
+    }
+    if (event.type === "review_verdict") {
+      return (
+        typeof event.round === "number" && Number.isInteger(event.round) && event.round > 0 &&
+        typeof event.sha === "string" && /^[0-9a-f]{40}$/i.test(event.sha.trim()) &&
+        event.sha.trim().toLowerCase() === currentHead &&
+        typeof event.verdict === "string" && event.verdict.trim().length > 0
+      );
+    }
+    if (event.type === "gate_result") {
+      return (
+        typeof event.gate === "string" && event.gate.trim().length > 0 &&
+        typeof event.result === "string" && ["pass", "fail", "partial", "skipped"].includes(event.result)
+      );
+    }
+    if (event.type === "tester_evidence" || event.type === "tester_targeted_check") {
+      return (
+        typeof event.candidate_sha === "string" && /^[0-9a-f]{40}$/i.test(event.candidate_sha.trim()) &&
+        event.candidate_sha.trim().toLowerCase() === currentHead
+      );
+    }
+    if (event.type === "harness_timeout") {
+      return (
+        typeof event.stage === "string" && event.stage.trim().length > 0 &&
+        typeof event.timeout_sec === "number" && Number.isFinite(event.timeout_sec) && event.timeout_sec > 0
+      );
+    }
+    if (event.type === "fix_harness_retry") {
+      return (
+        typeof event.stage === "string" && event.stage.trim().length > 0 &&
+        typeof event.attempt === "number" && Number.isInteger(event.attempt) && event.attempt >= 2 &&
+        typeof event.limit === "number" && Number.isInteger(event.limit) && event.limit >= event.attempt &&
+        typeof event.reason === "string" && event.reason.trim().length > 0
+      );
+    }
+    if (event.type === "harness_mutation_ownership") {
+      return (
+        typeof event.issue === "number" && Number.isInteger(event.issue) && String(event.issue) === item.id &&
+        typeof event.attempt_id === "string" && event.attempt_id.trim().length > 0
+      );
+    }
+    if (event.type === "delta_round") {
+      return (
+        typeof event.round === "number" && Number.isInteger(event.round) && event.round > 0 &&
+        typeof event.cap === "number" && Number.isInteger(event.cap) && event.cap > 0
+      );
+    }
+    if (event.type === "delta_round_ceiling") {
+      return (
+        typeof event.observed === "number" && Number.isInteger(event.observed) && event.observed >= 0 &&
+        typeof event.cap === "number" && Number.isInteger(event.cap) && event.cap > 0 &&
+        (event.ceiling_action === "park" || event.ceiling_action === "demote_and_advance")
+      );
     }
     if (event.type === "loop_recovery_attempt") {
       return RECOVERY_ATTEMPT_OUTCOMES.has(event.outcome as RecoveryAttemptOutcome);
@@ -854,7 +951,7 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
     if (event.type === "run_complete") {
       return typeof event.final_state === "string" && event.final_state.trim().length > 0;
     }
-    if (event.type === "gh_metrics_summary") {
+    if (event.type === "gh_metrics_summary" && event.schema_version === 1) {
       const finiteNonNegative = (value: unknown): boolean =>
         typeof value === "number" && Number.isFinite(value) && value >= 0;
       return (
@@ -875,14 +972,22 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
         Object.values(event.by_wrapper).every(finiteNonNegative)
       );
     }
-    return false;
+    if (knownRole === "state") return false;
+    // The events stream is additive. Once the common schema/timestamp/type
+    // envelope is valid, an event this reader does not interpret cannot alter
+    // blocker authority. The RunEvent lifecycle/progress family above remains
+    // strict, while additive families may evolve under a later positive schema.
+    return true;
   });
   const hasTerminalRunComplete = laterEvents.some((event) => event.type === "run_complete");
   if (!validKnownTail || !hasTerminalRunComplete) return persisted;
   const blockerWasRecovered = laterEvents.some((event) => {
     if (typeof event !== "object" || event === null) return false;
-    if (event.type === "blocker_cleared") return true;
-    if (event.type === "stage_start") return true;
+    const knownRole = typeof event.type === "string" &&
+      Object.prototype.hasOwnProperty.call(RUN_EVENT_RECOVERY_AUTHORITY_ROLE, event.type)
+      ? RUN_EVENT_RECOVERY_AUTHORITY_ROLE[event.type as keyof typeof RUN_EVENT_RECOVERY_AUTHORITY_ROLE]
+      : undefined;
+    if (knownRole === "state" && event.type !== "run_complete") return true;
     if (
       (event.type === "loop_recovery_attempt" || event.type === "recovery_result") &&
       (event.outcome === "success" || event.outcome === "recovered")
@@ -890,8 +995,6 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
     return event.type === "run_complete" && event.final_state === "ready-to-deploy";
   });
   if (blockerWasRecovered) return persisted;
-  const currentHead = item.last_verified_identity?.head_sha.trim().toLowerCase() ?? "";
-  const currentEpoch = observedCandidateEpoch(item).toLowerCase();
   const eventRunIds = [
     ...runStarts.flatMap((runStart) => [runStart.run_id, runStart.pipeline_run_id]),
     candidate.run_id,

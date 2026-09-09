@@ -1603,6 +1603,35 @@ test("5.9 crash after truncated recovery-attempt write reconstructs last-valid e
   assert.notEqual(restored.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
 });
 
+test("5.9a no-fallback legacy started claim missing only episode_id migrates at read boundary (#1568)", async () => {
+  const { deps, files, contract, token } = await setup();
+  await blockCi(deps, contract, token);
+  const { attempt } = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "rerun_ci",
+    candidateIdentity: "head-current",
+  });
+  const published = [...files.keys()].find((key) => key.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  const legacy = JSON.parse(files.get(published)!);
+  delete legacy.recovery_attempts[0].episode_id;
+  files.set(published, JSON.stringify(legacy, null, 2));
+
+  const migrated = await readLedger(deps, "run-1");
+
+  assert.equal(migrated.recovery_attempts[0]?.episode_id, attempt.episode_id);
+  assert.equal(migrated.recovery_attempts[0]?.outcome, "started");
+  assert.equal(migrated.cooling, undefined);
+  assert.equal(
+    [...files.keys()].some((key) => key.includes("quarantine")),
+    false,
+    "a derivable historical claim is migrated rather than quarantined or replaced",
+  );
+});
+
 test("5.10 unreconstructable truncated recovery-attempt is not live episode authority", async () => {
   const { deps, files, contract, token } = await setup();
   await blockCi(deps, contract, token);
