@@ -2,7 +2,7 @@
 
 ### Requirement: Recovery admission SHALL use applicable per-strategy bounds
 
-Every scheduler and controller gate that decides whether a blocked item is recoverable, including the gate reevaluated after a failed recovery action, SHALL use the same Recovery Episode authority as strategy selection: configured recipe order, diagnostic-specific applicability, attempts spent per strategy, Cooling eligibility, and candidate/evidence episode and progress identity. A depleted legacy class-level budget SHALL remain a compatibility projection and SHALL NOT make the item ineligible while a later applicable strategy has unspent bound in the same episode. A failed action SHALL NOT cause the controller to substitute a stale outer episode key or emit `strategy_cursor_exhausted` while that later strategy remains claimable.
+Every scheduler and controller gate that decides whether a blocked item is recoverable, including the gate reevaluated after a failed recovery action, SHALL use the same Recovery Episode authority as strategy selection: configured recipe order, diagnostic-specific applicability, attempts spent per strategy, Cooling eligibility, and candidate/evidence episode and progress identity. When logical candidate lineage is null or absent, every gate SHALL use the executor's full candidate-identity fallback for the episode epoch. A depleted legacy class-level budget SHALL remain a compatibility projection and SHALL NOT make the item ineligible while a later applicable strategy has unspent bound in the same episode. A failed action SHALL NOT cause the controller to substitute a stale outer episode key or emit `strategy_cursor_exhausted` while that later strategy remains claimable.
 
 Recovery admission SHALL reject exhausted strategies and SHALL NOT make an inapplicable strategy executable. When no applicable strategy has remaining bound, the episode SHALL remain finitely owned through the existing Cooling or wait contract. A Cooling or waiting item SHALL NOT suppress a proven-independent eligible sibling.
 
@@ -27,6 +27,12 @@ Recovery admission SHALL reject exhausted strategies and SHALL NOT make an inapp
 - **WHEN** a strategy has spent its per-strategy bound or its diagnostic preconditions are false
 - **THEN** recovery admission SHALL NOT make that strategy claimable
 - **AND** an inapplicable skip SHALL NOT consume another strategy's bound
+
+#### Scenario: Unavailable logical lineage retains exhausted episode authority
+
+- **WHEN** logical candidate lineage is null or absent
+- **AND** the executor persisted an exhausted episode under the full repository, base, PR, and head candidate-identity fallback
+- **THEN** every outer recovery-eligibility gate SHALL resume that episode and keep the exhausted item ineligible
 
 #### Scenario: No applicable unspent strategy remains bounded
 

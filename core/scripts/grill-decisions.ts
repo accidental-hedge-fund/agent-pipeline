@@ -728,8 +728,15 @@ export function parseDecisionsFromBody(body: string): ParseResult {
     // catalog value and rejected missing or unused references.
     referencedNodeEvidence: persistedReferencedNodeEvidence,
   }).trim();
+  const legacyCatalogRendered = hasEvidenceCatalog(parsed)
+    ? renderDecisionsSection(shape.artifact, {
+        sharedEvidence: new Set(Object.values(
+          (parsed as { evidence_catalog: Record<string, string> }).evidence_catalog,
+        )),
+      }).trim()
+    : null;
   const liveSection = extractDecisionsSection(body)?.trim();
-  if (liveSection !== rendered) {
+  if (liveSection !== rendered && liveSection !== legacyCatalogRendered) {
     return { ok: false, reason: "## Decisions section diverges from the artifact", code: "render_divergence" };
   }
   return {

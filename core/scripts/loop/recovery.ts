@@ -24,6 +24,8 @@ import {
   type LoopLedger,
   type LoopEngineName,
   type LoopCoolingRecord,
+  type LoopItemLedgerEntry,
+  type LoopEvidencePointer,
 } from "./types.ts";
 import { initRun, readLedger, writeLedger, appendEvent, type LoopStoreDeps } from "./store.ts";
 import { mapLegacyThemeToBlockerClass } from "./import.ts";
@@ -459,6 +461,21 @@ function recoveryEpisodeKeyFor(input: {
     candidate_epoch: input.candidateEpoch,
     evidence_identity: input.evidenceIdentity,
   };
+}
+
+/** Episode key / persisted attempt epoch: prefer the observed logical epoch
+ * when lineage is observable. Keep the caller's candidate-identity fallback
+ * when the field is absent or lineage could not be read. */
+export function recoveryEpisodeCandidateEpoch(
+  item: LoopItemLedgerEntry | undefined,
+  fallback: string,
+): string {
+  const identity = item?.last_verified_identity;
+  if (identity && Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")) {
+    const logical = identity.logical_candidate_epoch?.trim() ?? "";
+    if (logical) return logical;
+  }
+  return fallback;
 }
 
 /** Durably claims exactly one recovery action before its external side effect.
@@ -906,29 +923,42 @@ export function independentlyRecoverableBlockedItems(
       const policy = contract.recovery_policy[entry.blocked_theme];
       if (!policy || policy.terminal_outcome === "human_authority") return false;
       const identity = entry.last_verified_identity;
-      const candidateEpoch = identity && Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")
-        ? identity.logical_candidate_epoch?.trim() || identity.head_sha.trim()
-        : identity?.head_sha.trim() ?? "";
-      const diagnostics = entry.history
+      const persistedEvidence = entry.history
         .filter((history) => history.to === "blocked" && history.evidence)
         .map((history) => {
           try {
-            const parsed = JSON.parse(history.evidence!) as { diagnostic?: unknown };
+            const parsed = JSON.parse(history.evidence!) as {
+              diagnostic?: unknown;
+              transport?: Partial<LoopEvidencePointer>;
+            };
             if (projectStageDiagnostic(parsed.diagnostic).disposition !== "protocol_failure") {
-              return parsed.diagnostic as StageDiagnostic;
+              return {
+                diagnostic: parsed.diagnostic as StageDiagnostic,
+                prNumber: parsed.transport?.pr_number,
+              };
             }
           } catch {
             // A malformed historical entry is an invariant boundary.
           }
           return null;
         });
-      const diagnostic = diagnostics[diagnostics.length - 1] ?? null;
+      const persisted = persistedEvidence[persistedEvidence.length - 1] ?? null;
+      const diagnostic = persisted?.diagnostic ?? null;
+      const candidateEpoch = recoveryEpisodeCandidateEpoch(
+        entry,
+        [
+          `repo=${contract.repo.name}`,
+          `base=${contract.repo.base_branch}`,
+          `pr=${identity?.pr_number ?? persisted?.prNumber ?? "none"}`,
+          `head=${identity?.head_sha.trim() || "none"}`,
+        ].join("|"),
+      );
       const evidenceIdentity = diagnostic
         ? recoveryProgressIdentity({
             itemId: entry.id,
             blockerClass: entry.blocked_theme,
             diagnostic,
-            priorDiagnostics: diagnostics.slice(0, -1).reverse(),
+            priorDiagnostics: persistedEvidence.slice(0, -1).reverse().map((value) => value?.diagnostic ?? null),
             attempts: ledger.recovery_attempts,
             candidateEpoch,
           })

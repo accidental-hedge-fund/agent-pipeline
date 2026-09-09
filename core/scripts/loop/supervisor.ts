@@ -66,7 +66,7 @@ import {
   transitionItem,
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
-import { blockItem, completeRecoveryAttempt, eligibleIndependentItems, fingerprintEvidence, hasContinuableIndependentSibling, persistOwnedCooling, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
+import { blockItem, completeRecoveryAttempt, eligibleIndependentItems, fingerprintEvidence, hasContinuableIndependentSibling, persistOwnedCooling, recoveryEpisodeCandidateEpoch, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
 import { isCanonicalUtcEventTimestamp } from "./advance-event-envelope.ts";
 import {
   buildCoolingRecord,
@@ -1042,21 +1042,6 @@ function observedCandidateEpoch(item: LoopItemLedgerEntry | undefined): string {
     return identity.head_sha.trim();
   }
   return identity.head_sha.trim();
-}
-
-/** Episode key / persisted attempt epoch: prefer the observed logical epoch
- * when lineage is observable. Keep the caller's existing fallback when the
- * field is absent or lineage could not be read. */
-function recoveryEpisodeCandidateEpoch(
-  item: LoopItemLedgerEntry | undefined,
-  fallback: string,
-): string {
-  const identity = item?.last_verified_identity;
-  if (identity && Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")) {
-    const logical = identity.logical_candidate_epoch?.trim() ?? "";
-    if (logical) return logical;
-  }
-  return fallback;
 }
 
 async function stopForRecoveryPreflight(

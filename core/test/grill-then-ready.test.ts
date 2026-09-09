@@ -606,6 +606,56 @@ test("grill: a catalog reference in authority evidence does not rewrite the same
   if (parsed.ok) assert.deepEqual(parsed.artifact, art);
 });
 
+test("grill: legacy catalog-wide rendering rewrites node evidence referenced only by authority evidence", () => {
+  const spec = "## Summary\nLegacy authority-only catalog rendering.\n";
+  const shared = "authority evidence ".repeat(20);
+  const node = {
+    ...makeNode({
+      id: "legacy-authority-occurrence",
+      question: "Who authorizes this operation?",
+      recommendation: "Obtain authority",
+      class: "merge-release",
+    }),
+    typed_request: "AuthorityRequest" as const,
+    evidence: [shared],
+    authority_request: {
+      eligible_actor: "authenticated-github-actor",
+      repository: "acme/repo",
+      operation: "merge",
+      scope: "merge-release",
+      candidate_epoch: null,
+      evidence: [shared],
+      expiry: "2026-09-16T00:00:00.000Z",
+      grant: null,
+    },
+  };
+  const art = artifact([node], spec);
+  const ref = `sha256:${sha256Hex(shared)}`;
+  const wire = {
+    ...art,
+    nodes: [{
+      ...node,
+      evidence: [shared],
+      authority_request: { ...node.authority_request, evidence: [{ evidence_ref: ref }] },
+    }],
+    evidence_catalog: { [ref]: shared },
+  };
+  const payload = canonicalJson(wire);
+  const body = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(payload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${payload}\n\`\`\``,
+    "",
+    renderDecisionsSection(art, { sharedEvidence: new Set([shared]) }).trimEnd(),
+    "",
+  ].join("\n");
+
+  const parsed = parseDecisionsFromBody(body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) assert.deepEqual(parsed.artifact, art);
+});
+
 test("grill: legacy inline-evidence artifacts and rendered sections remain readable", () => {
   const spec = "## Summary\nLegacy artifact.\n";
   const evidence = "legacy shared evidence";

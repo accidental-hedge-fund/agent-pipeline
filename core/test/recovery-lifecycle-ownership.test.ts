@@ -363,6 +363,36 @@ test("3.1 recovery eligibility starts a fresh same-candidate episode for a new d
 
   assert.deepEqual(independentlyRecoverableBlockedItems(contract, ledger), ["200"]);
   assert.equal(hasContinuableIndependentSibling(contract, ledger), true);
+
+  const currentIdentity = fingerprintEvidence(recoveryProgressEvidence({
+    blockerClass: "workflow-state",
+    diagnostic: currentDiagnostic,
+  }));
+  const fullCandidateEpoch = `repo=acme/repo|base=main|pr=12|head=${head}`;
+  const exhaustedCurrentEpisode = {
+    ...ledger,
+    items: {
+      ...ledger.items,
+      "200": {
+        ...ledger.items["200"],
+        last_verified_identity: {
+          ...ledger.items["200"]!.last_verified_identity!,
+          logical_candidate_epoch: null,
+        },
+      },
+    },
+    recovery_attempts: ledger.recovery_attempts.map((attempt) => ({
+      ...attempt,
+      candidate_identity: `${fullCandidateEpoch}|advance=advance-current|attempt=0`,
+      candidate_epoch: fullCandidateEpoch,
+      evidence_identity: currentIdentity,
+    })),
+  } as LoopLedger;
+  assert.deepEqual(
+    independentlyRecoverableBlockedItems(contract, exhaustedCurrentEpisode),
+    [],
+    "null logical lineage must resume the executor's exhausted full candidate-identity fallback",
+  );
 });
 
 test("3.2 recovery_exhausted is Cooling, not human ownership", () => {
