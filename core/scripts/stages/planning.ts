@@ -808,14 +808,36 @@ export async function runPlanningPhases(
       return blockedOutcome(reason, "worktree-missing");
     }
     wt = { path: remat.worktree.path, branch: remat.worktree.branch };
-    const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
-    const existingPlan = extractPlan(detail.comments ?? []);
-    planText =
-      existingPlan && existingPlan !== "(plan not found in comments)" ? existingPlan : "";
-    promptPlanText = planText;
-    specContext = undefined;
-    planComment = planText;
-    revisedPlan = planText;
+    if (hooks.bindResumePlanArtifacts) {
+      const bound = await hooks.bindResumePlanArtifacts(wt);
+      if (!bound.ok) {
+        await doSetBlocked(cfg, issueNumber, bound.reason, "implementing", bound.tag);
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+        return blockedOutcome(bound.reason, bound.tag);
+      }
+      const validated = await hooks.revalidateArtifact(wt, bound.promptPlanText, {
+        requireChange: false,
+      });
+      if (!validated.ok) {
+        await doSetBlocked(cfg, issueNumber, validated.reason, "implementing", validated.tag);
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+        return blockedOutcome(validated.reason, validated.tag);
+      }
+      planText = validated.updatedPlanText;
+      promptPlanText = validated.updatedPlanText;
+      specContext = validated.updatedSpecContext;
+      planComment = validated.updatedPlanText;
+      revisedPlan = validated.updatedPlanText;
+    } else {
+      const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
+      const existingPlan = extractPlan(detail.comments ?? []);
+      planText =
+        existingPlan && existingPlan !== "(plan not found in comments)" ? existingPlan : "";
+      promptPlanText = planText;
+      specContext = undefined;
+      planComment = planText;
+      revisedPlan = planText;
+    }
   } else {
 
   // ---- Step 0: optional carry-forward context (last30days) + cross-repo context ----

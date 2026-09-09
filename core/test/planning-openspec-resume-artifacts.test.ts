@@ -505,6 +505,94 @@ test("runPlanningPhases: freeform plan-review resume still uses the GitHub comme
   assert.ok(section.includes(FREEFORM_PLAN_BODY), "freeform resume uses the GitHub comment as plan text");
 });
 
+test("runPlanningPhases: OpenSpec implementation resume validates and implements the living bundle (#1568)", async () => {
+  const implementationPrompts: string[] = [];
+  const validateCalls: string[] = [];
+  let issueDetailCalls = 0;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: recordingValidate(validateCalls),
+    readChangeFile: (_dir, _name, file) =>
+      file === "proposal.md"
+        ? LIVING_PROPOSAL
+        : file === "tasks.md"
+          ? "- [ ] living implementation task"
+          : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumeImplementing: true },
+    hooks,
+    eqBaseDeps({
+      ensureManagedWorktree: async () => ({ result: "ok", worktree: wt }),
+      getIssueDetail: async () => {
+        issueDetailCalls += 1;
+        throw new Error("OpenSpec implementation resume must not read a stale plan comment");
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        implementationPrompts.push(prompt);
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.deepEqual(validateCalls, ["fresh-change"]);
+  assert.equal(issueDetailCalls, 0);
+  assert.equal(implementationPrompts.length, 1);
+  assert.match(implementationPrompts[0]!, new RegExp(WORKTREE_PROPOSAL_PIN));
+  assert.match(implementationPrompts[0]!, /living implementation task/);
+  assert.match(implementationPrompts[0]!, new RegExp(SPEC_DELTA_PIN));
+  assert.doesNotMatch(implementationPrompts[0]!, new RegExp(STALE_COMMENT_PIN));
+});
+
+test("runPlanningPhases: OpenSpec implementation resume blocks when the stable bundle changes during validation (#1568)", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let implementationCalls = 0;
+  let blocked: { reason: string; stage: string; tag: string } | undefined;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => {
+      proposal = "replacement written during validation";
+      return validItem();
+    },
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : "- [ ] task",
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumeImplementing: true },
+    hooks,
+    eqBaseDeps({
+      ensureManagedWorktree: async () => ({ result: "ok", worktree: wt }),
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, stage: string, tag: string) => {
+        blocked = { reason, stage, tag };
+      },
+      invoke: async () => {
+        implementationCalls += 1;
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.stage, "implementing");
+  assert.equal(blocked?.tag, "openspec-invalid");
+  assert.match(blocked?.reason ?? "", /changed during validation/i);
+  assert.equal(implementationCalls, 0);
+});
+
 test("runPlanningPhases: OpenSpec resume with zero or multiple restore candidates blocks before review (#1418 3.6)", async () => {
   for (const dirs of [[] as string[], ["change-a", "change-b"]]) {
     let reviewCalls = 0;
