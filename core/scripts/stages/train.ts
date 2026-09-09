@@ -1179,7 +1179,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       reportMechanicalFault(deps.reportOperationObservation, {
         operation: "train",
         form_id: "public-admission:train",
-        message: "approved factory-control root is unavailable",
+        message: "approved persist root is unavailable",
         domain: opts.pipelineConfig?.domain ?? opts.repo,
         logical_operation_id: outerLogicalOperationId,
         repository: opts.repo,
@@ -1196,7 +1196,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           next_action: "stopped",
           merge_mode: true,
           items: [],
-          blocker: "train merge admission refused: approved factory-control root is unavailable",
+          blocker: "train merge admission refused: approved persist root is unavailable",
           complete: false,
           events_coverage: "unknown",
         }),

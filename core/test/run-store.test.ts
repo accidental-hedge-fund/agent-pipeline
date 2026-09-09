@@ -576,7 +576,7 @@ test("persistPublicEntrypointAdmission: an uninventoried production route fails 
   assert.equal(store.files.size, 0);
 });
 
-test("resolvePublicAdmissionPersistRoot: unknown factory-control root fails closed (#1454)", async () => {
+test("resolvePublicAdmissionPersistRoot: explicit empty overlay fails closed (#1454)", async () => {
   assert.equal(
     await resolvePublicAdmissionPersistRoot({
       repoDir: "/candidate-worktree",
@@ -591,6 +591,48 @@ test("resolvePublicAdmissionPersistRoot: unknown factory-control root fails clos
     }),
     "/control-repo",
   );
+});
+
+test("resolvePublicAdmissionPersistRoot: product repo without factory-control uses repoDir", async () => {
+  assert.equal(
+    await resolvePublicAdmissionPersistRoot({
+      repoDir: "/home/me/dev/lyric-utils",
+      env: {},
+    }),
+    "/home/me/dev/lyric-utils",
+  );
+  assert.equal(
+    await resolvePublicAdmissionPersistRoot({
+      repoDir: "  /product-repo  ",
+      env: { AGENT_PIPELINE_FACTORY_CONTROL: "/factory-control" },
+    }),
+    "/product-repo",
+  );
+});
+
+test("persistPublicEntrypointAdmission: product repo without factory-control overlay persists in repoDir", async () => {
+  const { deps, readFile } = memRunStore();
+  const startedAt = new Date("2026-09-09T12:41:23.000Z");
+  const result = await persistPublicEntrypointAdmission(
+    {
+      repoDir: "/product-repo",
+      kind: "train",
+      route: "train.direct",
+      repo: "owner/product",
+      startedAt,
+      env: {},
+    },
+    deps,
+  );
+  assert.equal(result.acknowledged, true);
+  if (!result.acknowledged) return;
+  assert.equal(
+    result.runDir,
+    path.join("/product-repo", ".agent-pipeline", "runs", result.runId),
+  );
+  const meta = JSON.parse(readFile(path.join(result.runDir, "run.json")));
+  assert.equal(meta.kind, "train");
+  assert.equal(meta.admission_stamp.approved_root, "/product-repo");
 });
 
 test("resolvePublicAdmissionClaimRoot: uses the RecoverySupervisor state home (#1454)", () => {
