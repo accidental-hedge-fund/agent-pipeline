@@ -565,6 +565,52 @@ export interface BuildFixArgs {
    * managed worktree's local synthetic branch when the pipeline adopts an
    * existing PR. */
   deliveryBranch?: string;
+  /** Who owns the remote push after the harness commits. Defaults to the
+   * historical harness-owned behavior used by ordinary review-fix rounds. */
+  pushOwnership?: "harness" | "pipeline-wrapper";
+}
+
+function fixDeliveryBranchInstruction(deliveryBranch?: string): string {
+  return deliveryBranch
+    ? `\n\n## Delivery branch (required)\n\nThe linked PR's authoritative remote branch is \`${deliveryBranch}\`. The current local branch may be a pipeline-managed workspace identity with a different name. Do not pull, rebase from, or push the local branch's same-named remote. If you push, use exactly \`git push origin HEAD:${deliveryBranch}\`.`
+    : "";
+}
+
+function fixPushOwnershipBlock(a: BuildFixArgs): string {
+  if (a.pushOwnership === "pipeline-wrapper") {
+    return `## Pre-Commit Self-Check (required)
+
+Before committing:
+1. Review your own diff against the findings you were given.
+2. If any change in your diff appears to introduce a problem of **higher severity** than the finding it resolves — surface the concern in your output and stop before committing.
+3. Conservative-open: when in doubt whether a new issue is higher severity, call it out and stop before committing rather than silently proceeding.
+
+This self-check is a targeted scan of your own changes against the findings you were given — it is not a full re-review (the SHA-gate re-review handles that after the wrapper push).
+
+## Push ownership (pipeline wrapper)
+
+Commit the completed fix locally, but do **not** push. The pre-merge auto-fix wrapper is the sole push owner: it amends the commit with canonical traceability and performs the authoritative compare-and-swap push.
+
+## Single-Turn Invocation (required)
+
+This invocation is single-turn: there is no later turn in which deferred work can complete. Do NOT end your turn while committing still depends on a background task (e.g. a test suite launched in the background and not yet awaited) — wait synchronously for that work to finish, then commit, before ending the turn. Do not push; the pipeline wrapper owns delivery. A notification that arrives after your turn ends will never reach you.`;
+  }
+  return `## Pre-Commit Self-Check (required)
+
+Before committing or pushing:
+1. Review your own diff against the findings you were given.
+2. If any change in your diff appears to introduce a problem of **higher severity** than the finding it resolves — surface the concern in your output and **do NOT push**.
+3. Conservative-open: when in doubt whether a new issue is higher severity, call it out and withhold the push rather than silently proceeding.
+
+This self-check is a targeted scan of your own changes against the findings you were given — it is not a full re-review (the SHA-gate re-review handles that on push).
+
+## Git push auth (pipeline-configured)
+
+Push authentication is configured by the pipeline (\`git.push_auth\` in \`.github/pipeline.yml\`). Prefer the worktree's existing \`origin\` / \`pushurl\` and the process environment the pipeline prepared for this stage (including any process-only HTTPS pushurl / askpass when \`https-token\` is configured). Do **not** reconfigure origin to HTTPS via ambient \`gh auth setup-git\` / \`gh auth git-credential\` as the selected mechanism — that classic PAT often lacks the GitHub \`workflow\` scope and rejects pushes that touch \`.github/workflows/**\`. When you push, use \`git push origin <branch>\` with the remotes and environment the pipeline prepared — do not invent a separate remote.${fixDeliveryBranchInstruction(a.deliveryBranch)}
+
+## Single-Turn Invocation (required)
+
+This invocation is single-turn: there is no later turn in which deferred work can complete. Do NOT end your turn while committing or pushing still depends on a background task (e.g. a test suite launched in the background and not yet awaited) — wait synchronously for that work to finish, then commit and push, before ending the turn. A notification that arrives after your turn ends will never reach you.`;
 }
 
 export function buildFixPrompt(a: BuildFixArgs): string {
@@ -581,9 +627,7 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     spec_context: specContextSection(a.specContext),
     spec_revision_instruction: fixSpecRevisionInstruction(a.specContext),
     reviewed_sha: a.reviewedSha ?? "(unknown — no reviewed SHA supplied)",
-    delivery_branch_instruction: a.deliveryBranch
-      ? `\n\n## Delivery branch (required)\n\nThe linked PR's authoritative remote branch is \`${a.deliveryBranch}\`. The current local branch may be a pipeline-managed workspace identity with a different name. Do not pull, rebase from, or push the local branch's same-named remote. If you push, use exactly \`git push origin HEAD:${a.deliveryBranch}\`.`
-      : "",
+    push_ownership_block: fixPushOwnershipBlock(a),
     papercut_instruction: papercutInstructionSection(a.cfg),
   });
 }

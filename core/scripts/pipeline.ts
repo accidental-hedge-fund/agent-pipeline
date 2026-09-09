@@ -285,7 +285,7 @@ import {
 import {
   followLoopStageProgress,
   formatAuditStageTableRow,
-  parseAdvanceEventsJsonl,
+  parseRecoveryAuthorityAdvanceEventsJsonl,
 } from "./loop/stage-progress.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import {
@@ -3243,6 +3243,22 @@ export type LoopEngineResult =
   | { kind: "drive"; result: Awaited<ReturnType<typeof driveSupervisor>> }
   | { kind: "error"; message: string };
 
+/** Production recovery-authority reader. A concurrent partial write or any
+ * malformed row returns no evidence; a later supervisor cycle retries. */
+export async function readRecoveryAuthorityAdvanceEvents(
+  eventsPath: string,
+  readFile?: (eventsPath: string) => Promise<string>,
+) {
+  try {
+    const text = readFile
+      ? await readFile(eventsPath)
+      : await fsPromises.readFile(eventsPath, "utf8");
+    return parseRecoveryAuthorityAdvanceEventsJsonl(text);
+  } catch {
+    return [];
+  }
+}
+
 export type NewRunSupersessionDecision =
   | { kind: "resume-existing" }
   | { kind: "mint"; newRunId: string }
@@ -3533,14 +3549,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     },
     // Mid-advance stage-progress observation (#611): read the linked advance
     // events.jsonl while waiting on the child. Injectable for unit tests.
-    readAdvanceEvents: async (eventsPath) => {
-      try {
-        const text = await fsPromises.readFile(eventsPath, "utf8");
-        return parseAdvanceEventsJsonl(text);
-      } catch {
-        return [];
-      }
-    },
+    readAdvanceEvents: readRecoveryAuthorityAdvanceEvents,
     // Opt-in durable-run-blocker auto-file (#538): best-effort, gated on
     // resolved config, wrapped so a failure here can never alter the drive
     // result (driveSupervisor's own onDriveEnd call site already swallows any

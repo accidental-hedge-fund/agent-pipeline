@@ -48,7 +48,7 @@ import {
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, type LoopExecutionRequest, type LoopExecutionResponse } from "../scripts/loop-execution-contract.ts";
 import { buildStageDiagnostic, projectStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 import { consultLifecycleRecord } from "../scripts/recovery-lifecycle-ownership.ts";
-import { realExecuteRecovery } from "../scripts/pipeline.ts";
+import { readRecoveryAuthorityAdvanceEvents, realExecuteRecovery } from "../scripts/pipeline.ts";
 import { emitBlockedOutcomeEvents } from "../scripts/pipeline-run.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
@@ -6373,7 +6373,6 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
       required_role: "implementation",
       observed_role: "missing",
       blocker_code: "tester_rebind_pr_head_unobservable",
-      subject_omitted_because_unobservable: true,
     },
   });
   const emittedBlocker = await emitBlockedOutcomeEvents(
@@ -6393,6 +6392,12 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
       appendEvent: async () => true,
     },
   );
+  const historicalBlocker = structuredClone(emittedBlocker) as Record<string, unknown>;
+  delete historicalBlocker.run_id;
+  delete historicalBlocker.issue;
+  delete historicalBlocker.pr_head;
+  delete historicalBlocker.subject_omitted;
+  delete historicalBlocker.pr_head_omitted;
   let dispatchCount = 0;
   const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
     dispatchCount++;
@@ -6442,7 +6447,14 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
       assert.equal(eventsPath, "/persistent/repo/.agent-pipeline/runs/advance-100/events.jsonl");
       linkedReads.push(actions.length);
       if (actions.length < 2) return [];
-      return [emittedBlocker];
+      return [{
+        schema_version: 1,
+        type: "run_start",
+        at: "2026-09-08T19:56:18Z",
+        run_id: "advance-100",
+        issue: 100,
+        repo: "acme/widgets",
+      } as never, historicalBlocker as never];
     },
   };
   const { token } = await acquireLock(deps, "run-1", "claude");
@@ -6469,6 +6481,11 @@ test("linked child events refine coarse evidence and reach an unspent strategy a
       (attempt) => attempt.action === "unlink_engine_scratch" && attempt.outcome !== "skipped",
     ).length,
     2,
+  );
+  assert.equal(
+    repaired.recovery_attempts.at(-1)?.skipped_strategies?.includes("unlink_engine_scratch"),
+    false,
+    "spent scratch attempts must not be persisted as semantically false skipped-strategy evidence",
   );
 });
 
@@ -6573,6 +6590,31 @@ test("driveSupervisor continues after the failed checkpoint that depleted the le
   );
 });
 
+test("production recovery-authority reader rejects any malformed or non-object JSONL row (#1568)", async () => {
+  const runStart = JSON.stringify({ type: "run_start" });
+  const blocker = JSON.stringify({ type: "blocker_set" });
+  for (const badRow of ["not-json", "null", "[]", '"scalar"']) {
+    const events = await readRecoveryAuthorityAdvanceEvents(
+      "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      async () => `${runStart}\n${badRow}\n${blocker}\n`,
+    );
+    assert.deepEqual(events, [], `row ${badRow} must invalidate the complete authority snapshot`);
+  }
+  assert.deepEqual(
+    await readRecoveryAuthorityAdvanceEvents("/repo/events.jsonl", async () => `${runStart}\n{"type":`),
+    [],
+    "a partial final append must confer no authority until a later read succeeds",
+  );
+  assert.equal(
+    (await readRecoveryAuthorityAdvanceEvents(
+      "/repo/events.jsonl",
+      async () => `${runStart}\n${blocker}\n`,
+    )).length,
+    2,
+    "a complete object-only stream remains readable",
+  );
+});
+
 test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1568)", async () => {
   const head = "c".repeat(40);
   const precise = buildStageDiagnostic({
@@ -6590,13 +6632,21 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
     },
   });
   const terminalEvent = {
+    schema_version: 1,
     type: "blocker_set",
-    run_id: "advance-100",
-    issue: 100,
+    at: "2026-09-08T21:21:28Z",
     blocker_kind: "harness-failure",
     reason: precise.detail.reason,
     stage: precise.detail.stage,
     diagnostic: precise,
+  } as never;
+  const runStart = {
+    schema_version: 1,
+    type: "run_start",
+    at: "2026-09-08T19:56:18Z",
+    run_id: "advance-100",
+    issue: 100,
+    repo: "acme/widgets",
   } as never;
   const headMismatchDiagnostic = buildStageDiagnostic({
     reasonCode: "workflow-engine-defect",
@@ -6612,63 +6662,265 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
       pr_head: "d".repeat(40),
     },
   });
+  const unjustifiedMissingHeadDiagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "missing head without typed omission authority",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      blocker_code: "some_other_blocker",
+    },
+  });
   const cases = [
     { name: "missing", eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl", events: [] },
     { name: "malformed", eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl", events: null as never },
-    { name: "arbitrary path", eventsPath: "/tmp/advance-100/events.jsonl", events: [terminalEvent], expectRead: false },
+    { name: "anonymous stream", eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl", events: [terminalEvent] },
+    {
+      name: "repoDir-only cannot authorize refinement",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent],
+      omitRunStoreRepoDir: true,
+      expectRead: false,
+    },
+    { name: "arbitrary path", eventsPath: "/tmp/advance-100/events.jsonl", events: [runStart, terminalEvent], expectRead: false },
+    {
+      name: "lexical traversal alias",
+      eventsPath: "/repo/.agent-pipeline/runs/../runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent],
+      expectRead: false,
+    },
+    {
+      name: "traversal advance run id",
+      linkedRunId: "../../../../tmp/forged-run",
+      eventsPath: "/tmp/forged-run/events.jsonl",
+      events: [{
+        ...runStart,
+        run_id: "../../../../tmp/forged-run",
+      } as never, terminalEvent],
+      expectRead: false,
+    },
     {
       name: "foreign prefix",
       eventsPath: "/foreign/.agent-pipeline/runs/advance-100/events.jsonl",
-      events: [terminalEvent],
+      events: [runStart, terminalEvent],
       expectRead: false,
     },
     {
       name: "operator worktree root",
       eventsPath: "/repo/.worktrees/operator/.agent-pipeline/runs/advance-100/events.jsonl",
-      events: [terminalEvent],
+      events: [runStart, terminalEvent],
       expectRead: false,
     },
     {
       name: "run mismatch",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
-      events: [{ ...terminalEvent, run_id: "another-run" } as never],
+      events: [runStart, { ...terminalEvent, run_id: "another-run" } as never],
     },
     {
-      name: "missing run identity",
+      name: "terminal repo mismatch",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
-      events: [{ ...terminalEvent, run_id: undefined } as never],
+      events: [runStart, { ...terminalEvent, repo: "foreign/repo" } as never],
+    },
+    {
+      name: "run-start mismatch",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, run_id: "another-run" } as never, terminalEvent],
+    },
+    {
+      name: "duplicate run-start mismatch",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, { ...runStart, run_id: "another-run" } as never, terminalEvent],
+    },
+    {
+      name: "duplicate identical run-start",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, runStart, terminalEvent],
+    },
+    {
+      name: "post-blocker foreign run-start",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent, { ...runStart, repo: "foreign/repo" } as never],
+    },
+    {
+      name: "sole matching run-start after terminal blocker",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [terminalEvent, runStart],
+    },
+    {
+      name: "run-start missing schema",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, schema_version: undefined } as never, terminalEvent],
+    },
+    {
+      name: "run-start missing timestamp",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, at: undefined } as never, terminalEvent],
+    },
+    {
+      name: "run-start invalid timestamp",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, at: "not-a-time" } as never, terminalEvent],
+    },
+    {
+      name: "run-start impossible calendar date",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, at: "2026-02-30T19:56:18Z" } as never, terminalEvent],
+    },
+    {
+      name: "run-start noncanonical UTC offset",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, at: "2026-09-08T19:56:18+00:00" } as never, terminalEvent],
+    },
+    {
+      name: "run-start missing repo",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, repo: undefined } as never, terminalEvent],
+    },
+    {
+      name: "run-start missing run",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, run_id: undefined } as never, terminalEvent],
+    },
+    {
+      name: "run-start missing issue",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, issue: undefined } as never, terminalEvent],
+    },
+    {
+      name: "run-start string issue",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, issue: "100" } as never, terminalEvent],
+    },
+    {
+      name: "run-start repo mismatch",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, repo: "foreign/repo" } as never, terminalEvent],
     },
     {
       name: "item mismatch",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
-      events: [{ ...terminalEvent, issue: 999 } as never],
+      events: [runStart, { ...terminalEvent, issue: 999 } as never],
     },
     {
-      name: "missing item identity",
+      name: "terminal string issue",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
-      events: [{ ...terminalEvent, issue: undefined } as never],
+      events: [runStart, { ...terminalEvent, issue: "100" } as never],
+    },
+    {
+      name: "run-start item mismatch",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...runStart, issue: 999 } as never, terminalEvent],
     },
     {
       name: "candidate mismatch",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
-      events: [{ ...terminalEvent, candidate_epoch: "d".repeat(40) } as never],
+      events: [runStart, { ...terminalEvent, candidate_epoch: "d".repeat(40) } as never],
+    },
+    {
+      name: "object candidate identity",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, { ...terminalEvent, candidate_sha: { value: head } } as never],
     },
     {
       name: "explicit head mismatch",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
-      events: [{ ...terminalEvent, diagnostic: headMismatchDiagnostic } as never],
+      events: [runStart, { ...terminalEvent, diagnostic: headMismatchDiagnostic } as never],
     },
     {
-      name: "non-terminal",
+      name: "numeric diagnostic head",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
-      events: [{ type: "stage_started", run_id: "advance-100", issue: 100 } as never],
+      events: [runStart, {
+        ...terminalEvent,
+        diagnostic: {
+          ...precise,
+          detail: {
+            ...precise.detail,
+            evidence_ordering: { ...precise.detail.evidence_ordering!, pr_head: 123 },
+          },
+        },
+      } as never],
+    },
+    {
+      name: "object diagnostic head",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, {
+        ...terminalEvent,
+        diagnostic: {
+          ...precise,
+          detail: {
+            ...precise.detail,
+            evidence_ordering: { ...precise.detail.evidence_ordering!, pr_head: { value: head } },
+          },
+        },
+      } as never],
+    },
+    {
+      name: "non-serializable nested diagnostic",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, {
+        ...terminalEvent,
+        diagnostic: {
+          ...precise,
+          detail: { ...precise.detail, finding_key: 1n },
+        },
+      } as never],
+    },
+    {
+      name: "missing head without exact blocker code or omission flag",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, { ...terminalEvent, diagnostic: unjustifiedMissingHeadDiagnostic } as never],
+    },
+    {
+      name: "short observed head",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent],
+      observedHead: "abc",
+    },
+    {
+      name: "later blocker clear",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent, { type: "blocker_cleared" } as never],
+    },
+    {
+      name: "later forward stage start",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent, {
+        schema_version: 1,
+        type: "stage_start",
+        at: "2026-09-08T21:22:00Z",
+        stage: "implementing",
+      } as never],
+    },
+    {
+      name: "terminal blocker wrong schema",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, { ...terminalEvent, schema_version: 2 } as never],
+    },
+    {
+      name: "terminal blocker invalid timestamp",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, { ...terminalEvent, at: "not-a-time" } as never],
+    },
+    {
+      name: "terminal blocker impossible calendar date",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, { ...terminalEvent, at: "2026-02-30T21:21:28.000Z" } as never],
+    },
+    {
+      name: "terminal blocker locale timestamp",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, { ...terminalEvent, at: "September 8, 2026 21:21:28 UTC" } as never],
     },
   ];
 
   for (const candidate of cases) {
     const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+    const linkedRunId = candidate.linkedRunId ?? "advance-100";
     const ledger = testLedger({
-      "100": { ...itemEntry("100", "pending"), advance_run_id: "advance-100" },
+      "100": { ...itemEntry("100", "pending"), advance_run_id: linkedRunId },
     });
     const { deps } = await setup(contract, ledger);
     const actions: string[] = [];
@@ -6676,8 +6928,9 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
     const { token } = await acquireLock(deps, "run-1", "claude");
     await runSupervisorCycle({
       store: deps,
-      observe: fakeObserveDeps({ async getLocalHead() { return { branch: "pipeline/100-x", sha: head }; } }).deps,
+      observe: fakeObserveDeps({ async getLocalHead() { return { branch: "pipeline/100-x", sha: candidate.observedHead ?? head }; } }).deps,
       repoDir: "/repo",
+      ...(candidate.omitRunStoreRepoDir ? {} : { runStoreRepoDir: "/repo" }),
       readAdvanceEvents: async () => {
         readCount++;
         return candidate.events;
@@ -6687,7 +6940,7 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
         item_id: request.item_id,
         run_id: request.run_id,
         outcome: "blocked_recoverable",
-        evidence: { pr_number: 99, pipeline_run_id: "advance-100", events_path: candidate.eventsPath },
+        evidence: { pr_number: 99, pipeline_run_id: linkedRunId, events_path: candidate.eventsPath },
         diagnostic: buildStageDiagnostic({
           reasonCode: "workflow-engine-defect",
           blockerKind: "harness-failure",

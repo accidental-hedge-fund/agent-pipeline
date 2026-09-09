@@ -418,6 +418,120 @@ test("2.2 exhausting one strategy advances the cursor without run_fatal", () => 
   }
 });
 
+test("custom per-strategy bound does not persist an exhausted predecessor as skipped (#1568)", async () => {
+  const { deps } = fakeDeps();
+  const base = testContract();
+  const policyEntry = base.recovery_policy["implementation-ci"];
+  const contract = testContract({
+    recovery_policy: {
+      ...base.recovery_policy,
+      "implementation-ci": { ...policyEntry, per_strategy_bound: 1 },
+    },
+  });
+  await initRun(deps, contract, testLedger());
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockCi(deps, contract, token);
+
+  const verify = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "verify_head_goal",
+    candidateIdentity: "head-custom-bound",
+  });
+  await completeRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    attemptId: verify.attempt.attempt_id,
+    succeeded: false,
+    error: "head still fails the goal",
+  });
+  const rerun = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "rerun_ci",
+    candidateIdentity: "head-custom-bound",
+  });
+
+  assert.equal(rerun.attempt.outcome, "started");
+  assert.deepEqual(rerun.attempt.skipped_strategies, []);
+  assert.equal(rerun.attempt.attempts_per_strategy?.verify_head_goal, 1);
+  assert.equal(rerun.attempt.attempts_per_strategy?.rerun_ci, 1);
+  const persisted = await readLedger(deps, "run-1", token);
+  assert.deepEqual(persisted.recovery_attempts.at(-1)?.skipped_strategies, []);
+  assert.equal(
+    persisted.recovery_attempts.at(-1)?.strategy_cursor,
+    policyEntry.recipes.indexOf("rerun_ci"),
+  );
+  assert.equal(persisted.cooling, undefined, "the custom-bound episode must remain valid on reread");
+});
+
+test("custom-bound exhaustion before an inapplicable recipe remains valid through a later claim (#1568)", async () => {
+  const { deps } = fakeDeps();
+  const base = testContract();
+  const policyEntry = base.recovery_policy["implementation-ci"];
+  const contract = testContract({
+    recovery_policy: {
+      ...base.recovery_policy,
+      "implementation-ci": { ...policyEntry, per_strategy_bound: 1 },
+    },
+  });
+  await initRun(deps, contract, testLedger());
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockCi(deps, contract, token);
+
+  const verify = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "verify_head_goal",
+    candidateIdentity: "head-custom-skip",
+  });
+  await completeRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    attemptId: verify.attempt.attempt_id,
+    succeeded: false,
+    error: "goal remains unmet",
+  });
+  const skipped = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "rerun_ci",
+    candidateIdentity: "head-custom-skip",
+    skipInapplicable: true,
+  });
+  assert.equal(skipped.attempt.outcome, "skipped");
+
+  const repair = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "repair_pipeline_item",
+    candidateIdentity: "head-custom-skip",
+  });
+  assert.equal(repair.attempt.outcome, "started");
+  assert.deepEqual(repair.attempt.skipped_strategies, ["rerun_ci"]);
+  const persisted = await readLedger(deps, "run-1", token);
+  assert.deepEqual(persisted.recovery_attempts.at(-1)?.skipped_strategies, ["rerun_ci"]);
+  assert.equal(
+    persisted.recovery_attempts.at(-1)?.strategy_cursor,
+    policyEntry.recipes.indexOf("repair_pipeline_item"),
+  );
+  assert.equal(persisted.cooling, undefined, "the mixed exhausted/skipped episode must remain valid on reread");
+});
+
 test("2.3 inapplicable verify_head_goal skip does not consume repair bound", async () => {
   const { deps, contract, token } = await setup();
   await blockCi(deps, contract, token);
@@ -444,7 +558,7 @@ test("2.3 inapplicable verify_head_goal skip does not consume repair bound", asy
   assert.equal(repair.attempt.attempts_per_strategy?.["repair_pipeline_item"], 1);
 });
 
-test("2.4 three-recipe class claims the last recipe after earlier spent or skipped", () => {
+test("2.4 three-recipe class claims the last recipe without re-recording spent predecessors", () => {
   const recipes: RecoveryRecipe[] = ["unlink_engine_scratch", "restart_workflow_engine", "repair_pipeline_item"];
   const selected = selectNextApplicableStrategy({
     recipes,
@@ -456,7 +570,7 @@ test("2.4 three-recipe class claims the last recipe after earlier spent or skipp
   assert.equal(selected.kind, "claim");
   if (selected.kind === "claim") {
     assert.equal(selected.action, "repair_pipeline_item");
-    assert.ok(selected.skipped.includes("unlink_engine_scratch"));
+    assert.equal(selected.skipped.includes("unlink_engine_scratch"), false);
   }
 });
 
@@ -889,6 +1003,143 @@ test("configured recovery sequences match DEFAULT_RECOVERY_POLICY", () => {
     assert.ok(sequence, cls);
     assert.deepEqual([...sequence.recipes], DEFAULT_RECOVERY_POLICY[cls].recipes);
     assert.equal(sequence.bound, perStrategyBound(DEFAULT_RECOVERY_POLICY[cls]));
+  }
+});
+
+test("contract policy membership governs authoritative actions, skips, and counters", () => {
+  const policy = {
+    ...DEFAULT_RECOVERY_POLICY,
+    "workflow-state": {
+      ...DEFAULT_RECOVERY_POLICY["workflow-state"],
+      recipes: ["repair_pipeline_item"],
+    },
+  } as LoopContract["recovery_policy"];
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-policy",
+    evidence_identity: "evidence-policy",
+  };
+  const base = {
+    item_id: "100",
+    seq: 0,
+    time: "2026-09-02T00:00:00.000Z",
+    class: "workflow-state",
+    action: "repair_pipeline_item",
+    outcome: "started",
+    episode_id: recoveryEpisodeId(key),
+    ...key,
+    attempts_per_strategy: { repair_pipeline_item: 1 },
+    strategy_cursor: 0,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  assert.equal(isAuthoritativeEpisodeState(base, [base], policy), true);
+  assert.equal(isAuthoritativeEpisodeState({ ...base, action: "verify_authentication" }, [], policy), false);
+  assert.equal(isAuthoritativeEpisodeState({ ...base, actions: ["verify_authentication"] }, [], policy), false);
+  assert.equal(isAuthoritativeEpisodeState({ ...base, skipped_strategies: ["verify_authentication"] }, [], policy), false);
+  assert.equal(
+    isAuthoritativeEpisodeState({ ...base, attempts_per_strategy: { verify_authentication: 1 } }, [], policy),
+    false,
+  );
+});
+
+test("persisted action outside the class policy is quarantined and cannot resume or execute", async () => {
+  const { deps, files } = fakeDeps();
+  const policy = {
+    ...DEFAULT_RECOVERY_POLICY,
+    "workflow-state": {
+      ...DEFAULT_RECOVERY_POLICY["workflow-state"],
+      recipes: ["repair_pipeline_item"],
+    },
+  } as LoopContract["recovery_policy"];
+  const contract = testContract({ recovery_policy: policy });
+  await initRun(deps, contract, testLedger());
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "workflow-state", evidence: "workflow state drift",
+  });
+  const base = await readLedger(deps, "run-1", token);
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-policy",
+    evidence_identity: base.items["100"]!.evidence_fingerprint!,
+  };
+  const forbidden = {
+    item_id: "100",
+    seq: 0,
+    time: "2026-09-02T00:00:00.000Z",
+    class: "workflow-state",
+    action: "verify_authentication",
+    actions: ["verify_authentication"],
+    outcome: "started",
+    episode_id: recoveryEpisodeId(key),
+    ...key,
+    attempts_per_strategy: { verify_authentication: 1 },
+    strategy_cursor: 0,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  const published = [...files.keys()].find((path) => path.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  files.set(published, JSON.stringify({ ...base, recovery_attempts: [forbidden] }));
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+  const owned = await readLedger(deps, "run-1", token);
+  assert.equal(owned.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  assert.equal(resumeEpisodeFromAttempts(owned.recovery_attempts, key), null);
+  await assert.rejects(
+    () => startRecoveryAttempt(deps, contract, {
+      runId: "run-1", token, itemId: "100", engine: "claude",
+      action: "verify_authentication", candidateIdentity: "epoch-policy",
+    }),
+    /not permitted for blocker class/,
+  );
+});
+
+test("malformed nested policy entries quarantine without throwing and validation matches compiler numeric semantics", async () => {
+  const fractionalPolicy = {
+    ...DEFAULT_RECOVERY_POLICY,
+    "workflow-state": {
+      ...DEFAULT_RECOVERY_POLICY["workflow-state"],
+      recipes: ["repair_pipeline_item"],
+      retry_budget: 0.5,
+      per_strategy_bound: 0.5,
+      backoff: { initial_seconds: 0.25, multiplier: 0.5, max_seconds: -1 },
+      repeated_evidence_limit: 1.5,
+    },
+  } as LoopContract["recovery_policy"];
+  const key = {
+    operation: "loop_recovery", invariant: "workflow-state",
+    candidate_epoch: "epoch-fractional", evidence_identity: "evidence-fractional",
+  };
+  const row = {
+    item_id: "100", seq: 0, time: "2026-09-02T00:00:00.000Z",
+    class: "workflow-state", action: "repair_pipeline_item", outcome: "started",
+    episode_id: recoveryEpisodeId(key), ...key,
+    attempts_per_strategy: { repair_pipeline_item: 1 }, strategy_cursor: 0,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  assert.equal(isAuthoritativeEpisodeState(row, [row], fractionalPolicy), true);
+  const zeroLimit = {
+    ...fractionalPolicy,
+    "workflow-state": { ...fractionalPolicy["workflow-state"], repeated_evidence_limit: 0 },
+  } as LoopContract["recovery_policy"];
+  assert.equal(isAuthoritativeEpisodeState(row, [row], zeroLimit), false);
+
+  for (const malformedEntry of [{}, { ...DEFAULT_RECOVERY_POLICY["workflow-state"], recipes: "repair_pipeline_item" }]) {
+    const { deps, files } = fakeDeps();
+    const malformedPolicy = {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": malformedEntry,
+    } as unknown as LoopContract["recovery_policy"];
+    await initRun(deps, testContract({ recovery_policy: malformedPolicy }), testLedger());
+    const { token } = await acquireLock(deps, "run-1", "claude");
+    const published = [...files.keys()].find((path) => path.endsWith("/ledger.json"))!;
+    files.delete(lastValidPathFor(published));
+    files.set(published, JSON.stringify({ ...testLedger(), recovery_attempts: [row] }));
+    await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+    const owned = await readLedger(deps, "run-1", token);
+    assert.equal(owned.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
   }
 });
 

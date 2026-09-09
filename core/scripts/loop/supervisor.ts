@@ -737,24 +737,42 @@ function persistedRecoveryEvidence(item: LoopItemLedgerEntry): PersistedRecovery
   return parsePersistedRecoveryEvidence(blocked?.evidence);
 }
 
+function isCanonicalUtcEventTimestamp(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)
+  ) return false;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return false;
+  const canonical = new Date(timestamp).toISOString();
+  return value.includes(".") ? canonical === value : canonical.replace(".000Z", "Z") === value;
+}
+
 async function refineRecoveryEvidenceFromLinkedAdvance(
   deps: SupervisorDeps,
   item: LoopItemLedgerEntry,
   persisted: PersistedRecoveryEvidence,
+  expectedRepo: string,
 ): Promise<PersistedRecoveryEvidence> {
   const linkedRunId = item.advance_run_id?.trim() ?? "";
   const eventsPath = persisted.transport.events_path?.trim() ?? "";
-  const normalizedEventsPath = path.normalize(eventsPath);
-  const runStoreRepoDir = deps.runStoreRepoDir ?? deps.repoDir ?? "";
-  const canonicalEventsPath = runStoreRepoDir && linkedRunId
+  const runStoreRepoDir = deps.runStoreRepoDir ?? "";
+  const linkedRunIdIsSafe =
+    linkedRunId.length > 0 &&
+    linkedRunId !== "." &&
+    linkedRunId !== ".." &&
+    !linkedRunId.includes("/") &&
+    !linkedRunId.includes("\\") &&
+    linkedRunId === path.basename(linkedRunId);
+  const canonicalEventsPath = runStoreRepoDir && linkedRunIdIsSafe
     ? path.join(runDirPath(runStoreRepoDir, linkedRunId), "events.jsonl")
     : "";
   if (
     !deps.readAdvanceEvents ||
-    !linkedRunId ||
+    !linkedRunIdIsSafe ||
     !path.isAbsolute(runStoreRepoDir) ||
     !path.isAbsolute(eventsPath) ||
-    normalizedEventsPath !== path.normalize(canonicalEventsPath) ||
+    eventsPath !== canonicalEventsPath ||
     persisted.transport.pipeline_run_id !== linkedRunId ||
     persisted.diagnostic.detail.evidence_ordering
   ) {
@@ -767,56 +785,126 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
     return persisted;
   }
   if (!Array.isArray(events) || events.length === 0) return persisted;
-  const candidate = [...events].reverse().find(
+  const finalBlockerIndex = events.findLastIndex(
     (event) => typeof event === "object" && event !== null && event.type === "blocker_set",
-  ) as
+  );
+  const candidate = events[finalBlockerIndex] as
     | (AdvanceStageEvent & {
         run_id?: unknown;
         pipeline_run_id?: unknown;
         issue?: unknown;
         item_id?: unknown;
+        repo?: unknown;
         candidate_epoch?: unknown;
         candidate_sha?: unknown;
       })
     | undefined;
-  if (!candidate) return persisted;
+  if (
+    !candidate ||
+    finalBlockerIndex < 0 ||
+    candidate.schema_version !== 1 ||
+    !isCanonicalUtcEventTimestamp(candidate.at) ||
+    (candidate.repo !== undefined && candidate.repo !== expectedRepo)
+  ) return persisted;
+  const runStartIndex = events.findIndex(
+    (event) => typeof event === "object" && event !== null && event.type === "run_start",
+  );
+  const runStarts = events.filter(
+    (event) => typeof event === "object" && event !== null && event.type === "run_start",
+  ) as
+    Array<AdvanceStageEvent & {
+        run_id?: unknown;
+        pipeline_run_id?: unknown;
+        issue?: unknown;
+        item_id?: unknown;
+        repo?: unknown;
+      }>;
+  if (runStarts.length !== 1 || runStartIndex >= finalBlockerIndex) return persisted;
+  const laterEvents = events.slice(finalBlockerIndex + 1) as Array<Record<string, unknown>>;
+  const blockerWasRecovered = laterEvents.some((event) => {
+    if (typeof event !== "object" || event === null) return false;
+    if (event.type === "blocker_cleared") return true;
+    if (event.type === "stage_start") return true;
+    if (
+      (event.type === "loop_recovery_attempt" || event.type === "recovery_result") &&
+      (event.outcome === "success" || event.outcome === "recovered")
+    ) return true;
+    return event.type === "run_complete" && event.final_state === "ready-to-deploy";
+  });
+  if (blockerWasRecovered) return persisted;
   const currentHead = item.last_verified_identity?.head_sha.trim().toLowerCase() ?? "";
   const currentEpoch = observedCandidateEpoch(item).toLowerCase();
-  const eventRunIds = [candidate.run_id, candidate.pipeline_run_id].filter(
+  const eventRunIds = [
+    ...runStarts.flatMap((runStart) => [runStart.run_id, runStart.pipeline_run_id]),
+    candidate.run_id,
+    candidate.pipeline_run_id,
+  ].filter(
     (value) => value !== undefined,
   );
-  const eventItemIds = [candidate.issue, candidate.item_id].filter(
-    (value) => value !== undefined,
+  const eventItemIds = [
+    ...runStarts.flatMap((runStart) => [runStart.issue, runStart.item_id]),
+    candidate.issue,
+    candidate.item_id,
+  ].filter((value) => value !== undefined);
+  const runStartsMatch = runStarts.every(
+    (runStart) =>
+      runStart.schema_version === 1 &&
+      isCanonicalUtcEventTimestamp(runStart.at) &&
+      runStart.run_id === linkedRunId &&
+      typeof runStart.issue === "number" &&
+      Number.isInteger(runStart.issue) &&
+      String(runStart.issue) === item.id &&
+      runStart.repo === expectedRepo,
   );
   if (
-    eventRunIds.length === 0 ||
+    !runStartsMatch ||
     eventRunIds.some((runId) => typeof runId !== "string" || runId !== linkedRunId) ||
-    eventItemIds.length === 0 ||
     eventItemIds.some(
       (itemId) =>
-        (typeof itemId !== "string" && typeof itemId !== "number") || String(itemId) !== item.id,
+        typeof itemId !== "number" || !Number.isInteger(itemId) || String(itemId) !== item.id,
     ) ||
     (candidate.candidate_epoch !== undefined &&
-      String(candidate.candidate_epoch).trim().toLowerCase() !== currentEpoch) ||
+      (typeof candidate.candidate_epoch !== "string" ||
+        !/^[0-9a-f]{40}$/i.test(candidate.candidate_epoch.trim()) ||
+        candidate.candidate_epoch.trim().toLowerCase() !== currentEpoch)) ||
     (candidate.candidate_sha !== undefined &&
-      String(candidate.candidate_sha).trim().toLowerCase() !== currentHead)
+      (typeof candidate.candidate_sha !== "string" ||
+        !/^[0-9a-f]{40}$/i.test(candidate.candidate_sha.trim()) ||
+        candidate.candidate_sha.trim().toLowerCase() !== currentHead))
   ) {
     return persisted;
   }
-  const resolution = lastStageDiagnosticFromEventsJsonl(
-    events.map((event) => JSON.stringify(event)).join("\n"),
-  );
+  let resolution: ReturnType<typeof lastStageDiagnosticFromEventsJsonl>;
+  try {
+    resolution = lastStageDiagnosticFromEventsJsonl(
+      events.map((event) => JSON.stringify(event)).join("\n"),
+    );
+  } catch {
+    return persisted;
+  }
   const precise = resolution.diagnostic;
   const ordering = precise?.detail.evidence_ordering;
-  if (!precise || !ordering || ordering.kind !== "tester_rebind_after_pr") return persisted;
+  if (
+    !precise ||
+    !ordering ||
+    ordering.kind !== "tester_rebind_after_pr" ||
+    ordering.required_role !== "implementation" ||
+    ordering.observed_role !== "missing"
+  ) return persisted;
   const observedHead = item.last_verified_identity?.head_sha.trim().toLowerCase() ?? "";
-  const diagnosticHead = ordering.pr_head?.trim().toLowerCase() ?? "";
+  const diagnosticHead = typeof ordering.pr_head === "string"
+    ? ordering.pr_head.trim().toLowerCase()
+    : "";
+  if (ordering.pr_head != null && typeof ordering.pr_head !== "string") return persisted;
   const candidateEpoch = observedCandidateEpoch(item);
   if (
-    !observedHead ||
-    !candidateEpoch ||
+    !/^[0-9a-f]{40}$/.test(observedHead) ||
+    !/^[0-9a-f]{40}$/.test(candidateEpoch) ||
+    (diagnosticHead.length > 0 && !/^[0-9a-f]{40}$/.test(diagnosticHead)) ||
     (diagnosticHead && observedHead !== diagnosticHead) ||
-    (!diagnosticHead && ordering.subject_omitted_because_unobservable !== true)
+    (!diagnosticHead &&
+      ordering.blocker_code !== "tester_rebind_pr_head_unobservable" &&
+      ordering.subject_omitted_because_unobservable !== true)
   ) return persisted;
   const projection = projectStageDiagnostic(precise);
   if (projection.disposition !== "recover" || projection.blockerClass !== item.blocked_theme) {
@@ -1209,7 +1297,7 @@ async function executeBlockedRecovery(
     }
   }
 
-  persisted = await refineRecoveryEvidenceFromLinkedAdvance(deps, item, persisted);
+  persisted = await refineRecoveryEvidenceFromLinkedAdvance(deps, item, persisted, contract.repo.name);
 
   const currentEpoch = observedCandidateEpoch(item);
   const progressEvidenceIdentity = recoveryProgressIdentityForBlockedItem(

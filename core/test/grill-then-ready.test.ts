@@ -469,6 +469,93 @@ test("grill: tiny repeated evidence stays inline when references would increase 
   assert.match(body, /\*\*Evidence:\*\* x/);
 });
 
+test("grill: evidence catalog charges its envelope once across aggregate savings", () => {
+  const spec = "## Summary\nAggregate catalog boundary.\n";
+  const nodes = Array.from({ length: 2 }, (_, valueIndex) =>
+    Array.from({ length: 2 }, (_, occurrence) => ({
+      ...makeNode({
+        id: `aggregate-${valueIndex}-${occurrence}`,
+        question: `Question ${valueIndex}-${occurrence}?`,
+        recommendation: "Keep exact evidence",
+        class: "test-evidence",
+      }),
+      evidence: [String(valueIndex).repeat(146)],
+    })),
+  ).flat();
+  const art = artifact(nodes, spec);
+
+  for (let valueIndex = 0; valueIndex < 2; valueIndex++) {
+    const valueOnly = nodes.filter((node) => node.id.startsWith(`aggregate-${valueIndex}-`));
+    assert.doesNotMatch(
+      embedDecisionsInBody(spec, artifact(valueOnly, spec)),
+      /"evidence_catalog"/,
+      `value ${valueIndex} alone must stay inline at the boundary`,
+    );
+  }
+
+  const body = embedDecisionsInBody(spec, art);
+
+  assert.match(body, /"evidence_catalog"/);
+  const inlinePayload = canonicalJson(art);
+  const inlineBody = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(inlinePayload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${inlinePayload}\n\`\`\``,
+    "",
+    renderDecisionsSection(art).trimEnd(),
+    "",
+  ].join("\n");
+  assert.ok(body.length < inlineBody.length, `${body.length} must be smaller than ${inlineBody.length}`);
+  const parsed = parseDecisionsFromBody(body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) assert.deepEqual(parsed.artifact, art);
+});
+
+test("grill: legacy mixed catalog selection validates its authenticated persisted layout", () => {
+  const spec = "## Summary\nLegacy mixed catalog layout.\n";
+  const catalogued = "A".repeat(200);
+  const inline = "B".repeat(143);
+  const nodes = [catalogued, inline].flatMap((value, valueIndex) =>
+    [0, 1].map((occurrence) => ({
+      ...makeNode({
+        id: `legacy-mixed-${valueIndex}-${occurrence}`,
+        question: `Question ${valueIndex}-${occurrence}?`,
+        recommendation: "Preserve historical layout",
+        class: "test-evidence",
+      }),
+      evidence: [value],
+    })),
+  );
+  const art = artifact(nodes, spec);
+  const ref = `sha256:${sha256Hex(catalogued)}`;
+  const wire = {
+    ...art,
+    nodes: art.nodes.map((node) => ({
+      ...node,
+      evidence: node.evidence?.map((value) =>
+        value === catalogued ? { evidence_ref: ref } : value
+      ),
+    })),
+    evidence_catalog: { [ref]: catalogued },
+  };
+  const payload = canonicalJson(wire);
+  const body = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(payload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${payload}\n\`\`\``,
+    "",
+    renderDecisionsSection(art, { sharedEvidence: new Set([catalogued]) }).trimEnd(),
+    "",
+  ].join("\n");
+
+  const parsed = parseDecisionsFromBody(body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) assert.deepEqual(parsed.artifact, art);
+  assert.match(embedDecisionsInBody(spec, art), /"evidence_catalog"/);
+});
+
 test("grill: legacy inline-evidence artifacts and rendered sections remain readable", () => {
   const spec = "## Summary\nLegacy artifact.\n";
   const evidence = "legacy shared evidence";
@@ -1176,6 +1263,36 @@ test("grill: apply persists a MAC-valid canonical frontier that ready requires",
   assert.equal(forged.ok, false);
 });
 
+test("grill: apply publishes exact parser-valid signed body bytes and binds the frontier to them", async () => {
+  const env = await signedPreview();
+  const signedBody = env.proposal.body.replace(
+    " -->\n```pipeline-decisions-v1",
+    " -->\n\n```pipeline-decisions-v1",
+  );
+  assert.notEqual(signedBody, env.proposal.body);
+  assert.equal(parseDecisionsFromBody(signedBody).ok, true);
+  const issued = issueGrillProposal({
+    now: new Date("2026-01-01T00:00:00Z"),
+    nonce: "f".repeat(32),
+    repo: env.repo,
+    issue: env.issue,
+    input: env.input,
+    proposal: { ...env.proposal, body: signedBody },
+    key: "test-key",
+  });
+  assert.equal(issued.ok, true);
+  if (!issued.ok) return;
+  const keyDeps = memoryKeyDeps();
+  await withExit(async () => {
+    const deps = applyDeps(issued.envelope, { keyDeps });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 0);
+    assert.deepEqual(deps.bodies, [signedBody]);
+  });
+  const frontier = loadVerifiedGrillFrontier("/tmp/repo", 42, "test-key", env.repo, keyDeps);
+  assert.equal(frontier?.body_sha256, sha256Prefixed(signedBody));
+});
+
 test("grill: apply creates pending grill-authority handoffs; preview creates none", async () => {
   const env = await signedPreview();
   const store = memoryHandoffStore();
@@ -1249,10 +1366,11 @@ test("grill: apply rejects a MAC-valid oversized Decisions body before durable m
   };
   let nonceWrites = 0;
 
-  await withExit(async () => {
+  const { err } = await capture(() => withExit(async () => {
     const deps = applyDeps(signed, {
       handoffStore,
       keyDeps,
+      writeStderr: (text) => { process.stderr.write(text); },
       nonceStore: {
         isConsumed: () => false,
         consume: () => { nonceWrites++; },
@@ -1261,7 +1379,9 @@ test("grill: apply rejects a MAC-valid oversized Decisions body before durable m
     await runRefineSpecApply(42, {}, deps);
     assert.equal(process.exitCode, 2);
     assert.equal(deps.bodies.length, 0);
-  });
+  }));
+  assert.match(err, /proposal body exceeds supported 65,536-character limit/);
+  assert.doesNotMatch(err, /cannot be published/);
   assert.equal(handoffWrites, 0);
   assert.equal(frontierWrites, 0);
   assert.equal(nonceWrites, 0);

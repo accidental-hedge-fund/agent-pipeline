@@ -11,6 +11,7 @@ import {
   hasReviewerChallenge,
   implementerSelfAccepted,
   makeNode,
+  MAX_ISSUE_BODY_LENGTH,
   MAX_NODES,
   MAX_NODE_TEXT,
   parseDecisionsFromBody,
@@ -574,17 +575,16 @@ export async function runRefineSpecApply(
   if (live.title !== envelope.input.title || live.body !== envelope.input.body) {
     return fail(deps, "live title/body drifted from the proposal input", 2);
   }
+  const publicationBody = envelope.proposal.body;
+  if (publicationBody.length > MAX_ISSUE_BODY_LENGTH) {
+    return fail(
+      deps,
+      `proposal body exceeds supported 65,536-character limit (actual ${publicationBody.length})`,
+      2,
+    );
+  }
   const bodyCheck = parseDecisionsFromBody(envelope.proposal.body);
   if (!bodyCheck.ok) return fail(deps, `proposal body is not a valid Decisions artifact: ${bodyCheck.reason}`, 2);
-  let publicationBody: string;
-  try {
-    publicationBody = embedDecisionsInBody(
-      extractSpecCore(envelope.proposal.body),
-      bodyCheck.artifact,
-    );
-  } catch (err) {
-    return fail(deps, `proposal body cannot be published: ${(err as Error).message}`, 2);
-  }
   const applyWalk = await walkDeclaredDependencyClosure(
     issueNumber,
     live.title,

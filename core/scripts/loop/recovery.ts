@@ -866,9 +866,12 @@ export async function startRecoveryAttempt(
   const notBefore = new Date(Date.parse(time) + backoffSeconds * 1000).toISOString();
   const recipeIndex = policyEntry.recipes.indexOf(input.action);
   if (recipeIndex >= 0 && recipeIndex > episode.strategy_cursor) {
-    const implicitSkips = policyEntry.recipes
-      .slice(episode.strategy_cursor, recipeIndex)
-      .filter((recipe) => !episode.skipped_strategies.includes(recipe));
+    const predecessors = policyEntry.recipes.slice(episode.strategy_cursor, recipeIndex);
+    const implicitSkips = predecessors
+      .filter((recipe) =>
+        !episode.skipped_strategies.includes(recipe) &&
+        (episode.attempts_per_strategy[recipe] ?? 0) < perStrategyBound(policyEntry, recipe)
+      );
     episode = {
       ...episode,
       strategy_cursor: recipeIndex,

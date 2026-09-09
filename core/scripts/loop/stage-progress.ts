@@ -478,6 +478,25 @@ export function parseAdvanceEventsJsonl(text: string | null): AdvanceStageEvent[
   return out;
 }
 
+/** Parse an advance stream used as recovery authority. Unlike the progress
+ * observer above, any malformed or non-object nonblank row invalidates the
+ * entire snapshot so a corrupt stream cannot authenticate later evidence. */
+export function parseRecoveryAuthorityAdvanceEventsJsonl(text: string | null): AdvanceStageEvent[] {
+  if (!text) return [];
+  const out: AdvanceStageEvent[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
+      out.push(parsed as AdvanceStageEvent);
+    } catch {
+      return [];
+    }
+  }
+  return out;
+}
+
 /**
  * Read-only whole-run stage-progress follow (#611).
  *

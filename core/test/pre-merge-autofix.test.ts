@@ -51,6 +51,7 @@ import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
 import type { InvokeFn } from "../scripts/openspec-consistency.ts";
 import type { HeadFileState, PriorRoundDigest } from "../scripts/review-history.ts";
 import type { TrySalvageResult } from "../scripts/salvage-harness-work.ts";
+import { memoryIntegrityStoreDeps } from "../scripts/candidate-integrity.ts";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -1438,13 +1439,14 @@ test("performPreMergeAutoFix finding-1 (bite): clean commit path → fix-committ
   assert.equal(resetCall, undefined, "clean path must NOT call reset --hard");
 });
 
-test("performPreMergeAutoFix: adopted PR prompt and pipeline push retain delivery authority (#1478)", async () => {
+test("performPreMergeAutoFix: wrapper exclusively owns the adopted-PR CAS push (#1478/#1568)", async () => {
   const { fn: gitFn, calls } = makeSeqGitFn([
     { code: 0, stdout: "" },
     { code: 0, stdout: "" },
     { code: 0, stdout: "sha1" },
     { code: 0, stdout: "sha2" },
     { code: 0, stdout: "" },
+    { code: 0, stdout: "sha1\trefs/heads/fix/release-convergence-durable\n" },
     { code: 0, stdout: "" },
     { code: 0, stdout: "sha3" },
     { code: 0, stdout: "" },
@@ -1474,7 +1476,9 @@ test("performPreMergeAutoFix: adopted PR prompt and pipeline push retain deliver
     },
   );
   assert.deepEqual(result, { status: "fix-committed", headSha: "sha3" });
-  assert.match(prompt, /git push origin HEAD:fix\/release-convergence-durable/);
+  assert.match(prompt, /do \*\*not\*\* push/i);
+  assert.match(prompt, /wrapper is the sole push owner/i);
+  assert.doesNotMatch(prompt, /If you push, use exactly/);
   assert.ok(
     calls.some((args) =>
       args[0] === "push" &&
@@ -1484,6 +1488,163 @@ test("performPreMergeAutoFix: adopted PR prompt and pipeline push retain deliver
     ),
     "pre-merge autofix must CAS-push local HEAD to the adopted PR delivery branch",
   );
+});
+
+test("performPreMergeAutoFix leases canonical amend against an exact harness-pushed head", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    { stdout: "" },
+    { stdout: "" },
+    { stdout: "sha1" },
+    { stdout: "sha2" },
+    { stdout: "" },
+    { stdout: "sha2\trefs/heads/fix/release-convergence-durable\n" },
+    { stdout: "" },
+    { stdout: "" },
+    { stdout: "sha3" },
+    { stdout: "" },
+  ]);
+  const result = await performPreMergeAutoFix(
+    autoFixCfg, 42, "run-id", "finding", "Test issue",
+    { path: "/fake/worktree", slug: "adopted-pr-1480" },
+    gitFn, makeSucceedInvoke(), undefined, {}, undefined, undefined,
+    { branch: "fix/release-convergence-durable", headSha: "sha1", prNumber: 1480, repository: "acme/repo" },
+  );
+  assert.deepEqual(result, { status: "fix-committed", headSha: "sha3" });
+  assert.ok(calls.some((args) =>
+    args[0] === "push" &&
+    args[1] === "--force-with-lease=refs/heads/fix/release-convergence-durable:sha2"
+  ));
+});
+
+test("performPreMergeAutoFix reconciles a failed invoke only when its clean descendant is already remote", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    { stdout: "" }, { stdout: "" }, { stdout: "sha1" }, { stdout: "sha2" },
+    { stdout: "" },
+    { stdout: "sha2\trefs/heads/fix/recovery\n" },
+    { stdout: "" },
+    { stdout: "" }, { stdout: "sha3" }, { stdout: "" },
+  ]);
+  const failedInvoke: InvokeFn = async () => ({
+    success: false, stdout: "", stderr: "adapter lost its response", exit_code: 1, duration: 0, timed_out: false,
+  });
+  const result = await performPreMergeAutoFix(
+    autoFixCfg, 42, "run-id", "finding", "Test issue",
+    { path: "/fake/worktree", slug: "recovery-42" },
+    gitFn, failedInvoke, undefined, {}, undefined, undefined,
+    { branch: "fix/recovery", headSha: "sha1", prNumber: 1480, repository: "acme/repo" },
+  );
+  assert.deepEqual(result, { status: "fix-committed", headSha: "sha3" });
+  assert.ok(calls.some((args) => args[0] === "merge-base" && args[2] === "sha1" && args[3] === "sha2"));
+  assert.ok(calls.some((args) => args[0] === "push" && args[1].includes(":sha2")));
+});
+
+test("performPreMergeAutoFix rejects a harness-pushed head outside the candidate ancestry", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    { stdout: "" },
+    { stdout: "" },
+    { stdout: "sha1" },
+    { stdout: "sha2" },
+    { stdout: "" },
+    { stdout: "sha2\trefs/heads/fix/release-convergence-durable\n" },
+    { code: 1 },
+    { stdout: "" },
+    { stdout: "" },
+  ]);
+  const result = await performPreMergeAutoFix(
+    autoFixCfg, 42, "run-id", "finding", "Test issue",
+    { path: "/fake/worktree", slug: "adopted-pr-1480" },
+    gitFn, makeSucceedInvoke(), undefined, {}, undefined, undefined,
+    { branch: "fix/release-convergence-durable", headSha: "sha1", prNumber: 1480, repository: "acme/repo" },
+  );
+  assert.deepEqual(result, { status: "error" });
+  assert.ok(calls.some((args) =>
+    args[0] === "merge-base" && args[1] === "--is-ancestor" && args[2] === "sha1" && args[3] === "sha2"
+  ));
+  assert.equal(calls.some((args) => args[0] === "commit" && args[1] === "--amend"), false);
+  assert.equal(calls.some((args) => args[0] === "push"), false);
+});
+
+test("performPreMergeAutoFix preserves an empty-scope recovery successor for ordinary whole-item re-gating", async () => {
+  const base = "a".repeat(40);
+  const before = "b".repeat(40);
+  const harness = "c".repeat(40);
+  const successor = "d".repeat(40);
+  const events: Array<{ classification: string; invalidated_review: boolean; invalidated_readiness: boolean }> = [];
+  const calls: string[][] = [];
+  let headReads = 0;
+  let pushed = false;
+  const gitFn = (async (_cwd: string, args: string[]) => {
+    calls.push([...args]);
+    if (args[0] === "diff") return { code: 0, stdout: "M\tcore/x.ts\n", stderr: "" };
+    if (args[0] === "rev-parse" && args[1] === "--verify") {
+      const treeish = args[2]!.split(":", 1)[0];
+      const blob = treeish === base ? "e".repeat(40) : treeish === before ? "f".repeat(40) : "1".repeat(40);
+      return { code: 0, stdout: `${blob}\n`, stderr: "" };
+    }
+    if (args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+    if (args[0] === "checkout") return { code: 0, stdout: "", stderr: "" };
+    if (args[0] === "rev-parse" && args[1] === "HEAD") {
+      const value = [before, harness, successor][headReads++] ?? successor;
+      return { code: 0, stdout: `${value}\n`, stderr: "" };
+    }
+    if (args[0] === "ls-remote") return { code: 0, stdout: `${before}\trefs/heads/fix/recovery\n`, stderr: "" };
+    if (args[0] === "commit") return { code: 0, stdout: "", stderr: "" };
+    if (args[0] === "config") return { code: 1, stdout: "", stderr: "" };
+    if (args[0] === "push") {
+      pushed = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg, 42, "run-id", "untrusted diagnostic mentions `new/path.ts:7`", "Test issue",
+    { path: "/fake/worktree", slug: "recovery-42" },
+    gitFn, makeSucceedInvoke(), undefined, {}, undefined,
+    {
+      storeRoot: "/memory/run",
+      subject: { run_id: "run-id", issue: 42, pr: 1480 },
+      base_ref: "main",
+      resolveBaseSha: async () => base,
+      resolveCandidateSha: async () => pushed ? successor : before,
+      declared_scope: { paths: [], directories: [], reason: "no trusted structured finding paths" },
+      mutation_method: "recovery_repair",
+      storeDeps: memoryIntegrityStoreDeps(),
+      emitEvent: async (event) => { events.push(event); },
+    },
+    { branch: "fix/recovery", headSha: before, prNumber: 1480, repository: "acme/repo" },
+  );
+
+  assert.deepEqual(result, { status: "fix-committed", headSha: successor });
+  assert.equal(pushed, true);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.classification, "scope_expansion");
+  assert.equal(events[0]!.invalidated_review, true);
+  assert.equal(events[0]!.invalidated_readiness, true,
+    "the successor is preserved only with durable gate invalidation, never a minted gate success");
+  assert.ok(calls.some((args) => args[0] === "push"));
+});
+
+test("performPreMergeAutoFix rejects unrelated remote movement before canonical amend", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    { stdout: "" },
+    { stdout: "" },
+    { stdout: "sha1" },
+    { stdout: "sha2" },
+    { stdout: "" },
+    { stdout: "foreign\trefs/heads/fix/release-convergence-durable\n" },
+    { stdout: "" },
+    { stdout: "" },
+  ]);
+  const result = await performPreMergeAutoFix(
+    autoFixCfg, 42, "run-id", "finding", "Test issue",
+    { path: "/fake/worktree", slug: "adopted-pr-1480" },
+    gitFn, makeSucceedInvoke(), undefined, {}, undefined, undefined,
+    { branch: "fix/release-convergence-durable", headSha: "sha1", prNumber: 1480, repository: "acme/repo" },
+  );
+  assert.deepEqual(result, { status: "error" });
+  assert.equal(calls.some((args) => args[0] === "commit" && args[1] === "--amend"), false);
+  assert.equal(calls.some((args) => args[0] === "push"), false);
 });
 
 test("performPreMergeAutoFix #553: harness cwd equals the salvage-inspected worktree path (worktree-locality invariant)", async () => {

@@ -17,6 +17,7 @@ import {
   type LoopRecoveryAttempt,
   type LoopStopRecord,
   type RecoveryBackoff,
+  type RecoveryPolicy,
   type RecoveryPolicyEntry,
   type RecoveryRecipe,
 } from "./types.ts";
@@ -160,6 +161,39 @@ function isNonEmptyText(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+/** Validate an on-disk policy entry before it is allowed to define ledger authority. */
+function isRecoveryPolicyEntry(blockerClass: DurableBlockerClass, value: unknown): value is RecoveryPolicyEntry {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  if (!Array.isArray(entry.recipes) || !entry.recipes.every(isRecoveryRecipe)) return false;
+  if (typeof entry.retry_budget !== "number" || !Number.isFinite(entry.retry_budget) || entry.retry_budget < 0) return false;
+  if (
+    entry.per_strategy_bound !== undefined &&
+    (typeof entry.per_strategy_bound !== "number" || !Number.isFinite(entry.per_strategy_bound) || entry.per_strategy_bound < 0)
+  ) return false;
+  if (typeof entry.backoff !== "object" || entry.backoff === null || Array.isArray(entry.backoff)) return false;
+  const backoff = entry.backoff as Record<string, unknown>;
+  if (
+    typeof backoff.initial_seconds !== "number" ||
+    typeof backoff.multiplier !== "number" ||
+    typeof backoff.max_seconds !== "number"
+  ) {
+    return false;
+  }
+  if (entry.terminal_outcome !== "retry" && entry.terminal_outcome !== "human_authority") return false;
+  if (typeof entry.run_fatal !== "boolean") return false;
+  if (
+    typeof entry.repeated_evidence_limit !== "number" ||
+    !Number.isFinite(entry.repeated_evidence_limit) ||
+    entry.repeated_evidence_limit < 1
+  ) return false;
+  if (
+    (blockerClass === "missing-authority" || blockerClass === "specification-decision") &&
+    (entry.terminal_outcome !== "human_authority" || entry.recipes.length > 0)
+  ) return false;
+  return true;
+}
+
 /**
  * Default configured recipe order and per-strategy bound per blocker class.
  * Must stay equal to {@link DEFAULT_RECOVERY_POLICY} recipes / retry_budget
@@ -259,14 +293,14 @@ function numericCounts(persisted: Record<string, unknown>): Record<string, numbe
  *  A later recipe's attempts cannot justify skipping an unaccounted predecessor. */
 function justifiedStrategyCursor(
   recipes: readonly RecoveryRecipe[],
-  bound: number,
+  strategyBound: (recipe: RecoveryRecipe) => number,
   counts: Record<string, number>,
   skipped: Set<string>,
 ): number {
   for (let i = 0; i < recipes.length; i++) {
     const recipe = recipes[i]!;
     const spent = counts[recipe] ?? 0;
-    if (skipped.has(recipe) || (bound > 0 && spent >= bound)) continue;
+    if (skipped.has(recipe) || spent >= strategyBound(recipe)) continue;
     return i;
   }
   return recipes.length;
@@ -274,14 +308,14 @@ function justifiedStrategyCursor(
 
 function sequenceFullyAccounted(
   recipes: readonly RecoveryRecipe[],
-  bound: number,
+  strategyBound: (recipe: RecoveryRecipe) => number,
   counts: Record<string, number>,
   skipped: Set<string>,
 ): boolean {
   for (const recipe of recipes) {
     if (skipped.has(recipe)) continue;
     const spent = counts[recipe] ?? 0;
-    if (bound > 0 && spent >= bound) continue;
+    if (spent >= strategyBound(recipe)) continue;
     return false;
   }
   return true;
@@ -295,6 +329,7 @@ function sequenceFullyAccounted(
 export function isAuthoritativeEpisodeState(
   value: Record<string, unknown>,
   siblings: readonly Record<string, unknown>[] = [],
+  recoveryPolicy?: RecoveryPolicy,
 ): boolean {
   if (!isNonEmptyText(value.operation)) return false;
   if (!isNonEmptyText(value.invariant)) return false;
@@ -311,17 +346,50 @@ export function isAuthoritativeEpisodeState(
   if (typeof value.strategy_cursor !== "number" || !Number.isInteger(value.strategy_cursor) || value.strategy_cursor < 0) {
     return false;
   }
-  const sequence = configuredRecoverySequence(value.class) ?? configuredRecoverySequence(value.invariant);
+  const blockerClass = isDurableBlockerClass(value.class)
+    ? value.class
+    : isDurableBlockerClass(value.invariant)
+      ? value.invariant
+      : null;
+  const hasPolicyEntry = blockerClass !== null && recoveryPolicy !== undefined &&
+    Object.prototype.hasOwnProperty.call(recoveryPolicy, blockerClass);
+  const policyEntryValue: unknown = hasPolicyEntry ? recoveryPolicy[blockerClass!] : undefined;
+  if (hasPolicyEntry && !isRecoveryPolicyEntry(blockerClass!, policyEntryValue)) return false;
+  const policyEntry = hasPolicyEntry ? policyEntryValue as RecoveryPolicyEntry : undefined;
+  const configured = configuredRecoverySequence(value.class) ?? configuredRecoverySequence(value.invariant);
+  const sequence = policyEntry
+    ? {
+        recipes: policyEntry.recipes,
+        strategyBound: (recipe: RecoveryRecipe) => perStrategyBound(policyEntry, recipe),
+      }
+    : configured
+      ? {
+          recipes: configured.recipes,
+          strategyBound: (_recipe: RecoveryRecipe) => configured.bound,
+        }
+      : null;
   if (!sequence) return false;
+  const allowedRecipes = new Set<RecoveryRecipe>(sequence.recipes);
+  if (isRecoveryRecipe(value.action) && !allowedRecipes.has(value.action)) return false;
+  if (
+    value.actions !== undefined &&
+    (!Array.isArray(value.actions) ||
+      !value.actions.every((recipe) => isRecoveryRecipe(recipe) && allowedRecipes.has(recipe)))
+  ) {
+    return false;
+  }
   if (value.strategy_cursor > sequence.recipes.length) return false;
   const skipped = collectSkippedRecipes(value, siblings);
   if (skipped === null) return false;
+  for (const recipe of skipped) {
+    if (!isRecoveryRecipe(recipe) || !allowedRecipes.has(recipe)) return false;
+  }
   if (typeof value.attempts_per_strategy !== "object" || value.attempts_per_strategy === null || Array.isArray(value.attempts_per_strategy)) {
     return false;
   }
   const persisted = value.attempts_per_strategy as Record<string, unknown>;
   for (const [recipe, count] of Object.entries(persisted)) {
-    if (!isRecoveryRecipe(recipe)) return false;
+    if (!isRecoveryRecipe(recipe) || !allowedRecipes.has(recipe)) return false;
     if (typeof count !== "number" || !Number.isInteger(count) || count < 0) return false;
   }
   let counts = numericCounts(persisted);
@@ -332,26 +400,29 @@ export function isAuthoritativeEpisodeState(
     if (!countsMatchPersisted(persisted, derived)) return false;
     counts = derived;
   }
-  if (value.strategy_cursor > justifiedStrategyCursor(sequence.recipes, sequence.bound, counts, skipped)) {
+  if (value.strategy_cursor > justifiedStrategyCursor(sequence.recipes, sequence.strategyBound, counts, skipped)) {
     return false;
   }
   if (
     value.strategy_cursor === sequence.recipes.length &&
-    !sequenceFullyAccounted(sequence.recipes, sequence.bound, counts, skipped)
+    !sequenceFullyAccounted(sequence.recipes, sequence.strategyBound, counts, skipped)
   ) {
     return false;
   }
   return true;
 }
 
-export function ledgerEpisodesAreAuthoritative(attempts: readonly Record<string, unknown>[]): boolean {
+export function ledgerEpisodesAreAuthoritative(
+  attempts: readonly Record<string, unknown>[],
+  recoveryPolicy?: RecoveryPolicy,
+): boolean {
   const latestByEpisode = new Map<string, Record<string, unknown>>();
   for (const attempt of attempts) {
     if (typeof attempt.episode_id !== "string" || attempt.episode_id.length === 0) continue;
     latestByEpisode.set(attempt.episode_id, attempt);
   }
   for (const latest of latestByEpisode.values()) {
-    if (!isAuthoritativeEpisodeState(latest, attempts)) return false;
+    if (!isAuthoritativeEpisodeState(latest, attempts, recoveryPolicy)) return false;
   }
   return true;
 }
@@ -497,13 +568,13 @@ export function selectNextApplicableStrategy(input: SelectStrategyInput): Select
   let cursor = Math.max(0, input.cursor);
   while (cursor < input.recipes.length) {
     const recipe = input.recipes[cursor]!;
-    if (!input.isApplicable(recipe)) {
-      skipped.push(recipe);
+    const spent = input.attemptsPerStrategy[recipe] ?? 0;
+    if (spent >= input.strategyBound(recipe)) {
       cursor += 1;
       continue;
     }
-    const spent = input.attemptsPerStrategy[recipe] ?? 0;
-    if (spent >= input.strategyBound(recipe)) {
+    if (!input.isApplicable(recipe)) {
+      skipped.push(recipe);
       cursor += 1;
       continue;
     }

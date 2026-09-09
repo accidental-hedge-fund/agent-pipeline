@@ -433,8 +433,7 @@ function evidenceValuesWorthReferencing(artifact: DecisionsArtifact): Set<string
       nodeRenderCounts.set(value, (nodeRenderCounts.get(value) ?? 0) + 1);
     }
   }
-  return new Set(
-    [...evidenceOccurrences(artifact)].flatMap(([value, count]) => {
+  const candidates = [...evidenceOccurrences(artifact)].flatMap(([value, count]) => {
       if (count < 2) return [];
       const ref = sha256Prefixed(value);
       const inlineJsonLength = canonicalJson(value).length;
@@ -443,13 +442,18 @@ function evidenceValuesWorthReferencing(artifact: DecisionsArtifact): Set<string
       const payloadDelta = count * referenceJsonLength + catalogEntryLength - count * inlineJsonLength;
       const renderedCount = nodeRenderCounts.get(value) ?? 0;
       const renderDelta = renderedCount * (`shared evidence ${ref}`.length - escapeMd(value).length);
-      // Charge each candidate the whole catalog envelope. This is conservative
-      // and guarantees that compact encoding never grows an otherwise-valid body.
-      return payloadDelta + renderDelta + canonicalJson({ evidence_catalog: {} }).length < 0
-        ? [value]
-        : [];
-    }),
-  );
+      const delta = payloadDelta + renderDelta;
+      return delta < 0 ? [{ value, delta }] : [];
+    });
+  const catalogSeparators = Math.max(0, candidates.length - 1);
+  const aggregateDelta = candidates.reduce((sum, candidate) => sum + candidate.delta, 0) +
+    canonicalJson({ evidence_catalog: {} }).length - 1 + catalogSeparators;
+  // The catalog envelope exists once for the selected set. Selecting every
+  // independently saving entry is optimal because entries do not share any
+  // other cost; publish references only when the complete representation shrinks.
+  return aggregateDelta < 0
+    ? new Set(candidates.map((candidate) => candidate.value))
+    : new Set<string>();
 }
 
 function evidenceReference(value: string): EvidenceReference {
@@ -492,16 +496,19 @@ function artifactWireShape(artifact: DecisionsArtifact): ArtifactWireShape {
 
 export function renderDecisionsSection(
   artifact: DecisionsArtifact,
-  options: { referenceSharedEvidence?: boolean } = {},
+  options: {
+    referenceSharedEvidence?: boolean;
+    sharedEvidence?: ReadonlySet<string>;
+  } = {},
 ): string {
   const lines: string[] = ["## Decisions", ""];
   if (artifact.nodes.length === 0) {
     lines.push("_No decision nodes._", "");
     return lines.join("\n");
   }
-  const repeated = options.referenceSharedEvidence
+  const repeated = options.sharedEvidence ?? (options.referenceSharedEvidence
     ? evidenceValuesWorthReferencing(artifact)
-    : new Set<string>();
+    : new Set<string>());
   const sorted = [...artifact.nodes].sort((a, b) => a.id.localeCompare(b.id));
   for (const node of sorted) {
     lines.push(`### ${node.id}`);
@@ -709,11 +716,15 @@ export function parseDecisionsFromBody(body: string): ParseResult {
   } catch {
     return { ok: false, reason: "Decisions fence is not JSON", code: "invalid_json" };
   }
-  const usesEvidenceCatalog = hasEvidenceCatalog(parsed);
+  const persistedSharedEvidence = evidenceCatalogValues(parsed);
   const shape = parseDecisionsArtifact(parsed);
   if (!shape.ok) return shape;
   const rendered = renderDecisionsSection(shape.artifact, {
-    referenceSharedEvidence: usesEvidenceCatalog,
+    // Validate the authenticated persisted layout. Older valid bodies can
+    // contain a mixed catalog/inline selection that differs from today's
+    // aggregate-optimal selector; expansion has already authenticated every
+    // catalog value and rejected missing or unused references.
+    sharedEvidence: persistedSharedEvidence,
   }).trim();
   const liveSection = extractDecisionsSection(body)?.trim();
   if (liveSection !== rendered) {
@@ -740,6 +751,15 @@ export function extractDecisionsSection(body: string): string | null {
 function hasEvidenceCatalog(raw: unknown): boolean {
   return raw !== null && typeof raw === "object" && !Array.isArray(raw) &&
     Object.prototype.hasOwnProperty.call(raw, "evidence_catalog");
+}
+
+function evidenceCatalogValues(raw: unknown): ReadonlySet<string> {
+  if (!hasEvidenceCatalog(raw)) return new Set<string>();
+  const catalog = (raw as Record<string, unknown>).evidence_catalog;
+  if (catalog === null || typeof catalog !== "object" || Array.isArray(catalog)) {
+    return new Set<string>();
+  }
+  return new Set(Object.values(catalog).filter((value): value is string => typeof value === "string"));
 }
 
 function expandEvidenceCatalog(raw: unknown): { ok: true; artifact: unknown } | ParseFailure {

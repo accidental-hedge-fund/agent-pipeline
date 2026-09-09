@@ -36,22 +36,7 @@ For **force push and merge-surface operations** (`git push --force`, `git push -
 
 A fix may NOT widen the blast radius of a destructive path while resolving an unrelated finding.
 
-## Pre-Commit Self-Check (required)
-
-Before committing or pushing:
-1. Review your own diff against the findings you were given.
-2. If any change in your diff appears to introduce a problem of **higher severity** than the finding it resolves — surface the concern in your output and **do NOT push**.
-3. Conservative-open: when in doubt whether a new issue is higher severity, call it out and withhold the push rather than silently proceeding.
-
-This self-check is a targeted scan of your own changes against the findings you were given — it is not a full re-review (the SHA-gate re-review handles that on push).
-
-## Git push auth (pipeline-configured)
-
-Push authentication is configured by the pipeline (`git.push_auth` in `.github/pipeline.yml`). Prefer the worktree's existing `origin` / `pushurl` and the process environment the pipeline prepared for this stage (including any process-only HTTPS pushurl / askpass when `https-token` is configured). Do **not** reconfigure origin to HTTPS via ambient `gh auth setup-git` / `gh auth git-credential` as the selected mechanism — that classic PAT often lacks the GitHub `workflow` scope and rejects pushes that touch `.github/workflows/**`. When you push, use `git push origin <branch>` with the remotes and environment the pipeline prepared — do not invent a separate remote.{{delivery_branch_instruction}}
-
-## Single-Turn Invocation (required)
-
-This invocation is single-turn: there is no later turn in which deferred work can complete. Do NOT end your turn while committing or pushing still depends on a background task (e.g. a test suite launched in the background and not yet awaited) — wait synchronously for that work to finish, then commit and push, before ending the turn. A notification that arrives after your turn ends will never reach you.
+{{push_ownership_block}}
 
 ## Injectable-Dep Rule (required)
 
