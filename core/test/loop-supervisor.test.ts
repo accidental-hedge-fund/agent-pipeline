@@ -6943,6 +6943,26 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
       } as never],
     },
     {
+      name: "no terminal run-complete after blocker",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent],
+    },
+    {
+      name: "unknown recovery-attempt outcome after blocker",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent, {
+        schema_version: 1,
+        type: "loop_recovery_attempt",
+        at: "2026-09-08T21:21:59Z",
+        outcome: "bogus",
+      } as never, {
+        schema_version: 1,
+        type: "run_complete",
+        at: "2026-09-08T21:22:00Z",
+        final_state: "design-gate",
+      } as never],
+    },
+    {
       name: "malformed run-complete after blocker",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
       events: [runStart, terminalEvent, {

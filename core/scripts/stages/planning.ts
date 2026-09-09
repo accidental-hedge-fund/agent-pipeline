@@ -998,6 +998,68 @@ export async function runPlanningPhases(
     const identityChangePrevious = skipPlanReview && boundPlanningFacts
       ? requiredFactIdentities(boundPlanningFacts)
       : undefined;
+    // Every plan-review pass, including exact-bundle refinement rereview, uses
+    // this one routing seam so executor delegation, ensemble independence,
+    // model/effort selection, and accounting cannot diverge.
+    const planReviewCwd = hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir;
+    const planReviewModelWasAuto = reviewerModelSourceWasAuto(cfg, opts.model);
+    const planReviewModel = resolveReviewerModelForHarness(
+      opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
+      reviewer,
+      planReviewModelWasAuto,
+    );
+    const planReviewEffort =
+      expandAutoEffort(cfg.harnesses.reviewerEffort, "plan-review", "claude") ??
+      cfg.plan_review_effort;
+    const invokeConfiguredPlanReview = async (prompt: string): Promise<EnsembleInvocation> => {
+      assertNoEnsembleStageExecutorBypass(cfg, "plan-review");
+      const assignment = resolveStageExecutor(cfg, "plan-review");
+      if (assignment) {
+        return {
+          result: (await invokeStageExecutor(
+            "plan-review",
+            cfg,
+            prompt,
+            {
+              timeoutSec: cfg.plan_review_timeout,
+              accounting: opts.runDir
+                ? {
+                    runDir: opts.runDir,
+                    runStoreDeps: opts.runStoreDeps,
+                    issue: issueNumber,
+                    stage: "plan-review",
+                    modelSlot: "review",
+                  }
+                : undefined,
+            },
+            opts.executorHttpDeps,
+          ))!,
+          effectiveReviewer: assignment.name,
+          selfReview: false,
+        };
+      }
+      return invokeReviewEnsemble(cfg, {
+        worktreeDir: planReviewCwd,
+        prompt,
+        implementer: primary,
+        kind: "plan-review",
+        timeoutSec: cfg.plan_review_timeout,
+        model: planReviewModel,
+        modelWasAuto: planReviewModelWasAuto,
+        reasoningEffort: planReviewEffort,
+        promptDelivery: cfg.harnesses.reviewerPromptDelivery,
+        invokeOpts: {
+          accounting: accountingForInvoke(
+            opts,
+            issueNumber,
+            "plan-review",
+            "review",
+            planReviewModel,
+          ),
+        },
+        invokeReviewerFn: deps.invokeReviewer ?? invokeReviewer,
+      });
+    };
 
     let planReview = "";
     let reviewPrompt = skipPlanReview
@@ -1019,7 +1081,6 @@ export async function runPlanningPhases(
     // implementing harness reviews the plan, clearly labeled below.
     // OpenSpec hooks supply planReviewCwd=wt.path so the reviewer can inspect
     // the just-authored change files; freeform uses cfg.repo_dir.
-    const planReviewCwd = hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir;
     // #646: same Tester acquisition helper (typically missing/not_run at plan-review).
     let planCandidateSha = "";
     try {
@@ -1038,65 +1099,15 @@ export async function runPlanningPhases(
       cfg,
     );
     reviewPrompt = appendTesterEvidenceSection(reviewPrompt, planTesterAcq);
-    const planReviewModelWasAuto = reviewerModelSourceWasAuto(cfg, opts.model);
-    const planReviewModel = resolveReviewerModelForHarness(
-      opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
-      reviewer,
-      planReviewModelWasAuto,
-    );
     // Plan-review's effort is sourced from cfg.plan_review_effort (derived from
     // effort.planning, classified Adversarial/Definitive — see stage-routing.ts),
     // with a structured review_harness.effort override taking precedence when set.
-    const planReviewEffort = expandAutoEffort(cfg.harnesses.reviewerEffort, "plan-review", "claude") ?? cfg.plan_review_effort;
-    // External stage executor delegation (#314): a `stage_executors` assignment
-    // for plan-review bypasses the local reviewer harness (and its #39
-    // self-review fallback) entirely — a deliberate operator choice, never
-    // silently degraded. #645: ensemble + stage_executors.plan-review is
-    // rejected (config-resolve + runtime guard) so we never silently run one
-    // executor instead of multi-agent fan-out.
-    assertNoEnsembleStageExecutorBypass(cfg, "plan-review");
-    const planReviewAssignment = resolveStageExecutor(cfg, "plan-review");
-    // #645: when ensemble is enabled and no stage_executor override, fan out at
-    // the shared reviewer seam. Injected `deps.invokeReviewer` still wins for
-    // unit tests of the single-agent path; ensemble uses invokeReviewEnsemble
-    // with that inject as the per-agent invokeReviewerFn when provided.
-    const planEnsembleInvocation: EnsembleInvocation | null = planReviewAssignment
-      ? null
-      : await invokeReviewEnsemble(cfg, {
-          worktreeDir: planReviewCwd,
-          prompt: reviewPrompt,
-          implementer: primary,
-          kind: "plan-review",
-          timeoutSec: cfg.plan_review_timeout,
-          model: planReviewModel,
-          // #870: preserve auto provenance so entitlement fallback can fire.
-          modelWasAuto: planReviewModelWasAuto,
-          reasoningEffort: planReviewEffort,
-          promptDelivery: cfg.harnesses.reviewerPromptDelivery,
-          invokeOpts: {
-            accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", planReviewModel),
-          },
-          invokeReviewerFn: deps.invokeReviewer ?? invokeReviewer,
-        });
+    const planReviewInvocation = await invokeConfiguredPlanReview(reviewPrompt);
+    const planEnsembleInvocation = planReviewInvocation.ensemble
+      ? planReviewInvocation
+      : null;
     const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
-      planReviewAssignment
-        ? {
-            result: (await invokeStageExecutor(
-              "plan-review",
-              cfg,
-              reviewPrompt,
-              {
-                timeoutSec: cfg.plan_review_timeout,
-                accounting: opts.runDir
-                  ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage: "plan-review", modelSlot: "review" }
-                  : undefined,
-              },
-              opts.executorHttpDeps,
-            ))!,
-            effectiveReviewer: planReviewAssignment.name,
-            selfReview: false,
-          }
-        : planEnsembleInvocation!;
+      planReviewInvocation;
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out
         ? `Plan review timed out after ${reviewResult.duration.toFixed(0)}s`
@@ -1352,17 +1363,14 @@ export async function runPlanningPhases(
         "## Stable authoritative artifact bundle",
         hooks.refinementReviewArtifact(),
       ].join("\n");
-      const rereview = await (deps.invokeReviewer ?? invokeReviewer)(
-        reviewer,
-        primary,
-        hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir,
-        refinementReviewPrompt,
-        {
-          timeoutSec: cfg.plan_review_timeout,
-        },
-        deps.invoke,
-      );
-      if (!rereview.result.success || parsePlanReviewVerdictToken(rereview.result.stdout) !== "APPROVE") {
+      const rereview = await invokeConfiguredPlanReview(refinementReviewPrompt);
+      const hasIndependentRereviewer =
+        !rereview.selfReview || (rereview.coverage?.counts.independent ?? 0) > 0;
+      if (
+        !hasIndependentRereviewer ||
+        !rereview.result.success ||
+        parsePlanReviewVerdictToken(rereview.result.stdout) !== "APPROVE"
+      ) {
         const reason = "The independent plan rereview did not confirm that the stable OpenSpec artifact bundle applies the accepted refinement";
         await doSetBlocked(cfg, issueNumber, reason, "plan-review", "openspec-invalid");
         await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);

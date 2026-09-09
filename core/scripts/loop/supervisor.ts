@@ -26,6 +26,7 @@ import {
   type LoopStopRecord,
   type LoopSupervisorProcess,
   type LoopRecoveryAttempt,
+  type RecoveryAttemptOutcome,
   type RecoveryRecipe,
 } from "./types.ts";
 import {
@@ -696,6 +697,28 @@ function hasSchedulableWorkRemaining(schedulableContract: LoopContract, ledger: 
 }
 
 const LOOP_RECOVERY_EVIDENCE_SCHEMA = "pipeline/loop-recovery-evidence@1";
+const RECOVERY_ATTEMPT_OUTCOMES = new Set<RecoveryAttemptOutcome>([
+  "started",
+  "recovered",
+  "superseded",
+  "exhausted",
+  "skipped",
+  "repeated_no_progress",
+  "needs_human",
+  "human_authority",
+  "failed",
+]);
+const LEGACY_RECOVERY_RESULT_OUTCOMES = new Set([
+  "success",
+  "recovered",
+  "ok",
+  "exhaustion",
+  "exhausted",
+  "failed",
+  "resume",
+  "resumed",
+  "started",
+]);
 
 interface PersistedRecoveryEvidence {
   schema: typeof LOOP_RECOVERY_EVIDENCE_SCHEMA;
@@ -822,8 +845,11 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
     if (event.type === "stage_start") {
       return typeof event.stage === "string" && event.stage.trim().length > 0;
     }
-    if (event.type === "loop_recovery_attempt" || event.type === "recovery_result") {
-      return typeof event.outcome === "string" && event.outcome.trim().length > 0;
+    if (event.type === "loop_recovery_attempt") {
+      return RECOVERY_ATTEMPT_OUTCOMES.has(event.outcome as RecoveryAttemptOutcome);
+    }
+    if (event.type === "recovery_result") {
+      return typeof event.outcome === "string" && LEGACY_RECOVERY_RESULT_OUTCOMES.has(event.outcome);
     }
     if (event.type === "run_complete") {
       return typeof event.final_state === "string" && event.final_state.trim().length > 0;
@@ -851,7 +877,8 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
     }
     return false;
   });
-  if (!validKnownTail) return persisted;
+  const hasTerminalRunComplete = laterEvents.some((event) => event.type === "run_complete");
+  if (!validKnownTail || !hasTerminalRunComplete) return persisted;
   const blockerWasRecovered = laterEvents.some((event) => {
     if (typeof event !== "object" || event === null) return false;
     if (event.type === "blocker_cleared") return true;

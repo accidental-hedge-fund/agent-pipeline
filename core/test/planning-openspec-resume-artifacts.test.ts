@@ -1031,6 +1031,178 @@ test("runPlanningPhases: exact accepted-refinement binding advances a coherent O
   assert.match(refinementReviewPrompt, /expanded implementation task/);
 });
 
+test("runPlanningPhases: exact-bundle rereview uses the configured plan-review stage executor", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let executorCalls = 0;
+  let localReviewerCalls = 0;
+  const cfg = {
+    ...eqCfg,
+    stage_executors: { "plan-review": "local-reviewer" },
+    executors: {
+      "local-reviewer": {
+        type: "model-endpoint",
+        base_url: "http://reviewer.invalid/v1",
+        model: "review-model",
+      },
+    },
+  } as unknown as PipelineConfig;
+  const hooks = makeOpenspecPlanningHooks(cfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+  const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "GET") return new Response("", { status: 200 });
+    executorCalls += 1;
+    const content = executorCalls === 1
+      ? "## Plan Review Verdict\n\nNEEDS_REVISION\n\nExpand the OpenSpec tasks."
+      : "## Plan Review Verdict\n\nAPPROVE";
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const result = await runPlanningPhases(
+    cfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true, executorHttpDeps: { fetchImpl } },
+    hooks,
+    eqBaseDeps({
+      invokeReviewer: async () => {
+        localReviewerCalls += 1;
+        throw new Error("local reviewer must not run when plan-review is delegated");
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = `${LIVING_PROPOSAL}\n\nApplied the requested task expansion.`;
+          tasks = "- [ ] expanded implementation task";
+        }
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(executorCalls, 2, "initial review and exact-bundle rereview must share the executor");
+  assert.equal(localReviewerCalls, 0);
+});
+
+test("runPlanningPhases: exact-bundle rereview preserves plan-review ensemble routing and metadata", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  const reviewerPrompts: string[] = [];
+  const comments: string[] = [];
+  const cfg = {
+    ...eqCfg,
+    review_ensemble: {
+      enabled: true,
+      agents: [{ role: "primary" }, { harness: "gemini" }],
+      min_usable_agents: 2,
+      max_agents: 4,
+    },
+  } as unknown as PipelineConfig;
+  const hooks = makeOpenspecPlanningHooks(cfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    cfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      postComment: async (_cfg: unknown, _n: unknown, body: string) => { comments.push(body); },
+      invokeReviewer: async (reviewer: string, _primary: string, _cwd: string, prompt: string) => {
+        reviewerPrompts.push(`${reviewer}:${prompt}`);
+        const exactBundle = prompt.includes("## Stable authoritative artifact bundle");
+        return {
+          result: {
+            ...planReviewOk,
+            stdout: exactBundle
+              ? "## Plan Review Verdict\n\nAPPROVE"
+              : "## Plan Review Verdict\n\nNEEDS_REVISION\n\nExpand the OpenSpec tasks.",
+          },
+          effectiveReviewer: reviewer,
+          selfReview: false,
+        };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = `${LIVING_PROPOSAL}\n\nApplied the requested task expansion.`;
+          tasks = "- [ ] expanded implementation task";
+        }
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  const exactBundlePrompts = reviewerPrompts.filter((prompt) =>
+    prompt.includes("## Stable authoritative artifact bundle")
+  );
+  assert.equal(exactBundlePrompts.length, 2, "both configured agents must independently rereview the bundle");
+  assert.ok(exactBundlePrompts.every((prompt) => prompt.includes("ensemble-agent")));
+  assert.match(comments.find((body) => body.startsWith("## Plan Review")) ?? "", /Reviewer.*ensemble/);
+});
+
+test("runPlanningPhases: same-harness self-review cannot authorize an exact-bundle refinement", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let reviewCalls = 0;
+  let blocked: { reason: string; tag: string } | undefined;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+        blocked = { reason, tag };
+      },
+      invokeReviewer: async () => {
+        reviewCalls += 1;
+        return {
+          result: reviewCalls === 1
+            ? planReviewNeedsRevision
+            : { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+          effectiveReviewer: reviewCalls === 1 ? "codex" : "claude",
+          selfReview: reviewCalls > 1,
+        };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = `${LIVING_PROPOSAL}\n\nApplied the requested task expansion.`;
+          tasks = "- [ ] expanded implementation task";
+        }
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.tag, "openspec-invalid");
+  assert.match(blocked?.reason ?? "", /independent plan rereview/i);
+});
+
 test("runPlanningPhases: approved unchanged OpenSpec artifact remains valid (#1568)", async () => {
   let implementationCalls = 0;
   const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], livingFileInjects());
