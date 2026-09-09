@@ -36,7 +36,7 @@ import {
   type LoopStoreDeps,
 } from "../scripts/loop/store.ts";
 import { DEFAULT_RECOVERY_POLICY, blockItem, persistOwnedCooling } from "../scripts/loop/recovery.ts";
-import { buildCoolingRecord, coolingDeadline, coolingRecordForItem } from "../scripts/loop/recovery-episodes.ts";
+import { buildCoolingRecord, coolingDeadline, coolingRecordForItem, recoveryEpisodeId } from "../scripts/loop/recovery-episodes.ts";
 import { resumeHold } from "../scripts/loop/pause.ts";
 import type { ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import {
@@ -8172,6 +8172,87 @@ test("lock-deferred recovery does not promote an exhausted old candidate episode
   assert.equal(finalLedger.cooling?.candidate_epoch, oldCooling.candidate_epoch);
   assert.notEqual(finalLedger.cooling?.candidate_epoch, head);
   assert.equal(finalLedger.recovery_attempts.length, 1, "the deferred new epoch remains unspent");
+});
+
+test("idle promotion ignores a started old-candidate attempt when the current candidate episode is exhausted (#1568)", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": {
+        ...workflowState,
+        recipes: ["resync_workflow_state"],
+        retry_budget: 1,
+        per_strategy_bound: 1,
+      },
+    },
+  });
+  const ledger = testLedger({ "100": blockedRecoveryItem("100") });
+  const { deps } = await setup(contract, ledger);
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  let head = oldHead;
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:review-1"] };
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: head };
+    },
+  }).deps;
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle({
+    store: deps,
+    observe,
+    dispatchItem: async () => { throw new Error("blocked item must not redispatch"); },
+    executeRecovery: async () => { throw new Error("backoff must defer execution"); },
+    recoverySleep: async () => {},
+  }, "run-1", token, "claude");
+
+  const startedLedger = await readLedger(deps, "run-1", token);
+  const oldAttempt = startedLedger.recovery_attempts[0]!;
+  assert.equal(oldAttempt.outcome, "started");
+  const currentEpisodeKey = {
+    operation: oldAttempt.operation!,
+    invariant: oldAttempt.invariant!,
+    candidate_epoch: oldAttempt.candidate_epoch!.replace(oldHead, currentHead),
+    evidence_identity: oldAttempt.evidence_identity!,
+  };
+  const currentAttempt = {
+    ...oldAttempt,
+    attempt_id: "current-candidate-failed",
+    idempotency_key: "current-candidate-failed",
+    seq: 1,
+    time: "2026-07-23T00:00:20.000Z",
+    completed_at: "2026-07-23T00:00:20.000Z",
+    candidate_identity: oldAttempt.candidate_identity.replace(oldHead, currentHead),
+    candidate_epoch: currentEpisodeKey.candidate_epoch,
+    episode_id: recoveryEpisodeId(currentEpisodeKey),
+    outcome: "failed" as const,
+    status: "failed" as const,
+    terminal_outcome: "failed" as const,
+    error: "resync failed",
+    last_error: "resync failed",
+    side_effect_certainty: "known_absent" as const,
+  };
+  startedLedger.recovery_attempts.push(currentAttempt);
+  await writeLedger(deps, startedLedger, token);
+
+  head = currentHead;
+  const cycle = await runSupervisorCycle({
+    store: deps,
+    observe,
+    dispatchItem: async () => { throw new Error("blocked item must not redispatch"); },
+    executeRecovery: async () => { throw new Error("live advance must defer recovery"); },
+    probeLiveAdvance: () => ({ live: true as const, evidence: "lock_held" as const, holder_pid: 4242 }),
+  }, "run-1", token, "claude");
+
+  assert.equal(cycle.cooling?.candidate_epoch, currentHead);
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.cooling?.candidate_epoch, currentHead);
+  assert.equal(finalLedger.recovery_attempts[0]?.outcome, "started", "the old candidate claim remains non-authoritative");
 });
 
 test("coexistence guard: the advance lock is acquired before the claim, held across the executor, and released even when the executor throws", async () => {

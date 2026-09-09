@@ -2646,15 +2646,6 @@ export async function runSupervisorCycle(
     // fatalities handled before this promotion.
     const exhausted = Object.values(ledger.items).find((candidate) => {
       if (candidate.state !== "blocked" || !candidate.blocked_theme) return false;
-      if (
-        ledger.recovery_attempts.some(
-          (attempt) =>
-            attempt.item_id === candidate.id &&
-            attempt.class === candidate.blocked_theme &&
-            attempt.evidence_fingerprint === candidate.evidence_fingerprint &&
-            attempt.outcome === "started",
-        )
-      ) return false;
       const policy = contract.recovery_policy[candidate.blocked_theme as DurableBlockerClass];
       if (!policy || policy.terminal_outcome === "human_authority") return false;
       const evidence = persistedRecoveryEvidence(candidate);
@@ -2679,6 +2670,16 @@ export async function runSupervisorCycle(
       };
       const episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, episodeKey) ??
         emptyEpisode(episodeKey, deps.store.now().toISOString());
+      // Fingerprints normalize candidate hashes. Only an in-flight claim from
+      // this exact candidate-and-evidence episode can defer its exhaustion.
+      if (
+        ledger.recovery_attempts.some(
+          (attempt) =>
+            attempt.item_id === candidate.id &&
+            attempt.outcome === "started" &&
+            attempt.episode_id === episode.episode_id,
+        )
+      ) return false;
       const selected = selectEligibleRecoveryStrategy({
         recipes: policy.recipes,
         cursor: episode.strategy_cursor,
