@@ -1303,20 +1303,26 @@ export async function initRunDir(
 }
 
 /**
- * Write root for a public `drive` / `single` / `merge` / `merge-queue` admission.
- * Unique-operation collection scores `runsDir(resolveFactoryControlRoot(...))`
- * plus loop state-home. Persist MUST land in that factory-control generic
- * store. A candidate-worktree `repoDir` is never a fallback: inability to
- * resolve the approved control root is an admission refusal.
+ * Write root for a public `drive` / `single` / `merge` / `merge-queue` / `train`
+ * admission.
+ *
+ * Resolution order:
+ * 1. Explicit `factoryControlRoot` overlay (tests / factory-plane inject).
+ *    A non-empty string wins. `null` or empty remains fail-closed.
+ * 2. Live factory-control identity when `repoDir` is that checkout (or a
+ *    managed worktree of it).
+ * 3. The working repository `repoDir`. Product-repo public commands
+ *    (`pipeline single`, `train`, `ship`, `merge`) MUST run from the target
+ *    checkout without `AGENT_PIPELINE_FACTORY_CONTROL`.
  */
 export async function resolvePublicAdmissionPersistRoot(opts: {
   repoDir: string;
   env?: NodeJS.ProcessEnv;
   factoryControlDir?: string | null;
   /**
-   * Test overlay. `undefined` resolves the live factory-control root.
-   * A non-empty string is that approved persist root. `null` / empty means
-   * there is no approved root and admission must fail closed.
+   * Overlay. `undefined` resolves live factory-control identity, then `repoDir`.
+   * A non-empty string is that persist root. `null` / empty means there is no
+   * approved root and admission must fail closed.
    */
   factoryControlRoot?: string | null;
 }): Promise<string | null> {
@@ -1331,7 +1337,9 @@ export async function resolvePublicAdmissionPersistRoot(opts: {
     env: opts.env,
     factoryControlDir: opts.factoryControlDir,
   });
-  return controlRoot;
+  if (controlRoot) return controlRoot;
+  const repoDir = typeof opts.repoDir === "string" ? opts.repoDir.trim() : "";
+  return repoDir !== "" ? repoDir : null;
 }
 
 export type PublicAdmissionFailureKind =
@@ -1776,7 +1784,7 @@ export async function persistPublicEntrypointAdmission(
       null,
       "approved_root_unavailable",
       "resolve_approved_root",
-      "approved factory-control root is unavailable",
+      "approved persist root is unavailable",
     );
   }
   const requestedRoot = path.resolve(persistRoot);

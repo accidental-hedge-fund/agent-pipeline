@@ -550,9 +550,9 @@ Unique-operation aggregation SHALL treat #1301 live train-link as present when a
 
 ### Requirement: Public single, merge, and merge-queue persist SHALL land in the unique-operation collection dual-root
 
-Public-command admission of `pipeline single`, `pipeline merge`, and `pipeline merge-queue`, plus each merge admitted inside `pipeline train --merge`, SHALL persist and verify the recognizable run artifact in the approved control-host generic run store that unique-operation collection scores. The stamp SHALL be bound to the admitted Logical Operation, physical attempt, exact entrypoint, repository, domain, and approved root. Persistence acknowledgement SHALL require atomic publication, durability flushes for the final files and containing directories, and exact read-back verification. Persist SHALL NOT fall back to a candidate worktree or any root that the control-host authority has not approved.
+Public-command admission of `pipeline single`, `pipeline merge`, and `pipeline merge-queue`, plus each merge admitted inside `pipeline train --merge`, SHALL persist and verify the recognizable run artifact in the approved persist root. When live factory-control identity matches this checkout, that root SHALL be the factory-control generic run store. Otherwise the working repository `repoDir` SHALL be the persist root. Product-repo `pipeline single`, `pipeline train`, `pipeline ship`, and `pipeline merge` SHALL NOT require `AGENT_PIPELINE_FACTORY_CONTROL` or a factory-control checkout. The stamp SHALL be bound to the admitted Logical Operation, physical attempt, exact entrypoint, repository, domain, and approved root. Persistence acknowledgement SHALL require atomic publication, durability flushes for the final files and containing directories, and exact read-back verification. An explicit empty persist-root overlay SHALL fail closed.
 
-When no approved control-host root is available, any persistence or verification step fails, or the read-back identity conflicts with the pre-bound admission, the covered command SHALL fail closed before protected work starts. The failure SHALL retain the pre-bound Logical Operation and physical run identities in typed mechanical evidence owned by RecoverySupervisor. Collection SHALL NOT invent entrypoint coverage, success, completion, or authority from a partial or out-of-root artifact.
+When any persistence or verification step fails, or the read-back identity conflicts with the pre-bound admission, the covered command SHALL fail closed before protected work starts. The failure SHALL retain the pre-bound Logical Operation and physical run identities in typed mechanical evidence owned by RecoverySupervisor. Collection SHALL NOT invent entrypoint coverage, success, completion, or authority from a partial or out-of-root artifact.
 
 #### Scenario: Persist into the factory-control generic store is observed
 
@@ -561,21 +561,20 @@ When no approved control-host root is available, any persistence or verification
 - **THEN** in-flight ship unique-operation scoring SHALL observe `single`
 - **AND** the child work SHALL retain the admitted Logical Operation identity
 
-#### Scenario: Persist only into a candidate worktree is not coverage
+#### Scenario: Persist only into an empty overlay is not coverage
 
 - **WHEN** an operator admits `pipeline merge` for a ready-to-deploy PR
-- **AND** the only available persist target is a candidate-worktree run store that is not an approved collection root
+- **AND** the persist-root overlay is empty or null
 - **THEN** admission SHALL fail before merge submission
 - **AND** entrypoint coverage SHALL NOT observe `merge`
 - **AND** the failure SHALL remain mechanically owned under the pre-bound identity
 
-#### Scenario: Unknown factory-control root stays fail-closed
+#### Scenario: Product-repo admission persists in the working repository
 
-- **WHEN** an operator admits `pipeline merge-queue --apply`
-- **AND** the approved control-host generic store cannot be resolved
-- **THEN** admission SHALL return a typed persistence failure
-- **AND** no merge, repair, or other protected apply side effect SHALL start
-- **AND** missing required coverage SHALL remain a hard-gate failure
+- **WHEN** an operator admits `pipeline single`, `pipeline train --merge`, `pipeline merge`, or `pipeline merge-queue --apply` from a product repository
+- **AND** factory-control identity does not identify this checkout
+- **THEN** admission SHALL persist in that repository's generic run store
+- **AND** the protected command SHALL NOT be refused for missing factory-control setup
 
 #### Scenario: Durability or read-back failure refuses protected work
 

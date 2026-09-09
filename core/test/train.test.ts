@@ -38,6 +38,7 @@ import {
 import {
   initRunDir,
   persistPublicEntrypointAdmission,
+  resolvePublicAdmissionPersistRoot,
   runIdFor,
   trainRunIdFor,
   type PublicAdmissionResult,
@@ -2179,6 +2180,38 @@ test("train merge admission: outer and nested attempts use distinct runs under o
   assert.equal(
     (nested.admission_stamp as Record<string, unknown>).logical_operation_id,
     outer.logical_operation_id,
+  );
+});
+
+test("train merge admission: product repo without factory-control overlay admits and merges", async () => {
+  let deps!: TrainTestDeps;
+  deps = makeDeps({
+    resolveApprovedControlRoot: () =>
+      resolvePublicAdmissionPersistRoot({ repoDir: "/product-repo", env: {} }),
+    persistPublicAdmission: (input) =>
+      persistPublicEntrypointAdmission(
+        { ...input, repoDir: "/product-repo", env: {} },
+        deps.store.deps,
+      ),
+  });
+  deps.seedIssue(snap(1454, "product repo train", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(1454, 2454);
+
+  const result = await runTrain(
+    baseOpts({ issues: [1454], merge: true, repoDir: "/product-repo" }),
+    deps,
+  );
+
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual(deps.mergeCalls, [2454]);
+  const metas = [...deps.store.files.entries()]
+    .filter(([filePath]) => filePath.endsWith("run.json"))
+    .map(([, raw]) => JSON.parse(raw) as Record<string, unknown>);
+  const outer = metas.find((meta) => meta.kind === "train");
+  assert.ok(outer);
+  assert.equal(
+    (outer.admission_stamp as Record<string, unknown>).approved_root,
+    "/product-repo",
   );
 });
 
