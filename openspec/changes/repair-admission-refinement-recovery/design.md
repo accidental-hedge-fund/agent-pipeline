@@ -73,7 +73,9 @@ Alternatives considered:
 
 ### 4. Refine coarse retained evidence through the existing linked-event seam
 
-Before selecting a blocked recovery recipe, RecoverySupervisor may reread the linked advance's terminal events when persisted recovery evidence is coarse. It reuses `SupervisorDeps.readAdvanceEvents`; no second event reader or recovery controller is added. The read is authorized only when the blocked record's transport run ID matches the retained `advance_run_id`, and the event location resolves to that run's canonical run-store `events.jsonl`. Parsed terminal evidence must name the same item and satisfy the existing structured diagnostic validator.
+Before selecting a blocked recovery recipe, RecoverySupervisor may reread the linked advance's terminal events when persisted recovery evidence is coarse. It reuses `SupervisorDeps.readAdvanceEvents`; no second event reader or recovery controller is added. The read is authorized only when the blocked record's transport run ID matches the retained `advance_run_id`, and the event location equals the `events.jsonl` path derived from the configured persistent/common run-store root and that run ID. A path that merely ends in `.agent-pipeline/runs/<run-id>/events.jsonl`, including one below the operator worktree or another foreign prefix, is not canonical authority. This follows the existing `core/scripts/pipeline.ts` pattern: resolve the persistent store with `resolveRunStoreRepoDir`, then derive the pinned child location with `runDirPath`.
+
+Parsed terminal evidence must name the same item and satisfy the existing structured diagnostic validator. For the actual #1558 historical shape, absence of `evidence_ordering.pr_head` is not itself a mismatch: matching retained run/item identity and the current authoritative full head/candidate epoch can bind the diagnostic. If the terminal evidence explicitly names a head or candidate, it must equal the current authoritative binding. Any explicit mismatch remains fail-closed. This refinement changes recipe classification only and never proves the Tester gate or creates a Tester subject.
 
 A valid more-precise diagnostic replaces only the diagnostic used for current classification and recipe applicability. The ledger history, attempts, class-budget projection, evidence/candidate episode key, and source events stay unchanged. Missing, malformed, mismatched, or non-canonical observations leave the coarse persisted evidence in force and fail closed.
 
@@ -85,7 +87,7 @@ Alternatives considered:
 
 ### 5. Share per-strategy eligibility logic between outer admission and selection
 
-Extract or reuse a pure eligibility predicate built from the current Recovery Episode: lifecycle/Cooling status, policy order, diagnostic-specific applicability, strategy cursor, attempts per strategy, and per-strategy bounds. Both `independentlyRecoverableBlockedItems` and execution-time strategy selection use that contract. The class-level `recovery_budgets_remaining` field remains updated for compatibility but is not an admission veto.
+Extract or reuse a pure eligibility predicate built from the current Recovery Episode: lifecycle/Cooling status, policy order, diagnostic-specific applicability, strategy cursor, attempts per strategy, and per-strategy bounds. Both `independentlyRecoverableBlockedItems` and execution-time strategy selection use that contract. The post-action controller also recomputes eligibility through that contract against the same authoritative episode/progress identity after a failed recovery action; it does not infer exhaustion from the just-failed action or an outer stale episode key. The class-level `recovery_budgets_remaining` field remains updated for compatibility but is not an admission veto.
 
 The predicate reports eligible if at least one applicable configured strategy has remaining bound. It reports bounded ineligible when every applicable strategy is exhausted, and it does not turn inapplicable recipes into candidates. Dependency filtering and compatibility-stop scoping remain separate scheduling constraints, so an ineligible item does not suppress independent siblings.
 
@@ -97,7 +99,11 @@ Alternatives considered:
 
 ### 6. Test the real boundaries with injected I/O
 
-Regression tests exercise `embedDecisionsInBody`/parser, `makeOpenspecPlanningHooks` through implementation-plan construction, `realDispatchItem`, and RecoverySupervisor/outer eligibility using existing dependency seams. The retained recovery reproduction seeds coarse evidence, two spent scratch attempts, zero legacy class projection, and matching linked terminal events; it must select the unspent Tester-rebind recipe without changing episode history. Negative cases cover unmatched event identity, malformed streams, invalid/no-op refinements, unique oversize bodies, exhausted strategies, and independent siblings.
+Regression tests exercise `embedDecisionsInBody`/parser; non-dry-run `grillOneIssue`; MAC-valid `runRefineSpecApply`; oversized-result `materializeGrillAnswer`; `makeOpenspecPlanningHooks` through implementation-plan construction; `realDispatchItem`; and RecoverySupervisor/outer eligibility using existing dependency seams. Each admission-writer refusal asserts zero body, label, handoff, frontier, sibling-rebind, and applicable recovery-receipt writes after measuring the complete body, including unrelated text and the readable Decisions section.
+
+The #1558 replay uses the captured coarse persisted record and terminal diagnostic without historical `pr_head`, a configured persistent/common run-store root, matching run/item identity, and current full-head/candidate-epoch observation; it must select the unspent Tester-rebind recipe without changing episode history or creating Tester success. Negative cases cover foreign-prefix and operator-worktree roots, unmatched run/item/candidate identity, explicit head mismatch, malformed/non-terminal streams, invalid/no-op refinements, unique oversize bodies, exhausted strategies, and independent siblings.
+
+The immutable #1568 `driveSupervisor` post-action replay starts with scratch ×2 and checkpoint ×2 spent and zero legacy class projection. One injected recovery failure must re-enter selection through the same authoritative episode/progress identity and reach a later applicable unspent strategy rather than emit `strategy_cursor_exhausted`. The next strategy is selected by the diagnostic and configured recipe order; it is not hard-coded to Tester rebind.
 
 Baseline-failure evidence should be retained in test names or commit history where practical; production tests themselves assert repaired behavior. No unit test uses live GitHub, git, child processes, or filesystem state outside injected seams.
 
@@ -109,6 +115,7 @@ Baseline-failure evidence should be retained in test names or commit history whe
 - **[Risk] A cached advisory snapshot can hide later feedback on a replan.** → Rebuild capped, sanitized prompt context from current eligible comments every invocation, retain prior-plan feedback across replacement-plan publication for revision acknowledgement, and keep only the public snapshot write idempotent.
 - **[Risk] A stale or unrelated event stream could steer recovery.** → Bind run ID, item, canonical path, and structured terminal diagnostic; otherwise retain coarse evidence.
 - **[Risk] Removing the class-budget veto could unbound recovery.** → Per-strategy bounds, strategy cursor, repeated-evidence limit, Cooling, and episode identity remain mandatory.
+- **[Risk] Moving an oversize guard after a durable side effect could leave partial admission state.** → At each exported writer boundary, construct and measure the complete body before the first issue, label, handoff, frontier, sibling-rebind, or recovery-receipt mutation.
 
 ## Migration Plan
 
