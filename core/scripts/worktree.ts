@@ -791,7 +791,14 @@ export async function createWorktree(
       }
       if (!linkedMerged) localOnly = true;
     }
-    if (candidatePath === wtPath && pathOnDisk && !dirty && localOnly === true) {
+    // Reusing the exact clean target does not discard commits, so remote
+    // verification is not required when no reclaim mutation is needed (#1568).
+    if (
+      candidatePath === wtPath &&
+      pathOnDisk &&
+      !dirty &&
+      (localOnly === true || localOnly === null)
+    ) {
       return "reuse";
     }
     const reconciled = reconcileWorktreeLifecycle({
