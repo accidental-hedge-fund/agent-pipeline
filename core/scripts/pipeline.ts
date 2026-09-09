@@ -1965,7 +1965,7 @@ export function realDispatchItem(
           // early-blocked re-dispatch as capacity (see lastBlockerKindFromComments).
         }
       }
-      const pr = await getPrForIssueFn(cfg, issueNumber).catch(() => null);
+      const pr = await getPrForIssueFn(cfg, issueNumber);
       prNumber = pr ?? null;
     } catch (err) {
       outcome = "failed";

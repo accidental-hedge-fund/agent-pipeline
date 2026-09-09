@@ -38,6 +38,7 @@ import {
 } from "./grill-frontier.ts";
 import { createPendingGrillHandoffs, supersedeStaleGrillHandoffs } from "./grill-handoff.ts";
 import { sha256Prefixed } from "./grill-hash.ts";
+import { classifyAuthority, NON_AUTHORITY_ELIGIBILITY_REASON } from "./grill-taxonomy.ts";
 import {
   defaultGrillProposalKeyDeps,
   fileConsumedNonceStore,
@@ -570,6 +571,62 @@ export async function runRefineSpecApply(
       `proposal body exceeds supported 65,536-character limit (actual ${publicationBody.length})`,
       2,
     );
+  }
+  const verdictIds = new Set<string>();
+  for (const verdict of envelope.proposal.verdicts) {
+    if (
+      verdict === null ||
+      typeof verdict !== "object" ||
+      typeof verdict.node_id !== "string" ||
+      (verdict.verdict !== "accept" && verdict.verdict !== "challenge") ||
+      typeof verdict.reason !== "string"
+    ) {
+      return fail(deps, "proposal verdicts are malformed", 2);
+    }
+    if (verdictIds.has(verdict.node_id)) {
+      return fail(deps, `duplicate reviewer verdict for node ${verdict.node_id}`, 2);
+    }
+    verdictIds.add(verdict.node_id);
+  }
+  const proposalNodeIds = new Set(proposalCheck.artifact.nodes.map((node) => node.id));
+  for (const verdict of envelope.proposal.verdicts) {
+    if (!proposalNodeIds.has(verdict.node_id)) {
+      return fail(deps, `reviewer verdict for unknown node ${verdict.node_id}`, 2);
+    }
+  }
+  for (const node of proposalCheck.artifact.nodes) {
+    const verdict = envelope.proposal.verdicts.find((candidate) => candidate.node_id === node.id);
+    if (!verdict) return fail(deps, `reviewer omitted verdict for node ${node.id}`, 2);
+    const expectedReason = verdict.reason.trim();
+    const mayAutoDefault = classifyAuthority(node.class).mayAutoDefault;
+    const settledByHandoff =
+      verdict.verdict === "accept" &&
+      !mayAutoDefault &&
+      node.resolution === "resolved" &&
+      node.provenance.settled_by === "handoff" &&
+      typeof node.provenance.reference === "string" &&
+      node.provenance.reference.length > 0 &&
+      node.provenance.eligibility_reason === null;
+    if (
+      node.provenance.reviewer_verdict !== verdict.verdict ||
+      node.provenance.reviewer_reason !== expectedReason ||
+      (verdict.verdict === "challenge" &&
+        (node.resolution !== "unresolved" ||
+          node.provenance.settled_by !== "none" ||
+          node.challenge_text !== expectedReason ||
+          node.provenance.eligibility_reason !==
+            (mayAutoDefault ? NON_AUTHORITY_ELIGIBILITY_REASON : null))) ||
+      (verdict.verdict === "accept" &&
+        !settledByHandoff &&
+        (node.challenge_text !== undefined ||
+          node.provenance.reference !== null ||
+          node.resolution !== (mayAutoDefault ? "resolved" : "unresolved") ||
+          node.provenance.settled_by !== (mayAutoDefault ? "reviewer-accept" : "none") ||
+          node.provenance.eligibility_reason !==
+            (mayAutoDefault ? NON_AUTHORITY_ELIGIBILITY_REASON : null)))
+    ) {
+      return fail(deps, `reviewer verdict for node ${node.id} does not match the proposed artifact`, 2);
+    }
   }
   const bodyCheck = parseDecisionsFromBody(envelope.proposal.body);
   if (!bodyCheck.ok) return fail(deps, `proposal body is not a valid Decisions artifact: ${bodyCheck.reason}`, 2);

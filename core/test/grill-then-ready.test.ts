@@ -1483,6 +1483,44 @@ test("grill: apply rejects a signed mismatch between the envelope and body artif
   assert.equal(nonceWrites, 0);
 });
 
+test("grill: apply rejects incomplete or inconsistent signed verdict sets before durable writes", async () => {
+  const env = await signedPreview();
+  const variants: Array<{ name: string; mutate(envelope: GrillProposalEnvelope): void }> = [
+    { name: "missing", mutate: (value) => { value.proposal.verdicts.pop(); } },
+    { name: "duplicate", mutate: (value) => { value.proposal.verdicts.push({ ...value.proposal.verdicts[0]! }); } },
+    { name: "unknown", mutate: (value) => { value.proposal.verdicts.push({ node_id: "unknown-node", verdict: "accept", reason: "ok" }); } },
+    { name: "mismatched reason", mutate: (value) => { value.proposal.verdicts[0]!.reason = "different signed reason"; } },
+  ];
+  for (const variant of variants) {
+    const mutated = structuredClone(env);
+    variant.mutate(mutated);
+    const resigned = signGrillProposal((({ mac: _mac, ...unsigned }) => unsigned)(mutated), "test-key");
+    let durableWrites = 0;
+    let nonceWrites = 0;
+    const baseStore = memoryHandoffStore();
+    const baseKeyDeps = memoryKeyDeps();
+    const deps = applyDeps(resigned, {
+      handoffStore: {
+        ...baseStore,
+        writeFile: async (path, data) => { durableWrites++; await baseStore.writeFile(path, data); },
+        appendFile: async (path, data) => { durableWrites++; await baseStore.appendFile(path, data); },
+      },
+      keyDeps: {
+        ...baseKeyDeps,
+        writeFile: (path, data, options) => { durableWrites++; baseKeyDeps.writeFile(path, data, options); },
+      },
+      nonceStore: { isConsumed: () => false, consume: () => { nonceWrites++; } },
+    });
+    await withExit(async () => {
+      await runRefineSpecApply(42, {}, deps);
+      assert.equal(process.exitCode, 2, variant.name);
+    });
+    assert.equal(deps.bodies.length, 0, variant.name);
+    assert.equal(durableWrites, 0, variant.name);
+    assert.equal(nonceWrites, 0, variant.name);
+  }
+});
+
 test("grill: apply fails closed on a MAC-valid malformed proposal artifact", async () => {
   const env = await signedPreview();
   const malformed = structuredClone(env) as unknown as Record<string, unknown>;
@@ -3168,13 +3206,17 @@ test("grill: second apply with a changed node definition supersedes first pendin
   if (!parsed.ok) return;
   const nodes = parsed.artifact.nodes.map((n) => {
     if (n.id !== "scope") return n;
-    return makeNode({
+    const revised = makeNode({
       id: n.id,
       question: "Revised live scope question?",
       recommendation: n.recommendation,
       class: n.class,
       term_id: n.term_id,
     });
+    const verdict = env.proposal.verdicts.find((candidate) => candidate.node_id === n.id)!;
+    const applied = applyReviewerVerdicts([revised], [verdict]);
+    assert.equal(applied.ok, true);
+    return applied.ok ? applied.nodes[0]! : revised;
   });
   const spec = extractSpecCore(env.proposal.body);
   const art2 = { ...parsed.artifact, nodes };

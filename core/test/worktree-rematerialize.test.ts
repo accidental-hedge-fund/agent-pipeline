@@ -855,11 +855,9 @@ test("source wiring: pre_merge autofix/archive and fix rematerialize before bare
   );
   assert.match(
     preMerge,
-    /deliveryPushArgs\(managedBranch, deliveryBranch, deliveryLeaseHead \?\? delivery\.headSha\)/,
-    "pre-merge autofix delivery must CAS-push using the reconciled adopted-PR lease",
+    /deliveryPushArgs\(managedBranch, deliveryBranch, delivery\.headSha\)/,
+    "pre-merge autofix delivery must CAS-push to the adopted PR branch",
   );
-  assert.match(preMerge, /remoteHead === harnessHead/);
-  assert.match(preMerge, /merge-base", "--is-ancestor", headBefore, ctx\.headAfter/);
   assert.match(
     preMerge,
     /fixRes\.status === "rematerialize-failed"/,

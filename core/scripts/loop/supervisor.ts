@@ -811,6 +811,32 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
       }>;
   if (runStarts.length !== 1 || runStartIndex >= finalBlockerIndex) return persisted;
   const laterEvents = events.slice(finalBlockerIndex + 1) as Array<Record<string, unknown>>;
+  const validKnownTail = laterEvents.every((event) => {
+    if (
+      typeof event !== "object" ||
+      event === null ||
+      event.schema_version !== 1 ||
+      !isCanonicalUtcEventTimestamp(event.at)
+    ) return false;
+    if (event.type === "blocker_cleared") return true;
+    if (event.type === "stage_start") {
+      return typeof event.stage === "string" && event.stage.trim().length > 0;
+    }
+    if (event.type === "loop_recovery_attempt" || event.type === "recovery_result") {
+      return typeof event.outcome === "string" && event.outcome.trim().length > 0;
+    }
+    if (event.type === "run_complete") {
+      return (
+        typeof event.final_state === "string" &&
+        event.final_state.trim().length > 0 &&
+        typeof event.elapsed_ms === "number" &&
+        Number.isFinite(event.elapsed_ms) &&
+        event.elapsed_ms >= 0
+      );
+    }
+    return false;
+  });
+  if (!validKnownTail) return persisted;
   const blockerWasRecovered = laterEvents.some((event) => {
     if (typeof event !== "object" || event === null) return false;
     if (event.type === "blocker_cleared") return true;

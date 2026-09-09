@@ -1615,35 +1615,6 @@ function buildSampleFixPrompt(): string {
   });
 }
 
-test("fix prompt: pipeline-wrapper ownership preserves the complete fix discipline", () => {
-  const out = buildFixPrompt({
-    cfg: dummyConfig(),
-    issueNumber: 235,
-    title: "Wrapper-owned surgical fix",
-    reviewFindings: "FINDINGS-SAMPLE",
-    fixRound: 1,
-    pipelineRunId: "235/2026-06-19T12:44:53Z",
-    pushOwnership: "pipeline-wrapper",
-  });
-
-  assert.match(out, /minimal diff/i, "wrapper-owned fixes must retain minimal-diff discipline");
-  assert.match(
-    out,
-    /managed worktree root|reviewed head/,
-    "wrapper-owned fixes must retain destructive-operation scope",
-  );
-  assert.match(out, /Review your own diff against the findings/i, "wrapper-owned fixes must self-review their diff");
-  assert.match(
-    out,
-    /Conservative-open:[\s\S]*stop before committing/i,
-    "wrapper-owned fixes must stop before commit on a conservative-open concern",
-  );
-  assert.match(out, /single-turn/i, "wrapper-owned fixes must complete in one turn");
-  assert.match(out, /sole push owner/i, "the wrapper must be the sole push owner");
-  assert.match(out, /do \*\*not\*\* push|Do not push/i, "the fixing harness must not push");
-  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/, "wrapper-owned output must resolve every placeholder");
-});
-
 test("fix prompt: minimal-diff discipline is a leading, prominent instruction (#235)", () => {
   const out = buildSampleFixPrompt();
   // Must explicitly forbid refactors

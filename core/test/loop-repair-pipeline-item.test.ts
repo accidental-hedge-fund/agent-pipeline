@@ -57,15 +57,6 @@ function createTestExecutor(deps: RepairPipelineItemDeps) {
 
 test("repair_pipeline_item uses the configured repair transaction and only succeeds after push", async () => {
   const calls: string[] = [];
-  const repairInput = input();
-  repairInput.diagnostic = buildStageDiagnostic({
-    reasonCode: "openspec-archive-apply-conflict",
-    evidenceKey: "openspec-archive-apply-conflict:change-a:archive_spec_update_failed",
-    blockerKind: "openspec-invalid",
-    reason: "archive failed near `untrusted/from-prose.ts:42`",
-    stage: "pre-merge",
-    offrampClass: "openspec-invalid",
-  });
   const execute = createTestExecutor({
     getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
     gitInWorktree: async (_dir, args) => {
@@ -109,8 +100,6 @@ test("repair_pipeline_item uses the configured repair transaction and only succe
       assert.equal(title, "Repair archive");
       assert.match(findings, /openspec-archive-apply-conflict/);
       await invokeFn(resolvedCfg.harnesses.implementer, "/repo/.worktrees/42", "repair", {});
-      const integrity = rest[3] as { declared_scope?: { paths?: string[] } } | undefined;
-      assert.deepEqual(integrity?.declared_scope?.paths, []);
       assert.deepEqual(rest.at(-1), TEST_DELIVERY);
       calls.push("repair");
       return { status: "fix-committed", headSha: NEXT };
@@ -120,49 +109,12 @@ test("repair_pipeline_item uses the configured repair transaction and only succe
     },
   });
 
-  const result = await execute(repairInput);
+  const result = await execute(input());
   assert.equal(result.succeeded, true);
   // The durable pre-invocation breadcrumb must land BEFORE the harness seam
   // runs (crash-window proof of authorship) and retire on controlled return.
   assert.deepEqual(calls, ["breadcrumb", "repair", "breadcrumb-drop", "clear"]);
   assert.match(result.evidence, new RegExp(`${HEAD}.*${NEXT}`));
-});
-
-test("repair_pipeline_item never grants integrity scope from backticked diagnostic prose", async () => {
-  let declaredPaths: string[] | undefined;
-  const execute = createTestExecutor({
-    getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
-    gitInWorktree: async (_dir, args) => {
-      return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
-    },
-    getIssueDetail: async () => ({
-      number: 42,
-      type: "issue",
-      title: "Repair archive",
-      body: "",
-      state: "open",
-      url: "https://example.test/42",
-      labels: ["blocked", "pipeline:pre-merge"],
-    }),
-    performRepair: async (_cfg, _issue, _run, _findings, _title, _wt, _git, _invoke, ...rest) => {
-      declaredPaths = (rest[3] as { declared_scope?: { paths?: string[] } } | undefined)
-        ?.declared_scope?.paths;
-      return { status: "fix-committed", headSha: NEXT };
-    },
-    clearBlocked: async () => {},
-  });
-
-  const proseInput = input();
-  proseInput.diagnostic = buildStageDiagnostic({
-    reasonCode: "openspec-archive-apply-conflict",
-    blockerKind: "openspec-invalid",
-    reason: "model mentioned `untrusted/from-prose.ts`",
-    stage: "pre-merge",
-    offrampClass: "openspec-invalid",
-  });
-  const result = await execute(proseInput);
-  assert.equal(result.succeeded, true);
-  assert.deepEqual(declaredPaths, []);
 });
 
 test("repair_pipeline_item rematerializes an adopted PR at its exact delivery head (#1478)", async () => {

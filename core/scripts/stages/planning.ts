@@ -409,6 +409,9 @@ export interface PlanningPhaseHooks {
     { ok: true } | { ok: false; reason: string; tag: BlockerKind }
   >;
 
+  /** Exact stable artifact bundle to independently re-review after a required revision. */
+  refinementReviewArtifact?(): string;
+
   /** Build the PR body from the plan excerpt and harness names. */
   buildPrBody(
     cfg: PipelineConfig,
@@ -1334,6 +1337,37 @@ export async function runPlanningPhases(
       await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return blockedOutcome(reason, "needs-human");
+    }
+    if (revisionRequiresArtifactChange && hooks.refinementReviewArtifact) {
+      const refinementReviewPrompt = [
+        "Independently verify that the exact stable authoritative OpenSpec bundle applies every accepted refinement below.",
+        "Return `## Plan Review Verdict` followed by exactly `APPROVE` only if the bundle substantively applies them; otherwise return `NEEDS_REVISION` and explain what is missing.",
+        "",
+        "## Accepted refinement",
+        planReview,
+        ...(humanComments.length > 0
+          ? ["", "## Accepted human feedback", formatHumanFeedback(humanComments)]
+          : []),
+        "",
+        "## Stable authoritative artifact bundle",
+        hooks.refinementReviewArtifact(),
+      ].join("\n");
+      const rereview = await (deps.invokeReviewer ?? invokeReviewer)(
+        reviewer,
+        primary,
+        hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir,
+        refinementReviewPrompt,
+        {
+          timeoutSec: cfg.plan_review_timeout,
+        },
+        deps.invoke,
+      );
+      if (!rereview.result.success || parsePlanReviewVerdictToken(rereview.result.stdout) !== "APPROVE") {
+        const reason = "The independent plan rereview did not confirm that the stable OpenSpec artifact bundle applies the accepted refinement";
+        await doSetBlocked(cfg, issueNumber, reason, "plan-review", "openspec-invalid");
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+        return blockedOutcome(reason, "openspec-invalid");
+      }
     }
     if (revisionSalvageFailureReason) {
       const reason = `Salvage of uncommitted work also failed: ${revisionSalvageFailureReason}`;
@@ -2521,6 +2555,11 @@ export function makeOpenspecPlanningHooks(
         updatedPlanText: revised.proposal,
         updatedSpecContext: revised.specContext,
       };
+    },
+
+    refinementReviewArtifact() {
+      if (!validatedArtifact) throw new Error("no stable validated OpenSpec artifact is available for refinement review");
+      return JSON.stringify(validatedArtifact);
     },
 
     buildPrBody(_innerCfg, issueNumber, _title, planExcerpt, primary, reviewer) {

@@ -215,7 +215,12 @@ export function verifyGrillProposal(
   if (envelope.repo !== expected.repo) {
     return { ok: false, reason: "proposal repo does not match", code: "repo_mismatch" };
   }
-  if (envelope.proposal.verdicts.some((v) => v.verdict === "challenge")) {
+  if (!Array.isArray(envelope.proposal.verdicts)) {
+    return { ok: false, reason: "proposal verdicts are malformed", code: "invalid_json" };
+  }
+  if (envelope.proposal.verdicts.some(
+    (v) => typeof v === "object" && v !== null && v.verdict === "challenge",
+  )) {
     return { ok: false, reason: "proposal contains a reviewer challenge", code: "challenge" };
   }
   if (envelope.proposal.artifact.nodes.some((n) => n.provenance.reviewer_verdict === "challenge")) {

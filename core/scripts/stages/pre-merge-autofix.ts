@@ -601,7 +601,6 @@ export async function performPreMergeAutoFix(
 
   const managedBranch = branchName(issueNumber, wt.slug);
   const deliveryBranch = delivery?.branch ?? managedBranch;
-  let deliveryLeaseHead = delivery?.headSha;
   const prompt = buildFixPrompt({
     cfg,
     issueNumber,
@@ -610,7 +609,6 @@ export async function performPreMergeAutoFix(
     fixRound: 1,
     pipelineRunId,
     deliveryBranch,
-    pushOwnership: "pipeline-wrapper",
   });
 
   const runBody = () =>
@@ -685,7 +683,6 @@ export async function performPreMergeAutoFix(
       const hasNewCommitHarness = Boolean(
         ctx.headAfter && headBefore && (ctx.salvaged || !ctx.confirmedNoNewCommit),
       );
-      let failedInvokeWithCleanCommit = false;
 
       if (!ctx.salvaged) {
         // #553 / #698: the harness ran and left the inspected worktree clean with
@@ -699,13 +696,7 @@ export async function performPreMergeAutoFix(
             `clean with no new commit — no recoverable work was found there`
           : undefined;
 
-        const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-        const hasUncommitted = statusAfter.code !== 0 || statusAfter.stdout.trim() !== "";
-        failedInvokeWithCleanCommit = Boolean(
-          !result.success && hasNewCommitHarness && !hasUncommitted && delivery && ctx.headAfter,
-        );
-
-        if (!result.success && !failedInvokeWithCleanCommit) {
+        if (!result.success) {
           if (diagnostic) console.error(`[pipeline] ${diagnostic}`);
           if (headBefore) {
             await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
@@ -719,6 +710,10 @@ export async function performPreMergeAutoFix(
           }
           return { status: "error" };
         }
+
+        const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+        // Fail closed when status exits non-zero: we cannot prove the worktree is clean (#359 R2 F4).
+        const hasUncommitted = statusAfter.code !== 0 || statusAfter.stdout.trim() !== "";
 
         // Spec (#359 / #698): a dirty post-harness worktree (uncommitted changes remaining)
         // is a failure — roll back. A confirmed clean no-commit is **noop-clean** so the
@@ -734,48 +729,6 @@ export async function performPreMergeAutoFix(
             return { status: "noop-clean", headSha: headBefore, diagnostic: finalDiagnostic };
           }
           return { status: "error" };
-        }
-      }
-
-      if (delivery && ctx.headAfter) {
-        const remote = await gitFn(
-          wt.path,
-          ["ls-remote", "origin", `refs/heads/${deliveryBranch}`],
-          { ignoreFailure: true },
-        );
-        const remoteHead = remote.code === 0
-          ? remote.stdout.trim().split(/\s+/, 1)[0]?.toLowerCase() ?? ""
-          : "";
-        if (failedInvokeWithCleanCommit && remoteHead !== ctx.headAfter.toLowerCase()) {
-          await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-          await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-          return { status: "error" };
-        }
-        if (remoteHead) {
-          const expectedHead = delivery.headSha.toLowerCase();
-          const harnessHead = ctx.headAfter.toLowerCase();
-          if (remoteHead === harnessHead) {
-            // A disobedient harness pushed exactly its own clean commit. Keep
-            // wrapper ownership by leasing the canonical amend against that
-            // exact remote head, but only after proving it descends from the
-            // candidate we handed to the harness. Remote/local equality alone
-            // must not bless a force-pushed unrelated history.
-            const ancestry = await gitFn(
-              wt.path,
-              ["merge-base", "--is-ancestor", headBefore, ctx.headAfter],
-              { ignoreFailure: true },
-            );
-            if (ancestry.code !== 0) {
-              await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-              await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-              return { status: "error" };
-            }
-            deliveryLeaseHead = ctx.headAfter;
-          } else if (remoteHead !== expectedHead) {
-            await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-            await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-            return { status: "error" };
-          }
         }
       }
 
@@ -816,7 +769,7 @@ export async function performPreMergeAutoFix(
         cwd: wt.path,
         auth: pushAuth,
         args: delivery
-          ? deliveryPushArgs(managedBranch, deliveryBranch, deliveryLeaseHead ?? delivery.headSha)
+          ? deliveryPushArgs(managedBranch, deliveryBranch, delivery.headSha)
           : ["push", "origin", deliveryPushRefspec(managedBranch, deliveryBranch)],
         deps: {
           gitConfigGet: async (cwd, key) => {
@@ -879,19 +832,6 @@ export async function performPreMergeAutoFix(
       status: "error",
       diagnostic: integrityResult.mutation_error ?? "auto-fix incomplete under integrity",
     };
-  }
-
-  // Recovery has no trusted structured finding paths today, so any substantive
-  // successor necessarily classifies as scope expansion. The integrity record
-  // has already invalidated review/readiness; preserve the exact pushed
-  // successor so the repair executor can verify the remote head and redispatch
-  // it through the ordinary whole-item gates.
-  if (
-    integrity.mutation_method === "recovery_repair" &&
-    integrityResult.classification === "scope_expansion" &&
-    body.status === "fix-committed"
-  ) {
-    return body;
   }
 
   // Scope expansion / unverified: force error so readiness cannot carry forward.

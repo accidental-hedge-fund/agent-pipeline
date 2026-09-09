@@ -6919,6 +6919,25 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
       } as never],
     },
     {
+      name: "unknown future event after blocker",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent, {
+        schema_version: 7,
+        type: "future_terminal_signal",
+        at: "2026-09-08T21:22:00Z",
+      } as never],
+    },
+    {
+      name: "malformed run-complete after blocker",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [runStart, terminalEvent, {
+        schema_version: 1,
+        type: "run_complete",
+        at: "2026-09-08T21:22:00Z",
+        final_state: "blocked",
+      } as never],
+    },
+    {
       name: "terminal blocker wrong schema",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
       events: [runStart, { ...terminalEvent, schema_version: 2 } as never],

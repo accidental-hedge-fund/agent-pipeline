@@ -109,8 +109,10 @@ export async function initRecoverableRun(
 export function upgradeContractForRecovery(contract: LoopContract): LoopContract {
   const policy = contract.recovery_policy;
   const normalized = normalizeRecoveryPolicyCompatibility(policy);
-  const compiled = compileRecoveryPolicy(normalized);
-  return normalized === policy ? contract : { ...contract, recovery_policy: compiled };
+  compileRecoveryPolicy(normalized);
+  return normalized === policy
+    ? contract
+    : { ...contract, recovery_policy: normalized as LoopContract["recovery_policy"] };
 }
 
 /** Defaults `recovery_attempts` to `[]` when absent (a pre-#509 ledger has no

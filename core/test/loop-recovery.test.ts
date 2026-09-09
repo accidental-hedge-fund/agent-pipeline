@@ -1412,10 +1412,11 @@ test("upgradeContractForRecovery: custom entries keep their policy while legacy 
   customPolicy["implementation-ci"] = {
     recipes: ["repair_pipeline_item", "rerun_ci"],
     retry_budget: 7,
-    backoff: { initial_seconds: 3, multiplier: 3, max_seconds: 99 },
+    backoff: { initial_seconds: 3, multiplier: 3, max_seconds: 99, operator_jitter: "bounded" },
     terminal_outcome: "retry",
     run_fatal: true,
     repeated_evidence_limit: 5,
+    operator_note: "preserve this unrelated custom entry",
   };
   customPolicy["environment-auth"] = {
     recipes: ["reauthenticate", "wait_and_retry"],

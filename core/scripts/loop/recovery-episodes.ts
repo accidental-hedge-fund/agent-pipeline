@@ -520,11 +520,11 @@ export function resumeEpisodeFromAttempts(
 function projectEpisode(matching: LoopRecoveryAttempt[], key: RecoveryEpisodeKey): RecoveryEpisodeRecord {
   const latest = matching[matching.length - 1]!;
   const attempts_per_strategy: Record<string, number> = { ...(latest.attempts_per_strategy ?? {}) };
-  const skipped: RecoveryRecipe[] = [];
+  const skipped: RecoveryRecipe[] = [...(latest.skipped_strategies ?? [])];
   if (Object.keys(attempts_per_strategy).length === 0) {
     for (const attempt of matching) {
       if (attempt.outcome === "skipped") {
-        skipped.push(attempt.action);
+        if (!skipped.includes(attempt.action)) skipped.push(attempt.action);
         continue;
       }
       if (attempt.outcome === "superseded") continue;
@@ -532,7 +532,7 @@ function projectEpisode(matching: LoopRecoveryAttempt[], key: RecoveryEpisodeKey
     }
   } else {
     for (const attempt of matching) {
-      if (attempt.outcome === "skipped") skipped.push(attempt.action);
+      if (attempt.outcome === "skipped" && !skipped.includes(attempt.action)) skipped.push(attempt.action);
     }
   }
   return {

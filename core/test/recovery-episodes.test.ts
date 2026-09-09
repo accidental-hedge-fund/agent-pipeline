@@ -1143,6 +1143,64 @@ test("pre-#1468 policy keeps a newly selected Tester-rebind claim authoritative 
   assert.equal(replay.ledger.recovery_attempts.length, 1);
 });
 
+test("pre-#1468 episode cursor migrates across inserted Tester-rebind strategy without losing history", async () => {
+  const { deps, files } = fakeDeps();
+  const pre1468Policy = {
+    ...DEFAULT_RECOVERY_POLICY,
+    "workflow-engine-defect": {
+      ...DEFAULT_RECOVERY_POLICY["workflow-engine-defect"],
+      recipes: [
+        "unlink_engine_scratch",
+        "checkpoint_owned_harness_dirt",
+        "publish_unpublished_stage_commit",
+        "restart_workflow_engine",
+        "repair_pipeline_item",
+      ],
+    },
+  } as LoopContract["recovery_policy"];
+  const persistedContract = testContract({ recovery_policy: pre1468Policy });
+  await initRun(deps, persistedContract, testLedger());
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockItem(deps, persistedContract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "workflow-engine-defect", evidence: "legacy workflow engine failure",
+  });
+  const started = await startRecoveryAttempt(deps, persistedContract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    action: "restart_workflow_engine", candidateIdentity: "legacy-head",
+  });
+  const historical = structuredClone(started.ledger);
+  historical.recovery_attempts[0]!.skipped_strategies = historical.recovery_attempts[0]!
+    .skipped_strategies?.filter((recipe) => recipe !== "rebind_tester_evidence_after_pr");
+  const historicalAttemptId = historical.recovery_attempts[0]!.attempt_id;
+  const episodeId = historical.recovery_attempts[0]!.episode_id;
+  const ledgerFile = [...files.keys()].find((candidate) => candidate.endsWith("/ledger.json"))!;
+  await deps.writeFileAtomic(ledgerFile, JSON.stringify(historical));
+  files.delete(lastValidPathFor(ledgerFile));
+
+  const fresh = await readLedger(deps, "run-1", token);
+  assert.equal(fresh.recovery_attempts.length, 1);
+  assert.equal(fresh.recovery_attempts[0]!.attempt_id, historicalAttemptId);
+  assert.equal(fresh.recovery_attempts[0]!.episode_id, episodeId);
+  assert.equal(fresh.recovery_attempts[0]!.strategy_cursor, 3);
+
+  const input = {
+    runId: "run-1" as const, token, itemId: "100", engine: "claude" as const,
+    action: "rebind_tester_evidence_after_pr" as const, candidateIdentity: "legacy-head",
+  };
+  const rebound = await startRecoveryAttempt(deps, persistedContract, input);
+  assert.equal(
+    ledgerEpisodesAreAuthoritative(rebound.ledger.recovery_attempts as unknown as Record<string, unknown>[], DEFAULT_RECOVERY_POLICY),
+    true,
+    JSON.stringify(rebound.ledger.recovery_attempts, null, 2),
+  );
+  const replay = await startRecoveryAttempt(deps, persistedContract, input);
+  assert.equal(rebound.attempt.episode_id, episodeId);
+  assert.equal(replay.attempt.attempt_id, rebound.attempt.attempt_id);
+  assert.equal(replay.ledger.recovery_attempts.length, 2);
+  assert.ok(replay.ledger.recovery_attempts.some((attempt) => attempt.attempt_id === historicalAttemptId));
+});
+
 test("malformed nested policy entries quarantine without throwing and validation matches compiler numeric semantics", async () => {
   const fractionalPolicy = {
     ...DEFAULT_RECOVERY_POLICY,

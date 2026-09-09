@@ -703,6 +703,7 @@ test("runPlanningPhases: applied OpenSpec refinement supplies the authoritative 
   let deltas = LIVING_DELTAS;
   const implementationPrompts: string[] = [];
   const revisionPrompts: string[] = [];
+  let reviewCalls = 0;
   const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
     listChangeDirs: () => ["fresh-change"],
     validateItem: async () => validItem(),
@@ -719,6 +720,13 @@ test("runPlanningPhases: applied OpenSpec refinement supplies the authoritative 
     { resumePlanReview: true },
     hooks,
     eqBaseDeps({
+      invokeReviewer: async () => ({
+        result: reviewCalls++ === 0
+          ? planReviewNeedsRevision
+          : { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+        effectiveReviewer: "codex",
+        selfReview: false,
+      }),
       invoke: async (_h: string, _dir: string, prompt: string) => {
         if (prompt.includes("Original implementation plan:")) {
           revisionPrompts.push(prompt);
@@ -750,6 +758,7 @@ test("runPlanningPhases: OpenSpec human-feedback acknowledgement is producer-aut
   let tasks = "- [ ] original task";
   const revisionPrompts: string[] = [];
   const implementationPrompts: string[] = [];
+  let reviewCalls = 0;
   const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
     listChangeDirs: () => ["fresh-change"],
     validateItem: async () => validItem(),
@@ -766,6 +775,13 @@ test("runPlanningPhases: OpenSpec human-feedback acknowledgement is producer-aut
     { resumePlanReview: true },
     hooks,
     eqBaseDeps({
+      invokeReviewer: async () => ({
+        result: reviewCalls++ === 0
+          ? planReviewNeedsRevision
+          : { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+        effectiveReviewer: "codex",
+        selfReview: false,
+      }),
       getIssueDetail: async () => ({
         title: "Test issue",
         body: "test body",
@@ -935,6 +951,84 @@ test("runPlanningPhases: acknowledged but unapplied OpenSpec refinement blocks b
   assert.equal(blocked?.tag, "openspec-invalid");
   assert.match(blocked?.reason ?? "", /acknowledged.*unchanged/i);
   assert.equal(implementationCalls, 0);
+});
+
+test("runPlanningPhases: unrelated OpenSpec edits do not prove the accepted proposal refinement was applied", async () => {
+  for (const variant of ["tasks-only", "proposal-only"] as const) {
+    let proposal = LIVING_PROPOSAL;
+    let tasks = "- [ ] original task";
+    let blocked: { reason: string; tag: string } | undefined;
+    let implementationCalls = 0;
+    const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+      listChangeDirs: () => ["fresh-change"],
+      validateItem: async () => validItem(),
+      readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+      readSpecDeltas: () => LIVING_DELTAS,
+    });
+    const result = await runPlanningPhases(
+      eqCfg, 42, "Test issue", "test body", "run-42", { resumePlanReview: true }, hooks,
+      eqBaseDeps({
+        setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+          blocked = { reason, tag };
+        },
+        invoke: async (_h: string, _dir: string, prompt: string) => {
+          if (prompt.includes("Original implementation plan:")) {
+            if (variant === "tasks-only") tasks = "- [ ] unrelated formatting cleanup";
+            else proposal = `${LIVING_PROPOSAL}\n\nUnrelated typo cleanup.`;
+          } else implementationCalls++;
+          return revisionOkResult;
+        },
+      }) as never,
+    );
+
+    assert.equal(result.advanced, false, variant);
+    assert.equal(blocked?.tag, "openspec-invalid", variant);
+    assert.match(blocked?.reason ?? "", /stable OpenSpec artifact bundle.*accepted refinement/i, variant);
+    assert.equal(implementationCalls, 0, variant);
+  }
+});
+
+test("runPlanningPhases: exact accepted-refinement binding advances a coherent OpenSpec revision", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let implementationCalls = 0;
+  let reviewCalls = 0;
+  let refinementReviewPrompt = "";
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+  const result = await runPlanningPhases(
+    eqCfg, 42, "Test issue", "test body", "run-42", { resumePlanReview: true }, hooks,
+    eqBaseDeps({
+      invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, prompt: string) => {
+        const firstReview = reviewCalls++ === 0;
+        if (!firstReview) refinementReviewPrompt = prompt;
+        return {
+          result: firstReview
+            ? planReviewNeedsRevision
+            : { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+          effectiveReviewer: "codex",
+          selfReview: false,
+        };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = `${LIVING_PROPOSAL}\n\nApplied the requested task expansion.`;
+          tasks = "- [ ] expanded implementation task";
+        } else implementationCalls++;
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(implementationCalls, 1);
+  assert.match(refinementReviewPrompt, /Expand the OpenSpec tasks/);
+  assert.match(refinementReviewPrompt, /Applied the requested task expansion/);
+  assert.match(refinementReviewPrompt, /expanded implementation task/);
 });
 
 test("runPlanningPhases: approved unchanged OpenSpec artifact remains valid (#1568)", async () => {

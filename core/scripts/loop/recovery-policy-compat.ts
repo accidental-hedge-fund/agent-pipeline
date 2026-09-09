@@ -250,6 +250,31 @@ export function normalizeRecoveryPolicyCompatibility(policy: unknown): unknown {
   return changed ? migrated : policy;
 }
 
+/** Rebase legacy episode cursors when the exact pre-#1468 workflow policy is
+ * upgraded with the Tester-rebind strategy. The new strategy must remain
+ * eligible, so cursors at or beyond its insertion point rewind to that point. */
+export function normalizeRecoveryLedgerCompatibility(value: unknown, policy: unknown): unknown {
+  if (!isPlainObject(value) || !Array.isArray(value.recovery_attempts) || !isPlainObject(policy)) {
+    return value;
+  }
+  const workflowEntry = policy["workflow-engine-defect"];
+  const pre1468 = STALE_DEFAULT_POLICY_ENTRIES["workflow-engine-defect"]?.at(-1);
+  if (!pre1468 || !samePolicyEntry(workflowEntry, pre1468)) return value;
+  let changed = false;
+  const recoveryAttempts = value.recovery_attempts.map((attempt) => {
+    if (
+      !isPlainObject(attempt) ||
+      (attempt.class !== "workflow-engine-defect" && attempt.invariant !== "workflow-engine-defect") ||
+      typeof attempt.strategy_cursor !== "number" ||
+      !Number.isInteger(attempt.strategy_cursor) ||
+      attempt.strategy_cursor < 3
+    ) return attempt;
+    changed = true;
+    return { ...attempt, strategy_cursor: 3 };
+  });
+  return changed ? { ...value, recovery_attempts: recoveryAttempts } : value;
+}
+
 export function effectiveRecoveryPolicyForLedgerValidation(policy: unknown): RecoveryPolicy | undefined {
   try {
     return compileRecoveryPolicy(normalizeRecoveryPolicyCompatibility(policy));

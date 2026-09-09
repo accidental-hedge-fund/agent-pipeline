@@ -501,10 +501,11 @@ export function createRepairPipelineItemExecutor(
             },
             base_ref: base,
             mutation_method: "recovery_repair" as const,
+            // Empty scope → any candidate-side map delta is scope_expansion.
             declared_scope: {
               paths: [] as string[],
               directories: [] as string[],
-              reason: "recovery_repair has no trusted structured finding paths",
+              reason: "recovery_repair",
             },
             resolveBaseSha: async () => {
               const r = await git(wt.path, ["rev-parse", `origin/${base}`], {

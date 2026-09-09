@@ -45,7 +45,10 @@ import {
   quarantinePathFor,
   RECOVERY_EPISODE_REQUIRED_FIELDS,
 } from "./recovery-episodes.ts";
-import { effectiveRecoveryPolicyForLedgerValidation } from "./recovery-policy-compat.ts";
+import {
+  effectiveRecoveryPolicyForLedgerValidation,
+  normalizeRecoveryLedgerCompatibility,
+} from "./recovery-policy-compat.ts";
 
 export const PIPELINE_STATE_HOME_ENV = "AGENT_PIPELINE_STATE_HOME";
 
@@ -379,6 +382,7 @@ async function quarantinePublished(
   reason: string,
   kind: "ledger" | "contract",
   recoveryPolicy?: RecoveryPolicy,
+  normalizeValue?: (value: unknown) => unknown,
 ): Promise<QuarantineEvidence> {
   const stamp = deps.now().toISOString();
   const quarantinePath = quarantinePathFor(publishedPath, stamp);
@@ -391,10 +395,14 @@ async function quarantinePublished(
   };
   const lastValidText = await deps.readTextFile(lastValidPathFor(publishedPath));
   if (lastValidText) {
-    const parsed = parseJsonObject(lastValidText);
+    const rawParsed = parseJsonObject(lastValidText);
+    const parsed = normalizeValue ? normalizeValue(rawParsed) : rawParsed;
     const ok = kind === "ledger" ? isLoopLedgerShape(parsed, recoveryPolicy) : isLoopContractShape(parsed);
     if (parsed !== undefined && ok) {
-      await deps.writeFileAtomic(publishedPath, lastValidText);
+      await deps.writeFileAtomic(
+        publishedPath,
+        parsed === rawParsed ? lastValidText : JSON.stringify(parsed, null, 2),
+      );
       evidence.reconstructed = true;
       return evidence;
     }
@@ -416,6 +424,7 @@ async function readPublishedDocument(
   kind: "ledger" | "contract",
   token?: string,
   recoveryPolicy?: RecoveryPolicy,
+  normalizeValue?: (value: unknown) => unknown,
 ): Promise<{ text: string; value: unknown; quarantine?: QuarantineEvidence }> {
   const names = await deps.listDir(path.dirname(publishedPath)).catch(() => [] as string[]);
   const basename = path.basename(publishedPath);
@@ -425,7 +434,8 @@ async function readPublishedDocument(
   if (text === null) {
     throw new LoopError("validation", `loop run document not found under ${publishedPath}`);
   }
-  const parsed = parseJsonObject(text);
+  const rawParsed = parseJsonObject(text);
+  const parsed = normalizeValue ? normalizeValue(rawParsed) : rawParsed;
   if (parsed !== undefined && documentShapeOk(kind, parsed, recoveryPolicy)) return { text, value: parsed };
   const schema = isPlainObject(parsed) && typeof parsed.schema === "string" ? parsed.schema : undefined;
   const supported = kind === "ledger" ? LOOP_LEDGER_SCHEMA : LOOP_CONTRACT_SCHEMA;
@@ -442,11 +452,13 @@ async function readPublishedDocument(
     parsed === undefined ? "truncated_or_invalid_json" : "schema_failure",
     kind,
     recoveryPolicy,
+    normalizeValue,
   );
   if (quarantine.reconstructed) {
     const restored = await deps.readTextFile(publishedPath);
     if (restored !== null) {
-      const restoredParsed = parseJsonObject(restored);
+      const rawRestoredParsed = parseJsonObject(restored);
+      const restoredParsed = normalizeValue ? normalizeValue(rawRestoredParsed) : rawRestoredParsed;
       if (restoredParsed !== undefined && documentShapeOk(kind, restoredParsed, recoveryPolicy)) {
         return { text: restored, value: restoredParsed, quarantine };
       }
@@ -624,9 +636,16 @@ export async function readLedger(deps: LoopStoreDeps, runId: string, token?: str
   if (text === null) {
     throw new LoopError("validation", `loop run "${runId}" ledger not found under ${dir}`);
   }
-  const parsed = parseJsonObject(text);
+  const parsed = normalizeRecoveryLedgerCompatibility(parseJsonObject(text), rawRecoveryPolicy);
   if (isLoopLedgerShape(parsed, recoveryPolicy)) return parsed;
-  const recovered = await readPublishedDocument(deps, ledgerPath(dir), "ledger", token, recoveryPolicy);
+  const recovered = await readPublishedDocument(
+    deps,
+    ledgerPath(dir),
+    "ledger",
+    token,
+    recoveryPolicy,
+    (value) => normalizeRecoveryLedgerCompatibility(value, rawRecoveryPolicy),
+  );
   return recovered.value as LoopLedger;
 }
 
@@ -636,22 +655,31 @@ export async function writeLedger(deps: LoopStoreDeps, ledger: LoopLedger, token
   await requireToken(deps, ledger.run_id, token);
   const contract = await readContract(deps, ledger.run_id, token);
   const recoveryPolicy = effectiveRecoveryPolicyForLedgerValidation(contract.recovery_policy) ?? contract.recovery_policy;
+  const effectiveLedger = normalizeRecoveryLedgerCompatibility(
+    ledger,
+    contract.recovery_policy,
+  ) as LoopLedger;
   const dir = runDir(deps, ledger.run_id);
   const dest = ledgerPath(dir);
   const current = await deps.readTextFile(dest);
-  const currentParsed = current ? parseJsonObject(current) : undefined;
-  if (isLoopLedgerShape(currentParsed, recoveryPolicy) && quarantineWaitBlocksMutation(currentParsed, ledger)) {
+  const currentRawParsed = current ? parseJsonObject(current) : undefined;
+  const currentParsed = normalizeRecoveryLedgerCompatibility(currentRawParsed, contract.recovery_policy);
+  if (isLoopLedgerShape(currentParsed, recoveryPolicy) && quarantineWaitBlocksMutation(currentParsed, effectiveLedger)) {
     throw new LoopError(
       "validation",
       `quarantined generation wait requires live reconciliation before mutation; evidence=${currentParsed.cooling?.quarantine_path ?? "missing"}`,
     );
   }
   if (current && isLoopLedgerShape(currentParsed, recoveryPolicy)) {
-    await publishLastValid(deps, dest, current);
+    await publishLastValid(
+      deps,
+      dest,
+      currentParsed === currentRawParsed ? current : JSON.stringify(currentParsed, null, 2),
+    );
   }
-  const content = JSON.stringify(ledger, null, 2);
+  const content = JSON.stringify(effectiveLedger, null, 2);
   await deps.writeFileAtomic(dest, content);
-  if (isLoopLedgerShape(ledger, recoveryPolicy)) {
+  if (isLoopLedgerShape(effectiveLedger, recoveryPolicy)) {
     await publishLastValid(deps, dest, content);
   }
 }
