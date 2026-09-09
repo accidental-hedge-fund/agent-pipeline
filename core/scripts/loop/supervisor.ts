@@ -767,29 +767,41 @@ async function refineRecoveryEvidenceFromLinkedAdvance(
     return persisted;
   }
   if (!Array.isArray(events) || events.length === 0) return persisted;
-  for (const event of events) {
-    const candidate = event as AdvanceStageEvent & {
-      run_id?: unknown;
-      pipeline_run_id?: unknown;
-      issue?: unknown;
-      item_id?: unknown;
-      candidate_epoch?: unknown;
-      candidate_sha?: unknown;
-    };
-    const currentHead = item.last_verified_identity?.head_sha.trim().toLowerCase() ?? "";
-    const currentEpoch = observedCandidateEpoch(item).toLowerCase();
-    if (
-      (candidate.run_id !== undefined && candidate.run_id !== linkedRunId) ||
-      (candidate.pipeline_run_id !== undefined && candidate.pipeline_run_id !== linkedRunId) ||
-      (candidate.issue !== undefined && String(candidate.issue) !== item.id) ||
-      (candidate.item_id !== undefined && String(candidate.item_id) !== item.id) ||
-      (candidate.candidate_epoch !== undefined &&
-        String(candidate.candidate_epoch).trim().toLowerCase() !== currentEpoch) ||
-      (candidate.candidate_sha !== undefined &&
-        String(candidate.candidate_sha).trim().toLowerCase() !== currentHead)
-    ) {
-      return persisted;
-    }
+  const candidate = [...events].reverse().find(
+    (event) => typeof event === "object" && event !== null && event.type === "blocker_set",
+  ) as
+    | (AdvanceStageEvent & {
+        run_id?: unknown;
+        pipeline_run_id?: unknown;
+        issue?: unknown;
+        item_id?: unknown;
+        candidate_epoch?: unknown;
+        candidate_sha?: unknown;
+      })
+    | undefined;
+  if (!candidate) return persisted;
+  const currentHead = item.last_verified_identity?.head_sha.trim().toLowerCase() ?? "";
+  const currentEpoch = observedCandidateEpoch(item).toLowerCase();
+  const eventRunIds = [candidate.run_id, candidate.pipeline_run_id].filter(
+    (value) => value !== undefined,
+  );
+  const eventItemIds = [candidate.issue, candidate.item_id].filter(
+    (value) => value !== undefined,
+  );
+  if (
+    eventRunIds.length === 0 ||
+    eventRunIds.some((runId) => typeof runId !== "string" || runId !== linkedRunId) ||
+    eventItemIds.length === 0 ||
+    eventItemIds.some(
+      (itemId) =>
+        (typeof itemId !== "string" && typeof itemId !== "number") || String(itemId) !== item.id,
+    ) ||
+    (candidate.candidate_epoch !== undefined &&
+      String(candidate.candidate_epoch).trim().toLowerCase() !== currentEpoch) ||
+    (candidate.candidate_sha !== undefined &&
+      String(candidate.candidate_sha).trim().toLowerCase() !== currentHead)
+  ) {
+    return persisted;
   }
   const resolution = lastStageDiagnosticFromEventsJsonl(
     events.map((event) => JSON.stringify(event)).join("\n"),
@@ -2566,25 +2578,28 @@ export async function runSupervisorCycle(
       ) return false;
       const policy = contract.recovery_policy[candidate.blocked_theme as DurableBlockerClass];
       if (!policy || policy.terminal_outcome === "human_authority") return false;
-      const attempts = ledger.recovery_attempts.filter(
-        (attempt) =>
-          attempt.item_id === candidate.id &&
-          attempt.class === candidate.blocked_theme &&
-          attempt.outcome !== "superseded",
-      );
-      const latest = attempts.at(-1);
-      const episode = latest?.invariant && latest.candidate_epoch && latest.evidence_identity
-        ? resumeEpisodeFromAttempts(ledger.recovery_attempts, {
-            operation: latest.operation ?? "loop_recovery",
-            invariant: latest.invariant,
-            candidate_epoch: latest.candidate_epoch,
-            evidence_identity: latest.evidence_identity,
-          })
-        : null;
-      if (!episode) {
+      const evidence = persistedRecoveryEvidence(candidate);
+      if (!evidence) {
         return (candidate.recovery_budgets_remaining[candidate.blocked_theme] ?? policy.retry_budget) <= 0;
       }
-      const evidence = persistedRecoveryEvidence(candidate);
+      const currentEpoch = observedCandidateEpoch(candidate);
+      const candidateIdentity = recoveryCandidateIdentity(contract, candidate, evidence.transport, 0);
+      const episodeKey = {
+        operation: "loop_recovery",
+        invariant: candidate.blocked_theme,
+        candidate_epoch: recoveryEpisodeCandidateEpoch(
+          candidate,
+          candidateIdentity.replace(/\|advance=.*$/i, ""),
+        ),
+        evidence_identity: recoveryProgressIdentityForBlockedItem(
+          candidate,
+          ledger.recovery_attempts,
+          evidence,
+          currentEpoch,
+        ),
+      };
+      const episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, episodeKey) ??
+        emptyEpisode(episodeKey, deps.store.now().toISOString());
       const selected = selectEligibleRecoveryStrategy({
         recipes: policy.recipes,
         cursor: episode.strategy_cursor,

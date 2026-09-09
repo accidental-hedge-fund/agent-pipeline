@@ -6623,9 +6623,19 @@ test("untrusted linked child events cannot confer a Tester-rebind diagnostic (#1
       events: [{ ...terminalEvent, run_id: "another-run" } as never],
     },
     {
+      name: "missing run identity",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...terminalEvent, run_id: undefined } as never],
+    },
+    {
       name: "item mismatch",
       eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
       events: [{ ...terminalEvent, issue: 999 } as never],
+    },
+    {
+      name: "missing item identity",
+      eventsPath: "/repo/.agent-pipeline/runs/advance-100/events.jsonl",
+      events: [{ ...terminalEvent, issue: undefined } as never],
     },
     {
       name: "candidate mismatch",
@@ -7770,6 +7780,56 @@ test("coexistence guard: an unavailable per-issue advance lock defers recovery w
   );
   assert.equal(deferred.length, 1);
   assert.equal((deferred[0] as any).data.reason, "recovery_deferred_advance_lock_busy");
+});
+
+test("lock-deferred recovery does not promote an exhausted old candidate episode under a new head (#1568)", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": {
+        ...workflowState,
+        recipes: ["resync_workflow_state"],
+        retry_budget: 1,
+      },
+    },
+  });
+  const ledger = testLedger({ "100": blockedRecoveryItem("100") });
+  const { deps } = await setup(contract, ledger);
+  let head = "a".repeat(40);
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:review-1"] };
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: head };
+    },
+  }).deps;
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const first = await runSupervisorCycle({
+    store: deps,
+    observe,
+    dispatchItem: async () => { throw new Error("blocked item must not redispatch"); },
+    executeRecovery: async () => ({ succeeded: false, evidence: "resync failed", error: "resync failed" }),
+  }, "run-1", token, "claude");
+  assert.equal(first.cooling?.candidate_epoch, head);
+
+  const oldCooling = first.cooling!;
+  head = "b".repeat(40);
+  const second = await runSupervisorCycle({
+    store: deps,
+    observe,
+    dispatchItem: async () => { throw new Error("blocked item must not redispatch"); },
+    executeRecovery: async () => { throw new Error("live advance must defer recovery"); },
+    probeLiveAdvance: () => ({ live: true as const, evidence: "lock_held" as const, holder_pid: 4242 }),
+  }, "run-1", token, "claude");
+
+  assert.equal(second.cooling, undefined, "old-epoch exhaustion cannot mint Cooling for the new head");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.cooling?.candidate_epoch, oldCooling.candidate_epoch);
+  assert.notEqual(finalLedger.cooling?.candidate_epoch, head);
+  assert.equal(finalLedger.recovery_attempts.length, 1, "the deferred new epoch remains unspent");
 });
 
 test("coexistence guard: the advance lock is acquired before the claim, held across the executor, and released even when the executor throws", async () => {
