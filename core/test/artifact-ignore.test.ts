@@ -41,7 +41,7 @@ function makeFakeFs(initial: string | null): { deps: ArtifactIgnoreDeps; get(): 
 // Contract (drift guard, #5.1/#5.3)
 // ---------------------------------------------------------------------------
 
-test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, control-attributions.jsonl, product-fault-reports.jsonl, handoffs/, outcomes/, lineage/, frg/, harness-ownership/, factory-release/, grill-proposal.key, and grill-proposals/ with non-empty comments", () => {
+test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, control-attributions.jsonl, product-fault-reports.jsonl, handoffs/, outcomes/, lineage/, frg/, harness-ownership/, factory-release/, release-publisher-recovery/, grill-proposal.key, and grill-proposals/ with non-empty comments", () => {
   const names = ARTIFACT_CONTRACT.map((e) => e.name);
   assert.deepEqual(names, [
     "runs",
@@ -56,6 +56,7 @@ test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, con
     "frg",
     "harness-ownership",
     "factory-release",
+    "release-publisher-recovery",
     "grill-proposal.key",
     "grill-proposals",
   ]);

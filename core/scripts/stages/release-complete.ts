@@ -9,6 +9,10 @@ import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import {
+  artifactSubdir,
+  RELEASE_PUBLISHER_RECOVERY_ARTIFACT,
+} from "../artifact-ignore.ts";
 import { primaryWorktreeFromPorcelain } from "../run-store.ts";
 import {
   observeProductionExactCandidateFrgPass,
@@ -84,6 +88,14 @@ export interface PublisherRunRow {
 export interface PublisherRecoveryObservation {
   exact_run_id: number | null;
   conclusion: "success" | "failure" | "pending";
+}
+
+export interface PublisherRecoveryEpisode {
+  schema_version: 1;
+  workflow: "release.yml";
+  tag: string;
+  candidate: string;
+  state: "dispatched";
 }
 
 export const TAGGED_STALE_C_MESSAGE =
@@ -566,6 +578,35 @@ export function assertReleaseManagedMetadataPaths(files: readonly string[]): voi
   }
 }
 
+function publisherRecoveryPath(repoDir: string, tag: string, candidate: string): string {
+  const id = createHash("sha256")
+    .update(`release.yml\n${tag}\n${candidate.toLowerCase()}`)
+    .digest("hex")
+    .slice(0, 32);
+  return path.join(artifactSubdir(repoDir, RELEASE_PUBLISHER_RECOVERY_ARTIFACT), `${id}.json`);
+}
+
+export function parsePublisherRecoveryEpisode(
+  raw: unknown,
+  expected: { tag: string; candidate: string },
+): PublisherRecoveryEpisode {
+  const candidate = exactOid(expected.candidate, `${expected.tag} publisher recovery candidate`);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`pipeline release: publisher recovery episode for ${expected.tag} at ${candidate} is malformed`);
+  }
+  const row = raw as Record<string, unknown>;
+  const storedCandidate = typeof row.candidate === "string"
+    ? exactOid(String(row.candidate), `${expected.tag} stored publisher recovery candidate`)
+    : "";
+  if (
+    row.schema_version !== 1 || row.workflow !== "release.yml" || typeof row.tag !== "string" ||
+    row.tag !== expected.tag || storedCandidate !== candidate || row.state !== "dispatched"
+  ) {
+    throw new Error(`pipeline release: publisher recovery episode for ${expected.tag} at ${candidate} is malformed`);
+  }
+  return { schema_version: 1, workflow: "release.yml", tag: expected.tag, candidate, state: "dispatched" };
+}
+
 /** Production adapter. Tests inject the complete seam and never touch git/GitHub. */
 export function realCompleteReleaseDeps(
   cfg: { repo_dir: string; repo: string; base_branch?: string },
@@ -574,6 +615,12 @@ export function realCompleteReleaseDeps(
     wait?: (ms: number) => Promise<void>;
     publicationAttempts?: number;
     dispatchObserveAttempts?: number;
+    loadPublisherRecoveryEpisode?: (key: {
+      workflow: "release.yml";
+      tag: string;
+      candidate: string;
+    }) => Promise<PublisherRecoveryEpisode | null>;
+    persistPublisherRecoveryEpisode?: (episode: PublisherRecoveryEpisode) => Promise<void>;
     finishReleasePr?: (
       pr: number,
       expected: { pr: number; version: string; base: string; head_oid: string },
@@ -598,6 +645,41 @@ export function realCompleteReleaseDeps(
       `repos/${repository}/actions/workflows/release.yml/runs?per_page=100&head_sha=${sha}`,
     ])) as unknown;
     return parsePublisherWorkflowRunPages(raw, tag);
+  }
+  async function defaultLoadPublisherRecoveryEpisode(key: {
+    workflow: "release.yml";
+    tag: string;
+    candidate: string;
+  }): Promise<unknown> {
+    try {
+      return JSON.parse(await fs.promises.readFile(publisherRecoveryPath(repoDir, key.tag, key.candidate), "utf8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+  async function loadPublisherRecoveryEpisode(tag: string, candidate: string): Promise<PublisherRecoveryEpisode | null> {
+    const key = { workflow: "release.yml" as const, tag, candidate: exactOid(candidate, `${tag} publisher recovery candidate`) };
+    const raw = io.loadPublisherRecoveryEpisode
+      ? await io.loadPublisherRecoveryEpisode(key)
+      : await defaultLoadPublisherRecoveryEpisode(key);
+    if (raw == null) return null;
+    return parsePublisherRecoveryEpisode(raw, key);
+  }
+  async function persistPublisherRecoveryEpisode(episode: PublisherRecoveryEpisode): Promise<void> {
+    if (io.persistPublisherRecoveryEpisode) {
+      await io.persistPublisherRecoveryEpisode(episode);
+    } else {
+      const dest = publisherRecoveryPath(repoDir, episode.tag, episode.candidate);
+      await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+      const tmp = `${dest}.tmp.${process.pid}`;
+      await fs.promises.writeFile(tmp, `${JSON.stringify(episode)}\n`, "utf8");
+      await fs.promises.rename(tmp, dest);
+    }
+    const readBack = await loadPublisherRecoveryEpisode(episode.tag, episode.candidate);
+    if (!readBack || readBack.tag !== episode.tag || readBack.candidate !== episode.candidate || readBack.state !== "dispatched") {
+      throw new Error(`pipeline release: publisher recovery episode for ${episode.tag} at ${episode.candidate} failed read-back`);
+    }
   }
   return {
     log: console.error,
@@ -894,10 +976,20 @@ export function realCompleteReleaseDeps(
       }
       const head = exactOid(await this.observeOriginHead(base), `origin/${base}`);
       if (head !== candidate) throw new Error(TAGGED_STALE_C_MESSAGE);
-      await gh([
-        "workflow", "run", "release.yml", "--repo", repository, "--ref", tag,
-        "-f", `tag=${tag}`, "-f", `candidate=${candidate}`,
-      ]);
+      const episode = await loadPublisherRecoveryEpisode(tag, candidate);
+      if (!episode) {
+        await persistPublisherRecoveryEpisode({
+          schema_version: 1,
+          workflow: "release.yml",
+          tag,
+          candidate: exactOid(candidate, `${tag} publisher recovery candidate`),
+          state: "dispatched",
+        });
+        await gh([
+          "workflow", "run", "release.yml", "--repo", repository, "--ref", tag,
+          "-f", `tag=${tag}`, "-f", `candidate=${candidate}`,
+        ]);
+      }
       for (let attempt = 1; attempt <= dispatchObserveAttempts; attempt++) {
         await waitFn(RELEASE_PUBLICATION_WAIT_MS);
         const observed = classifyPublisherRuns(await loadExactPublisherRuns(tag, candidate), tag, candidate);

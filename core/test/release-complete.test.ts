@@ -14,6 +14,7 @@ import {
   type CompleteReleaseDeps,
   type CompleteReleaseMilestone,
   type ObservedMetadataRelease,
+  type PublisherRecoveryEpisode,
 } from "../scripts/stages/release-complete.ts";
 import type { ExactCandidateFrgRecord } from "../scripts/exact-candidate-frg.ts";
 
@@ -569,6 +570,19 @@ function restPublisherPages(rows: unknown[]): string {
   return JSON.stringify([{ total_count: workflow_runs.length, workflow_runs }]);
 }
 
+function memoryPublisherRecovery() {
+  const records = new Map<string, PublisherRecoveryEpisode>();
+  const keyOf = (tag: string, candidate: string) => `release.yml\0${tag}\0${candidate.toLowerCase()}`;
+  return {
+    async loadPublisherRecoveryEpisode(key: { workflow: "release.yml"; tag: string; candidate: string }) {
+      return records.get(keyOf(key.tag, key.candidate)) ?? null;
+    },
+    async persistPublisherRecoveryEpisode(episode: PublisherRecoveryEpisode) {
+      records.set(keyOf(episode.tag, episode.candidate), { ...episode });
+    },
+  };
+}
+
 function publisherCommand(tag: string, notes: string, state: { runs: unknown[]; ghCalls: string[] }) {
   return async (_cwd: string, file: string, args: string[]) => {
     const joined = args.join(" ");
@@ -595,6 +609,7 @@ test("publisher recovery dispatches once when remote runs are absent and reruns 
   const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
     wait: async () => {},
     dispatchObserveAttempts: 2,
+    ...memoryPublisherRecovery(),
     command: async (cwd, file, args) => {
       const result = await publisherCommand(tag, notes, state)(cwd, file, args);
       if (file === "gh" && args[0] === "workflow") {
@@ -717,6 +732,7 @@ test("publisher recovery waits for delayed run visibility and does not dispatch 
   const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
     wait: async () => {},
     dispatchObserveAttempts: 4,
+    ...memoryPublisherRecovery(),
     command: async (_cwd, file, args) => {
       const joined = args.join(" ");
       if (file === "gh") ghCalls.push(joined);
@@ -756,6 +772,7 @@ test("publisher recovery fails closed when a dispatch never becomes observable",
   const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
     wait: async () => {},
     dispatchObserveAttempts: 2,
+    ...memoryPublisherRecovery(),
     command: async (cwd, file, args) => {
       if (file === "gh" && args[0] === "workflow") dispatches++;
       return publisherCommand(tag, notes, { runs: [], ghCalls: [] })(cwd, file, args);
@@ -763,6 +780,57 @@ test("publisher recovery fails closed when a dispatch never becomes observable",
   });
   await assert.rejects(() => adapter.recoverPublication(tag, C), /did not become an observable exact-identity/);
   assert.equal(dispatches, 1);
+});
+
+test("publisher recovery does not re-dispatch on a fresh invocation after an unobserved dispatch", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  const store = memoryPublisherRecovery();
+  let dispatches = 0;
+  const command = async (cwd: string, file: string, args: string[]) => {
+    if (file === "gh" && args[0] === "workflow") dispatches++;
+    return publisherCommand(tag, notes, { runs: [], ghCalls: [] })(cwd, file, args);
+  };
+  const first = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    dispatchObserveAttempts: 2,
+    ...store,
+    command,
+  });
+  await assert.rejects(() => first.recoverPublication(tag, C), /did not become an observable exact-identity/);
+  assert.equal(dispatches, 1);
+
+  const second = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    dispatchObserveAttempts: 2,
+    ...store,
+    command,
+  });
+  await assert.rejects(() => second.recoverPublication(tag, C), /did not become an observable exact-identity/);
+  assert.equal(dispatches, 1);
+});
+
+test("publisher recovery persists the episode before dispatch and does not dispatch when persist fails", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  let dispatches = 0;
+  let persisted = false;
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    dispatchObserveAttempts: 2,
+    async loadPublisherRecoveryEpisode() { return null; },
+    async persistPublisherRecoveryEpisode() {
+      persisted = true;
+      throw new Error("pipeline release: publisher recovery episode disk full");
+    },
+    command: async (cwd, file, args) => {
+      if (file === "gh" && args[0] === "workflow") dispatches++;
+      return publisherCommand(tag, notes, { runs: [], ghCalls: [] })(cwd, file, args);
+    },
+  });
+  await assert.rejects(() => adapter.recoverPublication(tag, C), /disk full/);
+  assert.equal(persisted, true);
+  assert.equal(dispatches, 0);
 });
 
 test("publication loop does not re-dispatch while the recovery run remains unlisted", async () => {
@@ -773,6 +841,7 @@ test("publication loop does not re-dispatch while the recovery run remains unlis
   const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
     wait: async () => {},
     dispatchObserveAttempts: 4,
+    ...memoryPublisherRecovery(),
     command: async (_cwd, file, args) => {
       const joined = args.join(" ");
       if (file === "gh" && isPublisherRunList(args)) {
