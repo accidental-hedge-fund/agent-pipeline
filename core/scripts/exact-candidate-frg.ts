@@ -19,7 +19,7 @@ import {
 } from "./ship-end-candidate.ts";
 import { PIPELINE_SUPPRESS_AUTO_FILE_ENV } from "./stages/papercut.ts";
 import { resolveConfig } from "./config.ts";
-import { closeIssue, closePr, createIssue, getGhActor, getIssueDetail, getPrCommits, getPrDetail, getPrDiff, listOpenPrsForIssue, listPrsForIssueAnyState } from "./gh.ts";
+import { createIssue, getGhActor, getIssueDetail, getPrCommits, getPrDetail, getPrDiff, listOpenPrsForIssue, listPrsForIssueAnyState } from "./gh.ts";
 import { defaultLoopStoreDeps, readContract, readLedger, readLoopRunHandoff, runExists as loopRunExists } from "./loop/store.ts";
 import { LOOP_RUN_HANDOFF_KIND, type LoopRunHandoff } from "./loop/handoff.ts";
 import { isDurableLoopRunHandoff, PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR_ENV, PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV } from "./loop/pack-loop-liveness.ts";
@@ -214,6 +214,17 @@ export interface ExactCandidateFrgCleanupFact {
   observed_at: string;
 }
 
+export interface ExactCandidateFailedSyntheticClassification {
+  classified_at: string;
+  classification: "known_failed_synthetic";
+}
+
+const FAILED_SYNTHETIC_CLEANUP_OUTCOMES = ["gate_defect", "exact_candidate_regression", "stale_candidate"] as const;
+
+function isFailedSyntheticCleanupOutcome(outcome: ExactCandidateFrgOutcome): outcome is (typeof FAILED_SYNTHETIC_CLEANUP_OUTCOMES)[number] {
+  return (FAILED_SYNTHETIC_CLEANUP_OUTCOMES as readonly ExactCandidateFrgOutcome[]).includes(outcome);
+}
+
 export interface ExactCandidateFrgGateEvidence {
   source: "controller" | "forge" | "run_store" | "review" | "tester";
   slot_id: ExactCandidateFrgSlotId | null;
@@ -255,6 +266,7 @@ export interface ExactCandidateFrgRecord {
   external_wait: { probe: string; wake_condition: string } | null;
   cleanup: ExactCandidateFrgCleanupFact[];
   cleanup_debt: boolean;
+  failed_synthetic?: ExactCandidateFailedSyntheticClassification | null;
   reconciliation_evidence?: RemoteFixtureMatch[];
   gate_evidence?: ExactCandidateFrgGateEvidence[];
   created_at: string;
@@ -355,8 +367,6 @@ export interface ProductionExactCandidateFrgIo {
   listPrsAnyState(input: BeginExactCandidateFrgInput, issueNumber: number): Promise<{ numbers: number[]; truncated: boolean }>;
   listOpenPrs(input: BeginExactCandidateFrgInput, issueNumber: number): Promise<number[]>;
   getPr(input: BeginExactCandidateFrgInput, prNumber: number): Promise<{ number: number; head_sha: string; base_ref: string; state: string; merged: boolean }>;
-  closeIssue?(issueNumber: number): Promise<void>;
-  closePr?(prNumber: number): Promise<void>;
   deleteBranch?(name: string): Promise<void>;
   observeBranch?(name: string): Promise<{ name: string; sha: string } | null>;
   observeWorktree?(worktreePath: string): Promise<{ path: string; owned: boolean; identity?: string } | null>;
@@ -758,6 +768,15 @@ export function parseExactCandidateFrgRecord(value: unknown): ExactCandidateFrgR
     canonicalIso(fact.observed_at, `cleanup[${index}].observed_at`);
   }
   if (record.cleanup_debt !== record.cleanup.some((fact) => fact.status === "debt")) throw new Error("cleanup debt does not match cleanup facts");
+  if (record.failed_synthetic !== undefined && record.failed_synthetic !== null) {
+    canonicalIso(record.failed_synthetic.classified_at, "failed_synthetic.classified_at");
+    if (record.failed_synthetic.classification !== "known_failed_synthetic") {
+      throw new Error("failed_synthetic.classification is malformed");
+    }
+    if (!isFailedSyntheticCleanupOutcome(record.outcome)) {
+      throw new Error("failed synthetic classification cannot apply to this outcome");
+    }
+  }
   if (record.reconciliation_evidence !== undefined) {
     if (!Array.isArray(record.reconciliation_evidence)) throw new Error("reconciliation evidence is malformed");
     for (const evidence of record.reconciliation_evidence) {
@@ -1211,6 +1230,13 @@ async function persistOutcome(
   record.outcome_detail = detail;
   record.external_wait = wait;
   record.updated_at = iso(deps.now());
+  if (isFailedSyntheticCleanupOutcome(outcome)) {
+    if (record.failed_synthetic == null) {
+      record.failed_synthetic = { classified_at: record.updated_at, classification: "known_failed_synthetic" };
+    }
+  } else {
+    record.failed_synthetic = null;
+  }
   await deps.persist(record);
   return record;
 }
@@ -1517,12 +1543,14 @@ export interface OwnedSyntheticCleanupIo {
   now(): Date;
   getIssue(issueNumber: number): Promise<{ body: string; labels: string[]; state: "open" | "closed" }>;
   getPr?(prNumber: number): Promise<{ number: number; head_sha: string; state: string; merged: boolean }>;
-  closeIssue?(issueNumber: number): Promise<void>;
-  closePr?(prNumber: number): Promise<void>;
   observeBranch?(name: string): Promise<{ name: string; sha: string } | null>;
   deleteBranch?(name: string): Promise<void>;
   observeWorktree?(worktreePath: string): Promise<{ path: string; owned: boolean; identity?: string } | null>;
   deleteOwnedWorktree?(worktreePath: string): Promise<void>;
+}
+
+function isPersistedFailedSynthetic(record: ExactCandidateFrgRecord): boolean {
+  return record.failed_synthetic?.classification === "known_failed_synthetic";
 }
 
 function recordedFixtureBranch(issueNumber: number): string {
@@ -1544,8 +1572,11 @@ function issueIdentityMatches(record: ExactCandidateFrgRecord, slot: ExactCandid
 
 /**
  * Ownership-safe cleanup of known failed synthetic artifacts.
- * Mutates only identities that still match recorded provenance.
- * Simulated test results prove product behavior only; they are not operator live cleanup.
+ * Mutates only identities that still match recorded provenance after an
+ * explicit persisted failed-synthetic classification. GitHub issue/PR close
+ * cannot enforce observed provenance atomically, so those targets become
+ * cleanup debt. Simulated test results prove product behavior only; they
+ * are not operator live cleanup.
  */
 export async function cleanupOwnedFailedSyntheticArtifacts(
   record: ExactCandidateFrgRecord,
@@ -1560,6 +1591,21 @@ export async function cleanupOwnedFailedSyntheticArtifacts(
     push(target, "debt", detail);
   };
 
+  if (!isPersistedFailedSynthetic(record)) {
+    for (const slot of record.slots) {
+      const issueNumber = slot.issue_number;
+      if (issueNumber === null) {
+        debtWithoutMutation(`issue:unknown`, "slot has no recorded issue identity; no mutation attempted");
+        continue;
+      }
+      debtWithoutMutation(`issue:${issueNumber}`, "record is not a persisted known failed synthetic artifact; no mutation attempted");
+      if (slot.pr_number !== null) {
+        debtWithoutMutation(`pr:${slot.pr_number}`, "record is not a persisted known failed synthetic artifact; no mutation attempted");
+      }
+    }
+    return facts;
+  }
+
   for (const slot of record.slots) {
     const issueNumber = slot.issue_number;
     if (issueNumber === null) {
@@ -1573,11 +1619,8 @@ export async function cleanupOwnedFailedSyntheticArtifacts(
         debtWithoutMutation(issueTarget, "recorded synthetic identity no longer matches; no mutation attempted");
       } else if (issue.state === "closed") {
         push(issueTarget, "cleaned", "owned fixture issue already closed; no mutation");
-      } else if (!io.closeIssue) {
-        debtWithoutMutation(issueTarget, "ownership-safe cleanup requires a conditional remote mutation; no mutation attempted");
       } else {
-        await io.closeIssue(issueNumber);
-        push(issueTarget, "cleaned", "closed owned failed synthetic issue after identity match");
+        debtWithoutMutation(issueTarget, "ownership-safe cleanup requires a conditional remote mutation; GitHub close cannot enforce observed provenance atomically; no mutation attempted");
       }
     } catch (error) {
       debtWithoutMutation(issueTarget, `issue identity uncertain: ${(error as Error).message}; no mutation attempted`);
@@ -1596,11 +1639,8 @@ export async function cleanupOwnedFailedSyntheticArtifacts(
             debtWithoutMutation(prTarget, "recorded synthetic PR identity no longer matches; no mutation attempted");
           } else if (pr.state !== "open") {
             push(prTarget, "cleaned", "owned fixture PR already closed; no mutation");
-          } else if (!io.closePr) {
-            debtWithoutMutation(prTarget, "ownership-safe cleanup requires a conditional remote mutation; no mutation attempted");
           } else {
-            await io.closePr(prNumber);
-            push(prTarget, "cleaned", "closed owned failed synthetic PR after identity match");
+            debtWithoutMutation(prTarget, "ownership-safe cleanup requires a conditional remote mutation; GitHub close cannot enforce observed provenance atomically; no mutation attempted");
           }
         } catch (error) {
           debtWithoutMutation(prTarget, `PR identity uncertain: ${(error as Error).message}; no mutation attempted`);
@@ -2065,8 +2105,6 @@ export function defaultProductionExactCandidateFrgIo(
       const pr = await getPrDetail(cfg, prNumber);
       return { number: pr.number, head_sha: pr.head_sha, base_ref: pr.base_ref, state: pr.state, merged: pr.state === "merged" || pr.merge_commit_sha !== null };
     },
-    closeIssue: (issueNumber) => closeIssue(cfg, issueNumber, "ownership-safe cleanup of failed exact-candidate FRG fixture"),
-    closePr: (prNumber) => closePr(cfg, prNumber, "ownership-safe cleanup of failed exact-candidate FRG fixture"),
     async getRequiredChecks(_input, prNumber) {
       try {
         return JSON.parse(await commandOutput("gh", ["pr", "checks", String(prNumber), "--required", "--json", "name,bucket", "-R", input.repository], input.repoDir)) as RequiredCheck[];
@@ -2436,8 +2474,6 @@ export function createProductionExactCandidateFrgDeps(
       now: () => io.now(),
       getIssue: (issueNumber) => io.getIssue(input, issueNumber),
       getPr: io.getPr ? (prNumber) => io.getPr(input, prNumber) : undefined,
-      closeIssue: io.closeIssue,
-      closePr: io.closePr,
       observeBranch: io.observeBranch,
       deleteBranch: io.deleteBranch,
       observeWorktree: io.observeWorktree,
