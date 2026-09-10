@@ -349,7 +349,7 @@ Operator heal if the docs step failed:
 node scripts/release-docs-refresh.mjs --version X.Y.Z --push
 ```
 
-The bounded `pipeline release prepare <version>` helper only prepares metadata; it cannot merge, tag, or publish. Direct `pipeline release <version>` completes through verified non-draft publication.
+The bounded `pipeline release prepare <version>` helper only prepares metadata; it cannot merge, tag, or publish. Direct-release `pipeline release <version>` completes the SemVer contract through verified non-draft publication. SemVer `pipeline ship --milestone` uses ship-final-delegation to that same command. Neither path deploys, promotes, or installs. Historical optional-FRG, `release finish` as a tag or publish owner, and ship-promotion are not the live procedure.
 
 Git cannot atomically create a tag and assert that an unrelated protected `main` ref remains candidate C. Release observes `origin/main = C` immediately before the non-force tag create, re-fetches the remote tag, and has `release.yml` re-check tag identity and `origin/main = C` before publication. Observable movement fails closed as tagged-stale-C. Tags are never force-moved or deleted. The remaining main-observation/tag-create and workflow-observation/publication windows are an unavoidable distributed race, not compare-and-swap atomicity.
 
@@ -461,6 +461,6 @@ Local-only artifact paths (must stay gitignored): `.agent-pipeline/runs/`, `.age
 
 Full stage inventory lives in living specs and engine `STAGES`, not in the generated SKILL. Label-inventory terminals are exactly `TERMINAL_STAGES` = `{ready-to-deploy, needs-human}`. `needs-human` projects a current typed-input wait; it is not lifecycle cancellation. Mechanical exhaustion is Cooling. Loop selectors are documented above; see [cli.md](cli.md) for the generated verb inventory.
 
-Release-plan rows live in `ROADMAP.md`. Columns: Release, Bump, Theme, Issues, Why. The unshipped row shape is `| **vX.Y.Z** | bump | theme | issues | why |`. `pipeline release prepare <version>` prepares metadata from the matching milestone; direct `pipeline release <version>` completes the verified release. Release scaffolds a missing unshipped row when the `| *(none)* |` insert sentinel is present, or fails with remediation (file, copy-paste row, restore the sentinel) when it is not. `Ship milestone vX.Y.Z` maps to `pipeline ship --milestone vX.Y.Z` and delegates its SemVer tail once.
+Release-plan rows live in `ROADMAP.md`. Columns: Release, Bump, Theme, Issues, Why. The unshipped row shape is `| **vX.Y.Z** | bump | theme | issues | why |`. `pipeline release prepare <version>` prepares metadata from the matching milestone; direct-release `pipeline release <version>` completes the verified release. SemVer ship completion is ship-final-delegation to that command. Release scaffolds a missing unshipped row when the `| *(none)* |` insert sentinel is present, or fails with remediation (file, copy-paste row, restore the sentinel) when it is not. `Ship milestone vX.Y.Z` maps to `pipeline ship --milestone vX.Y.Z` and delegates its SemVer tail once.
 
 True-fast commands (`status`, `doctor`, read-only `pipeline loop --audit`) complete in seconds and need no Monitor. `status` completes in seconds. Loop drive/resume and `pipeline train` do not.

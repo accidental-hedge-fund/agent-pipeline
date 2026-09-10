@@ -106,7 +106,9 @@ The pipeline advances the issue through planning, implementation, cross-harness 
 An external supervisor (chat bot, host agent, or shell automation) may compose the
 existing Pipeline CLI: `pipeline single`, `pipeline train`, `pipeline loop`,
 `pipeline merge`, `pipeline merge-queue --apply`, `pipeline ship --milestone`,
-`pipeline release`, and related read-only commands. This repository does **not** ship a Hermes/Buzz/Slack factory
+`pipeline release`, and related read-only commands. Independent `pipeline release VERSION`
+is direct-release. SemVer `pipeline ship --milestone` uses ship-final-delegation to
+that command. Neither path deploys, promotes, or installs. This repository does **not** ship a Hermes/Buzz/Slack factory
 control plane, grant schema, or second durable scheduler.
 
 Ordinary `pipeline advance`, `pipeline single`, and `pipeline loop` still stop at

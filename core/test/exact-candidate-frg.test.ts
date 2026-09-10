@@ -34,6 +34,8 @@ import {
   renderExactCandidateFrgFixtureBody,
   withReleaseFrgExclusion,
   verifyExactCandidateFrgResult,
+  cleanupOwnedFailedSyntheticArtifacts,
+  isHistoricalFailedShipEvidencePath,
   type ExactCandidateFrgDeps,
   type ExactCandidateFrgObservation,
   type ExactCandidateFrgRecord,
@@ -875,7 +877,6 @@ test("production cleanup records deterministic debt when the remote has no condi
   const { record } = await begun();
   record.loop_run_id = CANONICAL_LOOP;
   record.loop_dispatch_certainty = "known_complete";
-  const mutations: string[] = [];
   record.slots.forEach((slot, index) => {
     slot.issue_number = 101 + index;
     slot.create_certainty = "known_complete";
@@ -887,17 +888,164 @@ test("production cleanup records deterministic debt when the remote has no condi
   const io = {
     now: () => new Date("2026-09-08T20:10:00.000Z"),
     readFile: async (file: string) => candidateTemplateForPath(file),
-    getIssue: async () => { mutations.push("getIssue"); throw new Error("cleanup must not probe a mutable remote without CAS"); },
+    getIssue: async (_input: unknown, issueNumber: number) => {
+      const slot = record.slots.find((item) => item.issue_number === issueNumber)!;
+      return { body: templateBodyForTest(record, slot), labels: ["pipeline:ready-to-deploy"], state: "open" as const };
+    },
     listPrsAnyState: async (_input: unknown, issue: number) => ({ numbers: [issue + 200], truncated: false }),
     listOpenPrs: async () => [],
-    getPr: async () => { throw new Error("cleanup must not inspect then mutate"); },
+    getPr: async (_input: unknown, prNumber: number) => {
+      const slot = record.slots.find((item) => item.pr_number === prNumber)!;
+      return { number: prNumber, head_sha: slot.pr_head_sha!, base_ref: record.base_branch, state: "open", merged: false };
+    },
   } as unknown as ProductionExactCandidateFrgIo;
   const deps = createProductionExactCandidateFrgDeps({ repoDir: "/operator", repository: record.repository,
     baseBranch: record.base_branch, releaseVersion: record.release_version }, io);
   const facts = await deps.cleanup!(record);
-  assert.deepEqual(facts.map((fact) => fact.status), ["debt", "debt"]);
-  assert.ok(facts.every((fact) => /conditional remote mutation/.test(fact.detail)));
-  assert.deepEqual(mutations, [], "safe debt performs no remote read-then-close mutation");
+  assert.ok(facts.every((fact) => fact.status === "debt"));
+  assert.ok(facts.some((fact) => /conditional remote mutation/.test(fact.detail)));
+});
+
+function ownedCleanupRecord(): ExactCandidateFrgRecord {
+  return {
+    slots: [
+      {
+        id: "clean-docs",
+        issue_number: 101,
+        provenance_id: "prov-docs",
+        pr_number: 301,
+        pr_head_sha: "1".repeat(40),
+      },
+      {
+        id: "clean-openspec",
+        issue_number: 102,
+        provenance_id: "prov-openspec",
+        pr_number: 302,
+        pr_head_sha: "2".repeat(40),
+      },
+    ],
+    epoch_id: "frg-1.40.1-aaaaaaaaaaaa",
+    candidate: { sha: CANDIDATE },
+  } as ExactCandidateFrgRecord;
+}
+
+function provenanceBody(record: ExactCandidateFrgRecord, slot: ExactCandidateFrgRecord["slots"][number]): string {
+  return `<!-- pipeline-exact-frg:v1 epoch=${record.epoch_id} candidate=${record.candidate.sha} slot=${slot.id} provenance=${slot.provenance_id} -->\nfixture`;
+}
+
+test("owned failed synthetic identity can be cleaned after identity match", async () => {
+  const record = ownedCleanupRecord();
+  const closed: string[] = [];
+  const facts = await cleanupOwnedFailedSyntheticArtifacts(record, {
+    now: () => new Date("2026-09-10T00:00:00.000Z"),
+    getIssue: async (issueNumber) => {
+      const slot = record.slots.find((item) => item.issue_number === issueNumber)!;
+      return { body: provenanceBody(record, slot), labels: ["factory-gate"], state: "open" };
+    },
+    getPr: async (prNumber) => {
+      const slot = record.slots.find((item) => item.pr_number === prNumber)!;
+      return { number: prNumber, head_sha: slot.pr_head_sha!, state: "open", merged: false };
+    },
+    closeIssue: async (issueNumber) => { closed.push(`issue:${issueNumber}`); },
+    closePr: async (prNumber) => { closed.push(`pr:${prNumber}`); },
+    observeBranch: async (name) => {
+      const issueNumber = Number(name.match(/pipeline\/(\d+)-frg/)?.[1]);
+      const slot = record.slots.find((item) => item.issue_number === issueNumber)!;
+      return { name, sha: slot.pr_head_sha! };
+    },
+    deleteBranch: async (name) => { closed.push(`branch:${name}`); },
+    observeWorktree: async (worktreePath) => {
+      const issueNumber = Number(worktreePath.match(/pipeline-(\d+)-frg/)?.[1]);
+      return { path: worktreePath, owned: true, identity: `issue:${issueNumber}` };
+    },
+    deleteOwnedWorktree: async (worktreePath) => { closed.push(`worktree:${worktreePath}`); },
+  });
+  assert.deepEqual(closed, [
+    "issue:101", "pr:301", "branch:pipeline/101-frg", "worktree:.worktrees/pipeline-101-frg",
+    "issue:102", "pr:302", "branch:pipeline/102-frg", "worktree:.worktrees/pipeline-102-frg",
+  ]);
+  assert.ok(facts.every((fact) => fact.status === "cleaned"));
+  assert.ok(!facts.some((fact) => /operator completed live cleanup/i.test(fact.detail)));
+});
+
+test("unrelated issues, pull requests, and user worktrees stay unchanged with cleanup debt", async () => {
+  const record = ownedCleanupRecord();
+  const closed: string[] = [];
+  const facts = await cleanupOwnedFailedSyntheticArtifacts(record, {
+    now: () => new Date("2026-09-10T00:00:00.000Z"),
+    getIssue: async (issueNumber) => ({
+      body: `unrelated issue #${issueNumber} without exact-frg provenance`,
+      labels: ["bug"],
+      state: "open",
+    }),
+    getPr: async (prNumber) => ({
+      number: prNumber + 50,
+      head_sha: "9".repeat(40),
+      state: "open",
+      merged: false,
+    }),
+    closeIssue: async (issueNumber) => { closed.push(`issue:${issueNumber}`); },
+    closePr: async (prNumber) => { closed.push(`pr:${prNumber}`); },
+    observeBranch: async (name) => ({ name, sha: "9".repeat(40) }),
+    deleteBranch: async (name) => { closed.push(`branch:${name}`); },
+    observeWorktree: async (worktreePath) => ({
+      path: "/home/user/.worktrees/feat-other",
+      owned: false,
+      identity: "user",
+    }),
+    deleteOwnedWorktree: async (worktreePath) => { closed.push(`worktree:${worktreePath}`); },
+  });
+  assert.deepEqual(closed, []);
+  assert.ok(facts.every((fact) => fact.status === "debt"));
+  assert.ok(facts.some((fact) => fact.target.startsWith("issue:") && /no longer matches/.test(fact.detail)));
+  assert.ok(facts.some((fact) => fact.target.startsWith("pr:") && /no longer matches/.test(fact.detail)));
+  assert.ok(facts.some((fact) => fact.target.startsWith("worktree:") && /not the recorded owned synthetic worktree/.test(fact.detail)));
+});
+
+test("historical HMAC latest.json is not current-candidate authority", async () => {
+  assert.equal(isHistoricalFailedShipEvidencePath(".agent-pipeline/frg/1.40.1/latest.json"), true);
+  assert.equal(isHistoricalFailedShipEvidencePath("/repo/.agent-pipeline/frg/1.39.0/attestor.json"), true);
+  assert.equal(isHistoricalFailedShipEvidencePath(".agent-pipeline/frg/exact-pair/frg-1.40.1-aaaaaaaaaaaa.json"), false);
+  const { record, deps, persisted } = await begun();
+  const reads: string[] = [];
+  const originalRead = deps.readCandidateFile;
+  deps.readCandidateFile = async (file) => {
+    reads.push(file);
+    assert.equal(isHistoricalFailedShipEvidencePath(file), false, `current proof must not read ${file}`);
+    return originalRead(file);
+  };
+  record.loop_run_id = CANONICAL_LOOP;
+  record.loop_dispatch_certainty = "known_complete";
+  record.slots.forEach((slot, index) => {
+    slot.issue_number = 101 + index;
+    slot.create_certainty = "known_complete";
+    slot.advance_run_id = `advance-${index + 1}`;
+  });
+  const result = await observeExactCandidateFrgPair(record, deps);
+  assert.equal(result.outcome, "passed");
+  assert.equal(reads.some((file) => isHistoricalFailedShipEvidencePath(file)), false);
+  assert.equal(persisted.at(-1)?.outcome, "passed");
+  assert.throws(
+    () => verifyExactCandidateFrgResult(
+      { pass: true, integrity: { attestation: "hmac" }, candidate_sha: "b".repeat(40) },
+      { epoch_id: record.epoch_id, candidate_sha: CANDIDATE },
+    ),
+    /schema/,
+  );
+});
+
+test("absent old scorer does not block a current exact-pair proof", async () => {
+  const { record, deps } = await begun();
+  record.loop_run_id = CANONICAL_LOOP;
+  record.loop_dispatch_certainty = "known_complete";
+  record.slots.forEach((slot, index) => {
+    slot.issue_number = 101 + index;
+    slot.create_certainty = "known_complete";
+    slot.advance_run_id = `advance-${index + 1}`;
+  });
+  const result = await observeExactCandidateFrgPair(record, deps);
+  assert.equal(result.outcome, "passed");
+  verifyExactCandidateFrgResult(result, { epoch_id: result.epoch_id, candidate_sha: CANDIDATE });
 });
 
 test("legacy score, HMAC, qualification, and public-hash shapes cannot satisfy verifier", () => {
@@ -2304,4 +2452,45 @@ test("tagged retry discovers exactly one forge pair and never treats local pass 
   );
   assert.ok(observedIssues > 0, "local passed JSON must be re-observed from forge");
   assert.equal(created, 0);
+});
+
+test("tagged reconstruction ignores historical latest.json and still proceeds without an old scorer", async () => {
+  const { record } = await begun();
+  record.loop_run_id = CANONICAL_LOOP;
+  record.loop_dispatch_certainty = "known_complete";
+  record.outcome = "passed";
+  record.slots.forEach((slot, index) => {
+    slot.issue_number = 101 + index;
+    slot.create_certainty = "known_complete";
+    slot.advance_run_id = `advance-${index + 1}`;
+    slot.pr_number = 301 + index;
+    slot.pr_head_sha = String(index + 1).repeat(40);
+    slot.observation = passingObservation(record, index);
+  });
+  const issues = record.slots.map((slot, index) => ({
+    number: 101 + index,
+    body: templateBodyForTest(record, slot),
+    state: "open" as const,
+  }));
+  const reads: string[] = [];
+  const base = taggedRetryFreshCheckoutIo(record, issues, { created: () => undefined, writes: () => undefined });
+  const io: ProductionExactCandidateFrgIo = {
+    ...base,
+    readFile: async (file) => {
+      reads.push(file);
+      assert.equal(isHistoricalFailedShipEvidencePath(file), false, `must not consult ${file}`);
+      return base.readFile(file);
+    },
+  };
+  const reconstructed = await observeProductionExactCandidateFrgPass(
+    {
+      repoDir: "/linked", repository: record.repository, baseBranch: record.base_branch,
+      releaseVersion: record.release_version, operationalDomain: "agent-pipeline",
+    },
+    CANDIDATE,
+    io,
+  );
+  assert.equal(reconstructed.outcome, "passed");
+  assert.equal(reconstructed.candidate.sha, CANDIDATE);
+  assert.equal(reads.some((file) => isHistoricalFailedShipEvidencePath(file)), false);
 });

@@ -1066,6 +1066,58 @@ async function mintHybridEvidence(opts: {
   return evidence;
 }
 
+test("direct-release and ship-final-delegation complete the same SemVer contract without deployment (#1564)", async () => {
+  const store = memoryShipStore();
+  let completeCalls = 0;
+  let promoteCalls = 0;
+  let deployCalls = 0;
+  const wrap = (deps: ReturnType<typeof shipCoordinatorDepsFromOperations>) => ({
+    ...deps,
+    authorizationPublicKey: "test",
+    withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
+    convergeEnginePromote: async () => {
+      promoteCalls++;
+      throw new Error("ship-final-delegation must not promote");
+    },
+    convergeDeployment: async () => {
+      deployCalls++;
+      throw new Error("ship-final-delegation must not deploy");
+    },
+  });
+  const coordinator = wrap(shipCoordinatorDepsFromOperations(operations({
+    completeRelease: async (observedIntent, observedTrain) => {
+      completeCalls++;
+      assert.equal(observedIntent.version, intent.version);
+      assert.equal(observedTrain.integrated_head_oid, head);
+      return {
+        version: observedIntent.version,
+        candidate_sha: observedTrain.integrated_head_oid,
+        tag: `v${observedIntent.version}`,
+        published_at: "2026-08-10T12:30:00.000Z",
+      };
+    },
+    promote: async () => {
+      promoteCalls++;
+      throw new Error("legacy promote must not run");
+    },
+    deploy: async () => {
+      deployCalls++;
+      throw new Error("legacy deploy must not run");
+    },
+  }), { state: store }));
+  const status = await runShipCoordinator(intent, null, coordinator);
+  assert.equal(status.lifecycle, "complete");
+  assert.equal(completeCalls, 1);
+  assert.equal(promoteCalls, 0);
+  assert.equal(deployCalls, 0);
+  assert.ok(store.status?.complete_release);
+  assert.ok(!store.status?.promotion);
+  assert.ok(!store.status?.deployed);
+  const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/stages/ship.ts"), "utf8");
+  assert.match(src, /convergeCompleteRelease/);
+  assert.match(src, /release_complete/);
+});
+
 test("ship coordinator delegates once immediately after observed train (#1563)", async () => {
   const store = memoryShipStore();
   let runs = 0;

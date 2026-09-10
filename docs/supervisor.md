@@ -77,10 +77,10 @@ Supervisors SHOULD parse operator text into one of these intents. Prefer
 | Integrate train | same + `and merge` / `integrate` | add `--merge` |
 | Status | `status`, `train status` | last train JSON, or `pipeline status <N>` / loop logs |
 | Stop | `stop` | stop the host process / systemd unit running train; do not invent force-merge cleanup |
-| Release complete | `release 1.34.0` | `pipeline release 1.34.0 --no-edit` (metadata, FRG, tag, publication) |
+| Release complete (direct-release) | `release 1.34.0` | `pipeline release 1.34.0 --no-edit` (metadata, exact-candidate FRG, tag, publication; no install/promote/deploy) |
 | Release prepare | `release prepare 1.34.0` | `pipeline release prepare 1.34.0 --no-edit` (opens PR; no merge/tag) |
-| Release finish | `release finish 123` | `pipeline release finish 123` (merge metadata PR only; does not tag) |
-| Engine promote | `engine-promote 1.34.0` | `pipeline engine-promote --for 1.34.0` (pin + install to **all** hosts by default after published Release; `--host <name>` to scope) |
+| Release finish | `release finish 123` | `pipeline release finish 123` (metadata-PR merge helper only; does not tag; not the live complete-release command) |
+| Engine promote | `engine-promote 1.34.0` | Separate operator command: `pipeline engine-promote --for 1.34.0` (pin + install to **all** hosts by default after published Release; `--host <name>` to scope). Not part of live ship-final-delegation. |
 
 **Merge is opt-in.** Never default `--merge` from a vague “run the milestone”
 unless the deployment policy explicitly allows it for that channel and operator.
@@ -262,10 +262,11 @@ not scrape human output or search for a title match.
 ```
 
 Does **not** create git tags or GitHub Releases. `pipeline release finish` remains
-a metadata-PR merge helper. Complete publication is `pipeline release VERSION`
-or SemVer `pipeline ship --milestone`, which delegates to that command once.
+a metadata-PR merge helper. Complete publication is direct-release
+`pipeline release VERSION` or SemVer `pipeline ship --milestone` ship-final-delegation,
+which delegates to that command once. Neither path deploys, promotes, or installs.
 `release.yml` is the sole GitHub Release publisher after the annotated `v*` tag
-exists. Legacy `release ensure-tag` remains a compatibility seam pending #1560.
+exists. Historical `release ensure-tag` is not the live complete-release command.
 
 ## Hermes production (Phase 2b)
 
@@ -281,7 +282,7 @@ not the product owner. #1001 / #971 do not ban in-engine ship.
 
 | Script | Role |
 |---|---|
-| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → exactly one complete release delegation for SemVer; continuous completes at exact-candidate integration). Status is a RecoverySupervisor projection. Mechanical faults stay Cooling or wait. |
+| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → ship-final-delegation: exactly one complete-release call for SemVer; continuous completes at exact-candidate integration). Status is a RecoverySupervisor projection. Mechanical faults stay Cooling or wait. Neither path deploys, promotes, or installs. |
 
 All-integrated milestones (every freeze-eligible issue closed at
 `pipeline:ready-to-deploy` with merged PRs contained in base) do **not** stop
@@ -292,7 +293,9 @@ or promote. Leftover open GitHub issues on the ship milestone, including
 `pipeline:backlog`, fail closed before FRG pack, release, and `engine-promote`.
 Pipeline labels do not exempt an open milestoned issue. `--skip-frg` is not a
 way to start those operations while the milestone still has open issues.
-Missing FRG evidence is recovered with
+Live exact-candidate FRG is owned by complete `pipeline release`. The following
+factory-pack recovery is **historical** and is not the live ship-final-delegation
+procedure: missing factory-pack FRG evidence was recovered with
 `pipeline loop --label factory-gate --profile claude` then
 `pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id>`. `--skip-frg` is
 an escape that writes `no-frg-*`; it is not the implied path for a non-claude

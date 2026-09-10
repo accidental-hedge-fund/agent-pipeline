@@ -78,7 +78,7 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   ship: {
     summary:
-      "Run or inspect one durable milestone shipment (train --merge, then one complete release call for SemVer; continuous completes at integration). No install, promotion, or deployment is performed.",
+      "Ship-final-delegation: train --merge, then exactly one complete-release call. Direct-release and this tail complete the same SemVer contract. Neither path deploys, promotes, or installs.",
     usage:
       "ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json]",
     documented: true,

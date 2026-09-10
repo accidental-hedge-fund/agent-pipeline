@@ -1,15 +1,16 @@
 # Ship milestone (`pipeline ship --milestone`)
 
 **Primary path:** `pipeline ship --milestone vX.Y.Z`. That command is the
-in-engine ship product. It runs `train --merge`, then (SemVer) exactly one
-complete `pipeline release VERSION` delegation. Continuous `roadmap.release_model`
-completes when exact-candidate integration is proven and does not run SemVer
-release. Native ship does not install, promote, or deploy. Tugboat may still
-compose a compatibility FRG/finish/ensure-tag/promote sequence pending #1560;
-that composer is not the product path. It does not invent a second merge policy,
-grant schema, or RecoverySupervisor. `human_authority` is a typed projection,
-never error-message regex. Generic install or verify failure does not roll the
-pin back; use `pipeline factory-pin rollback`.
+in-engine ship product. It runs `train --merge`, then (SemVer) ship-final-delegation:
+exactly one complete `pipeline release VERSION` call. Direct-release is the same
+complete owner without train. Continuous `roadmap.release_model` completes when
+exact-candidate integration is proven and does not run SemVer release. Native
+ship does not install, promote, or deploy. Historical Tugboat FRG-pack / finish /
+ensure-tag / promote text later in this runbook is not the live procedure. It
+does not invent a second merge policy, grant schema, or RecoverySupervisor.
+`human_authority` is a typed projection, never error-message regex. Generic
+install or verify failure does not roll the pin back; use
+`pipeline factory-pin rollback`.
 
 Phrase: **`Ship milestone vX.Y.Z`** → `pipeline ship --milestone vX.Y.Z`
 (detach if the CLI is blocking).  
@@ -43,7 +44,7 @@ Epic / hardening: #1096 (in-engine durable ship). #1001 / #971 do not ban this p
 
 | Concern | Owner |
 |---|---|
-| Train, merge policy, release, promote decisions | Pipeline CLI (`train`, `release`, `release finish`, `engine-promote`) |
+| Train, merge policy, release decisions | Pipeline CLI (`train`, `release`; `release finish` is a metadata-PR merge helper). `engine-promote` is a separate operator command, not the live ship tail |
 | Phase sequence, wait CI / Release, failure detail, notify | **Pipeline ship ledger** (hosts notify from exact child-run identities) |
 | Detached process, logs, state dir | host (`nohup` + `PIPELINE_SUPERVISOR_STATE`) |
 | Material progress during train (optional) | shared `ship-stage-watch.sh` + `material-filter.mjs` |
@@ -173,8 +174,8 @@ non-claude profile.
 1. `pipeline train --milestone vX.Y.Z --merge --json` (complete gate + resume)
 2. `pipeline ship --milestone vX.Y.Z` runs that train, then delegates once to `pipeline release X.Y.Z` for SemVer. Continuous ship stops after integration. Release validates contained milestone work, prepares or reuses metadata, runs exact-candidate FRG, tags C, and waits for the `release.yml` publisher plus a non-draft GitHub Release. No install, promotion, or deployment is a ship or release completion prerequisite.
 3. Direct `pipeline release X.Y.Z --no-edit` (**bare** version — leading `v` is invalid; **no** `--skip-frg`) is the same complete owner without train.
-4. Bounded prepare-only callers remain `pipeline release prepare`, `pipeline factory-release prepare --request`, and merge-queue `--release-when-complete`. `pipeline release finish <pr>` merges a metadata PR and does not tag.
-5. Legacy Tugboat `release ensure-tag` remains a compatibility seam pending #1560. `release.yml` is the sole GitHub Release publisher.
+4. Bounded prepare-only callers remain `pipeline release prepare`, `pipeline factory-release prepare --request`, and merge-queue `--release-when-complete`. `pipeline release finish <pr>` is a metadata-PR merge helper and does not tag.
+5. Historical Tugboat `release ensure-tag` is not the live complete-release command. `release.yml` is the sole GitHub Release publisher.
 
 Hardened behaviors (preserve):
 
@@ -186,14 +187,15 @@ Hardened behaviors (preserve):
 | Idempotent | Existing open PR titled `release: X.Y.Z …` is reused |
 | Thinness | No grant factory or second merge policy inside Tugboat. Tugboat is not the ship owner. |
 
-## FRG pack is part of thin ship
+## Historical factory-pack FRG, finish, ensure-tag, and ship-promotion
 
 Default native ship sequence is train → one complete `pipeline release VERSION`
-call. Continuous mode is integration-only. **Train uses the production-pin CLI**
-(`$PIPELINE`). Direct release and SemVer ship do not promote or install. Legacy
-Tugboat FRG-pack / finish / `release ensure-tag` / promote remains a
-compatibility composer pending #1560. When that composer still runs candidate
-verbs, they use the candidate engine at the FRG-bound SHA
+call (ship-final-delegation). Continuous mode is integration-only. **Train uses
+the production-pin CLI** (`$PIPELINE`). Direct-release and SemVer ship-final-delegation
+do not promote or install. The rest of this section is **historical**: Tugboat
+FRG-pack / finish / `release ensure-tag` / promote is not the live procedure.
+When that historical composer still runs candidate verbs, they use the candidate
+engine at the FRG-bound SHA
 (`SHIP_END_CLI` = `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"`).
 That stable launcher uses same-process exec both to enter Node >=24 when a
 runtime bootstrap is needed and then to enter the candidate core CLI. It does

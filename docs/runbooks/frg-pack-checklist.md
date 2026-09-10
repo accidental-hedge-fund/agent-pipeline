@@ -1,5 +1,10 @@
 # FRG pack checklist (operator)
 
+**Historical factory-pack checklist.** Live exact-candidate FRG is owned by
+complete `pipeline release` (direct-release) and SemVer ship-final-delegation.
+The score/HMAC/`latest.json` steps below are **historical**. They are not the
+live procedure and cannot authorize the current candidate.
+
 **Goal:** diagnose the exact-candidate pair result under
 `.agent-pipeline/frg/exact-pair/<epoch>.json`. The score/HMAC steps below are a
 legacy caller checklist pending package-4 retirement; they cannot satisfy the
@@ -72,13 +77,15 @@ Optional observations / scenarios: see the main FRG runbook.
 python3 -c "import json; d=json.load(open('.agent-pipeline/frg/<X.Y.Z>/latest.json')); print(d.get('pass'), d.get('run_id'), d.get('version'))"
 ```
 
-## 4. Keep FRG evidence for release prepare
+## 4. Historical HMAC evidence (not current-candidate authority)
 
-`pipeline release` and `pipeline release ensure-tag` read on-disk HMAC
-`.agent-pipeline/frg/<X.Y.Z>/latest.json` on the ship host. That directory is
-gitignored. `pipeline release` does not `git add` it. The release PR body
-carries `run_id`; evidence stays on disk. Auto-tag must not stall the ship
-for a missing tree file.
+Historical factory-pack `pipeline release` and `pipeline release ensure-tag`
+read on-disk HMAC `.agent-pipeline/frg/<X.Y.Z>/latest.json` on the ship host.
+Live direct-release ignores that file as current-candidate authority. A new
+release does not require a working old scorer or attestor. That directory is
+gitignored. `pipeline release` does not `git add` it. Historical release PR
+bodies carried `run_id`; evidence stays on disk as historical-failed-ship-evidence.
+Auto-tag must not stall the ship for a missing tree file.
 
 - [ ] Leave the validated version directory in the control checkout
 - [ ] Do not merge a separate evidence PR into the base after the candidate is
