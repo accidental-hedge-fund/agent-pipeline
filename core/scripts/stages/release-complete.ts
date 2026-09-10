@@ -32,6 +32,7 @@ const OID_RE = /^[0-9a-f]{40}$/;
 const VERSION_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 export const RELEASE_PUBLICATION_ATTEMPTS = 120;
 export const RELEASE_PUBLICATION_WAIT_MS = 10_000;
+export const RELEASE_DISPATCH_OBSERVE_ATTEMPTS = 30;
 
 export interface ReleaseImplementationPr {
   number: number;
@@ -119,6 +120,7 @@ export interface CompleteReleaseDeps {
   recoverPublication(tag: string, candidate: string): Promise<boolean>;
   wait(ms: number): Promise<void>;
   publicationAttempts?: number;
+  dispatchObserveAttempts?: number;
 }
 
 export function releaseTagNotes(version: string, candidate: string): string {
@@ -523,7 +525,16 @@ export function assertReleaseManagedMetadataPaths(files: readonly string[]): voi
 /** Production adapter. Tests inject the complete seam and never touch git/GitHub. */
 export function realCompleteReleaseDeps(
   cfg: { repo_dir: string; repo: string; base_branch?: string },
-  io: { command?: (cwd: string, file: string, args: string[]) => Promise<string> } = {},
+  io: {
+    command?: (cwd: string, file: string, args: string[]) => Promise<string>;
+    wait?: (ms: number) => Promise<void>;
+    publicationAttempts?: number;
+    dispatchObserveAttempts?: number;
+    finishReleasePr?: (
+      pr: number,
+      expected: { pr: number; version: string; base: string; head_oid: string },
+    ) => Promise<{ mergeCommitOid: string | null }>;
+  } = {},
 ): CompleteReleaseDeps {
   const repoDir = cfg.repo_dir;
   const repository = cfg.repo;
@@ -531,6 +542,11 @@ export function realCompleteReleaseDeps(
   const runCommand = io.command ?? command;
   const git = (args: string[], cwd = repoDir) => runCommand(cwd, "git", args);
   const gh = (args: string[], cwd = repoDir) => runCommand(cwd, "gh", args);
+  const publicationAttempts = io.publicationAttempts ?? RELEASE_PUBLICATION_ATTEMPTS;
+  const dispatchObserveAttempts = io.dispatchObserveAttempts ?? RELEASE_DISPATCH_OBSERVE_ATTEMPTS;
+  const waitFn = io.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const finishPr = io.finishReleasePr ?? ((pr, expected) =>
+    finishReleasePr(pr, realReleaseFinishDeps(repository, repoDir), expected));
   return {
     log: console.error,
     withRunLock: (key, fn) => withLock(key, fn),
@@ -696,12 +712,11 @@ export function realCompleteReleaseDeps(
         .split("\n").filter(Boolean);
       try { assertReleaseManagedMetadataPaths(changed); }
       catch { throw new Error(`pipeline release: metadata PR #${release.pr} contains non-release-managed paths`); }
-      for (let attempt = 1; attempt <= RELEASE_PUBLICATION_ATTEMPTS; attempt++) {
+      for (let attempt = 1; attempt <= publicationAttempts; attempt++) {
         const observed = parseObject(await gh(["pr", "view", String(release.pr), "--repo", repository, "--json", "state,headRefOid,baseRefName"]), `metadata PR #${release.pr}`);
         if (String(observed.headRefOid).toLowerCase() !== release.head_oid.toLowerCase() || observed.baseRefName !== release.base) {
           throw new Error(`pipeline release: metadata PR #${release.pr} identity changed during CI wait`);
         }
-        if (observed.state === "MERGED") break;
         const checksRaw = JSON.parse(await gh([
           "api", `repos/${repository}/commits/${release.head_oid}/check-runs?per_page=100`, "--paginate", "--slurp",
         ])) as unknown;
@@ -709,11 +724,17 @@ export function realCompleteReleaseDeps(
         if (checkState === "fail") {
           throw new Error(`pipeline release: metadata PR #${release.pr} has failing checks at exact head ${release.head_oid}`);
         }
+        if (observed.state === "MERGED") {
+          if (checkState !== "pass") {
+            throw new Error(`pipeline release: metadata PR #${release.pr} has no nonempty green exact-head CI at ${release.head_oid}`);
+          }
+          break;
+        }
         if (checkState === "pass") break;
-        if (attempt === RELEASE_PUBLICATION_ATTEMPTS) throw new Error(`pipeline release: timed out waiting for nonempty green metadata checks on PR #${release.pr}`);
-        await new Promise((resolve) => setTimeout(resolve, RELEASE_PUBLICATION_WAIT_MS));
+        if (attempt === publicationAttempts) throw new Error(`pipeline release: timed out waiting for nonempty green metadata checks on PR #${release.pr}`);
+        await waitFn(RELEASE_PUBLICATION_WAIT_MS);
       }
-      const finished = await finishReleasePr(release.pr, realReleaseFinishDeps(repository, repoDir), { pr: release.pr, version: release.version, base: release.base, head_oid: release.head_oid });
+      const finished = await finishPr(release.pr, { pr: release.pr, version: release.version, base: release.base, head_oid: release.head_oid });
       if (!finished.mergeCommitOid) throw new Error("pipeline release: metadata merge returned no merge commit");
       return { ...release, state: "MERGED", merge_commit_oid: finished.mergeCommitOid };
     },
@@ -832,8 +853,20 @@ export function realCompleteReleaseDeps(
         "workflow", "run", "release.yml", "--repo", repository, "--ref", tag,
         "-f", `tag=${tag}`, "-f", `candidate=${candidate}`,
       ]);
-      return true;
+      for (let attempt = 1; attempt <= dispatchObserveAttempts; attempt++) {
+        await waitFn(RELEASE_PUBLICATION_WAIT_MS);
+        const observed = classifyPublisherRuns(JSON.parse(await gh([
+          "run", "list", "--repo", repository, "--workflow", "release.yml",
+          "--json", "databaseId,event,headBranch,headSha,status,conclusion,attempt", "--limit", "100",
+        ])) as unknown, tag, candidate);
+        if (observed.class !== "absent") return true;
+      }
+      throw new Error(
+        `pipeline release: recovery dispatch for ${tag} at ${candidate} did not become an observable exact-identity release.yml run`,
+      );
     },
-    wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    wait: waitFn,
+    publicationAttempts,
+    dispatchObserveAttempts,
   };
 }

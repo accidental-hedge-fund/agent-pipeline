@@ -49,6 +49,9 @@ test("release.yml order is tag checkout, root/core guards, main=C, publication, 
   }
   assert.ok(src.indexOf("npm ci") > mainCheckout, "dependency install must follow main checkout");
   assert.match(src, /non-atomic/);
+  const trackingRefspec = src.match(/\+refs\/heads\/main:refs\/remotes\/origin\/main/g) ?? [];
+  assert.equal(trackingRefspec.length, 2, "publication guard and docs checkout must update origin/main");
+  assert.doesNotMatch(src, /git fetch origin main$/m);
 });
 
 test("tugboat wait-release does not create GitHub Releases (#1167)", () => {

@@ -1,15 +1,15 @@
 # Ship milestone (`pipeline ship --milestone`)
 
 **Primary path:** `pipeline ship --milestone vX.Y.Z`. That command is the
-in-engine ship product. It composes existing verbs: `train --merge` →
-(semver) `release` → wait checks (`ship-release-check-wait`) →
-`release finish` → `release ensure-tag` → wait GitHub Release →
-`engine-promote` (pin then live-digest deploy). Continuous `roadmap.release_model`
+in-engine ship product. It runs `train --merge`, then (SemVer) exactly one
+complete `pipeline release VERSION` delegation. Continuous `roadmap.release_model`
 completes when exact-candidate integration is proven and does not run SemVer
-release/tag/promote/deploy. It does not invent a second merge policy, grant
-schema, or RecoverySupervisor. `human_authority` is a typed projection, never
-error-message regex. Generic install or verify failure does not roll the pin
-back; use `pipeline factory-pin rollback`.
+release. Native ship does not install, promote, or deploy. Tugboat may still
+compose a compatibility FRG/finish/ensure-tag/promote sequence pending #1560;
+that composer is not the product path. It does not invent a second merge policy,
+grant schema, or RecoverySupervisor. `human_authority` is a typed projection,
+never error-message regex. Generic install or verify failure does not roll the
+pin back; use `pipeline factory-pin rollback`.
 
 Phrase: **`Ship milestone vX.Y.Z`** → `pipeline ship --milestone vX.Y.Z`
 (detach if the CLI is blocking).  

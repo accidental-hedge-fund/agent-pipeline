@@ -334,6 +334,10 @@ export interface ProductionExactCandidateFrgIo {
     repository: string; baseBranch: string; domain: string; implementer: string; reviewer: string;
     gatesSha256: string; reviewPolicyHashes: { standard: string; lowRiskRound2: string };
   }>;
+  resolveAndPrepareCandidate?(
+    input: BeginExactCandidateFrgInput,
+    candidateSha: string,
+  ): ReturnType<typeof resolveAndPrepareCandidateEngine>;
   readFile(file: string): Promise<string | null>;
   listRecordEpochIds(repoDir: string): Promise<string[]>;
   writeRecord(repoDir: string, record: ExactCandidateFrgRecord): Promise<void>;
@@ -1978,6 +1982,9 @@ export function createProductionExactCandidateFrgDeps(
     now: io.now,
     observeOriginMainSha: () => io.observeOriginMainSha(input.repoDir),
     resolveAndPrepareDeps: defaultResolveAndPrepareDeps(),
+    resolveAndPrepareCandidate: io.resolveAndPrepareCandidate
+      ? (boundInput, candidateSha) => io.resolveAndPrepareCandidate!(boundInput, candidateSha)
+      : (boundInput, candidateSha) => productionResolveCandidate(boundInput, candidateSha, defaultResolveAndPrepareDeps()),
     readCandidateFile: async (file) => {
       const body = await io.readFile(file);
       if (body === null) throw new Error(`candidate input is missing: ${file}`);
@@ -2438,6 +2445,130 @@ export function discoverExactCandidateFrgPairIssues(
 }
 
 /**
+ * Bind a tagged exact pair from the candidate engine at C plus forge identity.
+ * Does not persist a checkpoint or create fixtures. Loop/advance IDs come from
+ * the canonical ordinary-loop observation, not from a local FRG record.
+ */
+async function reconstructTaggedExactCandidateFrgRecord(
+  input: BeginExactCandidateFrgInput,
+  candidateSha: string,
+  discovered: DiscoveredExactCandidateFrgPair,
+  deps: ExactCandidateFrgDeps,
+): Promise<ExactCandidateFrgRecord> {
+  const candidate = exactSha(candidateSha, "tagged candidate");
+  const prepared = await (deps.resolveAndPrepareCandidate
+    ? deps.resolveAndPrepareCandidate(input, candidate)
+    : productionResolveCandidate(input, candidate, deps.resolveAndPrepareDeps));
+  if (!prepared.ok) {
+    throw new ExactCandidateFrgGateDefect(`tagged retry cannot prepare candidate ${candidate}: ${prepared.error}`);
+  }
+  const root = path.resolve(prepared.engine.engineRoot);
+  if (prepared.engine.commitSha !== candidate || !contained(root, prepared.engine.launcherPath)) {
+    throw new ExactCandidateFrgGateDefect("prepared engine does not match the tagged candidate");
+  }
+  if (!deps.resolveCandidatePolicy) throw new ExactCandidateFrgGateDefect("candidate policy resolver is required");
+  const candidatePolicy = await deps.resolveCandidatePolicy(root);
+  if (candidatePolicy.repository !== input.repository || candidatePolicy.baseBranch !== input.baseBranch) {
+    throw new ExactCandidateFrgGateDefect("candidate repository or base policy does not match the FRG target");
+  }
+  const manifestPath = path.join(root, MANIFEST_REL);
+  const lockfilePath = path.join(root, LOCKFILE_REL);
+  if (!contained(root, manifestPath) || !contained(root, lockfilePath)) {
+    throw new ExactCandidateFrgGateDefect("candidate inputs escape prepared root");
+  }
+  const manifestText = await deps.readCandidateFile(manifestPath);
+  const lockfile = await deps.readCandidateFile(lockfilePath);
+  let manifest: {
+    schema_version?: unknown; pack_id?: unknown; manifest_version?: unknown;
+    templates?: Array<{ id?: unknown; file?: unknown; sha256?: unknown; title?: unknown }>;
+  };
+  try { manifest = JSON.parse(String(manifestText)); }
+  catch { throw new ExactCandidateFrgGateDefect("candidate FRG manifest is not valid JSON"); }
+  if (manifest.schema_version !== 1 || manifest.pack_id !== "factory-gate-v1" || manifest.manifest_version !== 1 ||
+      !Array.isArray(manifest.templates) || manifest.templates.length !== 2 ||
+      manifest.templates[0]?.id !== "clean-docs" || manifest.templates[1]?.id !== "clean-openspec") {
+    throw new ExactCandidateFrgGateDefect("candidate FRG manifest identity must be factory-gate-v1@1 with exactly clean-docs and clean-openspec");
+  }
+  const createdAt = iso(deps.now());
+  const epochId = discovered.epoch_id;
+  safeId(epochId, "exact candidate epoch");
+  const manifestIdentity = { relative_path: MANIFEST_REL, sha256: digest(manifestText) };
+  const slots = [] as unknown as [ExactCandidateFrgSlot, ExactCandidateFrgSlot];
+  for (const [index, id] of EXACT_CANDIDATE_FRG_SLOT_IDS.entries()) {
+    const ref = manifest.templates[index]!;
+    if (typeof ref.file !== "string" || typeof ref.sha256 !== "string" || !DIGEST_RE.test(ref.sha256) ||
+        typeof ref.title !== "string" || ref.title.trim() === "") {
+      throw new ExactCandidateFrgGateDefect(`candidate template ${id} manifest entry is malformed`);
+    }
+    relativeCandidatePath(ref.file, `candidate template ${id} file`);
+    const packRoot = path.join(root, PACK_ROOT_REL);
+    const absoluteTemplate = path.resolve(packRoot, ref.file);
+    if (!contained(packRoot, absoluteTemplate)) {
+      throw new ExactCandidateFrgGateDefect(`candidate template ${id} escapes the candidate pack`);
+    }
+    const rel = path.relative(root, absoluteTemplate);
+    const body = await deps.readCandidateFile(absoluteTemplate);
+    if (digest(body) !== ref.sha256) {
+      throw new ExactCandidateFrgGateDefect(`candidate template ${id} hash mismatch`);
+    }
+    const found = discovered.slots[id];
+    slots[index] = {
+      id, epoch_id: epochId, candidate_sha: candidate,
+      template: { relative_path: rel, sha256: ref.sha256 },
+      title_template: ref.title,
+      provenance_id: found.provenance_id,
+      issue_number: found.issue_number, create_certainty: "known_complete", advance_run_id: null,
+      pr_number: null, pr_head_sha: null, observation: null, failure_evidence: null,
+    };
+  }
+  const record: ExactCandidateFrgRecord = {
+    schema: EXACT_CANDIDATE_FRG_SCHEMA,
+    epoch_id: epochId,
+    repository: input.repository,
+    operational_domain: input.operationalDomain ?? input.repository,
+    base_branch: input.baseBranch,
+    release_version: input.releaseVersion,
+    loop_engine: input.loopEngine ?? "claude",
+    candidate: {
+      sha: candidate, engine_root: root, launcher_path: prepared.engine.launcherPath,
+      manifest: manifestIdentity,
+      lockfile: { relative_path: LOCKFILE_REL, sha256: digest(lockfile) },
+    },
+    loop_run_id: null,
+    loop_dispatch_certainty: "uncertain",
+    slots,
+    worker_config: {
+      implementer: candidatePolicy.implementer,
+      reviewer: candidatePolicy.reviewer,
+      gates_sha256: candidatePolicy.gatesSha256,
+      review_standard_sha256: candidatePolicy.reviewPolicyHashes.standard,
+      review_low_risk_round2_sha256: candidatePolicy.reviewPolicyHashes.lowRiskRound2,
+      auto_file_repairs: false,
+    },
+    outcome: "pending", outcome_detail: "reconstructing tagged exact pair from authoritative sources",
+    external_wait: null, cleanup: [], cleanup_debt: false,
+    created_at: createdAt, updated_at: createdAt,
+  };
+  parseExactCandidateFrgRecord(record);
+  if (!deps.discoverOrdinaryLoop) {
+    throw new ExactCandidateFrgGateDefect(
+      `tagged retry discovered exact-pair ${epochId} for ${candidate} but cannot reconstruct loop/advance identity from authoritative observations; refusing to create a replacement pair`,
+    );
+  }
+  const loop = await deps.discoverOrdinaryLoop(record);
+  if (!loop || loop.children.some((child) => child === null)) {
+    throw new ExactCandidateFrgGateDefect(
+      `tagged retry discovered exact-pair ${epochId} for ${candidate} but cannot reconstruct loop/advance identity from authoritative observations; refusing to create a replacement pair`,
+    );
+  }
+  record.loop_run_id = loop.runId;
+  record.loop_dispatch_certainty = "known_complete";
+  for (const [index, slot] of record.slots.entries()) slot.advance_run_id = loop.children[index]!;
+  parseExactCandidateFrgRecord(record);
+  return record;
+}
+
+/**
  * Read-only reconstruction used when an immutable release tag already exists.
  * Forge provenance is the pair identity. A local FRG record may bind loop/advance
  * IDs but never proves pass. Missing, ambiguous, or unverifiable evidence fails
@@ -2479,17 +2610,14 @@ export async function observeProductionExactCandidateFrgPass(
     );
   }
   const bound = records[0] ?? null;
-  if (!bound) {
-    throw new ExactCandidateFrgGateDefect(
-      `tagged retry discovered exact-pair ${discovered.epoch_id} for ${candidate} but cannot reconstruct loop/advance identity from a missing local checkpoint; refusing to create a replacement pair`,
-    );
-  }
-  for (const slot of bound.slots) {
-    const found = discovered.slots[slot.id];
-    if (slot.issue_number !== found.issue_number || slot.provenance_id !== found.provenance_id) {
-      throw new ExactCandidateFrgGateDefect(
-        `${slot.id} local identity contradicts authoritative forge pair ${discovered.epoch_id}`,
-      );
+  if (bound) {
+    for (const slot of bound.slots) {
+      const found = discovered.slots[slot.id];
+      if (slot.issue_number !== found.issue_number || slot.provenance_id !== found.provenance_id) {
+        throw new ExactCandidateFrgGateDefect(
+          `${slot.id} local identity contradicts authoritative forge pair ${discovered.epoch_id}`,
+        );
+      }
     }
   }
   const guardedIo: ProductionExactCandidateFrgIo = {
@@ -2504,7 +2632,14 @@ export async function observeProductionExactCandidateFrgPass(
     guardedIo,
     releaseStoreRepoDir,
   );
-  const reconstructed = cloneRecord(bound);
+  const reconstructed = bound
+    ? cloneRecord(bound)
+    : await reconstructTaggedExactCandidateFrgRecord(
+      { ...input, operationalDomain: target.domain, expectedCandidateSha: candidate },
+      candidate,
+      discovered,
+      deps,
+    );
   reconstructed.outcome = "pending";
   reconstructed.outcome_detail = "re-observing tagged exact pair from authoritative sources";
   for (const slot of reconstructed.slots) {

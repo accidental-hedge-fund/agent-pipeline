@@ -508,15 +508,11 @@ test("production Release lookup treats only non-auth HTTP 404 as absence", async
   await assert.rejects(() => prose.observePublication(tag), /observation is unknown/);
 });
 
-test("publisher recovery dispatches once when remote runs are absent and reruns a failed attempt 1", async () => {
-  const tag = "v1.2.3";
-  const notes = releaseTagNotes("1.2.3", C);
-  const ghCalls: string[] = [];
-  let runs: unknown[] = [];
-  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
+function publisherCommand(tag: string, notes: string, state: { runs: unknown[]; ghCalls: string[] }) {
+  return async (_cwd: string, file: string, args: string[]) => {
     const joined = args.join(" ");
-    if (file === "gh") ghCalls.push(joined);
-    if (file === "gh" && args[0] === "run" && args[1] === "list") return JSON.stringify(runs);
+    if (file === "gh") state.ghCalls.push(joined);
+    if (file === "gh" && args[0] === "run" && args[1] === "list") return JSON.stringify(state.runs);
     if (file === "gh" && args[0] === "workflow") return "";
     if (file === "gh" && args[0] === "run" && args[1] === "rerun") return "";
     if (args[0] === "fetch" && args.includes("origin") && args.includes("main")) return "";
@@ -528,20 +524,40 @@ test("publisher recovery dispatches once when remote runs are absent and reruns 
     if (joined === `rev-parse refs/pipeline/release-observe/${tag}^{}`) return C;
     if (args[0] === "for-each-ref") return notes;
     throw new Error(`unexpected ${file} ${joined}`);
-  } });
-  assert.equal(await adapter.recoverPublication(tag, C), true);
-  assert.ok(ghCalls.some((call) => call.includes("workflow run release.yml") && call.includes(`--ref ${tag}`) && call.includes(`tag=${tag}`) && call.includes(`candidate=${C}`)));
+  };
+}
 
-  ghCalls.length = 0;
-  runs = [{
+test("publisher recovery dispatches once when remote runs are absent and reruns a failed attempt 1", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  const state = { runs: [] as unknown[], ghCalls: [] as string[] };
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    dispatchObserveAttempts: 2,
+    command: async (cwd, file, args) => {
+      const result = await publisherCommand(tag, notes, state)(cwd, file, args);
+      if (file === "gh" && args[0] === "workflow") {
+        state.runs = [{
+          databaseId: 8, event: "workflow_dispatch", headBranch: tag, headSha: C,
+          status: "queued", conclusion: null, attempt: 1,
+        }];
+      }
+      return result;
+    },
+  });
+  assert.equal(await adapter.recoverPublication(tag, C), true);
+  assert.ok(state.ghCalls.some((call) => call.includes("workflow run release.yml") && call.includes(`--ref ${tag}`) && call.includes(`tag=${tag}`) && call.includes(`candidate=${C}`)));
+
+  state.ghCalls.length = 0;
+  state.runs = [{
     databaseId: 9, event: "workflow_dispatch", headBranch: tag, headSha: C,
     status: "completed", conclusion: "failure", attempt: 1,
   }];
   assert.equal(await adapter.recoverPublication(tag, C), true);
-  assert.ok(ghCalls.some((call) => call.startsWith("run rerun 9")));
-  assert.ok(!ghCalls.some((call) => call.includes("workflow run")));
+  assert.ok(state.ghCalls.some((call) => call.startsWith("run rerun 9")));
+  assert.ok(!state.ghCalls.some((call) => call.includes("workflow run")));
 
-  runs = [{
+  state.runs = [{
     databaseId: 9, event: "workflow_dispatch", headBranch: tag, headSha: C,
     status: "completed", conclusion: "failure", attempt: 2,
   }];
@@ -561,4 +577,186 @@ test("publisher recovery does not dispatch when an exact-identity run already ex
     throw new Error(`unexpected ${file} ${args.join(" ")}`);
   } });
   assert.equal(await adapter.recoverPublication(tag, C), false);
+});
+
+test("publisher recovery waits for delayed run visibility and does not dispatch twice", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  const ghCalls: string[] = [];
+  let dispatches = 0;
+  let listsAfterDispatch = 0;
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    dispatchObserveAttempts: 4,
+    command: async (_cwd, file, args) => {
+      const joined = args.join(" ");
+      if (file === "gh") ghCalls.push(joined);
+      if (file === "gh" && args[0] === "run" && args[1] === "list") {
+        if (dispatches === 0) return JSON.stringify([]);
+        listsAfterDispatch++;
+        if (listsAfterDispatch < 3) return JSON.stringify([]);
+        return JSON.stringify([{
+          databaseId: 12, event: "workflow_dispatch", headBranch: tag, headSha: C,
+          status: "in_progress", conclusion: null, attempt: 1,
+        }]);
+      }
+      if (file === "gh" && args[0] === "workflow") {
+        dispatches++;
+        return "";
+      }
+      if (args[0] === "fetch" && args.includes("origin") && args.includes("main")) return "";
+      if (joined === "rev-parse origin/main") return C;
+      if (args[0] === "ls-remote") return `${A}\trefs/tags/${tag}\n${C}\trefs/tags/${tag}^{}`;
+      if (args[0] === "fetch") return "";
+      if (joined === `rev-parse refs/pipeline/release-observe/${tag}`) return A;
+      if (joined === `cat-file -t refs/pipeline/release-observe/${tag}`) return "tag";
+      if (joined === `rev-parse refs/pipeline/release-observe/${tag}^{}`) return C;
+      if (args[0] === "for-each-ref") return notes;
+      throw new Error(`unexpected ${file} ${joined}`);
+    },
+  });
+  assert.equal(await adapter.recoverPublication(tag, C), true);
+  assert.equal(dispatches, 1);
+  assert.equal(ghCalls.filter((call) => call.includes("workflow run")).length, 1);
+});
+
+test("publisher recovery fails closed when a dispatch never becomes observable", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  let dispatches = 0;
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    dispatchObserveAttempts: 2,
+    command: async (cwd, file, args) => {
+      if (file === "gh" && args[0] === "workflow") dispatches++;
+      return publisherCommand(tag, notes, { runs: [], ghCalls: [] })(cwd, file, args);
+    },
+  });
+  await assert.rejects(() => adapter.recoverPublication(tag, C), /did not become an observable exact-identity/);
+  assert.equal(dispatches, 1);
+});
+
+test("publication loop does not re-dispatch while the recovery run remains unlisted", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  let dispatches = 0;
+  let listsAfterDispatch = 0;
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    dispatchObserveAttempts: 4,
+    command: async (_cwd, file, args) => {
+      const joined = args.join(" ");
+      if (file === "gh" && args[0] === "run" && args[1] === "list") {
+        if (dispatches === 0) return JSON.stringify([]);
+        listsAfterDispatch++;
+        if (listsAfterDispatch < 3) return JSON.stringify([]);
+        return JSON.stringify([{
+          databaseId: 13, event: "workflow_dispatch", headBranch: tag, headSha: C,
+          status: "in_progress", conclusion: null, attempt: 1,
+        }]);
+      }
+      if (file === "gh" && args[0] === "workflow") { dispatches++; return ""; }
+      if (args[0] === "fetch" && args.includes("origin") && args.includes("main")) return "";
+      if (joined === "rev-parse origin/main") return C;
+      if (args[0] === "ls-remote") return `${A}\trefs/tags/${tag}\n${C}\trefs/tags/${tag}^{}`;
+      if (args[0] === "fetch") return "";
+      if (joined === `rev-parse refs/pipeline/release-observe/${tag}`) return A;
+      if (joined === `cat-file -t refs/pipeline/release-observe/${tag}`) return "tag";
+      if (joined === `rev-parse refs/pipeline/release-observe/${tag}^{}`) return C;
+      if (args[0] === "for-each-ref") return notes;
+      throw new Error(`unexpected ${file} ${joined}`);
+    },
+  });
+  let published = false;
+  const d = deps({
+    async observeOriginHead() { return C; },
+    async versionsAt() { return { root: "1.2.3", core: "1.2.3" }; },
+    async resolveMilestones() { throw new Error("must not re-read milestone"); },
+    async observeTag() { return { annotated: true, peeled_commit: C, annotation: releaseTagNotes("1.2.3", C) }; },
+    async observePublication() {
+      return published
+        ? { tag, draft: false, published_at: "2026-09-10T00:00:00Z", workflow_conclusion: "success" as const }
+        : { tag, draft: true, published_at: null, workflow_conclusion: "pending" as const };
+    },
+    async recoverPublication(nextTag, candidate) {
+      const recovered = await adapter.recoverPublication(nextTag, candidate);
+      published = true;
+      return recovered;
+    },
+    async wait() {},
+    publicationAttempts: 3,
+  });
+  const result = await runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d);
+  assert.equal(result?.candidate_sha, C);
+  assert.equal(dispatches, 1);
+});
+
+test("finishMetadata requires nonempty green exact-head CI when the PR merges during wait", async () => {
+  let views = 0;
+  let finishCalls = 0;
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    publicationAttempts: 3,
+    finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
+    command: async (_cwd, file, args) => {
+      const joined = args.join(" ");
+      if (args[0] === "fetch") return "";
+      if (args[0] === "rev-parse") return A;
+      if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
+      if (args[0] === "diff") return "package.json\ncore/package.json";
+      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+        views++;
+        return JSON.stringify({
+          state: views === 1 ? "OPEN" : "MERGED",
+          headRefOid: A,
+          baseRefName: "main",
+        });
+      }
+      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+        return JSON.stringify([{ check_runs: views === 1
+          ? [{ name: "ci", head_sha: A, status: "in_progress", conclusion: null }]
+          : [{ name: "ci", head_sha: B, status: "completed", conclusion: "success" }] }]);
+      }
+      throw new Error(`unexpected ${file} ${joined}`);
+    },
+  });
+  await assert.rejects(
+    () => adapter.finishMetadata({ pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null }),
+    /no nonempty green exact-head CI/,
+  );
+  assert.equal(finishCalls, 0);
+
+  views = 0;
+  const green = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    publicationAttempts: 3,
+    finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
+    command: async (_cwd, file, args) => {
+      const joined = args.join(" ");
+      if (args[0] === "fetch") return "";
+      if (args[0] === "rev-parse") return A;
+      if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
+      if (args[0] === "diff") return "package.json\ncore/package.json";
+      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+        views++;
+        return JSON.stringify({
+          state: views === 1 ? "OPEN" : "MERGED",
+          headRefOid: A,
+          baseRefName: "main",
+        });
+      }
+      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+        return JSON.stringify([{ check_runs: views === 1
+          ? [{ name: "ci", head_sha: A, status: "in_progress", conclusion: null }]
+          : [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }] }]);
+      }
+      throw new Error(`unexpected ${file} ${joined}`);
+    },
+  });
+  const finished = await green.finishMetadata({
+    pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null,
+  });
+  assert.equal(finished.state, "MERGED");
+  assert.equal(finished.merge_commit_oid, C);
+  assert.equal(finishCalls, 1);
 });

@@ -103,6 +103,101 @@ function candidateTemplateForPath(file: string): string | null {
   return null;
 }
 
+function taggedRetryFreshCheckoutIo(
+  record: ExactCandidateFrgRecord,
+  issues: Array<{ number: number; body: string; state: "open" }>,
+  counters: { created(): void; writes(): void },
+): ProductionExactCandidateFrgIo {
+  const slotIo = record.slots.map((slot, index) => {
+    const issue = 101 + index;
+    const pr = 301 + index;
+    const head = String(index + 1).repeat(40);
+    const runId = `advance-${index + 1}`;
+    const traceRunId = `${issue}/2026-09-08T20:00:00Z`;
+    const changeId = `${record.epoch_id}-${slot.id}`.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+    const changedPaths = [
+      `core/test/fixtures/frg/${record.epoch_id}/${slot.id}.json`,
+      `core/test/frg-${record.epoch_id}-${slot.id}.test.ts`,
+      `openspec/changes/archive/2026-09-10-${changeId}/spec.md`,
+      `openspec/specs/${changeId}/spec.md`,
+    ];
+    const prDiff = changedPaths.map((file) =>
+      `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -0,0 +1 @@\n+fixture`).join("\n");
+    const reviewSubject = {
+      schema_version: 1, domain: "github.com/owner/repo", issue, pr, run_id: traceRunId,
+      candidate_sha: head, diff_hash: hash(prDiff).slice(0, 16), policy_hash: "2".repeat(64),
+      engine_fingerprint: "3".repeat(64), verifier_fingerprint: "4".repeat(64),
+      required_evidence_set_revision: "5".repeat(64),
+    };
+    const summarySubject = { ...reviewSubject, diff_hash: null };
+    const testerSubject = { ...reviewSubject, run_id: runId, policy_hash: record.worker_config.gates_sha256 };
+    return { issue, pr, head, runId, traceRunId, prDiff, reviewSubject, summarySubject, testerSubject, body: issues[index]!.body };
+  });
+  return {
+    now: () => new Date("2026-09-08T20:10:00.000Z"),
+    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: record.repository }),
+    resolveReleaseStoreRepoDir: async () => "/primary",
+    listRecordEpochIds: async () => [],
+    listIssues: async () => issues,
+    createIssue: async () => { counters.created(); return 999; },
+    writeRecord: async () => { counters.writes(); },
+    readFile: async (file: string) => files().get(path.resolve(file)) ?? candidateTemplateForPath(file),
+    resolveAndPrepareCandidate: async (_input, candidateSha) => {
+      assert.equal(candidateSha, CANDIDATE);
+      return { ok: true, engine: engine() };
+    },
+    resolveCandidatePolicy: async () => ({
+      repository: record.repository, baseBranch: record.base_branch, domain: "github.com/owner/repo",
+      implementer: "claude", reviewer: "codex", gatesSha256: record.worker_config.gates_sha256,
+      reviewPolicyHashes: { standard: "2".repeat(64), lowRiskRound2: "7".repeat(64) },
+    }),
+    loopRunExists: async () => true,
+    readLoopDocuments: async () => ({ ...loopResult(), ledger: { ...loopResult().ledger, stop: null } }),
+    getIssue: async (_input, issueNumber) => {
+      const row = slotIo.find((slot) => slot.issue === issueNumber);
+      if (!row) throw new Error(`unexpected issue ${issueNumber}`);
+      return { body: row.body, labels: ["pipeline:ready-to-deploy"], state: "open" as const };
+    },
+    listPrsAnyState: async (_input, issueNumber) => {
+      const row = slotIo.find((slot) => slot.issue === issueNumber)!;
+      return { numbers: [row.pr], truncated: false };
+    },
+    listOpenPrs: async (_input, issueNumber) => [slotIo.find((slot) => slot.issue === issueNumber)!.pr],
+    getPr: async (_input, prNumber) => {
+      const row = slotIo.find((slot) => slot.pr === prNumber)!;
+      return { number: row.pr, head_sha: row.head, base_ref: record.base_branch, state: "open", merged: false };
+    },
+    getRequiredChecks: async () => [{ name: "ci", bucket: "pass" }],
+    getPrDiff: async (_input, prNumber) => slotIo.find((slot) => slot.pr === prNumber)!.prDiff,
+    readAdvanceSummary: async (_input, advanceRunId) => {
+      const row = slotIo.find((slot) => slot.runId === advanceRunId)!;
+      return {
+        schema_version: 1, schemaVersion: 1, run_id: row.runId, runId: row.traceRunId, issue: row.issue, pr: row.pr,
+        branch: `pipeline/${row.issue}-frg`, harnesses: ["claude", "codex"], stages: [], overrides: [], recoveries: [],
+        finalState: "ready-to-deploy", finalizedAt: "2026-09-08T20:09:00.000Z", notifiedAt: null,
+        evidence_subject: row.summarySubject,
+        roles: { implementer: "claude", implementerSource: "repo-config", reviewer: "codex", reviewerSource: "repo-config" },
+        reviews: [{
+          round: 2, sha: row.head, verdict: "approved", findingCounts: {}, harness: "codex", selfReview: false,
+          ensemble: { agents: [], coverage: { independent: 1, required: 1 }, outcome: "accepted" },
+          evidence_subject: row.reviewSubject,
+        }],
+      };
+    },
+    readAdvanceTester: async (_input, advanceRunId) => {
+      const row = slotIo.find((slot) => slot.runId === advanceRunId)!;
+      return { status: "ok" as const, evidence: {
+        schema_version: 1, kind: "tester_evidence", candidate_sha: row.head, run_id: row.runId, issue: row.issue, pr: row.pr,
+        worktree_id: "fixture-worktree", config_digest: record.worker_config.gates_sha256,
+        toolchain_fingerprint: { node: "v24" }, started_at: "2026-09-08T20:00:00.000Z",
+        ended_at: "2026-09-08T20:01:00.000Z", duration_ms: 60_000, overall_status: "passed",
+        commands: [{ identity: "npm run ci", exit_code: 0, duration_ms: 60_000, status: "passed", output_excerpt: "ok" }],
+        output_excerpt: "ok", producer: { component: "test-build-gate" }, evidence_subject: row.testerSubject,
+      } };
+    },
+  } as unknown as ProductionExactCandidateFrgIo;
+}
+
 function passingObservation(record: ExactCandidateFrgRecord, index = 0): ExactCandidateFrgObservation {
   const slot = record.slots[index]!;
   const head = String(index + 1).repeat(40);
@@ -2145,24 +2240,46 @@ test("tagged retry discovers exactly one forge pair and never treats local pass 
   assert.throws(() => discoverExactCandidateFrgPairIssues([issues[0]!], CANDIDATE, record.release_version), /exactly one clean-openspec/);
 
   let created = 0;
+  let writes = 0;
   const input = {
     repoDir: "/linked", repository: record.repository, baseBranch: record.base_branch,
     releaseVersion: record.release_version, operationalDomain: "agent-pipeline",
   };
-  const noRecordIo = {
+  const missingLoopIo = {
     now: () => new Date(),
     validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: record.repository }),
     resolveReleaseStoreRepoDir: async () => "/primary",
     listRecordEpochIds: async () => [],
     listIssues: async () => issues,
     createIssue: async () => { created++; return 999; },
-    readFile: async () => null,
+    writeRecord: async () => { writes++; },
+    readFile: async (file: string) => files().get(path.resolve(file)) ?? candidateTemplateForPath(file),
+    resolveAndPrepareCandidate: async (_input: unknown, candidateSha: string) => {
+      assert.equal(candidateSha, CANDIDATE);
+      return { ok: true, engine: engine() };
+    },
+    resolveCandidatePolicy: async () => ({
+      repository: record.repository, baseBranch: record.base_branch, domain: "github.com/owner/repo",
+      implementer: "claude", reviewer: "codex", gatesSha256: record.worker_config.gates_sha256,
+      reviewPolicyHashes: { standard: "2".repeat(64), lowRiskRound2: "7".repeat(64) },
+    }),
+    loopRunExists: async () => false,
+    readLoopDocuments: async () => { throw new Error("loop store must not be required after absence"); },
   } as unknown as ProductionExactCandidateFrgIo;
   await assert.rejects(
-    () => observeProductionExactCandidateFrgPass(input, CANDIDATE, noRecordIo),
-    /refusing to create a replacement pair/,
+    () => observeProductionExactCandidateFrgPass(input, CANDIDATE, missingLoopIo),
+    /authoritative observations; refusing to create a replacement pair/,
   );
   assert.equal(created, 0);
+  assert.equal(writes, 0);
+
+  const reconstructed = await observeProductionExactCandidateFrgPass(
+    input, CANDIDATE, taggedRetryFreshCheckoutIo(record, issues, { created: () => created++, writes: () => writes++ }),
+  );
+  assert.equal(reconstructed.epoch_id, record.epoch_id);
+  assert.equal(reconstructed.loop_run_id, CANONICAL_LOOP);
+  assert.equal(created, 0);
+  assert.equal(writes, 0);
 
   let observedIssues = 0;
   const staleLocalIo = {
