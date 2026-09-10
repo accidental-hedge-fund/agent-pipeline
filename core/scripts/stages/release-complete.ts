@@ -896,6 +896,22 @@ export function realCompleteReleaseDeps(
       throw new Error(`pipeline release: publisher recovery episode for ${episode.tag} at ${episode.candidate} failed read-back`);
     }
   }
+  async function assertManagedMetadataFiles(pr: number): Promise<void> {
+    const filesRaw = JSON.parse(await gh([
+      "api", "--paginate", "--slurp",
+      `repos/${repository}/pulls/${pr}/files?per_page=100`,
+    ])) as unknown;
+    try { assertReleaseManagedMetadataPaths(parsePullRequestChangedFiles(filesRaw, pr)); }
+    catch { throw new Error(`pipeline release: metadata PR #${pr} contains non-release-managed paths`); }
+  }
+  async function requireExactHeadPass(pr: number, headOid: string): Promise<void> {
+    const checksRaw = JSON.parse(await gh([
+      "api", `repos/${repository}/commits/${headOid}/check-runs?per_page=100`, "--paginate", "--slurp",
+    ])) as unknown;
+    if (exactHeadCheckRunsState(checksRaw, headOid) !== "pass") {
+      throw new Error(`pipeline release: metadata PR #${pr} has no nonempty green exact-head CI at ${headOid}`);
+    }
+  }
   return {
     log: console.error,
     withRunLock: (key, fn) => withLock(key, fn),
@@ -980,19 +996,9 @@ export function realCompleteReleaseDeps(
       if (versions.root !== version || versions.core !== version) {
         throw new Error(`pipeline release: metadata PR #${parsed.pr} does not set both package versions to ${version}`);
       }
-      const filesRaw = JSON.parse(await gh([
-        "api", "--paginate", "--slurp",
-        `repos/${repository}/pulls/${parsed.pr}/files?per_page=100`,
-      ])) as unknown;
-      try { assertReleaseManagedMetadataPaths(parsePullRequestChangedFiles(filesRaw, parsed.pr)); }
-      catch { throw new Error(`pipeline release: metadata PR #${parsed.pr} contains non-release-managed paths`); }
+      await assertManagedMetadataFiles(parsed.pr);
       if (parsed.state === "MERGED") {
-        const checksRaw = JSON.parse(await gh([
-          "api", `repos/${repository}/commits/${parsed.head_oid}/check-runs?per_page=100`, "--paginate", "--slurp",
-        ])) as unknown;
-        if (exactHeadCheckRunsState(checksRaw, parsed.head_oid) !== "pass") {
-          throw new Error(`pipeline release: metadata PR #${parsed.pr} has no nonempty green exact-head CI at ${parsed.head_oid}`);
-        }
+        await requireExactHeadPass(parsed.pr, parsed.head_oid);
       }
       return parsed;
     },
@@ -1061,10 +1067,7 @@ export function realCompleteReleaseDeps(
       if (versions.root !== release.version || versions.core !== release.version) {
         throw new Error(`pipeline release: metadata PR #${release.pr} does not set both package versions to ${release.version}`);
       }
-      const changed = (await git(["diff", "--name-only", `origin/${release.base}...${release.head_oid}`]))
-        .split("\n").filter(Boolean);
-      try { assertReleaseManagedMetadataPaths(changed); }
-      catch { throw new Error(`pipeline release: metadata PR #${release.pr} contains non-release-managed paths`); }
+      await assertManagedMetadataFiles(release.pr);
       const observeManaged = async () => {
         const actor = (await gh(["api", "user", "--jq", ".login"])).trim();
         if (!actor) throw new Error("pipeline release: authenticated GitHub actor is missing");
@@ -1100,17 +1103,21 @@ export function realCompleteReleaseDeps(
       }
       const preMerge = await observeManaged();
       if (preMerge.state === "MERGED") {
-        const mergedChecksRaw = JSON.parse(await gh([
-          "api", `repos/${repository}/commits/${release.head_oid}/check-runs?per_page=100`, "--paginate", "--slurp",
-        ])) as unknown;
-        if (exactHeadCheckRunsState(mergedChecksRaw, release.head_oid) !== "pass") {
-          throw new Error(`pipeline release: metadata PR #${release.pr} has no nonempty green exact-head CI at ${release.head_oid}`);
-        }
+        await requireExactHeadPass(release.pr, release.head_oid);
         return preMerge;
       }
       const finished = await finishPr(release.pr, { pr: release.pr, version: release.version, base: release.base, head_oid: release.head_oid });
       if (!finished.mergeCommitOid) throw new Error("pipeline release: metadata merge returned no merge commit");
-      return { ...preMerge, state: "MERGED", merge_commit_oid: finished.mergeCommitOid };
+      const postMerge = await observeManaged();
+      if (postMerge.state !== "MERGED") {
+        throw new Error(`pipeline release: metadata PR #${release.pr} is not MERGED after finish`);
+      }
+      const mergeOid = exactOid(finished.mergeCommitOid, "metadata merge commit");
+      if (postMerge.merge_commit_oid !== mergeOid) {
+        throw new Error(`pipeline release: metadata PR #${release.pr} merge identity changed during finish`);
+      }
+      await requireExactHeadPass(release.pr, release.head_oid);
+      return postMerge;
     },
     async runExactFrg(version, candidate, branch) {
       const result = await runProductionExactCandidateFrg({ repoDir, repository, baseBranch: branch, releaseVersion: version, expectedCandidateSha: candidate });

@@ -141,6 +141,38 @@ function metadataObserverCommand(opts: {
   };
 }
 
+function managedPullFiles(): string {
+  return JSON.stringify([[{ filename: "package.json" }, { filename: "core/package.json" }]]);
+}
+
+function finishMetadataCommand(opts: {
+  calls?: string[];
+  nextView: () => Record<string, unknown>;
+  nextChecks: () => unknown;
+}) {
+  return async (_cwd: string, file: string, args: string[]) => {
+    const joined = args.join(" ");
+    opts.calls?.push(`${file} ${joined}`);
+    if (args[0] === "fetch") return "";
+    if (args[0] === "rev-parse") return A;
+    if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
+    if (args[0] === "diff") {
+      throw new Error("finishMetadata must not use origin/base...head after an external merge");
+    }
+    if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
+    if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+      return JSON.stringify(opts.nextView());
+    }
+    if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+      return JSON.stringify(opts.nextChecks());
+    }
+    if (file === "gh" && args[0] === "api" && joined.includes("/pulls/") && joined.includes("/files")) {
+      return managedPullFiles();
+    }
+    throw new Error(`unexpected ${file} ${joined}`);
+  };
+}
+
 test("complete release orders metadata merge before C/FRG/tag/publication", async () => {
   const d = deps();
   const result = await runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d);
@@ -952,6 +984,44 @@ test("publisher recovery does not re-dispatch on a fresh invocation after an uno
   assert.equal(dispatches, 1);
 });
 
+test("publisher recovery persists rerun_requested before gh run rerun and never reruns when persist or read-back fails", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  const failedRun = [{
+    databaseId: 9, event: "workflow_dispatch", headBranch: tag, headSha: C,
+    status: "completed", conclusion: "failure", attempt: 1,
+  }];
+  const failedCommand = (ghCalls: string[]) => async (cwd: string, file: string, args: string[]) => {
+    if (file === "gh") ghCalls.push(args.join(" "));
+    return publisherCommand(tag, notes, { runs: failedRun, ghCalls: [] })(cwd, file, args);
+  };
+
+  const persistCalls: string[] = [];
+  const persistFails = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    async loadPublisherRecoveryEpisode() { return null; },
+    async persistPublisherRecoveryEpisode() {
+      persistCalls.push("persist");
+      throw new Error("pipeline release: publisher recovery episode disk full");
+    },
+    command: failedCommand(persistCalls),
+  });
+  await assert.rejects(() => persistFails.recoverPublication(tag, C), /disk full/);
+  assert.ok(persistCalls.includes("persist"));
+  assert.equal(persistCalls.filter((call) => call.startsWith("run rerun")).length, 0);
+
+  const readBackCalls: string[] = [];
+  const readBackFails = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    async loadPublisherRecoveryEpisode() { return null; },
+    async persistPublisherRecoveryEpisode() { readBackCalls.push("persist"); },
+    command: failedCommand(readBackCalls),
+  });
+  await assert.rejects(() => readBackFails.recoverPublication(tag, C), /failed read-back/);
+  assert.ok(readBackCalls.includes("persist"));
+  assert.equal(readBackCalls.filter((call) => call.startsWith("run rerun")).length, 0);
+});
+
 test("publisher recovery persists the episode before dispatch and does not dispatch when persist fails", async () => {
   const tag = "v1.2.3";
   const notes = releaseTagNotes("1.2.3", C);
@@ -1038,27 +1108,18 @@ test("finishMetadata requires nonempty green exact-head CI when the PR merges du
     wait: async () => {},
     publicationAttempts: 3,
     finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
-    command: async (_cwd, file, args) => {
-      const joined = args.join(" ");
-      if (args[0] === "fetch") return "";
-      if (args[0] === "rev-parse") return A;
-      if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
-      if (args[0] === "diff") return "package.json\ncore/package.json";
-      if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
-      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+    command: finishMetadataCommand({
+      nextView: () => {
         views++;
-        return JSON.stringify(metadataPrPayload({
+        return metadataPrPayload({
           state: views === 1 ? "OPEN" : "MERGED",
           mergeCommit: views === 1 ? null : { oid: C },
-        }));
-      }
-      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
-        return JSON.stringify([{ check_runs: views === 1
-          ? [{ name: "ci", head_sha: A, status: "in_progress", conclusion: null }]
-          : [{ name: "ci", head_sha: B, status: "completed", conclusion: "success" }] }]);
-      }
-      throw new Error(`unexpected ${file} ${joined}`);
-    },
+        });
+      },
+      nextChecks: () => [{ check_runs: views === 1
+        ? [{ name: "ci", head_sha: A, status: "in_progress", conclusion: null }]
+        : [{ name: "ci", head_sha: B, status: "completed", conclusion: "success" }] }],
+    }),
   });
   await assert.rejects(
     () => adapter.finishMetadata({ pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null }),
@@ -1071,27 +1132,18 @@ test("finishMetadata requires nonempty green exact-head CI when the PR merges du
     wait: async () => {},
     publicationAttempts: 3,
     finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
-    command: async (_cwd, file, args) => {
-      const joined = args.join(" ");
-      if (args[0] === "fetch") return "";
-      if (args[0] === "rev-parse") return A;
-      if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
-      if (args[0] === "diff") return "package.json\ncore/package.json";
-      if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
-      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+    command: finishMetadataCommand({
+      nextView: () => {
         views++;
-        return JSON.stringify(metadataPrPayload({
+        return metadataPrPayload({
           state: views === 1 ? "OPEN" : "MERGED",
           mergeCommit: views === 1 ? null : { oid: C },
-        }));
-      }
-      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
-        return JSON.stringify([{ check_runs: views === 1
-          ? [{ name: "ci", head_sha: A, status: "in_progress", conclusion: null }]
-          : [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }] }]);
-      }
-      throw new Error(`unexpected ${file} ${joined}`);
-    },
+        });
+      },
+      nextChecks: () => [{ check_runs: views === 1
+        ? [{ name: "ci", head_sha: A, status: "in_progress", conclusion: null }]
+        : [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }] }],
+    }),
   });
   const finished = await green.finishMetadata({
     pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null,
@@ -1109,30 +1161,23 @@ test("finishMetadata reloads exact-head CI when merge lands after a green snapsh
     wait: async () => {},
     publicationAttempts: 3,
     finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
-    command: async (_cwd, file, args) => {
-      const joined = args.join(" ");
-      if (args[0] === "fetch") return "";
-      if (args[0] === "rev-parse") return A;
-      if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
-      if (args[0] === "diff") return "package.json\ncore/package.json";
-      if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
-      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+    command: finishMetadataCommand({
+      nextView: () => {
         views++;
-        return JSON.stringify(metadataPrPayload({
+        return metadataPrPayload({
           state: views === 1 ? "OPEN" : "MERGED",
           mergeCommit: views === 1 ? null : { oid: C },
-        }));
-      }
-      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+        });
+      },
+      nextChecks: () => {
         checkReads++;
-        return JSON.stringify([{
+        return [{
           check_runs: checkReads === 1
             ? [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }]
             : [{ name: "ci", head_sha: A, status: "in_progress", conclusion: null }],
-        }]);
-      }
-      throw new Error(`unexpected ${file} ${joined}`);
-    },
+        }];
+      },
+    }),
   });
   await assert.rejects(
     () => adapter.finishMetadata({ pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null }),
@@ -1147,36 +1192,107 @@ test("finishMetadata reloads exact-head CI when merge lands after a green snapsh
     wait: async () => {},
     publicationAttempts: 3,
     finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
-    command: async (_cwd, file, args) => {
-      const joined = args.join(" ");
-      if (args[0] === "fetch") return "";
-      if (args[0] === "rev-parse") return A;
-      if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
-      if (args[0] === "diff") return "package.json\ncore/package.json";
-      if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
-      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+    command: finishMetadataCommand({
+      nextView: () => {
         views++;
-        return JSON.stringify(metadataPrPayload({
+        return metadataPrPayload({
           state: views === 1 ? "OPEN" : "MERGED",
           mergeCommit: views === 1 ? null : { oid: C },
-        }));
-      }
-      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+        });
+      },
+      nextChecks: () => {
         checkReads++;
-        return JSON.stringify([{
+        return [{
           check_runs: checkReads === 1
             ? [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }]
             : [{ name: "ci", head_sha: A, status: "completed", conclusion: "failure" }],
-        }]);
-      }
-      throw new Error(`unexpected ${file} ${joined}`);
-    },
+        }];
+      },
+    }),
   });
   await assert.rejects(
     () => failing.finishMetadata({ pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null }),
     /no nonempty green exact-head CI/,
   );
   assert.equal(finishCalls, 0);
+});
+
+test("finishMetadata proves OPEN-to-MERGED files from pull-files after merge-commit squash and rebase", async () => {
+  for (const strategy of ["merge-commit", "squash", "rebase"] as const) {
+    let views = 0;
+    let finishCalls = 0;
+    const calls: string[] = [];
+    const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+      wait: async () => {},
+      publicationAttempts: 3,
+      finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
+      command: finishMetadataCommand({
+        calls,
+        nextView: () => {
+          views++;
+          return metadataPrPayload({
+            state: views === 1 ? "OPEN" : "MERGED",
+            mergeCommit: views === 1 ? null : { oid: C },
+          });
+        },
+        nextChecks: () => [{
+          check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }],
+        }],
+      }),
+    });
+    const finished = await adapter.finishMetadata({
+      pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null,
+    });
+    assert.equal(finished.state, "MERGED", strategy);
+    assert.equal(finished.merge_commit_oid, C, strategy);
+    assert.equal(finishCalls, 0, strategy);
+    assert.ok(calls.some((call) => call.includes("/pulls/31/files")), strategy);
+    assert.ok(!calls.some((call) => /\bdiff\b/.test(call)), strategy);
+  }
+});
+
+test("finishMetadata fails closed when finishPr reconciles a merge and post-finish exact-head CI is pending or failing", async () => {
+  for (const post of ["pending", "fail"] as const) {
+    let views = 0;
+    let checkReads = 0;
+    let finishCalls = 0;
+    const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+      wait: async () => {},
+      publicationAttempts: 3,
+      finishReleasePr: async () => {
+        finishCalls++;
+        return { mergeCommitOid: C };
+      },
+      command: finishMetadataCommand({
+        nextView: () => {
+          views++;
+          return metadataPrPayload({
+            state: views < 3 ? "OPEN" : "MERGED",
+            mergeCommit: views < 3 ? null : { oid: C },
+          });
+        },
+        nextChecks: () => {
+          checkReads++;
+          if (checkReads === 1) {
+            return [{ check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }] }];
+          }
+          return [{
+            check_runs: post === "pending"
+              ? [{ name: "ci", head_sha: A, status: "in_progress", conclusion: null }]
+              : [{ name: "ci", head_sha: A, status: "completed", conclusion: "failure" }],
+          }];
+        },
+      }),
+    });
+    await assert.rejects(
+      () => adapter.finishMetadata({ pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null }),
+      /no nonempty green exact-head CI/,
+      post,
+    );
+    assert.equal(finishCalls, 1, post);
+    assert.equal(views, 3, post);
+    assert.equal(checkReads, 2, post);
+  }
 });
 
 test("resumed publication loop completes after recovery advances main C to D", async () => {
@@ -1529,30 +1645,21 @@ test("finishMetadata rejects provenance change before merge and never calls fini
     wait: async () => {},
     publicationAttempts: 3,
     finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
-    command: async (_cwd, file, args) => {
-      const joined = args.join(" ");
-      if (args[0] === "fetch") return "";
-      if (args[0] === "rev-parse") return A;
-      if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
-      if (args[0] === "diff") return "package.json\ncore/package.json";
-      if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
-      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+    command: finishMetadataCommand({
+      nextView: () => {
         views++;
-        return JSON.stringify(metadataPrPayload({
+        return metadataPrPayload({
           state: "OPEN",
           mergeCommit: null,
           body: views === 1
             ? `Version metadata only for v1.2.3.\n\n${METADATA_PROVENANCE}`
             : `Version metadata only for v1.2.3.\n\n${METADATA_PROVENANCE}\nattacker-owned footer`,
-        }));
-      }
-      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
-        return JSON.stringify([{
-          check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }],
-        }]);
-      }
-      throw new Error(`unexpected ${file} ${joined}`);
-    },
+        });
+      },
+      nextChecks: () => [{
+        check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }],
+      }],
+    }),
   });
   await assert.rejects(
     () => adapter.finishMetadata({ pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null }),
