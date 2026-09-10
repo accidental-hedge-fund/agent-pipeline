@@ -14,6 +14,7 @@ import {
   isMaterialStageChange,
   mapAdvanceEventToStageDelta,
   parseAdvanceEventsJsonl,
+  parseRecoveryAuthorityAdvanceEventsJsonl,
   parseStageProgressEventData,
   projectionFromItem,
   recordItemStageProgress,
@@ -673,6 +674,36 @@ test("parseAdvanceEventsJsonl: skips corrupt lines", () => {
   );
   assert.equal(events.length, 2);
   assert.equal(events[1].stage, "implementing");
+});
+
+test("parseRecoveryAuthorityAdvanceEventsJsonl: every row must have a valid forward-compatible envelope", () => {
+  const valid = { schema_version: 1, type: "run_start", at: "2026-07-27T19:31:00Z", run_id: "advance-100" };
+  const future = { schema_version: 1, type: "future_event", at: "2026-07-27T19:31:00.123Z", payload: true };
+  const stageAccounting = { schema_version: 7, type: "stage_accounting", at: "2026-07-27T19:31:01Z" };
+
+  assert.deepEqual(
+    parseRecoveryAuthorityAdvanceEventsJsonl(
+      `${JSON.stringify(valid)}\n${JSON.stringify(future)}\n${JSON.stringify(stageAccounting)}\n`,
+    ),
+    [valid, future, stageAccounting],
+  );
+  for (const bad of [
+    {},
+    { schema_version: 0, type: "stage_start", at: "2026-07-27T19:31:00Z" },
+    { schema_version: "1", type: "stage_start", at: "2026-07-27T19:31:00Z" },
+    { schema_version: 1.5, type: "stage_start", at: "2026-07-27T19:31:00Z" },
+    { schema_version: 1, type: "", at: "2026-07-27T19:31:00Z" },
+    { schema_version: 1, type: 42, at: "2026-07-27T19:31:00Z" },
+    { schema_version: 1, type: "stage_start", at: "2026-07-27T19:31:00.12Z" },
+    { schema_version: 1, type: "stage_start", at: "2026-02-30T19:31:00Z" },
+  ]) {
+    assert.deepEqual(
+      parseRecoveryAuthorityAdvanceEventsJsonl(
+        [JSON.stringify(valid), JSON.stringify(bad), JSON.stringify(future)].join("\n"),
+      ),
+      [],
+    );
+  }
 });
 
 test("reconcileTerminalStageProgress: ready_to_deploy presentation without inventing advance id", async () => {

@@ -45,7 +45,7 @@ const revisionOkResult: HarnessResult = {
 
 const planReviewNeedsRevision: HarnessResult = {
   success: true,
-  stdout: "## Plan Review Verdict\n\nNEEDS_REVISION. Expand the OpenSpec tasks.",
+  stdout: "## Plan Review Verdict\n\nNEEDS_REVISION\n\nExpand the OpenSpec tasks.",
   stderr: "",
   exit_code: 0,
   duration: 1,
@@ -505,6 +505,94 @@ test("runPlanningPhases: freeform plan-review resume still uses the GitHub comme
   assert.ok(section.includes(FREEFORM_PLAN_BODY), "freeform resume uses the GitHub comment as plan text");
 });
 
+test("runPlanningPhases: OpenSpec implementation resume validates and implements the living bundle (#1568)", async () => {
+  const implementationPrompts: string[] = [];
+  const validateCalls: string[] = [];
+  let issueDetailCalls = 0;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: recordingValidate(validateCalls),
+    readChangeFile: (_dir, _name, file) =>
+      file === "proposal.md"
+        ? LIVING_PROPOSAL
+        : file === "tasks.md"
+          ? "- [ ] living implementation task"
+          : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumeImplementing: true },
+    hooks,
+    eqBaseDeps({
+      ensureManagedWorktree: async () => ({ result: "ok", worktree: wt }),
+      getIssueDetail: async () => {
+        issueDetailCalls += 1;
+        throw new Error("OpenSpec implementation resume must not read a stale plan comment");
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        implementationPrompts.push(prompt);
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.deepEqual(validateCalls, ["fresh-change"]);
+  assert.equal(issueDetailCalls, 0);
+  assert.equal(implementationPrompts.length, 1);
+  assert.match(implementationPrompts[0]!, new RegExp(WORKTREE_PROPOSAL_PIN));
+  assert.match(implementationPrompts[0]!, /living implementation task/);
+  assert.match(implementationPrompts[0]!, new RegExp(SPEC_DELTA_PIN));
+  assert.doesNotMatch(implementationPrompts[0]!, new RegExp(STALE_COMMENT_PIN));
+});
+
+test("runPlanningPhases: OpenSpec implementation resume blocks when the stable bundle changes during validation (#1568)", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let implementationCalls = 0;
+  let blocked: { reason: string; stage: string; tag: string } | undefined;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => {
+      proposal = "replacement written during validation";
+      return validItem();
+    },
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : "- [ ] task",
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumeImplementing: true },
+    hooks,
+    eqBaseDeps({
+      ensureManagedWorktree: async () => ({ result: "ok", worktree: wt }),
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, stage: string, tag: string) => {
+        blocked = { reason, stage, tag };
+      },
+      invoke: async () => {
+        implementationCalls += 1;
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.stage, "implementing");
+  assert.equal(blocked?.tag, "openspec-invalid");
+  assert.match(blocked?.reason ?? "", /changed during validation/i);
+  assert.equal(implementationCalls, 0);
+});
+
 test("runPlanningPhases: OpenSpec resume with zero or multiple restore candidates blocks before review (#1418 3.6)", async () => {
   for (const dirs of [[] as string[], ["change-a", "change-b"]]) {
     let reviewCalls = 0;
@@ -607,4 +695,621 @@ test("runPlanningPhases: missing proposal.md on a resolved id blocks without com
   assert.equal(reviewCalls, 0, "invokeReviewer must not run");
   assert.equal(revisionCalls, 0, "invokeRevision must not run");
   assert.deepEqual(reviewPrompts, [], "GitHub comment must not become plan text");
+});
+
+test("runPlanningPhases: applied OpenSpec refinement supplies the authoritative implementation input (#1568)", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let deltas = LIVING_DELTAS;
+  const implementationPrompts: string[] = [];
+  const revisionPrompts: string[] = [];
+  let reviewCalls = 0;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => deltas,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      invokeReviewer: async () => ({
+        result: reviewCalls++ === 0
+          ? planReviewNeedsRevision
+          : { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+        effectiveReviewer: "codex",
+        selfReview: false,
+      }),
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          revisionPrompts.push(prompt);
+          proposal = "Authoritative refined proposal PIN-1568";
+          tasks = "- [ ] authoritative refined task PIN-1568";
+          deltas = "#### spec.md\n\nRefined requirement PIN-1568 SHALL hold.";
+          return revisionOkResult;
+        }
+        implementationPrompts.push(prompt);
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(revisionPrompts.length, 1);
+  assert.match(revisionPrompts[0]!, /edit.*openspec\/changes\/fresh-change\/proposal\.md/is);
+  assert.match(revisionPrompts[0]!, /tasks\.md/);
+  assert.match(revisionPrompts[0]!, /specs\/\*\*\/\*\.md/);
+  assert.equal(implementationPrompts.length, 1);
+  assert.match(implementationPrompts[0]!, /Authoritative refined proposal PIN-1568/);
+  assert.match(implementationPrompts[0]!, /authoritative refined task PIN-1568/);
+  assert.match(implementationPrompts[0]!, /Refined requirement PIN-1568 SHALL hold/);
+  assert.doesNotMatch(implementationPrompts[0]!, /- \[ \] original task/);
+});
+
+test("runPlanningPhases: OpenSpec human-feedback acknowledgement is producer-authored in the stable proposal (#1568)", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  const revisionPrompts: string[] = [];
+  const implementationPrompts: string[] = [];
+  let reviewCalls = 0;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      invokeReviewer: async () => ({
+        result: reviewCalls++ === 0
+          ? planReviewNeedsRevision
+          : { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+        effectiveReviewer: "codex",
+        selfReview: false,
+      }),
+      getIssueDetail: async () => ({
+        title: "Test issue",
+        body: "test body",
+        comments: [
+          { author: "bot", body: STALE_PLAN_COMMENT, createdAt: "2026-09-03T00:00:00Z" },
+          { author: "alice", body: "Keep the exact candidate assertion.", createdAt: "2026-09-03T00:01:00Z" },
+        ],
+        number: 42,
+        labels: [],
+        state: "open",
+      }),
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          revisionPrompts.push(prompt);
+          proposal = [
+            "Authoritative refined proposal with exact candidate assertion.",
+            "",
+            "## Human Feedback Acknowledgement",
+            "",
+            "- @alice: addressed — retained the exact candidate assertion.",
+          ].join("\n");
+          tasks = "- [ ] verify exact candidate assertion";
+          return revisionOkResult;
+        }
+        implementationPrompts.push(prompt);
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(revisionPrompts.length, 1);
+  assert.match(
+    revisionPrompts[0]!,
+    /write.*Human Feedback Acknowledgement.*proposal\.md/is,
+  );
+  assert.equal(implementationPrompts.length, 1);
+  assert.match(implementationPrompts[0]!, /@alice: addressed/);
+});
+
+test("runPlanningPhases: stdout-only OpenSpec human-feedback acknowledgement is rejected (#1568)", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let implementationCalls = 0;
+  let blocked: { reason: string; tag: string } | undefined;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      getIssueDetail: async () => ({
+        title: "Test issue",
+        body: "test body",
+        comments: [
+          { author: "bot", body: STALE_PLAN_COMMENT, createdAt: "2026-09-03T00:00:00Z" },
+          { author: "alice", body: "Keep the exact candidate assertion.", createdAt: "2026-09-03T00:01:00Z" },
+        ],
+        number: 42,
+        labels: [],
+        state: "open",
+      }),
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+        blocked = { reason, tag };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = "Authoritative refined proposal without a durable acknowledgement.";
+          tasks = "- [ ] verify exact candidate assertion";
+          return revisionOkResult;
+        }
+        implementationCalls++;
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.tag, "needs-human");
+  assert.match(blocked?.reason ?? "", /Human Feedback Acknowledgement/);
+  assert.equal(implementationCalls, 0);
+  assert.doesNotMatch(proposal, /Human Feedback Acknowledgement/);
+});
+
+test("makeOpenspecPlanningHooks: rejects an artifact bundle replaced during validation (#1568)", async () => {
+  let proposal = "original proposal";
+  let tasks = "- [ ] original";
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    readChangeFile: (_dir, _change, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => "Requirement SHALL hold.",
+    validateItem: async () => {
+      proposal = "unvalidated replacement written during validation";
+      return validItem();
+    },
+  });
+
+  assert.equal((await hooks.captureRevisionBaseline!({ path: "/fake/wt" })).ok, true);
+  proposal = "valid revised proposal";
+  tasks = "- [ ] valid revised task";
+
+  const result = await hooks.revalidateArtifact({ path: "/fake/wt" }, "Acknowledged");
+  assert.equal(result.ok, false, "a bundle changed during validation must fail closed");
+  if (!result.ok) assert.match(result.reason, /changed during validation/i);
+});
+
+test("makeOpenspecPlanningHooks: buildImplPlan uses the same stable validated bundle (#1568)", async () => {
+  let proposal = "original proposal";
+  let tasks = "- [ ] original task";
+  let deltas = "Original requirement SHALL hold.";
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    readChangeFile: (_dir, _change, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => deltas,
+    validateItem: async () => validItem(),
+  });
+
+  assert.equal((await hooks.captureRevisionBaseline!({ path: "/fake/wt" })).ok, true);
+  proposal = "validated revised proposal";
+  tasks = "- [ ] validated revised task";
+  deltas = "Validated requirement SHALL hold.";
+  assert.equal((await hooks.revalidateArtifact({ path: "/fake/wt" }, "Acknowledged")).ok, true);
+
+  proposal = "later unvalidated proposal";
+  tasks = "- [ ] later unvalidated task";
+  const implPlan = await hooks.buildImplPlan({ path: "/fake/wt" }, "ignored");
+  assert.match(implPlan, /validated revised proposal/);
+  assert.match(implPlan, /validated revised task/);
+  assert.doesNotMatch(implPlan, /later unvalidated/);
+});
+
+test("runPlanningPhases: acknowledged but unapplied OpenSpec refinement blocks before implementation (#1568)", async () => {
+  let blocked: { reason: string; tag: string } | undefined;
+  let implementationCalls = 0;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], livingFileInjects());
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+        blocked = { reason, tag };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (!prompt.includes("Original implementation plan:")) implementationCalls++;
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.tag, "openspec-invalid");
+  assert.match(blocked?.reason ?? "", /acknowledged.*unchanged/i);
+  assert.equal(implementationCalls, 0);
+});
+
+test("runPlanningPhases: unrelated OpenSpec edits do not prove the accepted proposal refinement was applied", async () => {
+  for (const variant of ["tasks-only", "proposal-only"] as const) {
+    let proposal = LIVING_PROPOSAL;
+    let tasks = "- [ ] original task";
+    let blocked: { reason: string; tag: string } | undefined;
+    let implementationCalls = 0;
+    const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+      listChangeDirs: () => ["fresh-change"],
+      validateItem: async () => validItem(),
+      readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+      readSpecDeltas: () => LIVING_DELTAS,
+    });
+    const result = await runPlanningPhases(
+      eqCfg, 42, "Test issue", "test body", "run-42", { resumePlanReview: true }, hooks,
+      eqBaseDeps({
+        setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+          blocked = { reason, tag };
+        },
+        invoke: async (_h: string, _dir: string, prompt: string) => {
+          if (prompt.includes("Original implementation plan:")) {
+            if (variant === "tasks-only") tasks = "- [ ] unrelated formatting cleanup";
+            else proposal = `${LIVING_PROPOSAL}\n\nUnrelated typo cleanup.`;
+          } else implementationCalls++;
+          return revisionOkResult;
+        },
+      }) as never,
+    );
+
+    assert.equal(result.advanced, false, variant);
+    assert.equal(blocked?.tag, "openspec-invalid", variant);
+    assert.match(blocked?.reason ?? "", /stable OpenSpec artifact bundle.*accepted refinement/i, variant);
+    assert.equal(implementationCalls, 0, variant);
+  }
+});
+
+test("runPlanningPhases: exact accepted-refinement binding advances a coherent OpenSpec revision", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let implementationCalls = 0;
+  let reviewCalls = 0;
+  let refinementReviewPrompt = "";
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+  const result = await runPlanningPhases(
+    eqCfg, 42, "Test issue", "test body", "run-42", { resumePlanReview: true }, hooks,
+    eqBaseDeps({
+      invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, prompt: string) => {
+        const firstReview = reviewCalls++ === 0;
+        if (!firstReview) refinementReviewPrompt = prompt;
+        return {
+          result: firstReview
+            ? planReviewNeedsRevision
+            : { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+          effectiveReviewer: "codex",
+          selfReview: false,
+        };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = `${LIVING_PROPOSAL}\n\nApplied the requested task expansion.`;
+          tasks = "- [ ] expanded implementation task";
+        } else implementationCalls++;
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(implementationCalls, 1);
+  assert.match(refinementReviewPrompt, /Expand the OpenSpec tasks/);
+  assert.match(refinementReviewPrompt, /Applied the requested task expansion/);
+  assert.match(refinementReviewPrompt, /expanded implementation task/);
+});
+
+test("runPlanningPhases: exact-bundle rereview uses the configured plan-review stage executor", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let executorCalls = 0;
+  let localReviewerCalls = 0;
+  const cfg = {
+    ...eqCfg,
+    stage_executors: { "plan-review": "local-reviewer" },
+    executors: {
+      "local-reviewer": {
+        type: "model-endpoint",
+        base_url: "http://reviewer.invalid/v1",
+        model: "review-model",
+      },
+    },
+  } as unknown as PipelineConfig;
+  const hooks = makeOpenspecPlanningHooks(cfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+  const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "GET") return new Response("", { status: 200 });
+    executorCalls += 1;
+    const content = executorCalls === 1
+      ? "## Plan Review Verdict\n\nNEEDS_REVISION\n\nExpand the OpenSpec tasks."
+      : "## Plan Review Verdict\n\nAPPROVE";
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const result = await runPlanningPhases(
+    cfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true, executorHttpDeps: { fetchImpl } },
+    hooks,
+    eqBaseDeps({
+      invokeReviewer: async () => {
+        localReviewerCalls += 1;
+        throw new Error("local reviewer must not run when plan-review is delegated");
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = `${LIVING_PROPOSAL}\n\nApplied the requested task expansion.`;
+          tasks = "- [ ] expanded implementation task";
+        }
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(executorCalls, 2, "initial review and exact-bundle rereview must share the executor");
+  assert.equal(localReviewerCalls, 0);
+});
+
+test("runPlanningPhases: exact-bundle rereview preserves plan-review ensemble routing and metadata", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  const reviewerPrompts: string[] = [];
+  const comments: string[] = [];
+  const cfg = {
+    ...eqCfg,
+    review_ensemble: {
+      enabled: true,
+      agents: [{ role: "primary" }, { harness: "gemini" }],
+      min_usable_agents: 2,
+      max_agents: 4,
+    },
+  } as unknown as PipelineConfig;
+  const hooks = makeOpenspecPlanningHooks(cfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    cfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      postComment: async (_cfg: unknown, _n: unknown, body: string) => { comments.push(body); },
+      invokeReviewer: async (reviewer: string, _primary: string, _cwd: string, prompt: string) => {
+        reviewerPrompts.push(`${reviewer}:${prompt}`);
+        const exactBundle = prompt.includes("## Stable authoritative artifact bundle");
+        return {
+          result: {
+            ...planReviewOk,
+            stdout: exactBundle
+              ? "## Plan Review Verdict\n\nAPPROVE"
+              : "## Plan Review Verdict\n\nNEEDS_REVISION\n\nExpand the OpenSpec tasks.",
+          },
+          effectiveReviewer: reviewer,
+          selfReview: false,
+        };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = `${LIVING_PROPOSAL}\n\nApplied the requested task expansion.`;
+          tasks = "- [ ] expanded implementation task";
+        }
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  const exactBundlePrompts = reviewerPrompts.filter((prompt) =>
+    prompt.includes("## Stable authoritative artifact bundle")
+  );
+  assert.equal(exactBundlePrompts.length, 2, "both configured agents must independently rereview the bundle");
+  assert.ok(exactBundlePrompts.every((prompt) => prompt.includes("ensemble-agent")));
+  assert.match(comments.find((body) => body.startsWith("## Plan Review")) ?? "", /Reviewer.*ensemble/);
+});
+
+test("runPlanningPhases: same-harness self-review cannot authorize an exact-bundle refinement", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let reviewCalls = 0;
+  let blocked: { reason: string; tag: string } | undefined;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+        blocked = { reason, tag };
+      },
+      invokeReviewer: async () => {
+        reviewCalls += 1;
+        return {
+          result: reviewCalls === 1
+            ? planReviewNeedsRevision
+            : { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+          effectiveReviewer: reviewCalls === 1 ? "codex" : "claude",
+          selfReview: reviewCalls > 1,
+        };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = `${LIVING_PROPOSAL}\n\nApplied the requested task expansion.`;
+          tasks = "- [ ] expanded implementation task";
+        }
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.tag, "openspec-invalid");
+  assert.match(blocked?.reason ?? "", /independent plan rereview/i);
+});
+
+test("runPlanningPhases: configured same-harness reviewer cannot authorize an exact-bundle refinement", async () => {
+  let proposal = LIVING_PROPOSAL;
+  let tasks = "- [ ] original task";
+  let reviewCalls = 0;
+  let blocked: { reason: string; tag: string } | undefined;
+  const cfg = {
+    ...eqCfg,
+    harnesses: { ...eqCfg.harnesses, implementer: "claude", reviewer: "claude" },
+  } as unknown as PipelineConfig;
+  const hooks = makeOpenspecPlanningHooks(cfg, "Test issue", "test body", [], {
+    listChangeDirs: () => ["fresh-change"],
+    validateItem: async () => validItem(),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? proposal : file === "tasks.md" ? tasks : null,
+    readSpecDeltas: () => LIVING_DELTAS,
+  });
+
+  const result = await runPlanningPhases(
+    cfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+        blocked = { reason, tag };
+      },
+      invokeReviewer: async () => {
+        reviewCalls += 1;
+        return {
+          result: reviewCalls === 1
+            ? planReviewNeedsRevision
+            : { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+          effectiveReviewer: "claude",
+          selfReview: false,
+        };
+      },
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (prompt.includes("Original implementation plan:")) {
+          proposal = `${LIVING_PROPOSAL}\n\nApplied the requested task expansion.`;
+          tasks = "- [ ] expanded implementation task";
+        }
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.tag, "openspec-invalid");
+  assert.match(blocked?.reason ?? "", /independent plan rereview/i);
+});
+
+test("runPlanningPhases: approved unchanged OpenSpec artifact remains valid (#1568)", async () => {
+  let implementationCalls = 0;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], livingFileInjects());
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      invokeReviewer: async () => ({
+        result: { ...planReviewOk, stdout: "## Plan Review Verdict\n\nAPPROVE" },
+        effectiveReviewer: "codex",
+        selfReview: false,
+      }),
+      invoke: async (_h: string, _dir: string, prompt: string) => {
+        if (!prompt.includes("Original implementation plan:")) implementationCalls++;
+        return revisionOkResult;
+      },
+    }) as never,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(implementationCalls, 1);
+});
+
+test("runPlanningPhases: malformed approval cannot admit an unchanged OpenSpec artifact (#1568)", async () => {
+  let blocked: { reason: string; tag: string } | undefined;
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", [], livingFileInjects());
+
+  const result = await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { resumePlanReview: true },
+    hooks,
+    eqBaseDeps({
+      setBlocked: async (_cfg: unknown, _n: unknown, reason: string, _stage: string, tag: string) => {
+        blocked = { reason, tag };
+      },
+      invokeReviewer: async () => ({
+        result: planReviewOk,
+        effectiveReviewer: "codex",
+        selfReview: false,
+      }),
+    }) as never,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(blocked?.tag, "openspec-invalid");
+  assert.match(blocked?.reason ?? "", /acknowledged.*unchanged/i);
 });

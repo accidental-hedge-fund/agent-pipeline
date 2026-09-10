@@ -541,6 +541,118 @@ test("realDispatchItem preserves a child signal when authoritative observation f
   });
 });
 
+test("realDispatchItem preserves precise child diagnostic when the forge refresh fails (#1568)", async () => {
+  const fixedNow = new Date("2026-09-08T19:56:16.237Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 1558, fixedNow);
+  const prHead = "a".repeat(40);
+  const childDiagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "tester_rebind_pr_head_unobservable",
+    stage: "design-gate",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      blocker_code: "tester_rebind_pr_head_unobservable",
+      subject_omitted_because_unobservable: true,
+      pr_head: prHead,
+    },
+  });
+  const eventsText = JSON.stringify({
+    type: "blocker_set",
+    blocker_kind: "harness-failure",
+    reason: childDiagnostic.detail.reason,
+    stage: childDiagnostic.detail.stage,
+    diagnostic: childDiagnostic,
+  });
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      eventsPathExists: (candidate) => candidate === expectedPin.events_path,
+      readEventsText: () => eventsText,
+      readWriteHealthText: () => null,
+      spawn: (() => fakeSpawnChild(0)) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => {
+        throw new Error("GraphQL rate limit while refreshing forge state");
+      },
+    },
+  );
+
+  const response = await dispatch({
+    schema: "pipeline/loop-execution@1",
+    item_id: "1558",
+    repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: "loop-run-1558",
+  });
+
+  assert.equal(response.outcome, "failed");
+  assert.equal(
+    response.diagnostic?.detail.evidence_ordering?.blocker_code,
+    "tester_rebind_pr_head_unobservable",
+  );
+  assert.deepEqual(response.diagnostic?.detail.observation_uncertainty, {
+    observer: "forge",
+    operation: "issue_pr_refresh",
+    reason: "GraphQL rate limit while refreshing forge state",
+  });
+  assert.equal(response.diagnostic?.detail.evidence_ordering?.subject_omitted_because_unobservable, true);
+});
+
+test("realDispatchItem records uncertainty when the independent PR refresh throws", async () => {
+  const fixedNow = new Date("2026-09-08T19:56:16.237Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 1558, fixedNow);
+  const childDiagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "child blocker remains authoritative",
+    stage: "design-gate",
+  });
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      eventsPathExists: (candidate) => candidate === expectedPin.events_path,
+      readEventsText: () => JSON.stringify({
+        type: "blocker_set",
+        blocker_kind: "harness-failure",
+        reason: childDiagnostic.detail.reason,
+        stage: childDiagnostic.detail.stage,
+        diagnostic: childDiagnostic,
+      }),
+      readWriteHealthText: () => null,
+      spawn: (() => fakeSpawnChild(0)) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: ["pipeline:review-1"], state: "open" }) as never,
+      getPrForIssue: async () => { throw new Error("PR lookup unavailable"); },
+    },
+  );
+
+  const response = await dispatch({
+    schema: "pipeline/loop-execution@1",
+    item_id: "1558",
+    repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: "loop-run-1558",
+  });
+
+  assert.equal(response.outcome, "failed");
+  assert.equal(response.diagnostic?.detail.reason, "child blocker remains authoritative");
+  assert.deepEqual(response.diagnostic?.detail.observation_uncertainty, {
+    observer: "forge",
+    operation: "issue_pr_refresh",
+    reason: "PR lookup unavailable",
+  });
+  assert.equal(response.evidence.pr_number, null);
+});
+
 test("realDispatchItem preserves abnormal exit when durable start linkage rejects", async () => {
   const fixedNow = new Date("2026-07-29T13:49:56.421Z");
   const expectedPin = pinAdvanceRunIdentity("/repo", 623, fixedNow);

@@ -130,6 +130,8 @@ test("makeOpenspecPlanningHooks: skipped authoring restores the unique fresh cha
       return ["baseline-change", "fresh-change"];
     },
     validateItem: recordingValidate(validateCalls),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? "revised proposal" : "",
+    readSpecDeltas: () => "",
   });
 
   const validated = await hooks.validateArtifact(wt);
@@ -151,6 +153,8 @@ test("makeOpenspecPlanningHooks: exactly one active change is restored when it i
   const hooks = makeOpenspecPlanningHooks(eqCfg, "Test", "body", ["only-change"], {
     listChangeDirs: () => ["only-change"],
     validateItem: recordingValidate(validateCalls),
+    readChangeFile: (_dir, _name, file) => file === "proposal.md" ? "revised proposal" : "",
+    readSpecDeltas: () => "",
   });
 
   const result = await hooks.revalidateArtifact(wt, "revised proposal");

@@ -18,6 +18,7 @@ export const DECISIONS_FENCE_LANG = "pipeline-decisions-v1";
 export const DECISIONS_COMMENT_PREFIX = "<!-- pipeline-decisions:v1 sha256=";
 
 export const MAX_ARTIFACT_UTF8 = 256 * 1024;
+export const MAX_ISSUE_BODY_LENGTH = 65_536;
 export const MAX_NODES = 64;
 export const MAX_NODE_TEXT = 2000;
 export const MAX_CONTEXT_PROPOSAL_UTF8 = 16 * 1024;
@@ -401,12 +402,114 @@ export function unresolvedAuthorityNodes(nodes: readonly DecisionNode[]): Decisi
   });
 }
 
-export function renderDecisionsSection(artifact: DecisionsArtifact): string {
+type EvidenceReference = { evidence_ref: string };
+
+interface ArtifactWireShape extends Omit<DecisionsArtifact, "nodes"> {
+  nodes: Array<Omit<DecisionNode, "evidence" | "authority_request"> & {
+    evidence?: Array<string | EvidenceReference>;
+    authority_request?: Omit<AuthorityRequestFields, "evidence"> & {
+      evidence: Array<string | EvidenceReference>;
+    };
+  }>;
+  evidence_catalog?: Record<string, string>;
+}
+
+function evidenceOccurrences(artifact: DecisionsArtifact): Map<string, number> {
+  const counts = new Map<string, number>();
+  const add = (values: readonly string[] | undefined): void => {
+    for (const value of values ?? []) counts.set(value, (counts.get(value) ?? 0) + 1);
+  };
+  for (const node of artifact.nodes) {
+    add(node.evidence);
+    add(node.authority_request?.evidence);
+  }
+  return counts;
+}
+
+function evidenceValuesWorthReferencing(artifact: DecisionsArtifact): Set<string> {
+  const nodeRenderCounts = new Map<string, number>();
+  for (const node of artifact.nodes) {
+    for (const value of node.evidence ?? []) {
+      nodeRenderCounts.set(value, (nodeRenderCounts.get(value) ?? 0) + 1);
+    }
+  }
+  const candidates = [...evidenceOccurrences(artifact)].flatMap(([value, count]) => {
+      if (count < 2) return [];
+      const ref = sha256Prefixed(value);
+      const inlineJsonLength = canonicalJson(value).length;
+      const referenceJsonLength = canonicalJson(evidenceReference(value)).length;
+      const catalogEntryLength = canonicalJson(ref).length + 1 + inlineJsonLength;
+      const payloadDelta = count * referenceJsonLength + catalogEntryLength - count * inlineJsonLength;
+      const renderedCount = nodeRenderCounts.get(value) ?? 0;
+      const renderDelta = renderedCount * (`shared evidence ${ref}`.length - escapeMd(value).length);
+      const delta = payloadDelta + renderDelta;
+      return delta < 0 ? [{ value, delta }] : [];
+    });
+  const catalogSeparators = Math.max(0, candidates.length - 1);
+  const aggregateDelta = candidates.reduce((sum, candidate) => sum + candidate.delta, 0) +
+    canonicalJson({ evidence_catalog: {} }).length - 1 + catalogSeparators;
+  // The catalog envelope exists once for the selected set. Selecting every
+  // independently saving entry is optimal because entries do not share any
+  // other cost; publish references only when the complete representation shrinks.
+  return aggregateDelta < 0
+    ? new Set(candidates.map((candidate) => candidate.value))
+    : new Set<string>();
+}
+
+function evidenceReference(value: string): EvidenceReference {
+  return { evidence_ref: sha256Prefixed(value) };
+}
+
+/** Persist repeated evidence once. References are integrity bindings, never authority grants. */
+function artifactWireShape(artifact: DecisionsArtifact): ArtifactWireShape {
+  const repeated = evidenceValuesWorthReferencing(artifact);
+  if (repeated.size === 0) return artifact as ArtifactWireShape;
+
+  const evidence_catalog: Record<string, string> = {};
+  for (const value of repeated) {
+    const ref = sha256Prefixed(value);
+    const prior = evidence_catalog[ref];
+    if (prior !== undefined && prior !== value) {
+      throw new Error(`Decisions evidence digest collision at ${ref}`);
+    }
+    evidence_catalog[ref] = value;
+  }
+  const compact = (values: string[] | undefined): Array<string | EvidenceReference> | undefined =>
+    values?.map((value) => repeated.has(value) ? evidenceReference(value) : value);
+  return {
+    ...artifact,
+    nodes: artifact.nodes.map((node) => ({
+      ...node,
+      ...(node.evidence ? { evidence: compact(node.evidence) } : {}),
+      ...(node.authority_request
+        ? {
+            authority_request: {
+              ...node.authority_request,
+              evidence: compact(node.authority_request.evidence)!,
+            },
+          }
+        : {}),
+    })),
+    evidence_catalog,
+  };
+}
+
+export function renderDecisionsSection(
+  artifact: DecisionsArtifact,
+  options: {
+    referenceSharedEvidence?: boolean;
+    sharedEvidence?: ReadonlySet<string>;
+    referencedNodeEvidence?: ReadonlyMap<string, ReadonlySet<number>>;
+  } = {},
+): string {
   const lines: string[] = ["## Decisions", ""];
   if (artifact.nodes.length === 0) {
     lines.push("_No decision nodes._", "");
     return lines.join("\n");
   }
+  const repeated = options.sharedEvidence ?? (options.referenceSharedEvidence
+    ? evidenceValuesWorthReferencing(artifact)
+    : new Set<string>());
   const sorted = [...artifact.nodes].sort((a, b) => a.id.localeCompare(b.id));
   for (const node of sorted) {
     lines.push(`### ${node.id}`);
@@ -440,7 +543,12 @@ export function renderDecisionsSection(artifact: DecisionsArtifact): string {
       lines.push(`- **Risk:** ${escapeMd(node.risk)}`);
     }
     if (node.evidence && node.evidence.length > 0) {
-      lines.push(`- **Evidence:** ${node.evidence.map((e) => escapeMd(e)).join("; ")}`);
+      lines.push(`- **Evidence:** ${node.evidence.map((e, index) => {
+        const referencedOccurrence = options.referencedNodeEvidence?.get(node.id)?.has(index);
+        if (referencedOccurrence !== true && (options.referencedNodeEvidence || !repeated.has(e))) return escapeMd(e);
+        const ref = sha256Prefixed(e);
+        return `shared evidence ${ref}`;
+      }).join("; ")}`);
     }
     lines.push("");
   }
@@ -534,7 +642,7 @@ function escapeMd(text: string): string {
 }
 
 export function artifactCanonicalJson(artifact: DecisionsArtifact): string {
-  return canonicalJson(artifact);
+  return canonicalJson(artifactWireShape(artifact));
 }
 
 export function embedDecisionsInBody(specBody: string, artifact: DecisionsArtifact): string {
@@ -543,9 +651,15 @@ export function embedDecisionsInBody(specBody: string, artifact: DecisionsArtifa
   const digest = sha256Hex(payload);
   const comment = `${DECISIONS_COMMENT_PREFIX}${digest} -->`;
   const fence = `\`\`\`${DECISIONS_FENCE_LANG}\n${payload}\n\`\`\``;
-  const section = renderDecisionsSection(artifact).trimEnd();
+  const section = renderDecisionsSection(artifact, { referenceSharedEvidence: true }).trimEnd();
   const parts = [core, "", comment, fence, "", section, ""];
-  return parts.join("\n").replace(/^\n+/, "");
+  const body = parts.join("\n").replace(/^\n+/, "");
+  if (body.length > MAX_ISSUE_BODY_LENGTH) {
+    throw new Error(
+      `Decisions issue body exceeds supported 65,536-character limit (actual ${body.length})`,
+    );
+  }
+  return body;
 }
 
 export function extractSpecCore(body: string): string {
@@ -604,11 +718,25 @@ export function parseDecisionsFromBody(body: string): ParseResult {
   } catch {
     return { ok: false, reason: "Decisions fence is not JSON", code: "invalid_json" };
   }
+  const persistedReferencedNodeEvidence = referencedNodeEvidence(parsed);
   const shape = parseDecisionsArtifact(parsed);
   if (!shape.ok) return shape;
-  const rendered = renderDecisionsSection(shape.artifact).trim();
+  const rendered = renderDecisionsSection(shape.artifact, {
+    // Validate the authenticated persisted layout. Older valid bodies can
+    // contain a mixed catalog/inline selection that differs from today's
+    // aggregate-optimal selector; expansion has already authenticated every
+    // catalog value and rejected missing or unused references.
+    referencedNodeEvidence: persistedReferencedNodeEvidence,
+  }).trim();
+  const legacyCatalogRendered = hasEvidenceCatalog(parsed)
+    ? renderDecisionsSection(shape.artifact, {
+        sharedEvidence: new Set(Object.values(
+          (parsed as { evidence_catalog: Record<string, string> }).evidence_catalog,
+        )),
+      }).trim()
+    : null;
   const liveSection = extractDecisionsSection(body)?.trim();
-  if (liveSection !== rendered) {
+  if (liveSection !== rendered && liveSection !== legacyCatalogRendered) {
     return { ok: false, reason: "## Decisions section diverges from the artifact", code: "render_divergence" };
   }
   return {
@@ -629,7 +757,116 @@ export function extractDecisionsSection(body: string): string | null {
   return body.slice(start, end).replace(/\s+$/, "") + "\n";
 }
 
+function hasEvidenceCatalog(raw: unknown): boolean {
+  return raw !== null && typeof raw === "object" && !Array.isArray(raw) &&
+    Object.prototype.hasOwnProperty.call(raw, "evidence_catalog");
+}
+
+function referencedNodeEvidence(raw: unknown): ReadonlyMap<string, ReadonlySet<number>> {
+  const referenced = new Map<string, Set<number>>();
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return referenced;
+  const nodes = (raw as Record<string, unknown>).nodes;
+  if (!Array.isArray(nodes)) return referenced;
+  for (const nodeRaw of nodes) {
+    if (nodeRaw === null || typeof nodeRaw !== "object" || Array.isArray(nodeRaw)) continue;
+    const node = nodeRaw as Record<string, unknown>;
+    if (typeof node.id !== "string" || !Array.isArray(node.evidence)) continue;
+    for (const [index, value] of node.evidence.entries()) {
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        Object.keys(value).length === 1 &&
+        isSha256Prefixed((value as Record<string, unknown>).evidence_ref)
+      ) {
+        const indexes = referenced.get(node.id) ?? new Set<number>();
+        indexes.add(index);
+        referenced.set(node.id, indexes);
+      }
+    }
+  }
+  return referenced;
+}
+
+function expandEvidenceCatalog(raw: unknown): { ok: true; artifact: unknown } | ParseFailure {
+  if (!hasEvidenceCatalog(raw)) return { ok: true, artifact: raw };
+  const source = raw as Record<string, unknown>;
+  const catalogRaw = source.evidence_catalog;
+  if (catalogRaw === null || typeof catalogRaw !== "object" || Array.isArray(catalogRaw)) {
+    return { ok: false, reason: "artifact.evidence_catalog must be an object", code: "invalid_shape" };
+  }
+  const catalog = catalogRaw as Record<string, unknown>;
+  for (const [ref, value] of Object.entries(catalog)) {
+    if (!isSha256Prefixed(ref) || typeof value !== "string") {
+      return { ok: false, reason: "artifact.evidence_catalog entry is malformed", code: "invalid_shape" };
+    }
+    if (sha256Prefixed(value) !== ref) {
+      return { ok: false, reason: `evidence catalog digest does not match ${ref}`, code: "digest_mismatch" };
+    }
+  }
+  const used = new Set<string>();
+  const expand = (value: unknown, nodeId: string): unknown => {
+    if (typeof value === "string") return value;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+    const reference = value as Record<string, unknown>;
+    if (Object.keys(reference).length !== 1 || !isSha256Prefixed(reference.evidence_ref)) return value;
+    const ref = reference.evidence_ref;
+    const resolved = catalog[ref];
+    if (typeof resolved !== "string") {
+      throw new Error(`node ${nodeId} references missing evidence ${ref}`);
+    }
+    used.add(ref);
+    return resolved;
+  };
+  try {
+    const nodes = Array.isArray(source.nodes)
+      ? source.nodes.map((item) => {
+          if (item === null || typeof item !== "object" || Array.isArray(item)) return item;
+          const node = item as Record<string, unknown>;
+          const nodeId = typeof node.id === "string" ? node.id : "<unknown>";
+          const authority = node.authority_request;
+          return {
+            ...node,
+            ...(Array.isArray(node.evidence)
+              ? { evidence: node.evidence.map((value) => expand(value, nodeId)) }
+              : {}),
+            ...(authority !== null && typeof authority === "object" && !Array.isArray(authority)
+              ? {
+                  authority_request: {
+                    ...(authority as Record<string, unknown>),
+                    ...(Array.isArray((authority as Record<string, unknown>).evidence)
+                      ? {
+                          evidence: ((authority as Record<string, unknown>).evidence as unknown[])
+                            .map((value) => expand(value, nodeId)),
+                        }
+                      : {}),
+                  },
+                }
+              : {}),
+          };
+        })
+      : source.nodes;
+    for (const ref of Object.keys(catalog)) {
+      if (!used.has(ref)) {
+        return { ok: false, reason: `unused evidence catalog entry ${ref}`, code: "invalid_shape" };
+      }
+    }
+    const { evidence_catalog: _catalog, ...artifact } = source;
+    void _catalog;
+    return { ok: true, artifact: { ...artifact, nodes } };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof Error ? error.message : "evidence reference is invalid",
+      code: "invalid_shape",
+    };
+  }
+}
+
 export function parseDecisionsArtifact(raw: unknown): ParseSuccess | ParseFailure {
+  const expanded = expandEvidenceCatalog(raw);
+  if (!expanded.ok) return expanded;
+  raw = expanded.artifact;
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, reason: "artifact is not an object", code: "invalid_shape" };
   }

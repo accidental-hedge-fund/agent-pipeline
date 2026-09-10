@@ -2082,6 +2082,63 @@ test("gatherContextSnapshot: last30days comment does NOT prevent human-comment s
   assert.match(snapshot!, /alice/, "snapshot must contain the human comment author");
 });
 
+test("runPlanningPhases: replan carries feedback after an existing snapshot to every planning producer (#1568)", async () => {
+  const lateFeedback = "AUTHORIZED_LATE_FEEDBACK: retain the exact acceptance assertion.";
+  const pipelineNoise = "## Pipeline: blocked\n\nPIPELINE_ONLY_STATUS";
+  const comments = [
+    { author: "alice", body: "Initial planning context.", createdAt: "2026-09-08T20:00:00Z" },
+    { author: "pipeline", body: "## Pre-Planning Context\n\nold snapshot", createdAt: "2026-09-08T20:01:00Z" },
+    { author: "pipeline", body: "## Implementation Plan\n\nOld plan.", createdAt: "2026-09-08T20:02:00Z" },
+    { author: "operator", body: lateFeedback, createdAt: "2026-09-08T20:03:00Z" },
+    { author: "pipeline", body: pipelineNoise, createdAt: "2026-09-08T20:04:00Z" },
+  ];
+  let clock = Date.parse("2026-09-08T21:00:00Z");
+  const captured = { author: "", reviewer: "", revision: "" };
+  let snapshotPublications = 0;
+  const hooks = freeformHooks({
+    async authorArtifact(_cfg, _n, _wt, _opts, _carry, _run, _deps, contextSnapshot) {
+      captured.author = contextSnapshot ?? "";
+      return { ok: true, planText: "New plan.", specContext: "", readyToPlanningMsg: "generated" };
+    },
+    async invokeRevision(_primary, _wt, prompt) {
+      captured.revision = prompt;
+      return revisionOkResult;
+    },
+  });
+  const deps = {
+    ...eqBaseDeps(),
+    getIssueDetail: async () => ({
+      title: "Test",
+      body: "test body",
+      comments: structuredClone(comments),
+      number: 42,
+      labels: [],
+      state: "open",
+    }),
+    postComment: async (_cfg: unknown, _n: unknown, postedBody: string) => {
+      if (postedBody.startsWith("## Pre-Planning Context\n")) snapshotPublications++;
+      comments.push({
+        author: "pipeline",
+        body: postedBody,
+        createdAt: new Date(clock += 1_000).toISOString(),
+      });
+    },
+    invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, prompt: string) => {
+      captured.reviewer = prompt;
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
+    },
+  };
+
+  await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, hooks, deps as any);
+
+  for (const prompt of [captured.author, captured.reviewer, captured.revision]) {
+    assert.match(prompt, /AUTHORIZED_LATE_FEEDBACK/);
+    assert.doesNotMatch(prompt, /PIPELINE_ONLY_STATUS/);
+  }
+  assert.match(captured.revision, /Human comments on the plan:[\s\S]*@operator/);
+  assert.equal(snapshotPublications, 0, "the advisory snapshot comment remains idempotent");
+});
+
 test("runPlanningPhases: context snapshot is gathered after bootstrap (#318 Finding 4)", async () => {
   let bootstrapDone = false;
   const getIssueDetailCallsAfterBootstrap: boolean[] = [];
@@ -2527,7 +2584,7 @@ test("planning.ts source pin #1419: removing plan-revision salvage would return 
   const repairHeadIdx = src.indexOf("const headBeforeRetry = (");
   const repairInvokeIdx = src.indexOf("const repairResult = await invokeRevisionOnce(repairPrompt);");
   const retrySalvageIdx = src.indexOf('await salvagePlanRevisionOpenspec(headBeforeRetry, "plan revision format-repair");');
-  const revalidateIdx = src.indexOf("const rv = await hooks.revalidateArtifact(wt, revisionResult.stdout.trim());");
+  const revalidateIdx = src.indexOf("const rv = await hooks.revalidateArtifact(wt, revisionResult.stdout.trim(), {");
   const revisionSlice = src.slice(helperIdx, revalidateIdx);
   assert.ok(helperIdx !== -1, "plan-revision salvage helper must exist");
   assert.ok(invokeIdx !== -1, "initial plan-revision invoke must exist");

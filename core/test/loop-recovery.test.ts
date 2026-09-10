@@ -25,6 +25,7 @@ import {
 } from "../scripts/loop/recovery.ts";
 import { mapLegacyThemeToBlockerClass } from "../scripts/loop/import.ts";
 import { admitLifecycleRecord, applyLifecycleTransition, deriveLifecycleState } from "../scripts/recovery-lifecycle-ownership.ts";
+import { recoveryEpisodeId } from "../scripts/loop/recovery-episodes.ts";
 import { initRun, readContract, readLedger, writeLedger, acquireLock, type LoopStoreDeps } from "../scripts/loop/store.ts";
 import {
   DURABLE_BLOCKER_CLASSES,
@@ -229,6 +230,40 @@ test("compileRecoveryPolicy: a recipe outside the permitted catalogue fails comp
 test("compileRecoveryPolicy: a malformed entry (missing terminal_outcome) fails compilation", () => {
   const bad = { ...DEFAULT_RECOVERY_POLICY, "implementation-ci": { ...DEFAULT_RECOVERY_POLICY["implementation-ci"], terminal_outcome: undefined } };
   assert.throws(() => compileRecoveryPolicy(bad), /terminal_outcome/);
+});
+
+test("compileRecoveryPolicy: a supplied per_strategy_bound must be a finite non-negative integer", () => {
+  for (const perStrategyBound of ["1", -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const bad = {
+      ...DEFAULT_RECOVERY_POLICY,
+      "implementation-ci": {
+        ...DEFAULT_RECOVERY_POLICY["implementation-ci"],
+        per_strategy_bound: perStrategyBound,
+      },
+    };
+    assert.throws(() => compileRecoveryPolicy(bad), (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "validation");
+      assert.match(err.message, /implementation-ci.*per_strategy_bound/);
+      return true;
+    });
+  }
+});
+
+test("compileRecoveryPolicy: per_strategy_bound may be omitted, zero, or a positive integer", () => {
+  const omitted = compileRecoveryPolicy(DEFAULT_RECOVERY_POLICY);
+  assert.equal(omitted["implementation-ci"].per_strategy_bound, undefined);
+
+  for (const perStrategyBound of [0, 2]) {
+    const compiled = compileRecoveryPolicy({
+      ...DEFAULT_RECOVERY_POLICY,
+      "implementation-ci": {
+        ...DEFAULT_RECOVERY_POLICY["implementation-ci"],
+        per_strategy_bound: perStrategyBound,
+      },
+    });
+    assert.equal(compiled["implementation-ci"].per_strategy_bound, perStrategyBound);
+  }
 });
 
 test("compileRecoveryPolicy: missing-authority / specification-decision must route to human_authority with no recipes", () => {
@@ -1155,6 +1190,36 @@ test("upgradeContractForRecovery: adding review recovery preserves unrelated cus
   assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"], DEFAULT_RECOVERY_POLICY["workflow-engine-defect"]);
 });
 
+test("upgradeContractForRecovery: stale-shaped workflow policy with custom fields is not widened", () => {
+  const customPolicy = structuredClone(DEFAULT_RECOVERY_POLICY) as unknown as Record<string, unknown>;
+  const customWorkflowPolicy = {
+    recipes: [
+      "unlink_engine_scratch",
+      "checkpoint_owned_harness_dirt",
+      "publish_unpublished_stage_commit",
+      "restart_workflow_engine",
+      "repair_pipeline_item",
+    ],
+    retry_budget: 2,
+    backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
+    terminal_outcome: "retry",
+    run_fatal: true,
+    repeated_evidence_limit: 2,
+    per_strategy_bound: 1,
+    operator_note: "do not widen this custom policy",
+  };
+  customPolicy["workflow-engine-defect"] = customWorkflowPolicy;
+  const contract = {
+    ...testContract(),
+    recovery_policy: customPolicy,
+  } as unknown as LoopContract;
+
+  const upgraded = upgradeContractForRecovery(contract);
+
+  assert.equal(upgraded, contract);
+  assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"], customWorkflowPolicy);
+});
+
 test("upgradeContractForRecovery #1060: exact pre-#1060 repair-only review-findings migrates to unlink-then-repair", () => {
   const legacyPolicy = structuredClone(DEFAULT_RECOVERY_POLICY) as unknown as Record<string, unknown>;
   legacyPolicy["review-findings"] = {
@@ -1382,10 +1447,11 @@ test("upgradeContractForRecovery: custom entries keep their policy while legacy 
   customPolicy["implementation-ci"] = {
     recipes: ["repair_pipeline_item", "rerun_ci"],
     retry_budget: 7,
-    backoff: { initial_seconds: 3, multiplier: 3, max_seconds: 99 },
+    backoff: { initial_seconds: 3, multiplier: 3, max_seconds: 99, operator_jitter: "bounded" },
     terminal_outcome: "retry",
     run_fatal: true,
     repeated_evidence_limit: 5,
+    operator_note: "preserve this unrelated custom entry",
   };
   customPolicy["environment-auth"] = {
     recipes: ["reauthenticate", "wait_and_retry"],
@@ -1436,6 +1502,46 @@ test("upgradeLedgerForRecovery: an unmapped legacy theme is left as-is rather th
   legacy.items["100"] = { ...legacy.items["100"], state: "blocked", blocked_theme: "something-nobody-ever-recorded" };
   const upgraded = upgradeLedgerForRecovery(legacy);
   assert.equal(upgraded.items["100"].blocked_theme, "something-nobody-ever-recorded");
+});
+
+test("upgradeLedgerForRecovery: reconstructs only a derivable legacy started attempt episode identity (#1568)", () => {
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-engine-defect",
+    candidate_epoch: "b".repeat(40),
+    evidence_identity: "exact-evidence-identity",
+  };
+  const attempt = {
+    attempt_id: "legacy-started",
+    seq: 0,
+    time: "2026-09-09T20:00:00.000Z",
+    item_id: "100",
+    class: "workflow-engine-defect" as const,
+    candidate_identity: `repo=acme/widgets|head=${key.candidate_epoch}`,
+    action: "rebind_tester_evidence_after_pr" as const,
+    actions: ["rebind_tester_evidence_after_pr" as const],
+    evidence_fingerprint: key.evidence_identity,
+    outcome: "started" as const,
+    budget_remaining: 0,
+    ...key,
+  };
+  const ledger = testLedger();
+  ledger.recovery_attempts = [attempt, {
+    ...attempt,
+    attempt_id: "under-specified-started",
+    seq: 1,
+    operation: undefined,
+    candidate_epoch: undefined,
+  }];
+
+  const upgraded = upgradeLedgerForRecovery(ledger);
+
+  assert.equal(upgraded.recovery_attempts[0]?.episode_id, recoveryEpisodeId(key));
+  assert.equal(
+    upgraded.recovery_attempts[1]?.episode_id,
+    undefined,
+    "an under-specified claim must not gain authority by guessed episode identity",
+  );
 });
 
 test("recoverItem: a pre-#509 contract and ledger (missing recovery_policy / recovery_attempts, legacy blocked_theme) resume without faulting", async () => {

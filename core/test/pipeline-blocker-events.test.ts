@@ -90,6 +90,8 @@ test("mechanical OpenSpec, merge, and test blocks emit blocker_set without human
     assert.equal(blockerEvents.length, 1, `${kind} must retain canonical blocker evidence`);
     assert.equal(interventionEvents.length, 0, `${kind} is mechanical, not human authority`);
     assert.equal(event.blocker_kind, kind);
+    assert.equal(event.run_id, "run");
+    assert.equal(event.issue, 42);
     assert.equal(event.offramp_class, expectedClass);
     assert.equal(event.offramp_id, `offramp-${kind}`);
     assert.equal(event.diagnostic?.detail.blocker_kind, kind);
@@ -331,6 +333,8 @@ test("runAdvance emits blocker_set with the producer diagnostic to events.jsonl 
     );
     const event = blockerEvents[0];
     assert.equal(event.stage, "ready");
+    assert.equal(event.run_id, runId);
+    assert.equal(event.issue, 7);
     assert.equal(event.blocker_kind, "merge-conflict");
     assert.equal(event.reason, "merge conflict with base");
     assert.deepEqual(event.diagnostic, diagnostic, "the producer diagnostic must be transported into the event");

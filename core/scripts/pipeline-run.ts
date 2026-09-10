@@ -625,6 +625,8 @@ export async function emitBlockedOutcomeEvents(
     type: "blocker_set",
     at: evidenceTimestamp(),
     reason: out.reason,
+    run_id: path.basename(runDir),
+    issue: issueNumber,
     ...(diagnostic ? { diagnostic } : {}),
     stage,
     blocker_kind: blockerKind,

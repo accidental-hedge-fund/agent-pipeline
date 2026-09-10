@@ -8,6 +8,7 @@
 
 import type { LoopItemLedgerEntry, LoopItemState, LoopLedger } from "./types.ts";
 import { appendEvent, readEvents, readLedger, writeLedger, type LoopStoreDeps } from "./store.ts";
+import { isCanonicalUtcEventTimestamp } from "./advance-event-envelope.ts";
 
 /** Stable loop event kind for whole-run stage-progress follow (#611). */
 export const LOOP_ITEM_STAGE_PROGRESS = "loop_item_stage_progress";
@@ -49,6 +50,7 @@ export interface AdvanceStageEvent {
   round?: number;
   at?: string;
   outcome?: string;
+  [key: string]: unknown;
 }
 
 /** Result of mapping one advance event onto the current projection. */
@@ -472,6 +474,34 @@ export function parseAdvanceEventsJsonl(text: string | null): AdvanceStageEvent[
       if (parsed && typeof parsed === "object") out.push(parsed);
     } catch {
       // skip corrupt lines
+    }
+  }
+  return out;
+}
+
+/** Parse an advance stream used as recovery authority. Unlike the progress
+ * observer above, any malformed or non-object nonblank row invalidates the
+ * entire snapshot so a corrupt stream cannot authenticate later evidence. */
+export function parseRecoveryAuthorityAdvanceEventsJsonl(text: string | null): AdvanceStageEvent[] {
+  if (!text) return [];
+  const out: AdvanceStageEvent[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        !Number.isInteger((parsed as Record<string, unknown>).schema_version) ||
+        ((parsed as Record<string, unknown>).schema_version as number) <= 0 ||
+        typeof (parsed as Record<string, unknown>).type !== "string" ||
+        ((parsed as Record<string, unknown>).type as string).trim().length === 0 ||
+        !isCanonicalUtcEventTimestamp((parsed as Record<string, unknown>).at)
+      ) return [];
+      out.push(parsed as AdvanceStageEvent);
+    } catch {
+      return [];
     }
   }
   return out;

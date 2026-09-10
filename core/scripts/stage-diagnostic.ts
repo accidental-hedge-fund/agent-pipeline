@@ -96,6 +96,12 @@ export interface StageDiagnosticDetail {
     signal: string | null;
     store_initialized: boolean;
   };
+  /** Independent observer uncertainty retained without replacing child evidence. */
+  observation_uncertainty?: {
+    observer: "forge";
+    operation: "issue_pr_refresh";
+    reason: string;
+  };
 }
 
 export type NestedAdvanceProcessExit = NonNullable<StageDiagnosticDetail["process_exit"]>;
@@ -335,6 +341,9 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
   const processExit = detail && typeof detail === "object"
     ? (detail as Partial<StageDiagnosticDetail>).process_exit
     : undefined;
+  const observationUncertainty = detail && typeof detail === "object"
+    ? (detail as Partial<StageDiagnosticDetail>).observation_uncertainty
+    : undefined;
   const validAuthorityEvidence =
     Array.isArray(authorityEvidence) &&
     authorityEvidence.length > 0 &&
@@ -356,6 +365,13 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
     (detail.stage !== undefined &&
       (typeof detail.stage !== "string" || detail.stage.trim().length === 0)) ||
     (detail.offramp_class !== undefined && !isPreMergeOfframpClass(detail.offramp_class)) ||
+    (observationUncertainty !== undefined &&
+      (typeof observationUncertainty !== "object" ||
+        observationUncertainty === null ||
+        observationUncertainty.observer !== "forge" ||
+        observationUncertainty.operation !== "issue_pr_refresh" ||
+        typeof observationUncertainty.reason !== "string" ||
+        observationUncertainty.reason.trim().length === 0)) ||
     (processExit !== undefined &&
       (!isNestedAdvanceProcessExit(processExit) ||
         detail.blocker_kind !== "harness-failure" ||

@@ -48,9 +48,11 @@ import {
 import { collectNeedsHumanParkWithoutClassifier } from "../scripts/fault-recovery-static-guards.ts";
 import {
   eligibleIndependentItems,
+  fingerprintEvidence,
   hasContinuableIndependentSibling,
   independentlyRecoverableBlockedItems,
 } from "../scripts/loop/recovery.ts";
+import { recoveryProgressEvidence } from "../scripts/loop/recovery-applicability.ts";
 import {
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
@@ -282,6 +284,115 @@ test("3.1 live run_fatal projects Cooling; siblings remain schedulable; operatio
   });
   assert.equal(blockedSibling.continueSiblings, true);
   assert.equal(blockedSibling.cooling, null);
+});
+
+test("3.1 recovery eligibility starts a fresh same-candidate episode for a new diagnostic", () => {
+  const head = "a".repeat(40);
+  const oldDiagnostic = {
+    schema: "pipeline/stage-diagnostic@1" as const,
+    reason_code: "workflow-state" as const,
+    evidence_key: "old-merge-conflict",
+    detail: { blocker_kind: "merge-conflict" as const, reason: "old conflict", stage: "pre-merge" },
+  };
+  const currentDiagnostic = {
+    schema: "pipeline/stage-diagnostic@1" as const,
+    reason_code: "workflow-state" as const,
+    evidence_key: "current-head-drift",
+    detail: { blocker_kind: "head-drift" as const, reason: "current head drift", stage: "shipcheck-gate" },
+  };
+  const oldIdentity = fingerprintEvidence(recoveryProgressEvidence({
+    blockerClass: "workflow-state",
+    diagnostic: oldDiagnostic,
+  }));
+  const evidence = (diagnostic: typeof oldDiagnostic | typeof currentDiagnostic, runId: string) => JSON.stringify({
+    schema: "pipeline/loop-recovery-evidence@1",
+    diagnostic,
+    transport: { pipeline_run_id: runId, pr_number: 12 },
+  });
+  const contract: LoopContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "run-fresh-episode",
+    repo: { name: "acme/repo", base_branch: "main" },
+    selector: { kind: "explicit", issues: [100, 200] },
+    items: [{ id: "100", depends_on: [] }, { id: "200", depends_on: [] }],
+    created_at: "2026-09-02T00:00:00.000Z",
+  };
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: contract.run_id,
+    items: {
+      "100": { id: "100", state: "blocked", history: [], recovery_budgets_remaining: { default: 3 } },
+      "200": {
+        id: "200",
+        state: "blocked",
+        blocked_theme: "workflow-state",
+        history: [
+          { time: "2026-09-02T00:00:00.000Z", from: "in_progress", to: "blocked", engine: "codex", evidence: evidence(oldDiagnostic, "advance-old") },
+          { time: "2026-09-02T00:05:00.000Z", from: "in_progress", to: "blocked", engine: "codex", evidence: evidence(currentDiagnostic, "advance-current") },
+        ],
+        recovery_budgets_remaining: { "workflow-state": 0 },
+        last_verified_identity: { issue_open: true, pr_number: 12, pr_state: "open", head_sha: head, ready_label_present: false, pipeline_stage: "shipcheck-gate" },
+      },
+    },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: { reason: "run_fatal", time: "2026-09-02T00:06:00.000Z", item_id: "100", theme: "workflow-engine-defect" },
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [{
+      attempt_id: "old-exhausted",
+      seq: 1,
+      time: "2026-09-02T00:01:00.000Z",
+      item_id: "200",
+      class: "workflow-state",
+      candidate_identity: `head=${head}`,
+      action: "repair_pipeline_item",
+      actions: ["repair_pipeline_item"],
+      evidence_fingerprint: "old",
+      outcome: "failed",
+      budget_remaining: 0,
+      operation: "loop_recovery",
+      invariant: "workflow-state",
+      candidate_epoch: head,
+      evidence_identity: oldIdentity,
+      attempts_per_strategy: { resync_workflow_state: 3, repair_pipeline_item: 3 },
+      strategy_cursor: 2,
+    }],
+  } as LoopLedger;
+
+  assert.deepEqual(independentlyRecoverableBlockedItems(contract, ledger), ["200"]);
+  assert.equal(hasContinuableIndependentSibling(contract, ledger), true);
+
+  const currentIdentity = fingerprintEvidence(recoveryProgressEvidence({
+    blockerClass: "workflow-state",
+    diagnostic: currentDiagnostic,
+  }));
+  const fullCandidateEpoch = `repo=acme/repo|base=main|pr=12|head=${head}`;
+  const exhaustedCurrentEpisode = {
+    ...ledger,
+    items: {
+      ...ledger.items,
+      "200": {
+        ...ledger.items["200"],
+        last_verified_identity: {
+          ...ledger.items["200"]!.last_verified_identity!,
+          logical_candidate_epoch: null,
+        },
+      },
+    },
+    recovery_attempts: ledger.recovery_attempts.map((attempt) => ({
+      ...attempt,
+      candidate_identity: `${fullCandidateEpoch}|advance=advance-current|attempt=0`,
+      candidate_epoch: fullCandidateEpoch,
+      evidence_identity: currentIdentity,
+    })),
+  } as LoopLedger;
+  assert.deepEqual(
+    independentlyRecoverableBlockedItems(contract, exhaustedCurrentEpisode),
+    [],
+    "null logical lineage must resume the executor's exhausted full candidate-identity fallback",
+  );
 });
 
 test("3.2 recovery_exhausted is Cooling, not human ownership", () => {

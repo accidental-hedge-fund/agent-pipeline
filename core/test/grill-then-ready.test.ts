@@ -9,6 +9,7 @@ import {
   extractSpecCore,
   parseDecisionsFromBody,
   parseDecisionsArtifact,
+  renderDecisionsSection,
   applyReviewerVerdicts,
   implementerSelfAccepted,
   makeNode,
@@ -92,7 +93,7 @@ import {
 import { runTriage, TriageReadyError, type TriageDeps } from "../scripts/stages/triage.ts";
 import { COMMAND_REGISTRY, validateFlags } from "../scripts/command-registry.ts";
 import { buildCmd, maxPositionalsFor } from "../scripts/pipeline.ts";
-import { sha256Prefixed } from "../scripts/grill-hash.ts";
+import { canonicalJson, sha256Hex, sha256Prefixed } from "../scripts/grill-hash.ts";
 import { buildGrillImplementerPrompt, buildGrillReviewerPrompt } from "../scripts/prompts/index.ts";
 import type { GrillReadySnapshot } from "../scripts/grill-ready.ts";
 
@@ -326,6 +327,478 @@ test("grill: valid artifact embeds, parses, and render matches", () => {
     assert.equal(parsed.artifact.nodes.length, 5);
     assert.equal(extractSpecCore(body).includes("Do the thing"), true);
   }
+});
+
+test("grill: repeated authority evidence is stored once and round-trips through the body artifact", () => {
+  const spec = "## Summary\nKeep this unrelated specification text.\n";
+  const sharedEvidence = "e".repeat(25_000);
+  const nodes = Array.from({ length: 11 }, (_, i) => {
+    const node = makeNode({
+      id: `authority-${i}`,
+      question: `Who authorizes operation ${i}?`,
+      recommendation: `Obtain authority ${i}`,
+      class: "merge-release",
+    });
+    return {
+      ...node,
+      typed_request: "AuthorityRequest" as const,
+      rationale: `Protected operation ${i}`,
+      alternatives: [],
+      risk: "high",
+      evidence: [sharedEvidence],
+      authority_request: {
+        eligible_actor: "authenticated-github-actor",
+        repository: "acme/repo",
+        operation: `operation-${i}`,
+        scope: "merge-release",
+        candidate_epoch: null,
+        evidence: [sharedEvidence],
+        expiry: "2026-09-09T00:00:00.000Z",
+        grant: null,
+      },
+    };
+  });
+  const art = artifact(nodes, spec);
+
+  const body = embedDecisionsInBody(spec, art);
+
+  assert.ok(body.length <= 65_536, `body length ${body.length} exceeds GitHub's supported issue-body ceiling`);
+  assert.equal(body.split(sharedEvidence).length - 1, 1, "shared evidence content is persisted once");
+  assert.match(body, /Keep this unrelated specification text/);
+  const parsed = parseDecisionsFromBody(body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) {
+    assert.deepEqual(parsed.artifact, art);
+    assert.equal(parsed.artifact.nodes[7]!.authority_request!.evidence[0], sharedEvidence);
+    assert.equal(nodeDefinitionDigest(parsed.artifact.nodes[7]!), nodeDefinitionDigest(nodes[7]!));
+  }
+});
+
+test("grill: genuinely unique oversized evidence fails before publication", () => {
+  const spec = "## Summary\nUnique evidence cannot be discarded.\n";
+  const nodes = Array.from({ length: 3 }, (_, i) => ({
+    ...makeNode({
+      id: `unique-${i}`,
+      question: `Question ${i}?`,
+      recommendation: `Recommendation ${i}`,
+      class: "test-evidence",
+    }),
+    rationale: `Rationale ${i}`,
+    alternatives: [],
+    risk: "low",
+    evidence: [String(i).repeat(25_000)],
+  }));
+
+  assert.throws(
+    () => embedDecisionsInBody(spec, artifact(nodes, spec)),
+    /issue body exceeds.*65,536/i,
+  );
+});
+
+test("grill: evidence catalog references reject content tampering even with a recomputed public body digest", () => {
+  const spec = "## Summary\nTamper check.\n";
+  const evidence = "shared evidence ".repeat(200);
+  const nodes = ["one", "two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "test-evidence" }),
+    rationale: id,
+    alternatives: [],
+    risk: "low",
+    evidence: [evidence],
+  }));
+  const body = embedDecisionsInBody(spec, artifact(nodes, spec));
+  const payloadMatch = body.match(/```pipeline-decisions-v1\n([\s\S]*?)\n```/);
+  assert.ok(payloadMatch);
+  const originalPayload = payloadMatch[1]!;
+  const tamperedPayload = originalPayload.replace(evidence, `${evidence}tampered`);
+  assert.notEqual(tamperedPayload, originalPayload);
+  const tamperedBody = body
+    .replace(originalPayload, tamperedPayload)
+    .replace(sha256Hex(originalPayload), sha256Hex(tamperedPayload));
+
+  const parsed = parseDecisionsFromBody(tamperedBody);
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) {
+    assert.equal(parsed.code, "digest_mismatch");
+    assert.match(parsed.reason, /evidence catalog digest/);
+  }
+});
+
+test("grill: evidence catalog rejects a tampered reference with a recomputed public body digest", () => {
+  const spec = "## Summary\nReference tamper check.\n";
+  const evidence = "shared evidence ".repeat(200);
+  const nodes = ["one", "two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "test-evidence" }),
+    rationale: id,
+    alternatives: [],
+    risk: "low",
+    evidence: [evidence],
+  }));
+  const body = embedDecisionsInBody(spec, artifact(nodes, spec));
+  const payloadMatch = body.match(/```pipeline-decisions-v1\n([\s\S]*?)\n```/);
+  assert.ok(payloadMatch);
+  const originalPayload = payloadMatch[1]!;
+  const wire = JSON.parse(originalPayload) as {
+    nodes: Array<{ evidence: Array<{ evidence_ref: string }> }>;
+  };
+  wire.nodes[0]!.evidence[0]!.evidence_ref = `sha256:${"f".repeat(64)}`;
+  const tamperedPayload = canonicalJson(wire);
+  const tamperedBody = body
+    .replace(originalPayload, tamperedPayload)
+    .replace(sha256Hex(originalPayload), sha256Hex(tamperedPayload));
+
+  const parsed = parseDecisionsFromBody(tamperedBody);
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) {
+    assert.equal(parsed.code, "invalid_shape");
+    assert.match(parsed.reason, /references missing evidence/);
+  }
+});
+
+test("grill: tiny repeated evidence stays inline when references would increase body size", () => {
+  const spec = "## Summary\nSmall evidence.\n";
+  const nodes = ["one", "two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "test-evidence" }),
+    rationale: id,
+    alternatives: [],
+    risk: "low",
+    evidence: ["x"],
+  }));
+
+  const body = embedDecisionsInBody(spec, artifact(nodes, spec));
+  assert.doesNotMatch(body, /evidence_catalog/);
+  assert.match(body, /\*\*Evidence:\*\* x/);
+});
+
+test("grill: evidence catalog charges its envelope once across aggregate savings", () => {
+  const spec = "## Summary\nAggregate catalog boundary.\n";
+  const nodes = Array.from({ length: 2 }, (_, valueIndex) =>
+    Array.from({ length: 2 }, (_, occurrence) => ({
+      ...makeNode({
+        id: `aggregate-${valueIndex}-${occurrence}`,
+        question: `Question ${valueIndex}-${occurrence}?`,
+        recommendation: "Keep exact evidence",
+        class: "test-evidence",
+      }),
+      evidence: [String(valueIndex).repeat(146)],
+    })),
+  ).flat();
+  const art = artifact(nodes, spec);
+
+  for (let valueIndex = 0; valueIndex < 2; valueIndex++) {
+    const valueOnly = nodes.filter((node) => node.id.startsWith(`aggregate-${valueIndex}-`));
+    assert.doesNotMatch(
+      embedDecisionsInBody(spec, artifact(valueOnly, spec)),
+      /"evidence_catalog"/,
+      `value ${valueIndex} alone must stay inline at the boundary`,
+    );
+  }
+
+  const body = embedDecisionsInBody(spec, art);
+
+  assert.match(body, /"evidence_catalog"/);
+  const inlinePayload = canonicalJson(art);
+  const inlineBody = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(inlinePayload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${inlinePayload}\n\`\`\``,
+    "",
+    renderDecisionsSection(art).trimEnd(),
+    "",
+  ].join("\n");
+  assert.ok(body.length < inlineBody.length, `${body.length} must be smaller than ${inlineBody.length}`);
+  const parsed = parseDecisionsFromBody(body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) assert.deepEqual(parsed.artifact, art);
+});
+
+test("grill: legacy mixed catalog selection validates its authenticated persisted layout", () => {
+  const spec = "## Summary\nLegacy mixed catalog layout.\n";
+  const catalogued = "A".repeat(200);
+  const inline = "B".repeat(143);
+  const nodes = [catalogued, inline].flatMap((value, valueIndex) =>
+    [0, 1].map((occurrence) => ({
+      ...makeNode({
+        id: `legacy-mixed-${valueIndex}-${occurrence}`,
+        question: `Question ${valueIndex}-${occurrence}?`,
+        recommendation: "Preserve historical layout",
+        class: "test-evidence",
+      }),
+      evidence: [value],
+    })),
+  );
+  const art = artifact(nodes, spec);
+  const ref = `sha256:${sha256Hex(catalogued)}`;
+  const wire = {
+    ...art,
+    nodes: art.nodes.map((node) => ({
+      ...node,
+      evidence: node.evidence?.map((value) =>
+        value === catalogued ? { evidence_ref: ref } : value
+      ),
+    })),
+    evidence_catalog: { [ref]: catalogued },
+  };
+  const payload = canonicalJson(wire);
+  const body = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(payload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${payload}\n\`\`\``,
+    "",
+    renderDecisionsSection(art, { sharedEvidence: new Set([catalogued]) }).trimEnd(),
+    "",
+  ].join("\n");
+
+  const parsed = parseDecisionsFromBody(body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) assert.deepEqual(parsed.artifact, art);
+  assert.match(embedDecisionsInBody(spec, art), /"evidence_catalog"/);
+});
+
+test("grill: a catalog reference in authority evidence does not rewrite the same inline node evidence", () => {
+  const spec = "## Summary\nMixed evidence occurrences.\n";
+  const shared = "authority evidence ".repeat(20);
+  const node = {
+    ...makeNode({
+      id: "mixed-occurrence",
+      question: "Who authorizes this operation?",
+      recommendation: "Obtain authority",
+      class: "merge-release",
+    }),
+    typed_request: "AuthorityRequest" as const,
+    evidence: [shared],
+    authority_request: {
+      eligible_actor: "authenticated-github-actor",
+      repository: "acme/repo",
+      operation: "merge",
+      scope: "merge-release",
+      candidate_epoch: null,
+      evidence: [shared],
+      expiry: "2026-09-16T00:00:00.000Z",
+      grant: null,
+    },
+  };
+  const art = artifact([node], spec);
+  const ref = `sha256:${sha256Hex(shared)}`;
+  const wire = {
+    ...art,
+    nodes: [{
+      ...node,
+      evidence: [shared],
+      authority_request: { ...node.authority_request, evidence: [{ evidence_ref: ref }] },
+    }],
+    evidence_catalog: { [ref]: shared },
+  };
+  const payload = canonicalJson(wire);
+  const body = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(payload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${payload}\n\`\`\``,
+    "",
+    renderDecisionsSection(art).trimEnd(),
+    "",
+  ].join("\n");
+
+  const parsed = parseDecisionsFromBody(body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) assert.deepEqual(parsed.artifact, art);
+});
+
+test("grill: legacy catalog-wide rendering rewrites node evidence referenced only by authority evidence", () => {
+  const spec = "## Summary\nLegacy authority-only catalog rendering.\n";
+  const shared = "authority evidence ".repeat(20);
+  const node = {
+    ...makeNode({
+      id: "legacy-authority-occurrence",
+      question: "Who authorizes this operation?",
+      recommendation: "Obtain authority",
+      class: "merge-release",
+    }),
+    typed_request: "AuthorityRequest" as const,
+    evidence: [shared],
+    authority_request: {
+      eligible_actor: "authenticated-github-actor",
+      repository: "acme/repo",
+      operation: "merge",
+      scope: "merge-release",
+      candidate_epoch: null,
+      evidence: [shared],
+      expiry: "2026-09-16T00:00:00.000Z",
+      grant: null,
+    },
+  };
+  const art = artifact([node], spec);
+  const ref = `sha256:${sha256Hex(shared)}`;
+  const wire = {
+    ...art,
+    nodes: [{
+      ...node,
+      evidence: [shared],
+      authority_request: { ...node.authority_request, evidence: [{ evidence_ref: ref }] },
+    }],
+    evidence_catalog: { [ref]: shared },
+  };
+  const payload = canonicalJson(wire);
+  const body = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(payload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${payload}\n\`\`\``,
+    "",
+    renderDecisionsSection(art, { sharedEvidence: new Set([shared]) }).trimEnd(),
+    "",
+  ].join("\n");
+
+  const parsed = parseDecisionsFromBody(body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) assert.deepEqual(parsed.artifact, art);
+});
+
+test("grill: legacy inline-evidence artifacts and rendered sections remain readable", () => {
+  const spec = "## Summary\nLegacy artifact.\n";
+  const evidence = "legacy shared evidence";
+  const nodes = ["legacy-one", "legacy-two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "test-evidence" }),
+    rationale: id,
+    alternatives: [],
+    risk: "low",
+    evidence: [evidence],
+  }));
+  const art = artifact(nodes, spec);
+  const payload = canonicalJson(art);
+  const legacyBody = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(payload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${payload}\n\`\`\``,
+    "",
+    renderDecisionsSection(art).trimEnd(),
+    "",
+  ].join("\n");
+
+  const parsed = parseDecisionsFromBody(legacyBody);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) assert.deepEqual(parsed.artifact, art);
+});
+
+test("grill: hash-bound handoff materialization consumes compact evidence artifacts", () => {
+  const spec = "## Summary\nAuthenticated handoff.\n";
+  const evidence = "authority evidence ".repeat(500);
+  const nodes = ["authority-one", "authority-two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "merge-release" }),
+    rationale: id,
+    alternatives: [],
+    risk: "high",
+    evidence: [evidence],
+  }));
+  const art = artifact(nodes, spec);
+  const body = embedDecisionsInBody(spec, art);
+  const handoff = handoffForNode(nodes[0]!);
+  const bodyDigest = sha256Prefixed(body);
+  handoff.scope.content_hashes![0] = bodyDigest;
+  handoff.declaration_identity = handoff.declaration_identity!
+    .replace(`:${"a".repeat(64)}:`, `:${bodyDigest.slice("sha256:".length)}:`);
+
+  const result = materializeGrillNode({ liveBody: body, handoff, answerText: "approved" });
+  assert.equal(result.ok, true, result.ok ? "" : result.reason);
+  if (result.ok) {
+    assert.equal(result.artifact.nodes[0]!.provenance.reference, `handoff:${handoff.handoff_id}`);
+    assert.equal(result.artifact.nodes[0]!.evidence![0], evidence);
+    const reparsed = parseDecisionsFromBody(result.body);
+    assert.equal(reparsed.ok, true, reparsed.ok ? "" : reparsed.reason);
+  }
+});
+
+test("grill: oversized answer materialization returns a refusal before receipt, body, frontier, or sibling writes (#1568)", async () => {
+  const node = makeNode({
+    id: "scope",
+    question: "Is this scope authorized?",
+    recommendation: "Keep the bounded scope",
+    class: "scope",
+  });
+  const baseSpec = "## Summary\nKeep unrelated issue text.\n";
+  const baseArtifact = artifact([node], baseSpec);
+  const baseBody = embedDecisionsInBody(baseSpec, baseArtifact);
+  const paddedSpec = `${baseSpec}${"x".repeat(65_535 - baseBody.length)}`;
+  const paddedArtifact = artifact([node], paddedSpec);
+  const liveBody = embedDecisionsInBody(paddedSpec, paddedArtifact);
+  assert.equal(liveBody.length, 65_536);
+  const handoff = handoffForNode(paddedArtifact.nodes[0]!);
+  const bodyDigest = sha256Prefixed(liveBody);
+  handoff.scope.content_hashes![0] = bodyDigest;
+  handoff.declaration_identity = handoff.declaration_identity!
+    .replace(`:${"a".repeat(64)}:`, `:${bodyDigest.slice("sha256:".length)}:`);
+  let bodyWrites = 0;
+  let durableWrites = 0;
+  const baseKeyDeps = memoryKeyDeps();
+  const keyDeps: GrillProposalKeyDeps = {
+    ...baseKeyDeps,
+    writeFile: (path, data, options) => {
+      durableWrites++;
+      baseKeyDeps.writeFile(path, data, options);
+    },
+  };
+  const baseStore = memoryHandoffStore();
+  const handoffStore: HandoffStoreDeps = {
+    ...baseStore,
+    writeFile: async (path, data) => {
+      durableWrites++;
+      await baseStore.writeFile(path, data);
+    },
+  };
+
+  const result = await materializeGrillAnswer(handoff, "approved", {
+    getIssueBody: async () => liveBody,
+    updateIssueBody: async () => { bodyWrites++; },
+    repoDir: "/tmp/repo",
+    handoffStore,
+    keyDeps,
+    frontierKey: "test-key",
+    now: () => new Date("2026-01-01T00:00:01Z"),
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /issue body exceeds.*65,536/i);
+  assert.equal(bodyWrites, 0);
+  assert.equal(durableWrites, 0);
+});
+
+test("grill: ready validation consumes a compact evidence artifact", () => {
+  const title = "T";
+  const spec = "## Summary\nCompact ready artifact.\n";
+  const evidence = "ready evidence ".repeat(300);
+  const nodes = ["ready-one", "ready-two"].map((id) => ({
+    ...makeNode({ id, question: `${id}?`, recommendation: id, class: "test-evidence" }),
+    resolution: "resolved" as const,
+    provenance: {
+      settled_by: "auto-accept" as const,
+      reference: null,
+      reviewer_verdict: null,
+      reviewer_reason: null,
+      eligibility_reason: NON_AUTHORITY_ELIGIBILITY_REASON,
+    },
+    rationale: id,
+    alternatives: [],
+    risk: "low",
+    evidence: [evidence],
+  }));
+  const art = artifact(nodes, spec, title);
+  const body = embedDecisionsInBody(spec, art);
+
+  const ready = validateDecisionsForReady({
+    title,
+    body,
+    fingerprint: art.fingerprint,
+    contextMd: "**Grill**:\nA one-shot intake interview.\n",
+    integrationBaseSha: art.fingerprint.integration_base_sha,
+    handoffs: [],
+    comments: [],
+    frontier: frontierFor(body, art),
+  });
+  assert.equal(ready.ok, true, ready.ok ? "" : ready.reason);
+  if (ready.ok) assert.equal(ready.artifact.nodes[1]!.evidence![0], evidence);
 });
 
 test("grill: unknown schema version fails closed", () => {
@@ -890,6 +1363,36 @@ test("grill: apply persists a MAC-valid canonical frontier that ready requires",
   assert.equal(forged.ok, false);
 });
 
+test("grill: apply publishes exact parser-valid signed body bytes and binds the frontier to them", async () => {
+  const env = await signedPreview();
+  const signedBody = env.proposal.body.replace(
+    " -->\n```pipeline-decisions-v1",
+    " -->\n\n```pipeline-decisions-v1",
+  );
+  assert.notEqual(signedBody, env.proposal.body);
+  assert.equal(parseDecisionsFromBody(signedBody).ok, true);
+  const issued = issueGrillProposal({
+    now: new Date("2026-01-01T00:00:00Z"),
+    nonce: "f".repeat(32),
+    repo: env.repo,
+    issue: env.issue,
+    input: env.input,
+    proposal: { ...env.proposal, body: signedBody },
+    key: "test-key",
+  });
+  assert.equal(issued.ok, true);
+  if (!issued.ok) return;
+  const keyDeps = memoryKeyDeps();
+  await withExit(async () => {
+    const deps = applyDeps(issued.envelope, { keyDeps });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 0);
+    assert.deepEqual(deps.bodies, [signedBody]);
+  });
+  const frontier = loadVerifiedGrillFrontier("/tmp/repo", 42, "test-key", env.repo, keyDeps);
+  assert.equal(frontier?.body_sha256, sha256Prefixed(signedBody));
+});
+
 test("grill: apply creates pending grill-authority handoffs; preview creates none", async () => {
   const env = await signedPreview();
   const store = memoryHandoffStore();
@@ -901,6 +1404,87 @@ test("grill: apply creates pending grill-authority handoffs; preview creates non
   });
   const listed = [...store.files.keys()].filter((k) => k.endsWith(".json") && !k.endsWith("audit.json"));
   assert.ok(listed.length >= 1, "apply should persist pending grill-authority handoffs");
+});
+
+test("grill: apply rejects a MAC-valid oversized Decisions body before durable mutations (#1568)", async () => {
+  const env = await signedPreview();
+  const spec = "## Summary\nUnique evidence cannot be discarded.\n";
+  const nodes = Array.from({ length: 3 }, (_, i) => ({
+    ...makeNode({
+      id: `unique-${i}`,
+      question: `Question ${i}?`,
+      recommendation: `Recommendation ${i}`,
+      class: "test-evidence",
+    }),
+    rationale: `Rationale ${i}`,
+    alternatives: [],
+    risk: "low" as const,
+    evidence: [String(i).repeat(25_000)],
+  }));
+  const oversizedArtifact = artifact(nodes, spec, env.input.title);
+  const payload = canonicalJson(oversizedArtifact);
+  const oversizedBody = [
+    spec.trimEnd(),
+    "",
+    `<!-- pipeline-decisions:v1 sha256=${sha256Hex(payload)} -->`,
+    `\`\`\`pipeline-decisions-v1\n${payload}\n\`\`\``,
+    "",
+    renderDecisionsSection(oversizedArtifact).trimEnd(),
+    "",
+  ].join("\n");
+  assert.ok(oversizedBody.length > 65_536);
+  const { mac: _mac, ...unsigned } = env;
+  const signed = signGrillProposal({
+    ...unsigned,
+    proposal: {
+      ...unsigned.proposal,
+      body: oversizedBody,
+      artifact: oversizedArtifact,
+    },
+  }, "test-key");
+  let handoffWrites = 0;
+  const baseStore = memoryHandoffStore();
+  const handoffStore: HandoffStoreDeps = {
+    ...baseStore,
+    writeFile: async (path, data) => {
+      handoffWrites++;
+      await baseStore.writeFile(path, data);
+    },
+    appendFile: async (path, data) => {
+      handoffWrites++;
+      await baseStore.appendFile(path, data);
+    },
+  };
+  let frontierWrites = 0;
+  const baseKeyDeps = memoryKeyDeps();
+  const keyDeps: GrillProposalKeyDeps = {
+    ...baseKeyDeps,
+    writeFile: (path, data, options) => {
+      frontierWrites++;
+      baseKeyDeps.writeFile(path, data, options);
+    },
+  };
+  let nonceWrites = 0;
+
+  const { err } = await capture(() => withExit(async () => {
+    const deps = applyDeps(signed, {
+      handoffStore,
+      keyDeps,
+      writeStderr: (text) => { process.stderr.write(text); },
+      nonceStore: {
+        isConsumed: () => false,
+        consume: () => { nonceWrites++; },
+      },
+    });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 2);
+    assert.equal(deps.bodies.length, 0);
+  }));
+  assert.match(err, /proposal body exceeds supported 65,536-character limit/);
+  assert.doesNotMatch(err, /cannot be published/);
+  assert.equal(handoffWrites, 0);
+  assert.equal(frontierWrites, 0);
+  assert.equal(nonceWrites, 0);
 });
 
 test("grill: apply writes body only and refuses challenge / drift / kill-switch", async () => {
@@ -942,6 +1526,117 @@ test("grill: apply writes body only and refuses challenge / drift / kill-switch"
     assert.equal(deps.bodies.length, 0);
     assert.equal(process.exitCode, 2);
   });
+});
+
+test("grill: apply rejects a signed mismatch between the envelope and body artifacts before mutations", async () => {
+  const env = await signedPreview();
+  const mismatched = structuredClone(env);
+  const bodyArtifact = structuredClone(env.proposal.artifact);
+  bodyArtifact.nodes[0]!.recommendation = "Reject untrusted input at the security boundary.";
+  bodyArtifact.nodes[0]!.input_digests = nodeInputDigests(bodyArtifact.nodes[0]!);
+  mismatched.proposal.body = embedDecisionsInBody(extractSpecCore(env.proposal.body), bodyArtifact);
+  const resigned = signGrillProposal(
+    (({ mac: _mac, ...unsigned }) => unsigned)(mismatched),
+    "test-key",
+  );
+  let handoffWrites = 0;
+  const baseStore = memoryHandoffStore();
+  const handoffStore: HandoffStoreDeps = {
+    ...baseStore,
+    writeFile: async (path, data) => {
+      handoffWrites++;
+      await baseStore.writeFile(path, data);
+    },
+    appendFile: async (path, data) => {
+      handoffWrites++;
+      await baseStore.appendFile(path, data);
+    },
+  };
+  let frontierWrites = 0;
+  const baseKeyDeps = memoryKeyDeps();
+  const keyDeps: GrillProposalKeyDeps = {
+    ...baseKeyDeps,
+    writeFile: (path, data, options) => {
+      frontierWrites++;
+      baseKeyDeps.writeFile(path, data, options);
+    },
+  };
+  let nonceWrites = 0;
+
+  const { err } = await capture(() => withExit(async () => {
+    const deps = applyDeps(resigned, {
+      handoffStore,
+      keyDeps,
+      nonceStore: {
+        isConsumed: () => false,
+        consume: () => { nonceWrites++; },
+      },
+      writeStderr: (text) => { process.stderr.write(text); },
+    });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 2);
+    assert.equal(deps.bodies.length, 0);
+  }));
+  assert.match(err, /proposal artifact does not match the artifact embedded in proposal body/);
+  assert.equal(handoffWrites, 0);
+  assert.equal(frontierWrites, 0);
+  assert.equal(nonceWrites, 0);
+});
+
+test("grill: apply rejects incomplete or inconsistent signed verdict sets before durable writes", async () => {
+  const env = await signedPreview();
+  const variants: Array<{ name: string; mutate(envelope: GrillProposalEnvelope): void }> = [
+    { name: "missing", mutate: (value) => { value.proposal.verdicts.pop(); } },
+    { name: "duplicate", mutate: (value) => { value.proposal.verdicts.push({ ...value.proposal.verdicts[0]! }); } },
+    { name: "unknown", mutate: (value) => { value.proposal.verdicts.push({ node_id: "unknown-node", verdict: "accept", reason: "ok" }); } },
+    { name: "mismatched reason", mutate: (value) => { value.proposal.verdicts[0]!.reason = "different signed reason"; } },
+  ];
+  for (const variant of variants) {
+    const mutated = structuredClone(env);
+    variant.mutate(mutated);
+    const resigned = signGrillProposal((({ mac: _mac, ...unsigned }) => unsigned)(mutated), "test-key");
+    let durableWrites = 0;
+    let nonceWrites = 0;
+    const baseStore = memoryHandoffStore();
+    const baseKeyDeps = memoryKeyDeps();
+    const deps = applyDeps(resigned, {
+      handoffStore: {
+        ...baseStore,
+        writeFile: async (path, data) => { durableWrites++; await baseStore.writeFile(path, data); },
+        appendFile: async (path, data) => { durableWrites++; await baseStore.appendFile(path, data); },
+      },
+      keyDeps: {
+        ...baseKeyDeps,
+        writeFile: (path, data, options) => { durableWrites++; baseKeyDeps.writeFile(path, data, options); },
+      },
+      nonceStore: { isConsumed: () => false, consume: () => { nonceWrites++; } },
+    });
+    await withExit(async () => {
+      await runRefineSpecApply(42, {}, deps);
+      assert.equal(process.exitCode, 2, variant.name);
+    });
+    assert.equal(deps.bodies.length, 0, variant.name);
+    assert.equal(durableWrites, 0, variant.name);
+    assert.equal(nonceWrites, 0, variant.name);
+  }
+});
+
+test("grill: apply fails closed on a MAC-valid malformed proposal artifact", async () => {
+  const env = await signedPreview();
+  const malformed = structuredClone(env) as unknown as Record<string, unknown>;
+  (malformed.proposal as Record<string, unknown>).artifact = {};
+  const resigned = signGrillProposal(
+    (({ mac: _mac, ...unsigned }) => unsigned)(malformed) as never,
+    "test-key",
+  );
+  const { err } = await capture(() => withExit(async () => {
+    const deps = applyDeps(resigned);
+    deps.writeStderr = (text) => { process.stderr.write(text); };
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 2);
+    assert.equal(deps.bodies.length, 0);
+  }));
+  assert.match(err, /proposal artifact is not a valid Decisions artifact/);
 });
 
 test("grill: apply refuses empty, dual, and positional proposal input", async () => {
@@ -2611,13 +3306,17 @@ test("grill: second apply with a changed node definition supersedes first pendin
   if (!parsed.ok) return;
   const nodes = parsed.artifact.nodes.map((n) => {
     if (n.id !== "scope") return n;
-    return makeNode({
+    const revised = makeNode({
       id: n.id,
       question: "Revised live scope question?",
       recommendation: n.recommendation,
       class: n.class,
       term_id: n.term_id,
     });
+    const verdict = env.proposal.verdicts.find((candidate) => candidate.node_id === n.id)!;
+    const applied = applyReviewerVerdicts([revised], [verdict]);
+    assert.equal(applied.ok, true);
+    return applied.ok ? applied.nodes[0]! : revised;
   });
   const spec = extractSpecCore(env.proposal.body);
   const art2 = { ...parsed.artifact, nodes };

@@ -4,7 +4,11 @@ import {
 } from "../harness-adapters/background-job-lifecycle.ts";
 import { filterRecipesForWorkflowEngineDiagnostic } from "../rebind-tester-evidence-after-pr.ts";
 import { projectStageDiagnostic, type StageDiagnostic } from "../stage-diagnostic.ts";
-import type { DurableBlockerClass, RecoveryRecipe } from "./types.ts";
+import {
+  attemptBelongsToCandidateEpoch,
+  normalizeEvidenceIdentity,
+} from "./recovery-episodes.ts";
+import type { DurableBlockerClass, LoopRecoveryAttempt, RecoveryRecipe } from "./types.ts";
 
 export interface RecoveryApplicabilityInput {
   action: RecoveryRecipe;
@@ -88,6 +92,76 @@ export function recoveryProgressEvidence(input: {
     blocker_class: input.blockerClass,
     ...evidence,
   });
+}
+
+function isCoarseImplementationAttestation(diagnostic: StageDiagnostic): boolean {
+  if (diagnostic.reason_code !== "implementation-ci" || diagnostic.detail.stage?.trim()) return false;
+  const { blocker_kind: _blockerKind, reason: _reason, stage: _stage, ...qualifiers } = diagnostic.detail;
+  return Object.values(qualifiers).every((value) => value === undefined);
+}
+
+/** Resolve the Recovery Episode evidence identity from the current diagnostic.
+ * A coarse implementation attestation may resume only the nearest unresolved
+ * authoritative invariant for the same candidate. */
+export function recoveryProgressIdentity(input: {
+  itemId: string;
+  blockerClass: DurableBlockerClass;
+  diagnostic: StageDiagnostic;
+  priorDiagnostics: readonly (StageDiagnostic | null)[];
+  attempts: readonly LoopRecoveryAttempt[];
+  candidateEpoch: string;
+}): string {
+  const directIdentity = normalizeEvidenceIdentity(recoveryProgressEvidence({
+    blockerClass: input.blockerClass,
+    diagnostic: input.diagnostic,
+  }));
+  if (
+    input.blockerClass !== "implementation-ci" ||
+    !isCoarseImplementationAttestation(input.diagnostic)
+  ) {
+    return directIdentity;
+  }
+
+  const blockerKind = input.diagnostic.detail.blocker_kind;
+  for (const prior of input.priorDiagnostics) {
+    if (!prior) return directIdentity;
+    const projection = projectStageDiagnostic(prior);
+    if (isCoarseImplementationAttestation(prior)) {
+      if (
+        projection.disposition !== "recover" ||
+        projection.blockerClass !== "implementation-ci" ||
+        prior.detail.blocker_kind !== blockerKind
+      ) {
+        return directIdentity;
+      }
+      continue;
+    }
+    if (
+      projection.disposition !== "recover" ||
+      projection.blockerClass !== "implementation-ci" ||
+      prior.detail.blocker_kind !== blockerKind ||
+      !prior.detail.stage?.trim()
+    ) {
+      return directIdentity;
+    }
+    const priorIdentity = normalizeEvidenceIdentity(recoveryProgressEvidence({
+      blockerClass: "implementation-ci",
+      diagnostic: prior,
+    }));
+    const episodeAttempts = input.attempts.filter(
+      (attempt) =>
+        attempt.item_id === input.itemId &&
+        attempt.class === "implementation-ci" &&
+        attempt.evidence_identity === priorIdentity &&
+        attemptBelongsToCandidateEpoch(attempt, input.candidateEpoch),
+    );
+    if (episodeAttempts.length === 0) return directIdentity;
+    const resolved = episodeAttempts.some(
+      (attempt) => attempt.outcome === "recovered" && !recoveryRecipeOnlyProvesRedispatch(attempt.action),
+    );
+    return resolved ? directIdentity : priorIdentity;
+  }
+  return directIdentity;
 }
 
 /** Production candidate identities encode an absent head as `head=none`. */

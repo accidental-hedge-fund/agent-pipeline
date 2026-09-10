@@ -1,0 +1,150 @@
+## Context
+
+See `proposal.md` for motivation and the delta specs for required behavior. The change crosses four established boundaries but does not require a new subsystem:
+
+- `grill-decisions.ts` already owns canonical Decisions serialization, rendering, parsing, integrity checks, and the supported issue-body ceiling.
+- `runPlanningPhases` already owns revision acknowledgement and implementation dispatch; `makeOpenspecPlanningHooks` already owns change identity, structural validation, and artifact reads.
+- `realDispatchItem` already has injected child-event and forge observers and returns a structured stage diagnostic plus a linked run evidence pointer.
+- RecoverySupervisor already retains linked advance identity, injects `readAdvanceEvents`, classifies diagnostic-specific recipe applicability, and persists per-strategy Recovery Episode attempts. The legacy class budget is only a compatibility projection at the write-ahead claim boundary.
+
+The branch already contains the bounded admission repair candidate from the reproduced grill failure. Implementation must preserve and review that candidate rather than reconstructing it from the integration base.
+
+### Class vs site
+
+- The sites were grill admission for #1563/#1560/#1564 and planning/recovery for #1558.
+- The classes are repeated semantic values expanded at every render site, refinement acknowledgement detached from authoritative artifact application, diagnostic observation performed after a fallible independent refresh, and an outer admission gate using a weaker legacy budget than the strategy selector.
+- The shared renderer/parser, OpenSpec planning hooks, dispatch evidence boundary, linked-run observation seam, and Recovery Episode gates are the class-level repair surfaces. The next equivalent failure must use these same contracts without an issue-specific path.
+
+## Goals / Non-Goals
+
+**Goals:**
+
+- Keep one canonical semantic Decisions model while allowing a compact wire representation.
+- Make OpenSpec artifact application, validation, reread, and implementation-input construction one coherent handoff.
+- Preserve the most precise valid observation and represent independent uncertainty without turning it into success.
+- Align outer recovery admission with existing diagnostic-specific, per-strategy Recovery Episode authority.
+- Replay the captured failures with deterministic injected I/O at their real caller boundaries.
+
+**Non-Goals:**
+
+- A Decisions schema-version bump, lossy compression, or reduced authority/hash validation.
+- Treating arbitrary revision stdout as the authoritative OpenSpec change or adding a second planning store.
+- A second recovery classifier, recoverer, scheduler, or controller.
+- Editing retained historical logs or ledgers, refunding attempts, creating a new episode for the same identity, or synthesizing Tester success.
+- New FRG fixtures, release orchestration, public configuration, versioning, publication, deployment, or merge behavior.
+
+## Decisions
+
+### 1. Use an additive evidence catalog in the existing Decisions wire format
+
+The in-memory `DecisionsArtifact` remains fully expanded. Canonical serialization computes repeated evidence by exact string identity, stores beneficial repeated values in one digest-keyed catalog, and replaces their occurrences in node and authority-request evidence with digest references. Parsing validates each catalog key against its value before expanding references back into the existing semantic shape. The readable Decisions section renders repeated evidence as the shared digest reference, avoiding a second expansion.
+
+Compaction is used only when it reduces the complete body. The existing schema marker remains `decisions.v1` because inline artifacts remain valid and the catalog is an additive wire representation that expands to the same semantic object. The body-size guard remains at `embedDecisionsInBody`, after the full core, marker, fence, and readable section are assembled and before any caller can publish.
+
+Alternatives considered:
+
+- Truncate evidence or omit it from authority requests: rejected because it loses unique authority evidence and breaks semantic/hash guarantees.
+- Compress or externalize the artifact: rejected because the issue body is the specification and existing deterministic parsing must remain sufficient.
+- Increment the schema and migrate old bodies: rejected because additive parse compatibility provides the required round-trip without migration.
+
+### 2. Make OpenSpec revalidation prove application, then reread one artifact snapshot
+
+Revision acknowledgement continues through `plan-revision.ack@1`; it proves output shape only. The shared revision-prompt seam supplies format-specific action text: OpenSpec tells the producer to edit the identified proposal, tasks, and relevant spec deltas, while freeform retains its stdout-only instruction. When eligible human feedback exists, the OpenSpec instruction also requires the producer to place its genuine `## Human Feedback Acknowledgement` section in `proposal.md` as well as stdout. This is necessary because `runPlanningPhases` replaces revision stdout with the post-validation authoritative proposal before it calls `validateHumanFeedbackAck`. Pipeline does not copy or synthesize that acknowledgement on the producer's behalf.
+
+A material artifact change is required when the reviewer requests revision or eligible human feedback remains; an approved artifact with no such feedback may remain unchanged. The OpenSpec hook then compares the authoritative change after the revision with its pre-revision artifact state and the accepted refinement. It reads the complete candidate bundle immediately before structural validation and again immediately after, rejecting any intervening replacement. The hook caches that stable proposal, tasks, and spec context so acknowledgement validation, revised-plan publication, and `buildImplPlan` use the same validated bundle without another authoritative reread.
+
+The existing `changeId` restoration, worktree-scoped revision invocation, scoped OpenSpec salvage, and structural validation seams are reused. An unchanged artifact cannot use stdout fallback. A missing proposal, an acknowledged no-op, a mismatch between accepted refinement and artifact, or invalid deltas returns an explicit engine-owned OpenSpec failure before implementation. The freeform hook retains its current stdout-based behavior.
+
+Alternatives considered:
+
+- Prefer revision stdout when proposal files are unchanged: rejected because stdout is not the OpenSpec artifact and caused the reproduced silent fallback.
+- Write stdout directly into `proposal.md`: rejected because a refinement can require coordinated proposal, tasks, design, and delta changes; automatic single-file replacement can create incoherence.
+- Copy the acknowledgement from stdout into `proposal.md` after the producer returns: rejected because Pipeline would be synthesizing authoritative producer output and could conceal a producer/consumer contract failure.
+- Add a parallel refinement ledger: rejected because the worktree change directory and existing validation are already authoritative.
+
+### 3. Classify child evidence before the fallible forge refresh
+
+After the child settles and its run store is confirmed, `realDispatchItem` reads and validates the linked child events before calling forge observers. The child diagnostic is retained independently from issue/PR refresh results. Forge observations still determine forge facts and outcome projection when available; an exception contributes an uncertainty observation but cannot erase a valid child diagnostic. Process-termination diagnostics remain the fallback only when no more precise valid child diagnostic exists.
+
+The response continues to carry the existing structured diagnostic and evidence pointer. If representing the forge uncertainty requires an additive diagnostic detail field, that field records only observation failure; it is never a gate pass, candidate proof, or Tester subject.
+
+Alternatives considered:
+
+- Catch the forge exception and return only a generic loop-supervisor failure: rejected because it discards the stronger completed-child evidence.
+- Treat the child blocker as proof that forge state is unchanged: rejected because the forge is independently unobservable.
+- Retry or synthesize forge facts inside dispatch: rejected because this issue does not change observation authority or add a retry controller.
+
+### 4. Refine coarse retained evidence through the existing linked-event seam
+
+Before selecting a blocked recovery recipe, RecoverySupervisor may reread the linked advance's terminal events when persisted recovery evidence is coarse. It reuses `SupervisorDeps.readAdvanceEvents`; no second event reader or recovery controller is added. The read is authorized only when the blocked record's transport run ID matches the retained `advance_run_id`, and the event location equals the `events.jsonl` path derived from the configured persistent/common run-store root and that run ID. A path that merely ends in `.agent-pipeline/runs/<run-id>/events.jsonl`, including one below the operator worktree or another foreign prefix, is not canonical authority. This follows the existing `core/scripts/pipeline.ts` pattern: resolve the persistent store with `resolveRunStoreRepoDir`, then derive the pinned child location with `runDirPath`.
+
+Parsed terminal evidence must name the same item and satisfy the existing structured diagnostic validator. For the actual #1558 historical shape, absence of `evidence_ordering.pr_head` is not itself a mismatch: matching retained run/item identity and the current authoritative full head/candidate epoch can bind the diagnostic. If the terminal evidence explicitly names a head or candidate, it must equal the current authoritative binding. Any explicit mismatch remains fail-closed. This refinement changes recipe classification only and never proves the Tester gate or creates a Tester subject.
+
+A valid more-precise diagnostic replaces only the diagnostic used for current classification and recipe applicability. The ledger history, attempts, class-budget projection, evidence/candidate episode key, and source events stay unchanged. Missing, malformed, mismatched, or non-canonical observations leave the coarse persisted evidence in force and fail closed.
+
+Alternatives considered:
+
+- Repair the captured ledger manually: rejected because it does not protect future runs and violates historical-state constraints.
+- Accept the persisted event path without checking run identity/location: rejected because an arbitrary file could confer diagnostic authority.
+- Mint a new Recovery Episode for the refined diagnostic: rejected because the same operation, candidate, and retained linked run are being observed; prior attempt bounds must remain authoritative.
+
+### 5. Share per-strategy eligibility logic between outer admission and selection
+
+Extract or reuse a pure eligibility predicate built from the current Recovery Episode: lifecycle/Cooling status, policy order, diagnostic-specific applicability, strategy cursor, attempts per strategy, and per-strategy bounds. Both `independentlyRecoverableBlockedItems` and execution-time strategy selection use that contract. The post-action controller also recomputes eligibility through that contract against the same authoritative episode/progress identity after a failed recovery action; it does not infer exhaustion from the just-failed action or an outer stale episode key. The class-level `recovery_budgets_remaining` field remains updated for compatibility but is not an admission veto.
+
+The predicate reports eligible if at least one applicable configured strategy has remaining bound. It reports bounded ineligible when every applicable strategy is exhausted, and it does not turn inapplicable recipes into candidates. Dependency filtering and compatibility-stop scoping remain separate scheduling constraints, so an ineligible item does not suppress independent siblings.
+
+Alternatives considered:
+
+- Raise or reset the legacy class budget: rejected because it refunds historical attempts and conflicts with per-strategy episode authority.
+- Remove all outer eligibility checks: rejected because exhausted episodes still need finite Cooling and dependency/lifecycle gates.
+- Special-case `rebind_tester_evidence_after_pr`: rejected because every later strategy must obey the same shared contract.
+
+### 6. Test the real boundaries with injected I/O
+
+Regression tests exercise `embedDecisionsInBody`/parser; non-dry-run `grillOneIssue`; MAC-valid `runRefineSpecApply`; oversized-result `materializeGrillAnswer`; `makeOpenspecPlanningHooks` through implementation-plan construction; `realDispatchItem`; and RecoverySupervisor/outer eligibility using existing dependency seams. Each admission-writer refusal asserts zero body, label, handoff, frontier, sibling-rebind, and applicable recovery-receipt writes after measuring the complete body, including unrelated text and the readable Decisions section.
+
+The OpenSpec planning replay exercises the actual caller ordering: the revision worker returns a correctly shaped acknowledgement and edits the authoritative artifacts; revalidation replaces stdout with the stable proposal; the acknowledgement gate succeeds only when that proposal also contains the producer-authored section. A negative case leaves the section only in stdout and must block before publication or implementation. Freeform remains stdout-only.
+
+The #1558 replay uses the captured coarse persisted record and terminal diagnostic without historical `pr_head`, a configured persistent/common run-store root, matching run/item identity, and current full-head/candidate-epoch observation; it must select the unspent Tester-rebind recipe without changing episode history or creating Tester success. Negative cases cover foreign-prefix and operator-worktree roots, unmatched run/item/candidate identity, explicit head mismatch, malformed/non-terminal streams, invalid/no-op refinements, unique oversize bodies, exhausted strategies, and independent siblings.
+
+The immutable #1568 `driveSupervisor` post-action replay starts with scratch ×2 and checkpoint ×2 spent and zero legacy class projection. One injected recovery failure must re-enter selection through the same authoritative episode/progress identity and reach a later applicable unspent strategy rather than emit `strategy_cursor_exhausted`. The next strategy is selected by the diagnostic and configured recipe order; it is not hard-coded to Tester rebind.
+
+Baseline-failure evidence should be retained in test names or commit history where practical; production tests themselves assert repaired behavior. No unit test uses live GitHub, git, child processes, or filesystem state outside injected seams.
+
+### 7. Bind blocker evidence to the candidate that produced it
+
+The item ledger records the logical candidate epoch when a block is created. An explicitly unknown
+block-boundary observation stays unbound instead of falling back to a cached pre-dispatch identity.
+For legacy ledgers, only the first attempt strictly after the latest actual `in_progress` to `blocked`
+transition may supply that binding; it must carry a valid candidate binding, and the transition must
+match the current blocker class and fingerprint. Legacy authority requires canonical UTC timestamps
+and strictly increasing unique sequence identities. Ambiguous, inconsistent, or malformed history is not authority.
+
+Recovery preflight compares that binding with fresh engine-owned identity while the existing live-run
+probe and issue-run lock are held. Same-candidate claims keep the #797 replay contract. A started
+candidate-changing repair bound to the blocker candidate keeps its existing postcondition path. A
+different exact, clean, open, advance-still-needed implementation candidate with a positively absent
+blocked label atomically supersedes every started claim from the stale generation, clears its Cooling
+and linkage, updates stage projection, and becomes ordinary dispatchable work. CI remains ordinary
+pipeline evidence, so pending or failed checks do not prevent re-admission. If any identity, cleanliness,
+operation/legacy-PR, or label proof is absent, recovery defers without borrowing the old diagnostic.
+Candidate comparison includes positively known PR identity as well as a bounded logical/raw head pair:
+same-SHA evidence on a different PR is movement, while a recorded raw member preserves same-candidate
+authority when logical lineage later becomes unobservable. The original-candidate repair is the sole
+retained owner; stale siblings are retired before it resumes, and malformed selected claims defer.
+
+## Risks / Trade-offs
+
+- **[Risk] Digest references could hide a collision or malformed catalog.** → Recompute every digest during parse, reject collisions/unresolved references, and compare the readable render with the expanded artifact.
+- **[Risk] No-op detection could reject a valid wording-only acknowledgement.** → Require a material refinement only after the reviewer requested revision; bind the check to the accepted review/refinement contract rather than any stdout difference.
+- **[Risk] Artifact files could change during validation or before implementation-plan construction.** → Compare the complete bundle immediately before and after validation, fail on mutation, and cache that stable bundle for revised-plan publication and implementation input.
+- **[Risk] A cached advisory snapshot can hide later feedback on a replan.** → Rebuild capped, sanitized prompt context from current eligible comments every invocation, retain prior-plan feedback across replacement-plan publication for revision acknowledgement, and keep only the public snapshot write idempotent.
+- **[Risk] OpenSpec revalidation can discard a valid acknowledgement that exists only in worker stdout.** → Make persistence in `proposal.md` an explicit OpenSpec producer obligation, validate the stable authoritative proposal, and reject missing durable acknowledgement without synthesizing it.
+- **[Risk] A stale or unrelated event stream could steer recovery.** → Bind run ID, item, canonical path, and structured terminal diagnostic; otherwise retain coarse evidence.
+- **[Risk] Removing the class-budget veto could unbound recovery.** → Per-strategy bounds, strategy cursor, repeated-evidence limit, Cooling, and episode identity remain mandatory.
+- **[Risk] Moving an oversize guard after a durable side effect could leave partial admission state.** → At each exported writer boundary, construct and measure the complete body before the first issue, label, handoff, frontier, sibling-rebind, or recovery-receipt mutation.
+
+## Migration Plan
+
+No external data or configuration migration is required. Existing inline Decisions bodies remain parseable. Existing Recovery Episodes retain their identities and attempts; eligible later strategies become reachable on the next supervised cycle after trusted linked-event observation. After core implementation, regenerate host artifacts and run the full repository CI gate. Rollback is a source revert; no historical run, issue body, or ledger is rewritten as part of deployment.
