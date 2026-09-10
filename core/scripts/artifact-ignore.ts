@@ -121,11 +121,12 @@ export const FACTORY_RELEASE_ARTIFACT: ArtifactContractEntry = {
 };
 
 /** Host-local publisher recovery episodes (#1563). Keyed by `release.yml` plus
- *  exact tag plus exact C so an unobserved dispatch stays a durable wait. */
+ *  exact tag plus exact C so an unobserved dispatch stays a durable wait.
+ *  Stored under the primary worktree so sibling worktrees share one episode. */
 export const RELEASE_PUBLISHER_RECOVERY_ARTIFACT: ArtifactContractEntry = {
   name: "release-publisher-recovery",
   comment:
-    "Host-local publisher recovery episodes keyed by release.yml plus tag plus candidate (#1563); never committed.",
+    "Host-local publisher recovery episodes keyed by release.yml plus tag plus candidate (#1563); stored under the primary worktree so sibling worktrees share one episode; never committed.",
 };
 
 /** Host-local HMAC key for grill-proposal.v1 envelopes (#1072). */

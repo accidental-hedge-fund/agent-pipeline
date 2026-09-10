@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   assertReleaseManagedMetadataPaths,
   classifyPublisherRuns,
@@ -982,6 +985,52 @@ test("publisher recovery does not re-dispatch on a fresh invocation after an uno
   });
   await assert.rejects(() => second.recoverPublication(tag, C), /did not become an observable exact-identity/);
   assert.equal(dispatches, 1);
+});
+
+test("publisher recovery does not re-dispatch from a sibling worktree after an unobserved dispatch", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  const primary = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-1563-pub-rec-"));
+  const worktreeA = path.join(primary, ".worktrees", "a");
+  const worktreeB = path.join(primary, ".worktrees", "b");
+  const porcelain = [
+    `worktree ${primary}`,
+    `HEAD ${C}`,
+    "branch refs/heads/main",
+    "",
+    `worktree ${worktreeA}`,
+    `HEAD ${C}`,
+    "detached",
+    "",
+    `worktree ${worktreeB}`,
+    `HEAD ${C}`,
+    "detached",
+  ].join("\n");
+  let dispatches = 0;
+  const command = async (cwd: string, file: string, args: string[]) => {
+    if (file === "git" && args[0] === "worktree" && args[1] === "list") return porcelain;
+    if (file === "gh" && args[0] === "workflow") dispatches++;
+    return publisherCommand(tag, notes, { runs: [], ghCalls: [] })(cwd, file, args);
+  };
+  try {
+    const first = realCompleteReleaseDeps({ repo_dir: worktreeA, repo: "o/r" }, {
+      wait: async () => {},
+      dispatchObserveAttempts: 2,
+      command,
+    });
+    await assert.rejects(() => first.recoverPublication(tag, C), /did not become an observable exact-identity/);
+    assert.equal(dispatches, 1);
+
+    const second = realCompleteReleaseDeps({ repo_dir: worktreeB, repo: "o/r" }, {
+      wait: async () => {},
+      dispatchObserveAttempts: 2,
+      command,
+    });
+    await assert.rejects(() => second.recoverPublication(tag, C), /did not become an observable exact-identity/);
+    assert.equal(dispatches, 1);
+  } finally {
+    fs.rmSync(primary, { recursive: true, force: true });
+  }
 });
 
 test("publisher recovery persists rerun_requested before gh run rerun and never reruns when persist or read-back fails", async () => {

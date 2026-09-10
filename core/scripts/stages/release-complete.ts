@@ -855,13 +855,26 @@ export function realCompleteReleaseDeps(
     ])) as unknown;
     return parsePublisherWorkflowRunPages(raw, tag);
   }
+  let publisherRecoveryRoot: string | undefined;
+  async function resolvePublisherRecoveryRoot(): Promise<string> {
+    if (publisherRecoveryRoot) return publisherRecoveryRoot;
+    const primary = primaryWorktreeFromPorcelain(await git(["worktree", "list", "--porcelain"]));
+    if (!primary || !path.isAbsolute(primary)) {
+      throw new Error("pipeline release: cannot resolve the primary worktree for publisher recovery");
+    }
+    publisherRecoveryRoot = path.normalize(primary);
+    return publisherRecoveryRoot;
+  }
   async function defaultLoadPublisherRecoveryEpisode(key: {
     workflow: "release.yml";
     tag: string;
     candidate: string;
   }): Promise<unknown> {
     try {
-      return JSON.parse(await fs.promises.readFile(publisherRecoveryPath(repoDir, key.tag, key.candidate), "utf8"));
+      return JSON.parse(await fs.promises.readFile(
+        publisherRecoveryPath(await resolvePublisherRecoveryRoot(), key.tag, key.candidate),
+        "utf8",
+      ));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
@@ -879,7 +892,7 @@ export function realCompleteReleaseDeps(
     if (io.persistPublisherRecoveryEpisode) {
       await io.persistPublisherRecoveryEpisode(episode);
     } else {
-      const dest = publisherRecoveryPath(repoDir, episode.tag, episode.candidate);
+      const dest = publisherRecoveryPath(await resolvePublisherRecoveryRoot(), episode.tag, episode.candidate);
       await fs.promises.mkdir(path.dirname(dest), { recursive: true });
       const tmp = `${dest}.tmp.${process.pid}`;
       await fs.promises.writeFile(tmp, `${JSON.stringify(episode)}\n`, "utf8");
