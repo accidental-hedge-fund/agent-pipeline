@@ -408,6 +408,53 @@ export function parsePublisherRunRows(rows: unknown, tag: string): PublisherRunR
   });
 }
 
+function parsePublisherWorkflowRun(value: unknown, tag: string, index: number): PublisherRunRow {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`pipeline release: ${tag} publisher run ${index} returned unknown shape`);
+  }
+  const row = value as Record<string, unknown>;
+  const databaseId = Number(row.id);
+  const attempt = Number(row.run_attempt);
+  const headSha = String(row.head_sha ?? "").toLowerCase();
+  if (!Number.isSafeInteger(databaseId) || databaseId <= 0 || !Number.isSafeInteger(attempt) || attempt < 1 ||
+      typeof row.event !== "string" || typeof row.head_branch !== "string" || !OID_RE.test(headSha) ||
+      typeof row.status !== "string" || (row.conclusion !== null && typeof row.conclusion !== "string")) {
+    throw new Error(`pipeline release: ${tag} publisher run ${index} is malformed`);
+  }
+  return {
+    databaseId, event: row.event, headBranch: row.head_branch, headSha, status: row.status,
+    conclusion: row.conclusion === null ? null : String(row.conclusion), attempt,
+  };
+}
+
+/** Flatten `gh api --paginate --slurp` workflow-run pages and fail closed unless total_count matches. */
+export function parsePublisherWorkflowRunPages(raw: unknown, tag: string): PublisherRunRow[] {
+  const pages = Array.isArray(raw) ? raw : [raw];
+  if (pages.length === 0) throw new Error(`pipeline release: ${tag} publisher workflow list returned unknown shape`);
+  let total: number | null = null;
+  const runs: unknown[] = [];
+  for (const page of pages) {
+    if (!page || typeof page !== "object" || Array.isArray(page)) {
+      throw new Error(`pipeline release: ${tag} publisher workflow list returned unknown shape`);
+    }
+    const rec = page as Record<string, unknown>;
+    const count = Number(rec.total_count);
+    const list = rec.workflow_runs;
+    if (!Number.isSafeInteger(count) || count < 0 || !Array.isArray(list)) {
+      throw new Error(`pipeline release: ${tag} publisher workflow list returned unknown shape`);
+    }
+    if (total === null) total = count;
+    else if (count !== total) {
+      throw new Error(`pipeline release: ${tag} publisher workflow list returned unknown shape`);
+    }
+    runs.push(...list);
+  }
+  if (runs.length !== total) {
+    throw new Error(`pipeline release: ${tag} publisher workflow list is truncated`);
+  }
+  return runs.map((value, index) => parsePublisherWorkflowRun(value, tag, index));
+}
+
 export function exactPublisherRuns(rows: readonly PublisherRunRow[], tag: string, candidate: string): PublisherRunRow[] {
   const sha = candidate.toLowerCase();
   return rows.filter((row) =>
@@ -421,9 +468,6 @@ export function classifyPublisherRuns(
   candidate: string,
 ): { class: PublisherRemoteClass; exact: PublisherRunRow[] } {
   const parsed = parsePublisherRunRows(rows, tag);
-  if (parsed.length >= 100) {
-    throw new Error(`pipeline release: ${tag} publisher workflow list is truncated`);
-  }
   const exact = exactPublisherRuns(parsed, tag, candidate);
   if (exact.some((row) => row.status === "completed" && row.conclusion === "success")) {
     return { class: "successful", exact };
@@ -547,6 +591,14 @@ export function realCompleteReleaseDeps(
   const waitFn = io.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const finishPr = io.finishReleasePr ?? ((pr, expected) =>
     finishReleasePr(pr, realReleaseFinishDeps(repository, repoDir), expected));
+  async function loadExactPublisherRuns(tag: string, candidate: string): Promise<PublisherRunRow[]> {
+    const sha = exactOid(candidate, `${tag} publisher candidate`);
+    const raw = JSON.parse(await gh([
+      "api", "--paginate", "--slurp",
+      `repos/${repository}/actions/workflows/release.yml/runs?per_page=100&head_sha=${sha}`,
+    ])) as unknown;
+    return parsePublisherWorkflowRunPages(raw, tag);
+  }
   return {
     log: console.error,
     withRunLock: (key, fn) => withLock(key, fn),
@@ -820,20 +872,13 @@ export function realCompleteReleaseDeps(
         if (row.prerelease || row.name !== tag || String(row.body).trim() !== tagObservation.annotation.trim()) {
           throw new Error(`pipeline release: GitHub Release ${tag} metadata/notes do not match its annotated tag`);
         }
-        const runs = JSON.parse(await gh([
-          "run", "list", "--repo", repository, "--workflow", "release.yml",
-          "--json", "databaseId,event,headBranch,headSha,status,conclusion,attempt", "--limit", "100",
-        ])) as unknown;
+        const runs = await loadExactPublisherRuns(tag, tagObservation.peeled_commit);
         const conclusion = selectExactPublisherConclusion(runs, tag, tagObservation.peeled_commit);
         return { tag, draft: row.draft, published_at: row.published_at as string | null, workflow_conclusion: conclusion };
       }
     },
     async recoverPublication(tag, candidate) {
-      const runs = JSON.parse(await gh([
-        "run", "list", "--repo", repository, "--workflow", "release.yml",
-        "--json", "databaseId,event,headBranch,headSha,status,conclusion,attempt", "--limit", "100",
-      ])) as unknown;
-      const classified = classifyPublisherRuns(runs, tag, candidate);
+      const classified = classifyPublisherRuns(await loadExactPublisherRuns(tag, candidate), tag, candidate);
       if (classified.class === "successful" || classified.class === "pending") return false;
       if (classified.class === "failed") {
         const newest = [...classified.exact].sort((a, b) => b.databaseId - a.databaseId)[0]!;
@@ -855,10 +900,7 @@ export function realCompleteReleaseDeps(
       ]);
       for (let attempt = 1; attempt <= dispatchObserveAttempts; attempt++) {
         await waitFn(RELEASE_PUBLICATION_WAIT_MS);
-        const observed = classifyPublisherRuns(JSON.parse(await gh([
-          "run", "list", "--repo", repository, "--workflow", "release.yml",
-          "--json", "databaseId,event,headBranch,headSha,status,conclusion,attempt", "--limit", "100",
-        ])) as unknown, tag, candidate);
+        const observed = classifyPublisherRuns(await loadExactPublisherRuns(tag, candidate), tag, candidate);
         if (observed.class !== "absent") return true;
       }
       throw new Error(

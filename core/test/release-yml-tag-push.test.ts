@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { releaseTagNotes } from "../scripts/stages/release-complete.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WORKFLOW = join(__dirname, "../../.github/workflows/release.yml");
@@ -52,6 +53,21 @@ test("release.yml order is tag checkout, root/core guards, main=C, publication, 
   const trackingRefspec = src.match(/\+refs\/heads\/main:refs\/remotes\/origin\/main/g) ?? [];
   assert.equal(trackingRefspec.length, 2, "publication guard and docs checkout must update origin/main");
   assert.doesNotMatch(src, /git fetch origin main$/m);
+});
+
+test("release.yml rejects a same-C tag whose notes diverge from TAG and C (#1563)", () => {
+  const src = readFileSync(WORKFLOW, "utf8");
+  const publish = src.slice(src.indexOf("Publish GitHub Release from the annotated tag"));
+  const create = publish.indexOf("gh release create");
+  const edit = publish.indexOf("gh release edit");
+  const mismatch = publish.indexOf("annotation does not match required notes");
+  assert.ok(mismatch >= 0, "publish step must require exact TAG/C notes");
+  assert.ok(create >= 0 && edit >= 0, "publish step must still create or edit the Release");
+  assert.ok(mismatch < create && mismatch < edit, "exact notes must be checked before Release create/edit");
+  assert.match(publish, /Verified exact-candidate release at \$\{candidate\}/);
+  const C = "c".repeat(40);
+  assert.equal(releaseTagNotes("1.2.3", C), `v1.2.3\n\nVerified exact-candidate release at ${C}.`);
+  assert.match(publish, /outputs\.candidate/);
 });
 
 test("tugboat wait-release does not create GitHub Releases (#1167)", () => {

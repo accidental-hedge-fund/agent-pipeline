@@ -13,7 +13,7 @@
 
 Key: `(workflow = release.yml, tag = vVERSION, candidate = C)`.
 
-Exact-identity run: `event` is `push` or `workflow_dispatch`, `headBranch` equals the tag, and `headSha` equals C. Observation uses `gh run list --workflow release.yml` with `databaseId,event,headBranch,headSha,status,conclusion,attempt`. Unknown, truncated, or malformed lists fail closed.
+Exact-identity run: `event` is `push` or `workflow_dispatch`, `headBranch` equals the tag, and `headSha` equals C. Observation uses `gh api --paginate --slurp` on `repos/<repo>/actions/workflows/release.yml/runs?per_page=100&head_sha=C` and maps `id,event,head_branch,head_sha,status,conclusion,run_attempt`. Absence is concluded only when `total_count` matches the flattened set. Unknown, truncated, or malformed lists fail closed.
 
 | Remote class | Predicate | Action |
 | --- | --- | --- |

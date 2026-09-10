@@ -5,6 +5,7 @@ import {
   classifyPublisherRuns,
   exactHeadCheckRunsState,
   metadataChecksState,
+  parsePublisherWorkflowRunPages,
   realCompleteReleaseDeps,
   releaseTagNotes,
   selectExactPublisherConclusion,
@@ -251,6 +252,42 @@ test("publisher proof binds push or workflow_dispatch, tag branch, and exact C",
   ], "v1.2.3", C).class, "pending");
 });
 
+test("publisher classification locates the exact run among at least 100 workflow rows", () => {
+  const filler = Array.from({ length: 100 }, (_, i) => ({
+    databaseId: i + 1, attempt: 1, event: "push", headBranch: "v0.0.1", headSha: C,
+    status: "completed", conclusion: "success",
+  }));
+  const exact = {
+    databaseId: 101, attempt: 1, event: "push", headBranch: "v1.2.3", headSha: C,
+    status: "completed", conclusion: "success",
+  };
+  assert.equal(classifyPublisherRuns([...filler, exact], "v1.2.3", C).class, "successful");
+  assert.equal(classifyPublisherRuns([...filler.slice(0, 99), exact], "v1.2.3", C).class, "successful");
+  assert.equal(classifyPublisherRuns(filler, "v1.2.3", C).class, "absent");
+});
+
+test("publisher workflow pages fail closed unless total_count matches the flattened exact-identity set", () => {
+  const rest = (id: number, branch = "v0.0.1") => ({
+    id, event: "push", head_branch: branch, head_sha: C,
+    status: "completed", conclusion: "success", run_attempt: 1,
+  });
+  const filler = Array.from({ length: 100 }, (_, i) => rest(i + 1));
+  const exact = rest(101, "v1.2.3");
+  const parsed = parsePublisherWorkflowRunPages([
+    { total_count: 101, workflow_runs: filler },
+    { total_count: 101, workflow_runs: [exact] },
+  ], "v1.2.3");
+  assert.equal(classifyPublisherRuns(parsed, "v1.2.3", C).class, "successful");
+  assert.throws(
+    () => parsePublisherWorkflowRunPages([{ total_count: 101, workflow_runs: filler }], "v1.2.3"),
+    /truncated/,
+  );
+  assert.throws(
+    () => parsePublisherWorkflowRunPages([{ workflow_runs: [exact] }], "v1.2.3"),
+    /unknown shape/,
+  );
+});
+
 test("metadata adapter requires nonempty exact-head green checks", () => {
   assert.equal(metadataChecksState([]), "pending");
   assert.equal(metadataChecksState([{ name: "ci", bucket: "pending" }]), "pending");
@@ -344,7 +381,9 @@ test("production publication observer does not misclassify downstream 404 as rel
       tag_name: tag, draft: false, prerelease: false, published_at: "2026-09-10T00:00:00Z",
       body: notes, name: tag, html_url: "https://github.test/o/r/releases/tag/v1.2.3",
     });
-    if (file === "gh" && args[0] === "run") throw new Error("HTTP 404 from workflow runs API");
+    if (file === "gh" && args[0] === "api" && joined.includes("actions/workflows/release.yml/runs")) {
+      throw new Error("HTTP 404 from workflow runs API");
+    }
     if (args[0] === "ls-remote") return `${A}\trefs/tags/${tag}\n${C}\trefs/tags/${tag}^{}`;
     if (args[0] === "fetch") return "";
     if (joined === `rev-parse refs/pipeline/release-observe/${tag}`) return A;
@@ -508,11 +547,33 @@ test("production Release lookup treats only non-auth HTTP 404 as absence", async
   await assert.rejects(() => prose.observePublication(tag), /observation is unknown/);
 });
 
+function isPublisherRunList(args: string[]): boolean {
+  return args[0] === "api" && args.includes("--paginate") && args.includes("--slurp") &&
+    args.some((arg) => arg.includes("actions/workflows/release.yml/runs") && arg.includes(`head_sha=${C}`));
+}
+
+function restPublisherPages(rows: unknown[]): string {
+  const workflow_runs = rows.map((value) => {
+    const row = value as Record<string, unknown>;
+    if ("head_sha" in row) return row;
+    return {
+      id: row.databaseId,
+      event: row.event,
+      head_branch: row.headBranch,
+      head_sha: row.headSha,
+      status: row.status,
+      conclusion: row.conclusion,
+      run_attempt: row.attempt,
+    };
+  });
+  return JSON.stringify([{ total_count: workflow_runs.length, workflow_runs }]);
+}
+
 function publisherCommand(tag: string, notes: string, state: { runs: unknown[]; ghCalls: string[] }) {
   return async (_cwd: string, file: string, args: string[]) => {
     const joined = args.join(" ");
     if (file === "gh") state.ghCalls.push(joined);
-    if (file === "gh" && args[0] === "run" && args[1] === "list") return JSON.stringify(state.runs);
+    if (file === "gh" && isPublisherRunList(args)) return restPublisherPages(state.runs);
     if (file === "gh" && args[0] === "workflow") return "";
     if (file === "gh" && args[0] === "run" && args[1] === "rerun") return "";
     if (args[0] === "fetch" && args.includes("origin") && args.includes("main")) return "";
@@ -567,8 +628,8 @@ test("publisher recovery dispatches once when remote runs are absent and reruns 
 test("publisher recovery does not dispatch when an exact-identity run already exists", async () => {
   const tag = "v1.2.3";
   const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
-    if (file === "gh" && args[0] === "run" && args[1] === "list") {
-      return JSON.stringify([{
+    if (file === "gh" && isPublisherRunList(args)) {
+      return restPublisherPages([{
         databaseId: 11, event: "push", headBranch: tag, headSha: C,
         status: "in_progress", conclusion: null, attempt: 1,
       }]);
@@ -577,6 +638,74 @@ test("publisher recovery does not dispatch when an exact-identity run already ex
     throw new Error(`unexpected ${file} ${args.join(" ")}`);
   } });
   assert.equal(await adapter.recoverPublication(tag, C), false);
+});
+
+test("publisher recovery classifies the exact run after paginating past 100 workflow rows", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  const filler = Array.from({ length: 100 }, (_, i) => ({
+    id: i + 1, event: "push", head_branch: "v0.0.1", head_sha: C,
+    status: "completed", conclusion: "success", run_attempt: 1,
+  }));
+  const exact = {
+    id: 101, event: "push", head_branch: tag, head_sha: C,
+    status: "completed", conclusion: "failure", run_attempt: 1,
+  };
+  const ghCalls: string[] = [];
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    command: async (cwd, file, args) => {
+      if (file === "gh") ghCalls.push(args.join(" "));
+      if (file === "gh" && isPublisherRunList(args)) {
+        return JSON.stringify([
+          { total_count: 101, workflow_runs: filler },
+          { total_count: 101, workflow_runs: [exact] },
+        ]);
+      }
+      if (file === "gh" && args[0] === "workflow") throw new Error("must not dispatch");
+      return publisherCommand(tag, notes, { runs: [], ghCalls: [] })(cwd, file, args);
+    },
+  });
+  assert.equal(await adapter.recoverPublication(tag, C), true);
+  assert.ok(ghCalls.some((call) => call.startsWith("run rerun 101")));
+  assert.ok(!ghCalls.some((call) => call.includes("workflow run")));
+});
+
+test("production publication observer paginates exact-identity runs past 100 rows", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  const filler = Array.from({ length: 100 }, (_, i) => ({
+    id: i + 1, event: "push", head_branch: "v0.0.1", head_sha: C,
+    status: "completed", conclusion: "success", run_attempt: 1,
+  }));
+  const exact = {
+    id: 101, event: "push", head_branch: tag, head_sha: C,
+    status: "completed", conclusion: "success", run_attempt: 1,
+  };
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
+    const joined = args.join(" ");
+    if (file === "gh" && args[0] === "api" && joined.includes("releases/tags/")) {
+      return JSON.stringify({
+        tag_name: tag, draft: false, prerelease: false, published_at: "2026-09-10T00:00:00Z",
+        body: notes, name: tag, html_url: "https://github.test/o/r/releases/tag/v1.2.3",
+      });
+    }
+    if (file === "gh" && isPublisherRunList(args)) {
+      return JSON.stringify([
+        { total_count: 101, workflow_runs: filler },
+        { total_count: 101, workflow_runs: [exact] },
+      ]);
+    }
+    if (args[0] === "ls-remote") return `${A}\trefs/tags/${tag}\n${C}\trefs/tags/${tag}^{}`;
+    if (args[0] === "fetch") return "";
+    if (joined === `rev-parse refs/pipeline/release-observe/${tag}`) return A;
+    if (joined === `cat-file -t refs/pipeline/release-observe/${tag}`) return "tag";
+    if (joined === `rev-parse refs/pipeline/release-observe/${tag}^{}`) return C;
+    if (args[0] === "for-each-ref") return notes;
+    throw new Error(`unexpected ${file} ${joined}`);
+  } });
+  const observed = await adapter.observePublication(tag);
+  assert.equal(observed?.workflow_conclusion, "success");
+  assert.equal(observed?.draft, false);
 });
 
 test("publisher recovery waits for delayed run visibility and does not dispatch twice", async () => {
@@ -591,11 +720,11 @@ test("publisher recovery waits for delayed run visibility and does not dispatch 
     command: async (_cwd, file, args) => {
       const joined = args.join(" ");
       if (file === "gh") ghCalls.push(joined);
-      if (file === "gh" && args[0] === "run" && args[1] === "list") {
-        if (dispatches === 0) return JSON.stringify([]);
+      if (file === "gh" && isPublisherRunList(args)) {
+        if (dispatches === 0) return restPublisherPages([]);
         listsAfterDispatch++;
-        if (listsAfterDispatch < 3) return JSON.stringify([]);
-        return JSON.stringify([{
+        if (listsAfterDispatch < 3) return restPublisherPages([]);
+        return restPublisherPages([{
           databaseId: 12, event: "workflow_dispatch", headBranch: tag, headSha: C,
           status: "in_progress", conclusion: null, attempt: 1,
         }]);
@@ -646,11 +775,11 @@ test("publication loop does not re-dispatch while the recovery run remains unlis
     dispatchObserveAttempts: 4,
     command: async (_cwd, file, args) => {
       const joined = args.join(" ");
-      if (file === "gh" && args[0] === "run" && args[1] === "list") {
-        if (dispatches === 0) return JSON.stringify([]);
+      if (file === "gh" && isPublisherRunList(args)) {
+        if (dispatches === 0) return restPublisherPages([]);
         listsAfterDispatch++;
-        if (listsAfterDispatch < 3) return JSON.stringify([]);
-        return JSON.stringify([{
+        if (listsAfterDispatch < 3) return restPublisherPages([]);
+        return restPublisherPages([{
           databaseId: 13, event: "workflow_dispatch", headBranch: tag, headSha: C,
           status: "in_progress", conclusion: null, attempt: 1,
         }]);

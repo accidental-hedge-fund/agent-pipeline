@@ -99,6 +99,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.identity.outputs.tag }}
+          C: ${{ steps.identity.outputs.candidate }}
         run: |
           set -euo pipefail
           git tag -l "${TAG}" --format='%(contents)' > /tmp/notes.md
@@ -106,6 +107,17 @@ jobs:
             echo "::error::${TAG} has an empty or whitespace-only annotation message. Annotate the tag with release notes before pushing."
             exit 1
           fi
+          node -e '
+            const fs = require("fs");
+            const tag = process.env.TAG;
+            const candidate = process.env.C;
+            const actual = fs.readFileSync("/tmp/notes.md", "utf8").trim();
+            const expected = `${tag}\n\nVerified exact-candidate release at ${candidate}.`.trim();
+            if (actual !== expected) {
+              console.error(`::error::${tag} annotation does not match required notes for candidate ${candidate}`);
+              process.exit(1);
+            }
+          '
           if [[ "${TAG}" == *-* ]]; then
             flag="--prerelease"
           else
