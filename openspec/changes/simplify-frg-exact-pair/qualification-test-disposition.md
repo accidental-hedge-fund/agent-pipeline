@@ -18,4 +18,4 @@ carry qualification choreography into the exact-pair release verifier.
 
 The external installed-launcher smoke may remain while legacy callers exist,
 but it is not a release prerequisite and is not an input to
-`verifyReleasePathExactCandidateFrg`.
+`verifyExactCandidateFrgResult`.

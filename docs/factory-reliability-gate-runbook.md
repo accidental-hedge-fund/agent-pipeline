@@ -39,11 +39,12 @@ It is not release-eligible proof for the exact-pair verifier. Package 3 owns
 complete ship/release integration; package 2 performs no release, tag,
 publication, promotion, installation, or deployment.
 
-**Hard rule:** no release tag and no release PR prepared as ready without a recorded
-FRG pass artifact for that version.
+**Hard rule:** metadata release-PR preparation and merge may precede FRG. A release
+tag or publication must not proceed without a recorded FRG pass artifact for that
+version.
 
 ```text
-No release tag / release PR → ready
+No release tag / publication
   without a recorded Factory Reliability Gate (FRG) artifact for that version.
 ```
 

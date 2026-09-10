@@ -1910,6 +1910,8 @@ test("invoke(): no opts.env → the real spawned child sees no PIPELINE_RUN_ID (
 });
 
 test("invoke(): ship/FRG controller authority is absent from the harness child (#1478)", async () => {
+  assert.ok(harnessChildOmittedEnvNames().includes("PIPELINE_SUPPRESS_AUTO_FILE"));
+  assert.ok(harnessChildOmittedEnvNames().includes("PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR"));
   const prior = new Map<string, string | undefined>();
   for (const name of harnessChildOmittedEnvNames()) {
     prior.set(name, process.env[name]);

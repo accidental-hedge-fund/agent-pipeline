@@ -21,7 +21,7 @@
 - [x] 4.1 Build the release-owned observer from existing forge, CI, review, Tester, provenance, and ordinary-run evidence seams; verify a current unmerged head with matching ready-to-deploy, green CI, accepted independent review, passed Tester evidence, and expected provenance is accepted.
 - [x] 4.2 Validate every candidate-bearing observation against the current fixture PR head and authoritative source; verify stale, forged, label-only, comment-only, public-hash-only, worker-boolean, wrong-head, missing-evidence, and merged-fixture cases cannot pass.
 - [x] 4.3 Implement the deterministic four-way non-pass classifier and existing lifecycle mappings; verify ordinary revision stays with ordinary issue ownership, observer outage becomes an external-condition wait, demonstrated regression retains exact-candidate evidence, and gate defect names the shared owning contract.
-- [x] 4.4 Persist each final result atomically before ownership-safe nonmerge cleanup and append cleanup facts without changing the proof outcome; verify cleanup success, identity mismatch, failure, and uncertainty tests preserve evidence and report cleanup debt.
+- [x] 4.4 Persist each final result atomically before ownership-safe nonmerge cleanup accounting, then append cleaned/debt facts without changing the proof outcome; when the remote lacks a conditional compare-and-swap close, record deterministic debt and perform no mutation, so cleanup uncertainty cannot invalidate pass.
 
 ## 5. Release-Path Simplification
 

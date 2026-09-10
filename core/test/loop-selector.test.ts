@@ -162,6 +162,21 @@ test("realDispatchItem forwards cfg.engine_track onto the child advance argv", a
   const idx = spawned[0].indexOf("--engine-track");
   assert.ok(idx >= 0, "realDispatchItem must pass --engine-track from cfg");
   assert.equal(spawned[0][idx + 1], "candidate");
+  assert.equal(spawned[0].includes("--candidate-target-primary"), false,
+    "config track alone grants no cross-checkout artifact owner");
+});
+
+test("dispatchItemChildArgs carries target-primary only for the explicit exact-candidate bridge", () => {
+  for (const engineTrack of [undefined, "pinned"] as const) {
+    const args = dispatchItemChildArgs("/child.ts", 1, "codex", "/repo", { engineTrack });
+    assert.equal(args.includes("--candidate-target-primary"), false);
+  }
+  const candidate = dispatchItemChildArgs("/child.ts", 1, "codex", "/candidate", {
+    engineTrack: "candidate", targetRunStoreRepoDir: "/primary", candidateGuardModule: "/candidate/scripts/candidate-process-guard.mjs",
+  });
+  assert.deepEqual(candidate.slice(0, 2), ["--import", "/candidate/scripts/candidate-process-guard.mjs"]);
+  assert.deepEqual(candidate.slice(candidate.indexOf("--candidate-target-primary"), -2),
+    ["--candidate-target-primary", "/primary"]);
 });
 
 test("realDispatchItem nested child spawn sets PIPELINE_NESTED_ADVANCE=1", async () => {

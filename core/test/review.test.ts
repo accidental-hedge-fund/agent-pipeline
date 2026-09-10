@@ -76,6 +76,7 @@ import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, findi
 import type { SettledFinding } from "../scripts/review-history.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
+import { PIPELINE_SUPPRESS_AUTO_FILE_ENV } from "../scripts/stages/papercut.ts";
 
 // ---------------------------------------------------------------------------
 // parseStructuredVerdict â€” parse paths
@@ -3186,6 +3187,31 @@ test("#233 regression (a): ceiling + only-medium findings + demote_and_advance â
   const overrides = extractOverrides(overrideComments.map((b) => ({ body: b })));
   assert.ok(overrides.has(demotedKey), `override must be recorded for demoted key ${demotedKey}`);
   assert.match(overrides.get(demotedKey)!, /deferred/, "override disposition must reference deferral");
+});
+
+test("exact-candidate FRG keeps review-ceiling findings blocked without filing a deferred issue", async (t) => {
+  const prior = process.env[PIPELINE_SUPPRESS_AUTO_FILE_ENV];
+  process.env[PIPELINE_SUPPRESS_AUTO_FILE_ENV] = "1";
+  t.after(() => {
+    if (prior === undefined) delete process.env[PIPELINE_SUPPRESS_AUTO_FILE_ENV];
+    else process.env[PIPELINE_SUPPRESS_AUTO_FILE_ENV] = prior;
+  });
+  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  let creates = 0;
+  deps.createIssue = async () => { creates++; return 999; };
+  deps.getIssueDetail = async () => ({
+    number: 42, type: "issue", title: "T", body: "B", state: "open", url: "u", labels: [],
+    comments: [
+      ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-medium-1", SHA_A),
+      ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-medium-2", "b".repeat(40)),
+    ],
+  }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: Awaited<ReturnType<typeof advanceReview>>;
+  await quiet(t, async () => { outcome = await advanceReview(cfgDemote, 42, 2, {}, 0, deps); });
+  assert.equal(outcome!.status, "blocked");
+  assert.equal(outcome!.blockerKind, "review-findings");
+  assert.equal(creates, 0);
+  assert.equal(rec.transitions.length, 0);
 });
 
 // Task 4.3 / Regression (b): a high finding is never demoted, but remains engine-owned.

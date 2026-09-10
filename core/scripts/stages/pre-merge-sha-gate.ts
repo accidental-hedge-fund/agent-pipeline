@@ -15,6 +15,7 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
+import { autoFileAllowed } from "./papercut.ts";
 import {
   ensureManagedWorktree,
   getForIssue,
@@ -1162,7 +1163,7 @@ export async function enforceReviewShaGate(
           highOrCritical.length === 0 &&
           belowHigh.length > 0;
 
-        if (!shouldDemote) {
+        if (!shouldDemote || !autoFileAllowed()) {
           await postCommentFn(
             cfg, issueNumber,
             deltaRoundCeilingComment(

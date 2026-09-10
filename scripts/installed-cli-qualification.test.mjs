@@ -53,6 +53,12 @@ test("real candidate launcher produces complete parent-observed qualification", 
   );
   const stored = JSON.parse(readFileSync(qualificationArtifactPath(root, candidate), "utf8"));
   assert.ok(parseInstalledCliQualificationArtifact(stored, candidate));
+  const mismatchedInventory = structuredClone(stored);
+  mismatchedInventory.proofs.find((proof) => proof.operation === "candidate-core-suite").argv.push("core/test/operator-only.test.ts");
+  const { digest_sha256: _inventoryDigest, ...inventoryUnsigned } = mismatchedInventory;
+  mismatchedInventory.digest_sha256 = installedCliQualificationArtifactDigest(inventoryUnsigned);
+  assert.equal(parseInstalledCliQualificationArtifact(mismatchedInventory, candidate), null,
+    "a re-digested suite claim that differs from the trusted candidate commit inventory is rejected");
   const reused = runInstalledCliQualification({
     candidateSha: candidate,
     launcherPath: launcher,
