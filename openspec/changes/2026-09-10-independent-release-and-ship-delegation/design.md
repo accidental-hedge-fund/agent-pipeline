@@ -2,12 +2,95 @@
 
 - Git, GitHub forge/CI/review/Tester observations, workflow runs, and Releases are authoritative. Local state may checkpoint and bind an FRG epoch identity or provide same-host exclusion, but ignored files never prove completion.
 - Metadata merges before C is frozen. An unpublished bump on main is an accepted retry state.
-- Every metadata reuse state (open, observed transition to merged, or already merged) passes one common validator: exact PR/base/head identity; release-managed nonempty diff only; VERSION in root and core package files at that head; nonempty green checks bound to that head; exact merge identity and containment in C.
+- Every metadata reuse state (open, observed transition to merged, or already merged, including a deleted `release/vVERSION` head) passes one common validator: exact PR/base/head identity; release-managed nonempty diff only; VERSION in root and core package files at that head; nonempty green checks bound to that head; exact merge identity and containment in C. A version string on main without that PR proof fails closed.
 - Milestone membership and merged-PR containment are re-resolved against frozen C after metadata exact-head CI/merge and before fixtures, then revalidated after FRG immediately before tag creation. A change in membership, proof, or C blocks the next mutation.
 - Completed retry identity is tag C, both package versions at C, exact annotation, an authoritative reconstruction of the passed exact pair, successful exact `release.yml` run at C, and a matching non-draft publication. Reconstruction discovers exactly one pair by its external provenance and re-observes its issues, PRs, exact-head checks, reviews, Tester evidence, current-head readiness, and absence of fixture merges. A clean checkout with no local record performs the same read-only reconstruction; it never creates a replacement pair for a tagged candidate.
-- `release.yml` is the sole publisher and recovery implementation. Release can rerun an observed exact-C workflow run or issue one bounded exact-C recovery dispatch to that workflow when the run is authoritatively absent. The workflow re-verifies the annotated remote tag at C before create/edit. Only a status-aware exact-tag 404 proves Release absence; all other observer failures are unknown and block mutation.
-- Existing prepare is retained only behind the explicit `release prepare`/factory/merge-queue surfaces and runs in a dedicated worktree. Packed-candidate preparation must preserve the same caller-checkout isolation or reject before Git mutation.
+- `release.yml` is the sole publisher and recovery implementation. Recovery uses a remote-evidence state machine keyed by workflow `release.yml` + tag + C. Release can rerun one observed exact-C workflow run or issue one bounded exact-C recovery dispatch to that workflow when the run is authoritatively absent. The workflow re-verifies the annotated remote tag at C before create/edit. Only a status-aware exact-tag 404 that is not auth-shaped proves Release absence; all other observer failures are unknown and block mutation.
+- Existing prepare is retained only behind the explicit `release prepare`, `factory-release prepare`, and merge-queue `--release-when-complete` surfaces and runs in a dedicated worktree. `release prepare --packed-candidate` is rejected during argument validation before any Git command. `release finish` remains a metadata-PR merge helper and does not tag or publish.
 - Publisher order is tag checkout/fetch, annotated-tag and root/core version verification, publication, then checkout of current main before dependency installation and tag-derived docs generation. `release.yml` remains the sole publisher and post-tag docs owner; the obsolete main-push auto-tagger is disabled pending #1560 deletion.
+
+## Publisher recovery state machine
+
+Key: `(workflow = release.yml, tag = vVERSION, candidate = C)`.
+
+Exact-identity run: `event` is `push` or `workflow_dispatch`, `headBranch` equals the tag, and `headSha` equals C. Observation uses `gh run list --workflow release.yml` with `databaseId,event,headBranch,headSha,status,conclusion,attempt`. Unknown, truncated, or malformed lists fail closed.
+
+| Remote class | Predicate | Action |
+| --- | --- | --- |
+| successful | at least one exact run completed with `conclusion=success` | wait only for the matching non-draft Release; never dispatch or rerun |
+| pending | at least one exact run is queued, waiting, or in progress | wait; never dispatch or rerun |
+| failed | every exact run completed unsuccessfully | `gh run rerun` the newest exact `databaseId` only when its `attempt` is 1; if `attempt > 1`, fail closed |
+| absent | zero exact runs | one `gh workflow run release.yml --ref vVERSION -f tag=vVERSION -f candidate=C` after re-verifying the remote annotated tag and `origin/main = C` |
+
+Bounds come from that remote set across reinvocations. A local `recoveryAttempted` flag is not the bound. Dispatch is only for absence. A failed push or dispatch run is rerun in place; it never authorizes a second dispatch. CLI never creates or edits a GitHub Release.
+
+## workflow_dispatch contract
+
+`release.yml` keeps the existing `push: tags: ["v*"]` publisher and adds:
+
+```yaml
+workflow_dispatch:
+  inputs:
+    tag:
+      description: Exact annotated tag (vX.Y.Z)
+      required: true
+      type: string
+    candidate:
+      description: Exact 40-hex candidate SHA C
+      required: true
+      type: string
+```
+
+The dispatch path is the same job as tag-push, not a second publisher. The job resolves `TAG`/`C` from `inputs` on dispatch and from `github.ref_name`/`github.sha` on push, then independently fetches `refs/tags/${TAG}`, verifies it is annotated, peels to C, matches both package versions, and confirms `origin/main = C` before publication. Invalid inputs, tag/C mismatch, or main movement fail closed without creating or editing a Release. `core/test/release-yml-tag-push.test.ts` currently forbids `workflow_dispatch`; replace that assertion with a contract that the dispatch inputs exist and share the push job.
+
+## Metadata validator retrieval
+
+One validator covers open, observed merge, already merged, and already merged with deleted `release/vVERSION`.
+
+Do not use `gh pr list --head release/vVERSION` as the only lookup. Discover by release title/`gh pr view` identity. After branch deletion:
+
+- `gh pr view N --json number,state,baseRefName,headRefOid,mergeCommit` still returns head and merge identity
+- `git fetch origin pull/N/head:refs/pipeline/release-metadata/vVERSION` or fetch of the merge OID retrieves the exact head
+- `git show <head_oid>:package.json` and `git show <head_oid>:core/package.json` prove both versions
+- `git diff --name-only <base>...<head_oid>` or `gh api repos/.../pulls/N/files` proves release-managed paths
+- `gh pr checks N --json name,bucket` or commit check-runs at `headRefOid` prove nonempty exact-head CI
+- `git merge-base --is-ancestor <merge_oid> <C>` proves containment
+
+A version already on main without that PR proof fails closed. `observeMetadata` returning null is not permission to treat current package versions as provenance.
+
+## Prepare-only caller map
+
+| Surface | Authority |
+| --- | --- |
+| `pipeline release VERSION` | complete: metadata, merge, FRG, tag, publication |
+| `pipeline ship --milestone` (SemVer) | train, then exactly one complete-release call |
+| `pipeline ship --milestone` (continuous) | train/integration only |
+| `pipeline release prepare VERSION` | metadata PR only |
+| `pipeline factory-release prepare --request` | FRG pack plus shared prepare-only `runRelease` |
+| `pipeline merge-queue --release-when-complete` | shared prepare-only `runRelease` |
+| `pipeline release finish <pr>` | merge the metadata PR; no tag or publish |
+| `advance` / `single` / `loop` | no merge, no tag, no publish |
+
+`release prepare --packed-candidate` is rejected at argv validation before any Git command. Remove the current `alignReleaseCheckoutToCandidate` call from the `release prepare` path in `core/scripts/pipeline.ts`. Legacy `release ensure-tag --packed-candidate` is unchanged and is not a complete-release caller.
+
+## Tagged-stale-C versus completed docs refresh
+
+- Completed: annotated `vVERSION` at C, matching notes and package versions, reconstructed exact-pair FRG pass, successful exact `release.yml` run, matching non-draft Release. Later docs refresh may advance main. Repeat invocation returns complete without milestone, fixtures, retag, or republish.
+- Tagged-stale-C: annotated `vVERSION` at C exists, publication is not a verified success, and origin/main no longer equals C. Report durable incomplete/stale-C. Never retag, delete, recreate FRG, or rebind to later main. This is the observable half of the documented non-atomic tag-boundary race.
+
+## Status-aware Release lookup and workflow order
+
+Replace `gh release view … &>/dev/null` and CLI `/release not found/i` matching. Both owners classify observer errors with the existing `isHttp404Signal` and `isGithubAuthOrPermissionError` helpers in `core/scripts/gh.ts`. Absence is only an HTTP-404-class, not-auth-shaped response for that exact tag. Auth, rate-limit, network, malformed JSON, and 5xx remain unknown.
+
+Required `release.yml` order:
+
+1. Fetch and check out the intended tag object
+2. Guard annotated tag plus root and `core/package.json` versions
+3. Independently verify remote tag identity and `origin/main = C`
+4. Publish or edit the GitHub Release using status-aware lookup
+5. Check out current `origin/main`
+6. Install dependencies
+7. Generate tag-derived docs without retargeting the tag
 
 ## Tag-boundary proof and limitation
 
