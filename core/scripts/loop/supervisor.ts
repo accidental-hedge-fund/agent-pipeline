@@ -1137,14 +1137,462 @@ function recoveryCandidateIdentity(
  * authoritative. Older injected/test observations omit the field and
  * retain the historical raw-HEAD behavior. */
 function observedCandidateEpoch(item: LoopItemLedgerEntry | undefined): string {
-  const identity = item?.last_verified_identity;
+  return candidateEpochFromIdentity(item?.last_verified_identity);
+}
+
+function candidateEpochFromIdentity(identity: LoopItemLedgerEntry["last_verified_identity"]): string {
   if (!identity) return "";
   if (Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")) {
-    const logical = identity.logical_candidate_epoch?.trim() ?? "";
-    if (logical) return logical;
-    return identity.head_sha.trim();
+    return identity.logical_candidate_epoch?.trim() || identity.head_sha.trim();
   }
   return identity.head_sha.trim();
+}
+
+function latestBlockGeneration(item: LoopItemLedgerEntry): {
+  time: string;
+  blockerClass: string;
+  evidenceFingerprint: string;
+} | null {
+  const blockerClass = item.blocked_theme;
+  const evidenceFingerprint = item.evidence_fingerprint;
+  if (!blockerClass || !evidenceFingerprint) return null;
+  const entry = [...item.history].reverse().find(
+    (candidate) => candidate.from === "in_progress" && candidate.to === "blocked",
+  );
+  if (
+    !entry ||
+    entry.theme !== blockerClass ||
+    typeof entry.evidence !== "string" ||
+    fingerprintEvidence(entry.evidence) !== evidenceFingerprint
+  ) return null;
+  return { time: entry.time, blockerClass, evidenceFingerprint };
+}
+
+function canonicalUtcTime(value: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString() === value ? time : null;
+}
+
+function attemptBelongsToBlockGeneration(
+  attempt: LoopRecoveryAttempt,
+  itemId: string,
+  generation: NonNullable<ReturnType<typeof latestBlockGeneration>>,
+): boolean {
+  return (
+    attempt.item_id === itemId &&
+    attempt.class === generation.blockerClass &&
+    attempt.evidence_fingerprint === generation.evidenceFingerprint &&
+    canonicalUtcTime(attempt.time) !== null &&
+    canonicalUtcTime(generation.time) !== null &&
+    canonicalUtcTime(attempt.time)! > canonicalUtcTime(generation.time)!
+  );
+}
+
+function exactCandidatePrTokens(candidateIdentity: string): number[] {
+  return candidateIdentity.split("|").flatMap((token) => {
+    const match = /^pr=(\d+)$/i.exec(token);
+    return match ? [Number(match[1])] : [];
+  });
+}
+
+/** Pre-#1568 ledgers did not bind a block to its originating candidate. The
+ * first attempt from the latest block generation is authoritative: later
+ * attempts may already have been incorrectly rebound to a newer head. */
+function blockerCandidateBinding(
+  item: LoopItemLedgerEntry,
+  attempts: readonly LoopRecoveryAttempt[],
+): { kind: "bound"; attempt: Pick<LoopRecoveryAttempt, "candidate_epoch" | "candidate_identity">; display: string } |
+  { kind: "ambiguous" } | null {
+  const hasExplicit = Object.prototype.hasOwnProperty.call(item, "blocker_candidate_epoch");
+  const explicit = item.blocker_candidate_epoch?.trim() ?? "";
+  if (hasExplicit && !explicit) return null;
+  const generation = latestBlockGeneration(item);
+  const plausible = generation
+    ? attempts.filter(
+        (attempt) =>
+          attempt.item_id === item.id &&
+          attempt.class === generation.blockerClass &&
+          attempt.evidence_fingerprint === generation.evidenceFingerprint,
+      )
+    : [];
+  const generationTime = generation ? canonicalUtcTime(generation.time) : null;
+  if (
+    generation && (
+      generationTime === null ||
+      plausible.some((attempt) => {
+        const attemptTime = canonicalUtcTime(attempt.time);
+        return attemptTime === null || attemptTime === generationTime ||
+          !Number.isInteger(attempt.seq) || attempt.seq < 0;
+      }) ||
+      plausible.some((attempt, index) => index > 0 && attempt.seq <= plausible[index - 1]!.seq)
+    )
+  ) return { kind: "ambiguous" };
+  const eligible = generation
+    ? attempts.filter((attempt) => attemptBelongsToBlockGeneration(attempt, item.id, generation))
+    : [];
+  const firstSeq = Math.min(...eligible.map((attempt) => attempt.seq));
+  const firstCandidates = eligible.filter((attempt) => attempt.seq === firstSeq);
+  if (firstCandidates.length > 1) return { kind: "ambiguous" };
+  const first = firstCandidates[0];
+  const persistedPr = persistedRecoveryEvidence(item)?.transport.pr_number ?? null;
+  const firstPrTokens = first ? exactCandidatePrTokens(first.candidate_identity) : [];
+  if (
+    firstPrTokens.length > 1 ||
+    (persistedPr !== null && firstPrTokens.length === 1 && firstPrTokens[0] !== persistedPr &&
+      first?.action !== "repair_pipeline_item")
+  ) return { kind: "ambiguous" };
+
+  if (hasExplicit) {
+    if (!/^[0-9a-f]{40}$/i.test(explicit)) return { kind: "ambiguous" };
+    const firstEpochHeads = first
+      ? concreteCandidateHeads({ candidate_epoch: first.candidate_epoch, candidate_identity: "" })
+      : [];
+    const rawHead = item.blocker_candidate_head?.trim().toLowerCase() ?? "";
+    if (rawHead && !/^[0-9a-f]{40}$/.test(rawHead)) return { kind: "ambiguous" };
+    const legacyFirstIdentity = first && recoveryAttemptHasBoundedCandidateFields(first) &&
+        firstEpochHeads.length === 1 && firstEpochHeads[0] === explicit.toLowerCase()
+      ? first.candidate_identity
+      : "";
+    const candidateIdentity = rawHead || legacyFirstIdentity || explicit;
+    const attempt = { candidate_epoch: explicit, candidate_identity: candidateIdentity };
+    return { kind: "bound", attempt, display: explicit };
+  }
+  if (!generation) {
+    const hasCandidateBearingAttempt = attempts.some(
+      (attempt) =>
+        attempt.item_id === item.id &&
+        attempt.class === item.blocked_theme &&
+        attempt.evidence_fingerprint === item.evidence_fingerprint &&
+        concreteCandidateHeads(attempt).length > 0,
+    );
+    return hasCandidateBearingAttempt ? { kind: "ambiguous" } : null;
+  }
+  if (!first) return plausible.length > 0 ? { kind: "ambiguous" } : null;
+  const display = first.candidate_epoch?.trim() || first.candidate_identity.trim();
+  return display && recoveryAttemptHasBoundedCandidateFields(first)
+    ? { kind: "bound", attempt: first, display }
+    : { kind: "ambiguous" };
+}
+
+function recoveryAttemptHasBoundedCandidateFields(
+  attempt: Pick<LoopRecoveryAttempt, "candidate_epoch" | "candidate_identity">,
+): boolean {
+  if (exactCandidatePrTokens(attempt.candidate_identity).length > 1) return false;
+  const epochHeads = concreteCandidateHeads({
+    candidate_epoch: attempt.candidate_epoch,
+    candidate_identity: "",
+  });
+  const identityHeads = concreteCandidateHeads({
+    candidate_epoch: "",
+    candidate_identity: attempt.candidate_identity,
+  });
+  return attempt.candidate_epoch?.trim()
+    ? epochHeads.length === 1 && identityHeads.length <= 1
+    : identityHeads.length === 1;
+}
+
+function candidateMembershipHeads(
+  candidateEpoch: string | undefined,
+  candidateIdentity: string,
+): string[] {
+  return concreteCandidateHeads({
+    candidate_epoch: candidateEpoch,
+    candidate_identity: candidateIdentity,
+  });
+}
+
+function attemptBelongsToObservedCandidate(
+  attempt: Pick<LoopRecoveryAttempt, "candidate_epoch" | "candidate_identity">,
+  identity: LoopItemLedgerEntry["last_verified_identity"],
+  fallbackEpoch: string,
+): boolean {
+  const rawHead = identity?.head_sha.trim().toLowerCase() ?? "";
+  const logicalEpoch = candidateEpochFromIdentity(identity).toLowerCase();
+  if (
+    /^[0-9a-f]{40}$/.test(rawHead) &&
+    /^[0-9a-f]{40}$/.test(logicalEpoch) &&
+    recoveryAttemptHasBoundedCandidateFields(attempt)
+  ) {
+    const observedHeads = candidateMembershipHeads(logicalEpoch, rawHead);
+    return candidateMembershipHeads(attempt.candidate_epoch, attempt.candidate_identity)
+      .some((head) => observedHeads.includes(head));
+  }
+  return attemptBelongsToCandidateEpoch(attempt, fallbackEpoch);
+}
+
+function concreteCandidateHeads(
+  binding: Pick<LoopRecoveryAttempt, "candidate_epoch" | "candidate_identity">,
+): string[] {
+  const heads = new Set<string>();
+  for (const value of [binding.candidate_epoch ?? "", binding.candidate_identity ?? ""]) {
+    const bare = value.trim().toLowerCase();
+    if (/^[0-9a-f]{40}$/.test(bare)) heads.add(bare);
+    for (const token of value.split("|")) {
+      const match = /^head=([0-9a-f]{40})$/i.exec(token);
+      if (match) heads.add(match[1]!.toLowerCase());
+    }
+  }
+  return [...heads];
+}
+
+function identityProvesExactAdvanceCandidate(
+  identity: NonNullable<LoopItemLedgerEntry["last_verified_identity"]>,
+  item: LoopItemLedgerEntry,
+  binding: { attempt: Pick<LoopRecoveryAttempt, "candidate_epoch" | "candidate_identity"> },
+): boolean {
+  const head = identity.head_sha.trim().toLowerCase();
+  const localHead = identity.local_head_sha?.trim().toLowerCase() ?? "";
+  const expectedOperation = identity.expected_logical_operation_id?.trim() ?? "";
+  const observedOperation = identity.logical_operation_id?.trim() ?? "";
+  const persistedPr = persistedRecoveryEvidence(item)?.transport.pr_number ?? null;
+  const boundPr = exactCandidatePrTokens(binding.attempt.candidate_identity ?? "")[0];
+  const legacyPrBinding = identity.pr_number !== null &&
+    (persistedPr === identity.pr_number || (persistedPr === null && boundPr === identity.pr_number));
+  const operationMatches = observedOperation
+    ? Boolean(expectedOperation) && observedOperation === expectedOperation
+    : legacyPrBinding;
+  return (
+    identity.issue_open &&
+    !identity.blocked_label_present &&
+    isAdvanceStillNeeded(identity) &&
+    /^[0-9a-f]{40}$/.test(head) &&
+    (!localHead || localHead === head) &&
+    identity.rebase_in_progress !== true &&
+    identity.product_dirt !== true &&
+    identity.integration_certainty === "known_absent" &&
+    identity.artifact_role === "implementation" &&
+    Boolean(identity.artifact_identity?.trim()) &&
+    identity.candidate_epoch?.trim().toLowerCase() === head &&
+    operationMatches
+  );
+}
+
+function candidateBindingPrNumber(
+  item: LoopItemLedgerEntry,
+  binding: { attempt: Pick<LoopRecoveryAttempt, "candidate_identity"> },
+): number | null {
+  const persisted = persistedRecoveryEvidence(item)?.transport.pr_number ?? null;
+  if (persisted !== null) return persisted;
+  return exactCandidatePrTokens(binding.attempt.candidate_identity)[0] ?? null;
+}
+
+async function readmitCandidateSupersededBlock(
+  deps: SupervisorDeps,
+  contract: LoopContract,
+  runId: string,
+  token: string,
+  engine: LoopEngineName,
+  itemId: string,
+  observedIdentity: NonNullable<LoopItemLedgerEntry["last_verified_identity"]>,
+): Promise<{ ledger: LoopLedger; readmitted: boolean; continueRecovery?: boolean } | null> {
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId, token));
+  const item = ledger.items[itemId];
+  if (!item || item.state !== "blocked") return null;
+  const currentEpoch = candidateEpochFromIdentity(observedIdentity).toLowerCase();
+  const currentHead = observedIdentity.head_sha.trim().toLowerCase();
+  const hasAuthoritativeCurrentPrCandidate =
+    observedIdentity.pr_number !== null &&
+    observedIdentity.pr_state === "open";
+  // Candidate-less/pre-PR recovery keeps its historical behavior. The stale
+  // diagnostic hazard only exists once observation proves a concrete current
+  // implementation PR candidate that could differ from the block's owner.
+  if (!/^[0-9a-f]{40}$/.test(currentHead) || !hasAuthoritativeCurrentPrCandidate) return null;
+  const binding = blockerCandidateBinding(item, ledger.recovery_attempts);
+  if (binding?.kind === "ambiguous") {
+    await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+      item_id: itemId,
+      reason: "blocker_candidate_epoch_ambiguous",
+      head_sha: observedIdentity.head_sha || null,
+    });
+    return { ledger, readmitted: false };
+  }
+  if (!binding) {
+    await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+      item_id: itemId,
+      reason: "blocker_candidate_epoch_unbound",
+      head_sha: observedIdentity.head_sha,
+    });
+    return { ledger, readmitted: false };
+  }
+  const blockerHeads = candidateMembershipHeads(
+    binding.attempt.candidate_epoch,
+    binding.attempt.candidate_identity,
+  );
+  const currentHeads = candidateMembershipHeads(currentEpoch, currentHead);
+  const blockerPr = candidateBindingPrNumber(item, binding);
+  const prMoved = blockerPr !== null && blockerPr !== observedIdentity.pr_number;
+  if (
+    !currentEpoch ||
+    (!prMoved && blockerHeads.some((head) => currentHeads.includes(head)))
+  ) return null;
+  const blockedEpoch = binding.display;
+
+  const generation = latestBlockGeneration(item);
+  if (!generation) {
+    await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+      item_id: itemId,
+      reason: "blocker_generation_unreconstructable",
+      blocker_candidate_epoch: blockedEpoch,
+      head_sha: observedIdentity.head_sha,
+    });
+    return { ledger, readmitted: false };
+  }
+  const generationAttempts = ledger.recovery_attempts.filter((attempt) =>
+    attemptBelongsToBlockGeneration(attempt, itemId, generation)
+  );
+  // A candidate-changing repair may have pushed the observed head before its
+  // postcondition read. Preserve exactly one concretely A-bound owner and
+  // retire every later claim derived from the stale generation before the
+  // generic selector runs. Ambiguous repair ownership fails closed.
+  const startedRepairs = generationAttempts.filter(
+    (attempt) => attempt.outcome === "started" && attempt.action === "repair_pipeline_item",
+  );
+  if (startedRepairs.some((attempt) => !recoveryAttemptHasBoundedCandidateFields(attempt))) {
+    await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+      item_id: itemId,
+      reason: "candidate_changing_repair_binding_ambiguous",
+    });
+    return { ledger, readmitted: false };
+  }
+  if (
+    blockerPr !== null &&
+    startedRepairs.some((attempt) => exactCandidatePrTokens(attempt.candidate_identity).length !== 1)
+  ) {
+    await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+      item_id: itemId,
+      reason: "candidate_changing_repair_pr_binding_ambiguous",
+    });
+    return { ledger, readmitted: false };
+  }
+  const blockerOwnedRepairs = startedRepairs.filter((attempt) =>
+    (blockerPr === null || exactCandidatePrTokens(attempt.candidate_identity)[0] === blockerPr) &&
+    candidateMembershipHeads(attempt.candidate_epoch, attempt.candidate_identity)
+      .some((head) => blockerHeads.includes(head)),
+  );
+  if (blockerOwnedRepairs.length > 1) {
+    await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+      item_id: itemId,
+      reason: "candidate_changing_repair_owner_ambiguous",
+    });
+    return { ledger, readmitted: false };
+  }
+  if (blockerOwnedRepairs.length === 1) {
+    const owner = blockerOwnedRepairs[0]!;
+    const staleIds = new Set(
+      generationAttempts
+        .filter((attempt) => attempt.outcome === "started" && attempt.attempt_id !== owner.attempt_id)
+        .map((attempt) => attempt.attempt_id),
+    );
+    if (staleIds.size === 0) return { ledger, readmitted: false, continueRecovery: true };
+    const time = deps.store.now().toISOString();
+    const next = {
+      ...ledger,
+      recovery_attempts: ledger.recovery_attempts.map((attempt) =>
+        staleIds.has(attempt.attempt_id)
+          ? { ...attempt, outcome: "superseded" as const, status: "superseded" as const, terminal_outcome: "superseded" as const, completed_at: time }
+          : attempt
+      ),
+    };
+    await writeLedger(deps.store, next, token);
+    for (const attemptId of staleIds) {
+      const attempt = next.recovery_attempts.find((candidate) => candidate.attempt_id === attemptId)!;
+      await appendEvent(deps.store, runId, token, "loop_recovery_attempt", {
+        ...attempt,
+        superseded_reason: `candidate-changing repair ${owner.attempt_id} retains blocker-candidate ownership`,
+      });
+    }
+    return { ledger: next, readmitted: false, continueRecovery: true };
+  }
+
+  // A provably moved candidate must never inherit the old candidate's
+  // diagnostic. Until the new candidate is exact, clean, open, and positively
+  // unblocked, defer without minting or executing a new recovery episode.
+  if (!identityProvesExactAdvanceCandidate(observedIdentity, item, binding)) {
+    await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+      item_id: itemId,
+      reason: "candidate_moved_without_exact_clean_unblocked_identity",
+      blocker_candidate_epoch: blockedEpoch,
+      current_candidate_epoch: currentEpoch,
+      head_sha: observedIdentity.head_sha || null,
+    });
+    return { ledger, readmitted: false };
+  }
+
+  const current = ledger.items[itemId];
+  if (!current || current.state !== "blocked") return { ledger, readmitted: false };
+  const time = deps.store.now().toISOString();
+  const updated: LoopItemLedgerEntry = {
+    ...current,
+    state: "in_progress",
+    last_verified_identity: observedIdentity,
+    ...(observedIdentity.pipeline_stage
+      ? { current_stage: observedIdentity.pipeline_stage, current_stage_updated_at: observedIdentity.observed_at || time }
+      : {}),
+    history: [
+      ...current.history,
+      {
+        time,
+        from: "blocked",
+        to: "in_progress",
+        engine,
+        note: `candidate ${currentEpoch} superseded blocker candidate ${blockedEpoch}; re-admitted for ordinary dispatch`,
+      },
+    ],
+  };
+  delete updated.blocked_theme;
+  delete updated.evidence_fingerprint;
+  delete updated.blocker_candidate_epoch;
+  delete updated.blocker_candidate_head;
+  delete updated.repeated_evidence_count;
+  delete updated.current_stage_round;
+  delete updated.advance_run_id;
+  if (!observedIdentity.pipeline_stage) {
+    delete updated.current_stage;
+    delete updated.current_stage_updated_at;
+  }
+  const itemCooling = { ...(ledger.item_cooling ?? {}) };
+  delete itemCooling[itemId];
+  const supersededAttemptIds = new Set(
+    generationAttempts
+      .filter((attempt) => attempt.outcome === "started")
+      .map((attempt) => attempt.attempt_id),
+  );
+  const candidate: LoopLedger = {
+    ...ledger,
+    items: { ...ledger.items, [itemId]: updated },
+    cooling: ledger.cooling?.item_id === itemId ? null : ledger.cooling,
+    ...(Object.keys(itemCooling).length > 0 ? { item_cooling: itemCooling } : { item_cooling: undefined }),
+    recovery_attempts: ledger.recovery_attempts.map((attempt) =>
+      supersededAttemptIds.has(attempt.attempt_id)
+        ? { ...attempt, outcome: "superseded" as const, status: "superseded" as const, terminal_outcome: "superseded" as const, completed_at: time }
+        : attempt
+    ),
+  };
+  const next = bindLifecycle(contract, candidate, deriveLifecycleState({
+    typedRequest: typedRequestFromItems(candidate.items),
+    cooling: Boolean(candidate.cooling) || Object.keys(itemCooling).length > 0,
+    stopReason: candidate.stop?.reason ?? null,
+    activeAttempt: true,
+  }), time);
+  await writeLedger(deps.store, next, token);
+  for (const attemptId of supersededAttemptIds) {
+    const attempt = next.recovery_attempts.find((candidate) => candidate.attempt_id === attemptId)!;
+    await appendEvent(deps.store, runId, token, "loop_recovery_attempt", {
+      ...attempt,
+      superseded_reason: `candidate ${currentEpoch} superseded blocker candidate ${blockedEpoch}`,
+    });
+  }
+  await appendEvent(deps.store, runId, token, "loop_recovery_superseded", {
+    item_id: itemId,
+    state: "in_progress",
+    blocker_candidate_epoch: blockedEpoch,
+    current_candidate_epoch: currentEpoch,
+    pr_number: observedIdentity.pr_number,
+    head_sha: observedIdentity.head_sha,
+    reason: "candidate_superseded_block",
+  });
+  return { ledger: next, readmitted: true };
 }
 
 async function stopForRecoveryPreflight(
@@ -1290,7 +1738,9 @@ async function executeBlockedRecovery(
   // leaves the item blocked without charging an external-action budget.
   let observedIdentity: Awaited<ReturnType<typeof observeExternalIdentity>>;
   try {
-    const identity = await observeExternalIdentity(deps.observe, itemId);
+    const identity = await observeExternalIdentity(deps.observe, itemId, {
+      logicalOperationId: ledger.lifecycle?.logical_operation_id ?? contract.logical_operation_id,
+    });
     observedIdentity = identity;
     const currentLedger = upgradeLedgerForRecovery(await readLedger(deps.store, runId, token));
     const currentItem = currentLedger.items[itemId];
@@ -1391,6 +1841,22 @@ async function executeBlockedRecovery(
     }
   }
 
+  const readmitted = await readmitCandidateSupersededBlock(
+    deps,
+    contract,
+    runId,
+    token,
+    engine,
+    itemId,
+    observedIdentity,
+  );
+  if (readmitted?.continueRecovery) {
+    ledger = readmitted.ledger;
+    item = ledger.items[itemId]!;
+  } else if (readmitted) {
+    return { ledger: readmitted.ledger, attempted: readmitted.readmitted };
+  }
+
   persisted = await refineRecoveryEvidenceFromLinkedAdvance(deps, item, persisted, contract.repo.name);
 
   const currentEpoch = observedCandidateEpoch(item);
@@ -1413,7 +1879,7 @@ async function executeBlockedRecovery(
       attempt.outcome === "started" &&
       attempt.action !== "repair_pipeline_item" &&
       Boolean(currentEpoch) &&
-      !attemptBelongsToCandidateEpoch(attempt, currentEpoch),
+      !attemptBelongsToObservedCandidate(attempt, item.last_verified_identity, currentEpoch),
   );
   if (staleStarted.length > 0) {
     const staleIds = new Set(staleStarted.map((attempt) => attempt.attempt_id));
@@ -1590,8 +2056,30 @@ async function executeBlockedRecovery(
   }
   if (attempt.outcome !== "started") return { ledger, attempted: false };
 
+  const currentPr = item.last_verified_identity?.pr_number ?? null;
+  const attemptPrTokens = exactCandidatePrTokens(attempt.candidate_identity);
+  if (
+    currentPr !== null &&
+    item.last_verified_identity?.pr_state === "open" &&
+    /^[0-9a-f]{40}$/i.test(item.last_verified_identity.head_sha.trim()) &&
+    (!recoveryAttemptHasBoundedCandidateFields(attempt) ||
+      attemptPrTokens.length !== 1 || attemptPrTokens[0] !== currentPr)
+  ) {
+    await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+      item_id: itemId,
+      attempt_id: attempt.attempt_id,
+      reason: "started_recovery_candidate_binding_ambiguous",
+    });
+    return { ledger, attempted: false };
+  }
+
   const claimedIdentityHead = /(?:^|\|)head=([^|]+)(?:\||$)/i.exec(attempt.candidate_identity)?.[1]?.toLowerCase() ?? "none";
   const observedIdentityHead = item.last_verified_identity?.head_sha.trim().toLowerCase() || "none";
+  const claimedHeads = candidateMembershipHeads(attempt.candidate_epoch, attempt.candidate_identity);
+  const observedHeads = candidateMembershipHeads(
+    candidateEpochFromIdentity(item.last_verified_identity),
+    observedIdentityHead,
+  );
   // An unobservable fresh head ("none") is not movement evidence — skip only
   // this stale-supersede gate and let the claimed action replay in this same
   // cycle without burning another durable budget unit; supersede only on a
@@ -1599,6 +2087,7 @@ async function executeBlockedRecovery(
   if (
     observedIdentityHead !== "none" &&
     claimedIdentityHead !== observedIdentityHead &&
+    !claimedHeads.some((head) => observedHeads.includes(head)) &&
     attempt.action !== "repair_pipeline_item"
   ) {
     const error =
@@ -1915,6 +2404,8 @@ async function blockAndExecuteRecovery(
     engine: input.engine,
     blockerClass: input.blockerClass,
     evidence: serializeRecoveryEvidence(input.diagnostic, input.evidence),
+    blockerCandidateEpoch: candidateEpochFromIdentity(identity),
+    blockerCandidateHead: identity?.head_sha ?? "",
     allowAlreadyStopped: input.allowAlreadyStopped,
   });
   if (blocked.stop) return { ledger: blocked, attempted: false };
@@ -3271,6 +3762,7 @@ export async function runSupervisorCycle(
         evidence: unobservedItemIds.has(itemId)
           ? "parked for replan: changed-file observation failed for this item, so independence could not be proven"
           : "parked for replan: observed changed-file overlap with a concurrently-run item",
+        blockerCandidateEpoch: "",
         allowAlreadyStopped: true,
       });
     } else if (outcome === "capacity_wait") {

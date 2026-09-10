@@ -33,6 +33,7 @@
 - [x] 5.2 Replay the immutable actual-#1568 `driveSupervisor` state with scratch ×2 and checkpoint ×2 spent and zero class projection; after one injected recovery-action failure, verify the same episode and attempt history continue to the next diagnostic-applicable unspent strategy without `strategy_cursor_exhausted`, budget refund, or sibling suppression. Do not hard-code the next strategy to Tester rebind.
 - [x] 5.3 Separately replay #1558's missing-head observation and verify it selects `rebind_tester_evidence_after_pr`; add finite-boundary cases proving exhausted strategies stay ineligible, inapplicable recipes remain skips, an applicable unspent strategy does not enter false Cooling, repeated evidence cannot tight-loop, and the retained candidate/evidence episode key is preserved.
 - [x] 5.4 Add a scheduler regression proving an independent sibling remains eligible to advance or recover while another item is Cooling or waiting.
+- [x] 5.5 Persist each block's candidate epoch and add legacy first-attempt inference; atomically supersede a stale block generation only for a different exact, clean, positively unblocked candidate, while preserving same-candidate replay, original-candidate repair postconditions, and fail-closed deferral.
 
 ## 6. Verify and Hand Off
 

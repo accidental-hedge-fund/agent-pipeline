@@ -700,6 +700,14 @@ export interface LoopItemLedgerEntry {
   /** The pure fingerprint (`fingerprintEvidence`, loop/recovery.ts) of the
    *  most recent blocked evidence recorded for this item. */
   evidence_fingerprint?: string;
+  /** Logical candidate epoch that produced the current blocked evidence.
+   *  An own empty value records a known-unknown boundary; field absence is
+   *  reserved for pre-#1568 ledgers whose epoch may require legacy inference.
+   */
+  blocker_candidate_epoch?: string;
+  /** Exact raw PR HEAD observed with `blocker_candidate_epoch`. This preserves
+   *  the raw alias when logical lineage later becomes unobservable. */
+  blocker_candidate_head?: string;
   /** Consecutive prior blocks whose fingerprint equals `evidence_fingerprint`
    *  — 0 on first occurrence, reset to 0 whenever the fingerprint changes. At
    *  the class's `repeated_evidence_limit` the supervisor claims no further

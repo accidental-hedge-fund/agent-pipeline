@@ -35,7 +35,7 @@ import {
   writeLedger,
   type LoopStoreDeps,
 } from "../scripts/loop/store.ts";
-import { DEFAULT_RECOVERY_POLICY, blockItem, persistOwnedCooling } from "../scripts/loop/recovery.ts";
+import { DEFAULT_RECOVERY_POLICY, blockItem, completeRecoveryAttempt, fingerprintEvidence, persistOwnedCooling, startRecoveryAttempt } from "../scripts/loop/recovery.ts";
 import { buildCoolingRecord, coolingDeadline, coolingRecordForItem, recoveryEpisodeId } from "../scripts/loop/recovery-episodes.ts";
 import { resumeHold } from "../scripts/loop/pause.ts";
 import type { ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
@@ -3550,6 +3550,8 @@ test("unobservable commit list after S→H does not keep S-era Cooling authorita
     },
   });
   const seeded = blockedReviewRecoveryItem("100");
+  seeded.blocker_candidate_epoch = shaS;
+  seeded.evidence_fingerprint = fingerprintEvidence(seeded.history[0]!.evidence!);
   seeded.last_verified_identity = {
     ...currentLocalIdentity(100),
     pr_number: 12,
@@ -3597,6 +3599,7 @@ test("unobservable commit list after S→H does not keep S-era Cooling authorita
     },
   }).deps;
   let recoveryCalls = 0;
+  let dispatchCalls = 0;
   const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
     recoveryCalls++;
     return { succeeded: false, evidence: "H recovery claimed", error: "fixture stops after H claim" };
@@ -3605,8 +3608,15 @@ test("unobservable commit list after S→H does not keep S-era Cooling authorita
     {
       store: deps,
       observe,
-      dispatchItem: async () => {
-        throw new Error("blocked review item must recover before redispatch");
+      dispatchItem: async (request) => {
+        dispatchCalls++;
+        return {
+          schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+          item_id: request.item_id,
+          run_id: request.run_id,
+          outcome: "needs_spec",
+          evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+        };
       },
       executeRecovery,
     },
@@ -3614,10 +3624,8 @@ test("unobservable commit list after S→H does not keep S-era Cooling authorita
     token,
     "claude",
   );
-  assert.ok(
-    recoveryCalls >= 1,
-    "a readable S→H movement with unobservable lineage must not defer to S-era Cooling",
-  );
+  assert.equal(recoveryCalls, 0, "S-era recovery evidence must not execute against H");
+  assert.equal(dispatchCalls, 1, "the ordinary pipeline must diagnose the readable H candidate");
   const auditAfter = await auditSupervisor(deps, "run-1");
   const lastEntry = auditAfter.action_evidence.at(-1);
   assert.notEqual(
@@ -7868,6 +7876,1490 @@ function blockedReviewRecoveryItem(id: string): LoopLedger["items"][string] {
     }],
   };
 }
+
+function exactOpenCandidateIdentity(
+  head: string,
+  stage = "review-2",
+  blockedLabelPresent = false,
+): NonNullable<LoopLedger["items"][string]["last_verified_identity"]> {
+  return {
+    issue_number: 100,
+    issue_open: true,
+    ready_label_present: false,
+    blocked_label_present: blockedLabelPresent,
+    pr_number: 12,
+    pr_state: "open",
+    head_branch: "pipeline/100-fix",
+    head_sha: head,
+    merge_commit_sha: null,
+    checks_conclusion: "success",
+    pipeline_stage: stage,
+    observed_at: "2026-07-23T00:00:10.000Z",
+    artifact_role: "implementation",
+    artifact_identity: `pr:12:${head}`,
+    candidate_epoch: head,
+    logical_candidate_epoch: head,
+    logical_operation_id: "lop-loop-supervisor-test",
+    expected_logical_operation_id: "lop-loop-supervisor-test",
+  };
+}
+
+function exactOpenCandidateObserve(
+  head: string,
+  options: {
+    stage?: string | null;
+    blockedLabelPresent?: boolean;
+    labelsObservable?: boolean;
+    checks?: "success" | "pending" | "failure";
+    productDirt?: boolean;
+    rebaseInProgress?: boolean;
+    operationId?: string | null;
+    localHead?: string | null;
+    integrationUncertain?: boolean;
+    logicalBaseHead?: string;
+    prNumber?: number;
+  } = {},
+): ReconcileObserveDeps {
+  const stage = options.stage === undefined ? "review-2" : options.stage;
+  const labels = [...(stage ? [`pipeline:${stage}`] : []), ...(options.blockedLabelPresent ? ["blocked"] : [])];
+  return fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return options.labelsObservable === false ? null : { state: "open", labels };
+    },
+    async findPrForIssue() {
+      return options.prNumber ?? 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: head, merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: options.checks === "pending" ? "pending" : options.checks === "failure" ? "fail" : "pass" }];
+    },
+    ...(options.integrationUncertain
+      ? {
+          async listLinkedPrs() { return { numbers: [12], truncated: true }; },
+        }
+      : {}),
+    ...(options.logicalBaseHead
+      ? {
+          async getPrCommits() {
+            return [
+              { oid: options.logicalBaseHead!, messageHeadline: "fix: product behavior" },
+              { oid: head, messageHeadline: "chore: archive OpenSpec change(s) for #100" },
+            ];
+          },
+        }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(options, "operationId")
+      ? {
+          async getPrArtifactBinding(prNumber: number, detail: { head_sha: string }) {
+            return {
+              role: "implementation" as const,
+              artifactIdentity: `pr:${prNumber}:${detail.head_sha}`,
+              candidateSha: detail.head_sha,
+              candidateEpoch: detail.head_sha,
+              logicalOperationId: options.operationId ?? null,
+            };
+          },
+        }
+      : {}),
+    async getLocalHead() {
+      if (options.localHead === null) return null;
+      return {
+        branch: "pipeline/100-fix",
+        sha: options.localHead ?? head,
+        product_dirt: options.productDirt,
+        rebase_in_progress: options.rebaseInProgress,
+      };
+    },
+  }).deps;
+}
+
+async function seedCandidateBoundBlock(
+  deps: LoopStoreDeps,
+  contract: LoopContract,
+  token: string,
+  head: string,
+  action: "resync_workflow_state" | "repair_pipeline_item" = "resync_workflow_state",
+) {
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "candidate requires recovery",
+    stage: "fix-2",
+  });
+  const evidence = JSON.stringify({
+    schema: "pipeline/loop-recovery-evidence@1",
+    diagnostic,
+    transport: { pr_number: 12, pipeline_run_id: "advance-old" },
+  });
+  const before = await readLedger(deps, "run-1", token);
+  before.items["100"]!.last_verified_identity = exactOpenCandidateIdentity(head, "fix-2");
+  before.items["100"]!.current_stage = "fix-2";
+  before.items["100"]!.current_stage_updated_at = "2026-07-23T00:00:00.000Z";
+  before.items["100"]!.advance_run_id = "advance-old";
+  await writeLedger(deps, before, token);
+  await blockItem(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    blockerClass: "workflow-state",
+    evidence,
+  });
+  const fingerprint = fingerprintEvidence(evidence);
+  const started = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action,
+    candidateIdentity: `repo=acme/widgets|base=main|pr=12|head=${head}|advance=advance-old|attempt=0`,
+    candidateEpoch: head,
+    invariant: "workflow-state",
+    evidenceIdentity: fingerprint,
+  });
+  assert.equal(started.attempt.outcome, "started");
+  return started.attempt;
+}
+
+test("candidate-superseded block is re-admitted to ordinary dispatch without executing stale recovery (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "in_progress") });
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const staleAttempt = await seedCandidateBoundBlock(deps, contract, token, oldHead);
+  await persistOwnedCooling(deps, {
+    runId: "run-1",
+    token,
+    cooling: buildCoolingRecord({
+      reason: "strategy_cursor_exhausted",
+      time: "2026-07-23T00:00:01.000Z",
+      nextEligibleAt: "2026-07-23T01:00:00.000Z",
+      itemId: "100",
+      theme: "workflow-state",
+      candidateEpoch: oldHead,
+      historicalEvidence: "recovery_exhausted",
+    }),
+  });
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  const cycle = await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async () => {
+      recoveryCalls++;
+      throw new Error("stale recovery must not execute");
+    },
+    dispatchItem: async (request, hooks) => {
+      dispatchCalls++;
+      await hooks?.onAdvanceLinked?.({
+        item_id: request.item_id,
+        pipeline_run_id: "advance-current",
+        events: "/state/advance-current/events.jsonl",
+      });
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "needs_spec",
+        evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+      };
+    },
+  }, "run-1", token, "claude");
+
+  assert.equal(cycle.stop, null);
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 1, "the item re-enters the ordinary whole-item dispatch exactly once");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.recovery_attempts.find((attempt) => attempt.attempt_id === staleAttempt.attempt_id)?.outcome, "superseded");
+  assert.equal(finalLedger.cooling, null);
+  assert.equal(finalLedger.item_cooling?.["100"], undefined);
+  assert.equal(finalLedger.lifecycle?.state, "active", "Cooling ownership is atomically rebound to active");
+  assert.equal(finalLedger.items["100"]!.current_stage, "review-2");
+  assert.equal(finalLedger.items["100"]!.advance_run_id, "advance-current");
+  assert.ok((await readEvents(deps, "run-1")).some(
+    (event: any) => event.kind === LOOP_ITEM_ADVANCE_LINKED && event.data.pipeline_run_id === "advance-current"
+  ));
+});
+
+test("legacy block infers its original epoch from the first generation attempt and supersedes later rebound claims (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "in_progress") });
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const oldAttempt = await seedCandidateBoundBlock(deps, contract, token, oldHead);
+  let legacy = await readLedger(deps, "run-1", token);
+  delete legacy.items["100"]!.blocker_candidate_epoch;
+  legacy.recovery_attempts[0] = {
+    ...legacy.recovery_attempts[0]!,
+    outcome: "superseded",
+    status: "superseded",
+    terminal_outcome: "superseded",
+    completed_at: "2026-07-23T00:00:02.000Z",
+  };
+  legacy.items["100"]!.last_verified_identity = exactOpenCandidateIdentity(currentHead);
+  await writeLedger(deps, legacy, token);
+  const rebound = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "resync_workflow_state",
+    candidateIdentity: `repo=acme/widgets|base=main|pr=12|head=${currentHead}|advance=advance-old|attempt=1`,
+    candidateEpoch: currentHead,
+    invariant: "workflow-state",
+    evidenceIdentity: legacy.items["100"]!.evidence_fingerprint!,
+  });
+  assert.equal(rebound.attempt.outcome, "started");
+  await completeRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    attemptId: rebound.attempt.attempt_id, succeeded: false, error: "seq93 failed",
+  });
+  const rebound2 = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude", action: "resync_workflow_state",
+    candidateIdentity: `repo=acme/widgets|base=main|pr=12|head=${currentHead}|advance=advance-old|attempt=2`,
+    candidateEpoch: currentHead, invariant: "workflow-state",
+    evidenceIdentity: legacy.items["100"]!.evidence_fingerprint!,
+  });
+  await completeRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    attemptId: rebound2.attempt.attempt_id, succeeded: false, error: "seq94 failed",
+  });
+  const latestRebound = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude", action: "resync_workflow_state",
+    candidateIdentity: `repo=acme/widgets|base=main|pr=12|head=${currentHead}|advance=advance-old|attempt=3`,
+    candidateEpoch: currentHead, invariant: "workflow-state",
+    evidenceIdentity: legacy.items["100"]!.evidence_fingerprint!,
+  });
+  assert.equal(latestRebound.attempt.outcome, "started");
+  legacy = await readLedger(deps, "run-1", token);
+  legacy.items["100"]!.history.push({
+    time: "2026-07-23T00:00:13.000Z",
+    from: "blocked",
+    to: "blocked",
+    engine: "claude",
+    note: "reconciliation refreshed current identity without creating a new block generation",
+  });
+  await writeLedger(deps, legacy, token);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async () => {
+      recoveryCalls++;
+      throw new Error("wrongly rebound recovery must not execute");
+    },
+    dispatchItem: async (request) => {
+      dispatchCalls++;
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "needs_spec",
+        evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+      };
+    },
+  }, "run-1", token, "claude");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 0, JSON.stringify(finalLedger.recovery_attempts, null, 2));
+  assert.equal(dispatchCalls, 1);
+  assert.equal(finalLedger.recovery_attempts.find((attempt) => attempt.attempt_id === oldAttempt.attempt_id)?.outcome, "superseded");
+  assert.equal(
+    finalLedger.recovery_attempts.find((attempt) => attempt.attempt_id === latestRebound.attempt.attempt_id)?.outcome,
+    "superseded",
+    JSON.stringify(finalLedger.recovery_attempts, null, 2),
+  );
+  assert.equal(finalLedger.recovery_attempts.length, 4, "no replacement episode is minted from stale evidence");
+});
+
+test("candidate re-admission atomically preserves stale ownership when its ledger write fails (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const started = await seedCandidateBoundBlock(deps, contract, token, oldHead);
+  await persistOwnedCooling(deps, {
+    runId: "run-1",
+    token,
+    cooling: buildCoolingRecord({
+      reason: "strategy_cursor_exhausted",
+      time: "2026-07-23T00:00:01.000Z",
+      nextEligibleAt: "2026-07-23T01:00:00.000Z",
+      itemId: "100",
+      theme: "workflow-state",
+      candidateEpoch: oldHead,
+      historicalEvidence: "recovery_exhausted",
+    }),
+  });
+  const writeFileAtomic = deps.writeFileAtomic;
+  let injected = false;
+  deps.writeFileAtomic = async (path, content) => {
+    if (!injected && path.endsWith("ledger.json")) {
+      const candidate = JSON.parse(content) as LoopLedger;
+      if (candidate.items["100"]?.state === "in_progress" &&
+          candidate.recovery_attempts.some((attempt) => attempt.attempt_id === started.attempt_id && attempt.outcome === "superseded")) {
+        injected = true;
+        throw new Error("simulated atomic readmission failure");
+      }
+    }
+    return writeFileAtomic(path, content);
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "needs_spec",
+    evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+  });
+  await assert.rejects(
+    () => runSupervisorCycle({
+      store: deps,
+      observe: exactOpenCandidateObserve(currentHead),
+      executeRecovery: async () => { throw new Error("stale recovery must not execute"); },
+      dispatchItem,
+    }, "run-1", token, "claude"),
+    /simulated atomic readmission failure/,
+  );
+  const preserved = await readLedger(deps, "run-1");
+  assert.equal(preserved.items["100"]!.state, "blocked");
+  assert.equal(preserved.items["100"]!.advance_run_id, "advance-old");
+  assert.equal(preserved.recovery_attempts[0]!.outcome, "started");
+  assert.equal(preserved.cooling?.item_id, "100");
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async () => { throw new Error("stale recovery must not execute"); },
+    dispatchItem,
+  }, "run-1", token, "claude");
+  const recovered = await readLedger(deps, "run-1");
+  assert.equal(recovered.recovery_attempts[0]!.outcome, "superseded");
+  assert.equal(recovered.cooling, null);
+});
+
+for (const bindingSource of ["logical epoch", "raw-head fallback"] as const) {
+test(`same-candidate started recovery remains authoritative via ${bindingSource} when the live stage differs (#797/#1568)`, async () => {
+  const head = "a".repeat(40);
+  const rawHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const started = await seedCandidateBoundBlock(deps, contract, token, head);
+  const legacy = await readLedger(deps, "run-1", token);
+  if (bindingSource === "raw-head fallback") {
+    delete legacy.items["100"]!.blocker_candidate_epoch;
+    const attempt = legacy.recovery_attempts[0]!;
+    for (const field of [
+      "episode_id", "operation", "invariant", "candidate_epoch", "evidence_identity",
+      "attempts_per_strategy", "strategy_cursor", "skipped_strategies", "next_eligible_at",
+    ]) delete (attempt as unknown as Record<string, unknown>)[field];
+    attempt.candidate_identity =
+      `repo=acme/widgets|base=main|pr=12|head=${rawHead}|advance=advance-old|attempt=0`;
+  }
+  await writeLedger(deps, legacy, token);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(rawHead, { stage: "review-2", logicalBaseHead: head }),
+    executeRecovery: async (input) => {
+      recoveryCalls++;
+      assert.equal(input.attemptId, started.attempt_id);
+      return { succeeded: false, evidence: "same-candidate retry failed", error: "same-candidate retry failed" };
+    },
+    dispatchItem: async () => {
+      dispatchCalls++;
+      throw new Error("same-candidate block must not redispatch");
+    },
+  }, "run-1", token, "claude");
+  assert.equal(recoveryCalls, 1);
+  assert.equal(dispatchCalls, 0);
+  assert.equal((await readLedger(deps, "run-1")).items["100"]!.state, "blocked");
+});
+}
+
+for (const scenario of [
+  { name: "blocked label remains present", observe: (head: string) => exactOpenCandidateObserve(head, { blockedLabelPresent: true }) },
+  { name: "blocked label is unobservable", observe: (head: string) => exactOpenCandidateObserve(head, { labelsObservable: false }) },
+]) {
+  test(`moved candidate remains blocked when ${scenario.name} (#1568)`, async () => {
+    const oldHead = "a".repeat(40);
+    const currentHead = "b".repeat(40);
+    const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+    const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+    const { token } = await acquireLock(deps, "run-1", "claude");
+    await seedCandidateBoundBlock(deps, contract, token, oldHead);
+    let dispatchCalls = 0;
+    let recoveryCalls = 0;
+    await runSupervisorCycle({
+      store: deps,
+      observe: scenario.observe(currentHead),
+      executeRecovery: async () => {
+        recoveryCalls++;
+        return { succeeded: false, evidence: "still blocked", error: "still blocked" };
+      },
+      dispatchItem: async () => {
+        dispatchCalls++;
+        throw new Error("unproven unblock must not redispatch");
+      },
+    }, "run-1", token, "claude");
+    assert.equal(dispatchCalls, 0);
+    const finalLedger = await readLedger(deps, "run-1");
+    assert.equal(recoveryCalls, 0, "moved-candidate evidence is deferred, never rebound into recovery");
+    assert.equal(finalLedger.recovery_attempts.length, 1, "no new candidate episode is minted");
+    assert.equal(finalLedger.recovery_attempts[0]!.outcome, "started");
+    assert.equal(finalLedger.items["100"]!.state, "blocked");
+    if (scenario.name === "blocked label remains present") {
+      assert.equal(finalLedger.items["100"]!.last_verified_identity?.blocked_label_present, true);
+    }
+  });
+}
+
+for (const checks of ["pending", "failure"] as const) {
+  test(`exact clean moved candidate with ${checks} checks returns to ordinary pipeline diagnosis (#1568)`, async () => {
+    const oldHead = "a".repeat(40);
+    const currentHead = "b".repeat(40);
+    const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+    const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+    const { token } = await acquireLock(deps, "run-1", "claude");
+    await seedCandidateBoundBlock(deps, contract, token, oldHead);
+    let recoveryCalls = 0;
+    let dispatchCalls = 0;
+    await runSupervisorCycle({
+      store: deps,
+      observe: exactOpenCandidateObserve(currentHead, { checks }),
+      executeRecovery: async () => {
+        recoveryCalls++;
+        throw new Error("old diagnostic must not repair the new candidate");
+      },
+      dispatchItem: async (request) => {
+        dispatchCalls++;
+        return {
+          schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+          item_id: request.item_id,
+          run_id: request.run_id,
+          outcome: "needs_spec",
+          evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+        };
+      },
+    }, "run-1", token, "claude");
+    assert.equal(recoveryCalls, 0);
+    assert.equal(dispatchCalls, 1, "ordinary pipeline owns current-candidate CI diagnosis");
+  });
+}
+
+test("missing local worktree re-admits the exact remote candidate for ordinary rematerialization (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await seedCandidateBoundBlock(deps, contract, token, oldHead);
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead, { localHead: null }),
+    executeRecovery: async () => { throw new Error("old recovery must not execute"); },
+    dispatchItem: async (request) => {
+      dispatchCalls++;
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "needs_spec",
+        evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+      };
+    },
+  }, "run-1", token, "claude");
+  assert.equal(dispatchCalls, 1);
+});
+
+test("legacy exact candidate without an operation marker re-admits only through retained PR binding (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await seedCandidateBoundBlock(deps, contract, token, oldHead);
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead, { operationId: null }),
+    executeRecovery: async () => { throw new Error("stale recovery must not execute"); },
+    dispatchItem: async (request) => {
+      dispatchCalls++;
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "needs_spec",
+        evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+      };
+    },
+  }, "run-1", token, "claude");
+  assert.equal(dispatchCalls, 1);
+});
+
+for (const unsafe of [
+  { name: "product dirt", options: { productDirt: true } },
+  { name: "an in-progress rebase", options: { rebaseInProgress: true } },
+  { name: "a positive local/remote mismatch", options: { localHead: "c".repeat(40) } },
+  { name: "an explicit foreign logical operation", options: { operationId: "lop-foreign" } },
+  { name: "uncertain integration", options: { integrationUncertain: true } },
+]) {
+  test(`moved candidate with ${unsafe.name} defers without stale recovery or dispatch (#1568)`, async () => {
+    const oldHead = "a".repeat(40);
+    const currentHead = "b".repeat(40);
+    const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+    const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+    const { token } = await acquireLock(deps, "run-1", "claude");
+    await seedCandidateBoundBlock(deps, contract, token, oldHead);
+    let recoveryCalls = 0;
+    let dispatchCalls = 0;
+    await runSupervisorCycle({
+      store: deps,
+      observe: exactOpenCandidateObserve(currentHead, unsafe.options),
+      executeRecovery: async () => {
+        recoveryCalls++;
+        return { succeeded: false, evidence: "must defer" };
+      },
+      dispatchItem: async () => {
+        dispatchCalls++;
+        throw new Error("unsafe candidate must not dispatch");
+      },
+    }, "run-1", token, "claude");
+    const finalLedger = await readLedger(deps, "run-1");
+    assert.equal(recoveryCalls, 0);
+    assert.equal(dispatchCalls, 0);
+    assert.equal(finalLedger.items["100"]!.state, "blocked");
+    assert.equal(finalLedger.recovery_attempts.length, 1);
+  });
+}
+
+for (const ambiguous of [
+  {
+    name: "malformed explicit epoch token",
+    mutate(item: LoopLedger["items"][string]) {
+      item.blocker_candidate_epoch = `nothead=${"a".repeat(40)}`;
+    },
+  },
+  {
+    name: "multiple explicit candidate heads",
+    mutate(item: LoopLedger["items"][string]) {
+      item.blocker_candidate_epoch = `head=${"a".repeat(40)}|head=${"c".repeat(40)}`;
+    },
+  },
+  {
+    name: "equal-time legacy attempt",
+    mutate(item: LoopLedger["items"][string], ledger: LoopLedger) {
+      delete item.blocker_candidate_epoch;
+      const first = ledger.recovery_attempts[0]!;
+      first.time = item.history.find(
+        (entry) => entry.from === "in_progress" && entry.to === "blocked"
+      )!.time;
+    },
+  },
+  {
+    name: "current fields disagree with a newer true block generation",
+    mutate(item: LoopLedger["items"][string]) {
+      delete item.blocker_candidate_epoch;
+      item.history.push({
+        time: "2026-07-23T00:00:06.000Z",
+        from: "in_progress",
+        to: "blocked",
+        engine: "claude",
+        theme: "implementation-ci",
+        evidence: "newer unrelated block generation",
+      });
+    },
+  },
+]) {
+  test(`ambiguous blocker binding (${ambiguous.name}) defers without rebinding stale evidence (#1568)`, async () => {
+    const oldHead = "a".repeat(40);
+    const currentHead = "b".repeat(40);
+    const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+    const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+    const { token } = await acquireLock(deps, "run-1", "claude");
+    await seedCandidateBoundBlock(deps, contract, token, oldHead);
+    const seeded = await readLedger(deps, "run-1", token);
+    ambiguous.mutate(seeded.items["100"]!, seeded);
+    await writeLedger(deps, seeded, token);
+    let recoveryCalls = 0;
+    let dispatchCalls = 0;
+    await runSupervisorCycle({
+      store: deps,
+      observe: exactOpenCandidateObserve(currentHead),
+      executeRecovery: async () => {
+        recoveryCalls++;
+        return { succeeded: false, evidence: "must defer" };
+      },
+      dispatchItem: async () => {
+        dispatchCalls++;
+        throw new Error("ambiguous binding must not dispatch");
+      },
+    }, "run-1", token, "claude");
+    const finalLedger = await readLedger(deps, "run-1");
+    assert.equal(recoveryCalls, 0);
+    assert.equal(dispatchCalls, 0);
+    assert.equal(finalLedger.items["100"]!.state, "blocked");
+    assert.ok(finalLedger.recovery_attempts.length >= 1);
+    assert.ok(finalLedger.recovery_attempts.every((attempt) => attempt.outcome === "started"));
+  });
+}
+
+test("malformed current-head prefix cannot disguise one valid older blocker head (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await seedCandidateBoundBlock(deps, contract, token, oldHead);
+  const seeded = await readLedger(deps, "run-1", token);
+  delete seeded.items["100"]!.blocker_candidate_epoch;
+  seeded.recovery_attempts[0]!.candidate_epoch = oldHead;
+  seeded.recovery_attempts[0]!.candidate_identity = `nothead=${currentHead}|head=${oldHead}`;
+  await writeLedger(deps, seeded, token);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async () => {
+      recoveryCalls++;
+      throw new Error("malformed prefix must not preserve stale recovery");
+    },
+    dispatchItem: async (request) => {
+      dispatchCalls++;
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "needs_spec",
+        evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+      };
+    },
+  }, "run-1", token, "claude");
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 1);
+});
+
+test("unknown block-boundary candidate never falls back to a cached older identity (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const active = itemEntry("100", "in_progress");
+  active.last_verified_identity = exactOpenCandidateIdentity(oldHead);
+  const evidence = blockedRecoveryItem("100").history[0]!.evidence!;
+  const { deps } = await setup(contract, testLedger({ "100": active }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockItem(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    blockerClass: "workflow-state",
+    evidence,
+    blockerCandidateEpoch: "",
+  });
+  assert.equal((await readLedger(deps, "run-1")).items["100"]!.blocker_candidate_epoch, "");
+  assert.equal((await readLedger(deps, "run-1")).items["100"]!.blocker_candidate_head, undefined);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async () => {
+      recoveryCalls++;
+      return { succeeded: false, evidence: "must defer" };
+    },
+    dispatchItem: async () => {
+      dispatchCalls++;
+      throw new Error("unbound legacy evidence must not dispatch");
+    },
+  }, "run-1", token, "claude");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 0);
+  assert.equal(finalLedger.recovery_attempts.length, 0, "no current-candidate episode is minted");
+  assert.equal(finalLedger.items["100"]!.state, "blocked");
+});
+
+test("a newly discovered unknown boundary persists the own empty epoch sentinel (#1568)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const evidence = blockedRecoveryItem("100").history[0]!.evidence!;
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "workflow-state", evidence,
+  });
+  const item = (await readLedger(deps, "run-1")).items["100"]!;
+  assert.equal(Object.prototype.hasOwnProperty.call(item, "blocker_candidate_epoch"), true);
+  assert.equal(item.blocker_candidate_epoch, "");
+  assert.equal(item.blocker_candidate_head, undefined);
+});
+
+test("an explicitly unknown block never borrows a pre-PR recovery attempt for later PR admission (#1568)", async () => {
+  const prePrHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const active = itemEntry("100", "in_progress");
+  active.last_verified_identity = exactOpenCandidateIdentity("c".repeat(40));
+  const evidence = blockedRecoveryItem("100").history[0]!.evidence!;
+  const { deps } = await setup(contract, testLedger({ "100": active }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "workflow-state", evidence, blockerCandidateEpoch: "",
+  });
+  let firstRecoveryCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: fakeObserveDeps({
+      async getLocalHead() { return { branch: "pipeline/100-fix", sha: prePrHead }; },
+    }).deps,
+    executeRecovery: async () => {
+      firstRecoveryCalls++;
+      return { succeeded: false, evidence: "pre-PR recovery failed" };
+    },
+    dispatchItem: async () => { throw new Error("blocked item must recover before dispatch"); },
+  }, "run-1", token, "claude");
+  assert.equal(firstRecoveryCalls, 1, "candidate-less/pre-PR recovery remains eligible");
+  const afterFirst = await readLedger(deps, "run-1", token);
+  assert.equal(afterFirst.items["100"]!.blocker_candidate_epoch, "");
+  assert.equal(afterFirst.recovery_attempts.length, 1);
+  let laterRecoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async () => {
+      laterRecoveryCalls++;
+      throw new Error("unknown boundary must not borrow the pre-PR attempt");
+    },
+    dispatchItem: async () => {
+      dispatchCalls++;
+      throw new Error("unknown boundary must not dispatch on the later PR");
+    },
+  }, "run-1", token, "claude");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(laterRecoveryCalls, 0);
+  assert.equal(dispatchCalls, 0);
+  assert.equal(finalLedger.recovery_attempts.length, 1, "no replacement claim is minted");
+  assert.equal(finalLedger.items["100"]!.state, "blocked");
+});
+
+test("re-admitting one item preserves a sibling typed-input lifecycle owner (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [
+    { id: "100", depends_on: [] },
+    { id: "200", depends_on: [] },
+  ] });
+  const waitingSibling = {
+    ...itemEntry("200", "waiting"),
+    hold_request: {
+      request_id: "hold-200",
+      item_id: "200",
+      kind: "decision" as const,
+      typed_request: "DecisionRequest" as const,
+      prompt: "operator decision remains pending",
+      requested_by_engine: "claude" as const,
+      requested_at: "2026-07-23T00:00:00.000Z",
+    },
+  };
+  const { deps } = await setup(contract, testLedger({
+    "100": itemEntry("100", "in_progress"),
+    "200": waitingSibling,
+  }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await seedCandidateBoundBlock(deps, contract, token, oldHead);
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async () => { throw new Error("stale recovery must not execute"); },
+    dispatchItem: async (request) => ({
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "needs_spec",
+      evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+    }),
+  }, "run-1", token, "claude");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["200"]!.state, "waiting");
+  assert.equal(finalLedger.lifecycle?.state, "typed-input-wait");
+  assert.equal(finalLedger.lifecycle?.typed_request, "DecisionRequest");
+});
+
+test("wrongly rebound current-candidate repair claim is superseded with its stale block generation (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await seedCandidateBoundBlock(deps, contract, token, oldHead);
+  let legacy = await readLedger(deps, "run-1", token);
+  delete legacy.items["100"]!.blocker_candidate_epoch;
+  legacy.recovery_attempts[0] = {
+    ...legacy.recovery_attempts[0]!,
+    outcome: "superseded",
+    status: "superseded",
+    terminal_outcome: "superseded",
+    completed_at: "2026-07-23T00:00:06.000Z",
+  };
+  legacy.items["100"]!.last_verified_identity = exactOpenCandidateIdentity(currentHead);
+  await writeLedger(deps, legacy, token);
+  const reboundRepair = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "repair_pipeline_item",
+    candidateIdentity: `repo=acme/widgets|base=main|pr=12|head=${currentHead}|advance=advance-old|attempt=1`,
+    candidateEpoch: currentHead,
+    invariant: "workflow-state",
+    evidenceIdentity: legacy.items["100"]!.evidence_fingerprint!,
+  });
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async () => {
+      recoveryCalls++;
+      throw new Error("wrongly rebound repair must not own postcondition");
+    },
+    dispatchItem: async (request) => {
+      dispatchCalls++;
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "needs_spec",
+        evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+      };
+    },
+  }, "run-1", token, "claude");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 1);
+  assert.equal(finalLedger.recovery_attempts.find(
+    (attempt) => attempt.attempt_id === reboundRepair.attempt.attempt_id
+  )?.outcome, "superseded");
+});
+
+test("an original-candidate repair exclusively owns recovery over later rebound repair and non-repair claims (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const owner = await seedCandidateBoundBlock(deps, contract, token, oldHead, "repair_pipeline_item");
+  const seeded = await readLedger(deps, "run-1", token);
+  const fingerprint = seeded.items["100"]!.evidence_fingerprint!;
+  const rebound: LoopRecoveryAttempt[] = [];
+  for (const action of ["resync_workflow_state", "repair_pipeline_item"] as const) {
+    const started = await startRecoveryAttempt(deps, contract, {
+      runId: "run-1", token, itemId: "100", engine: "claude", action,
+      candidateIdentity: `repo=acme/widgets|base=main|pr=12|head=${currentHead}|advance=advance-old|attempt=${rebound.length + 1}`,
+      candidateEpoch: currentHead, invariant: "workflow-state", evidenceIdentity: fingerprint,
+    });
+    rebound.push(started.attempt);
+  }
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async (input) => {
+      recoveryCalls++;
+      assert.equal(input.attemptId, owner.attempt_id);
+      return { succeeded: false, evidence: "owner repair postcondition failed", error: "failed" };
+    },
+    dispatchItem: async () => { dispatchCalls++; throw new Error("repair owner must retain control"); },
+  }, "run-1", token, "claude");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 1);
+  assert.equal(dispatchCalls, 0);
+  for (const attempt of rebound) {
+    assert.equal(finalLedger.recovery_attempts.find((row) => row.attempt_id === attempt.attempt_id)?.outcome, "superseded");
+  }
+});
+
+test("a malformed current-generation sibling prevents an original-candidate repair from resuming (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const owner = await seedCandidateBoundBlock(deps, contract, token, oldHead, "repair_pipeline_item");
+  const seeded = await readLedger(deps, "run-1", token);
+  const sibling = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude", action: "repair_pipeline_item",
+    candidateIdentity: `repo=acme/widgets|base=main|pr=12|head=${currentHead}|advance=advance-old|attempt=1`,
+    candidateEpoch: currentHead, invariant: "workflow-state",
+    evidenceIdentity: seeded.items["100"]!.evidence_fingerprint!,
+  });
+  const malformed = await readLedger(deps, "run-1", token);
+  malformed.recovery_attempts.find((attempt) => attempt.attempt_id === sibling.attempt.attempt_id)!.time = "0";
+  await writeLedger(deps, malformed, token);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async () => {
+      recoveryCalls++;
+      throw new Error("malformed sibling must prevent owner execution");
+    },
+    dispatchItem: async () => {
+      dispatchCalls++;
+      throw new Error("malformed sibling must prevent dispatch");
+    },
+  }, "run-1", token, "claude");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 0);
+  assert.equal(finalLedger.recovery_attempts.find((attempt) => attempt.attempt_id === owner.attempt_id)?.outcome, "started");
+  assert.equal(finalLedger.recovery_attempts.find((attempt) => attempt.attempt_id === sibling.attempt.attempt_id)?.outcome, "started");
+});
+
+test("a same-head repair on a different known PR is superseded for ordinary dispatch (#1568)", async () => {
+  const head = "a".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const repair = await seedCandidateBoundBlock(deps, contract, token, head, "repair_pipeline_item");
+  const seeded = await readLedger(deps, "run-1", token);
+  seeded.recovery_attempts[0]!.candidate_identity =
+    `repo=acme/widgets|base=main|pr=13|head=${head}|advance=advance-old|attempt=0`;
+  await writeLedger(deps, seeded, token);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(head, { prNumber: 13 }),
+    executeRecovery: async () => {
+      recoveryCalls++;
+      throw new Error("different-PR repair must not execute");
+    },
+    dispatchItem: async (request) => {
+      dispatchCalls++;
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA, item_id: request.item_id, run_id: request.run_id,
+        outcome: "needs_spec", evidence: { pr_number: 13, pipeline_run_id: "advance-current" },
+      };
+    },
+  }, "run-1", token, "claude");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 1);
+  assert.equal(finalLedger.recovery_attempts.find((attempt) => attempt.attempt_id === repair.attempt_id)?.outcome, "superseded");
+});
+
+test("a same-head repair claim for another PR cannot execute against the blocker PR (#1568)", async () => {
+  const head = "a".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const repair = await seedCandidateBoundBlock(deps, contract, token, head, "repair_pipeline_item");
+  const seeded = await readLedger(deps, "run-1", token);
+  seeded.recovery_attempts[0]!.candidate_identity =
+    `repo=acme/widgets|base=main|pr=13|head=${head}|advance=advance-old|attempt=0`;
+  await writeLedger(deps, seeded, token);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(head, { prNumber: 12 }),
+    executeRecovery: async () => {
+      recoveryCalls++;
+      throw new Error("PR 13 repair must not execute against PR 12");
+    },
+    dispatchItem: async () => {
+      dispatchCalls++;
+      throw new Error("mismatched selected claim must defer before dispatch");
+    },
+  }, "run-1", token, "claude");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 0);
+  assert.equal(finalLedger.recovery_attempts.find((attempt) => attempt.attempt_id === repair.attempt_id)?.outcome, "started");
+});
+
+for (const repairPr of [
+  { name: "missing PR", identity: (head: string) => `repo=acme/widgets|base=main|head=${head}` },
+  { name: "multiple PRs", identity: (head: string) => `repo=acme/widgets|base=main|pr=12|pr=12|head=${head}` },
+] as const) {
+  test(`a same-head repair with ${repairPr.name} defers when the blocker names a PR (#1568)`, async () => {
+    const head = "a".repeat(40);
+    const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+    const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+    const { token } = await acquireLock(deps, "run-1", "claude");
+    const repair = await seedCandidateBoundBlock(deps, contract, token, head, "repair_pipeline_item");
+    const seeded = await readLedger(deps, "run-1", token);
+    seeded.recovery_attempts[0]!.candidate_identity = repairPr.identity(head);
+    await writeLedger(deps, seeded, token);
+    let recoveryCalls = 0;
+    let dispatchCalls = 0;
+    await runSupervisorCycle({
+      store: deps,
+      observe: exactOpenCandidateObserve(head, { prNumber: 13 }),
+      executeRecovery: async () => {
+        recoveryCalls++;
+        throw new Error("ambiguous repair PR must not execute");
+      },
+      dispatchItem: async () => {
+        dispatchCalls++;
+        throw new Error("ambiguous repair PR must not dispatch");
+      },
+    }, "run-1", token, "claude");
+    const finalLedger = await readLedger(deps, "run-1");
+    assert.equal(recoveryCalls, 0);
+    assert.equal(dispatchCalls, 0);
+    assert.equal(finalLedger.recovery_attempts.find((attempt) => attempt.attempt_id === repair.attempt_id)?.outcome, "started");
+  });
+}
+
+test("an ambiguous multi-head repair claim cannot own a candidate-changing postcondition (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await seedCandidateBoundBlock(deps, contract, token, oldHead, "repair_pipeline_item");
+  const seeded = await readLedger(deps, "run-1", token);
+  seeded.recovery_attempts = [];
+  await writeLedger(deps, seeded, token);
+  const ambiguous = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude", action: "repair_pipeline_item",
+    candidateIdentity: `repo=acme/widgets|base=main|pr=12|head=${currentHead}`,
+    candidateEpoch: `head=${oldHead}|head=${currentHead}`, invariant: "workflow-state",
+    evidenceIdentity: seeded.items["100"]!.evidence_fingerprint!,
+  });
+  assert.equal(ambiguous.attempt.outcome, "started");
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async () => { recoveryCalls++; return { succeeded: false, evidence: "must defer" }; },
+    dispatchItem: async () => { dispatchCalls++; throw new Error("ambiguous repair must not dispatch"); },
+  }, "run-1", token, "claude");
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 0);
+  assert.equal((await readLedger(deps, "run-1")).recovery_attempts[0]!.outcome, "started");
+});
+
+test("same head on a different PR is candidate movement, not same-candidate recovery (#1568)", async () => {
+  const head = "a".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await seedCandidateBoundBlock(deps, contract, token, head);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(head, { prNumber: 13 }),
+    executeRecovery: async () => { recoveryCalls++; throw new Error("PR 12 evidence must not execute on PR 13"); },
+    dispatchItem: async (request) => {
+      dispatchCalls++;
+      return { schema: LOOP_EXECUTION_CONTRACT_SCHEMA, item_id: request.item_id, run_id: request.run_id,
+        outcome: "needs_spec", evidence: { pr_number: 13, pipeline_run_id: "advance-current" } };
+    },
+  }, "run-1", token, "claude");
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 1);
+});
+
+test("loss of logical lineage observability cannot falsely supersede the same raw candidate (#1568)", async () => {
+  const logicalHead = "a".repeat(40);
+  const rawHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await seedCandidateBoundBlock(deps, contract, token, logicalHead);
+  const seeded = await readLedger(deps, "run-1", token);
+  delete seeded.items["100"]!.blocker_candidate_head;
+  seeded.recovery_attempts[0]!.candidate_identity =
+    `repo=acme/widgets|base=main|pr=12|head=${rawHead}|advance=advance-old|attempt=0`;
+  await writeLedger(deps, seeded, token);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  const observe = exactOpenCandidateObserve(rawHead);
+  observe.getPrCommits = async () => null;
+  await runSupervisorCycle({
+    store: deps, observe,
+    executeRecovery: async () => { recoveryCalls++; return { succeeded: false, evidence: "same candidate retry" }; },
+    dispatchItem: async () => { dispatchCalls++; throw new Error("unproven movement must not dispatch"); },
+  }, "run-1", token, "claude");
+  assert.equal(recoveryCalls, 1);
+  assert.equal(dispatchCalls, 0);
+});
+
+test("a block with no existing attempt durably aliases its logical epoch to the raw head (#1568)", async () => {
+  const logicalHead = "a".repeat(40);
+  const rawHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const active = itemEntry("100", "in_progress");
+  active.last_verified_identity = exactOpenCandidateIdentity(rawHead);
+  active.last_verified_identity.logical_candidate_epoch = logicalHead;
+  const evidence = blockedRecoveryItem("100").history[0]!.evidence!;
+  const { deps } = await setup(contract, testLedger({ "100": active }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "workflow-state", evidence,
+  });
+  const blocked = await readLedger(deps, "run-1", token);
+  assert.equal(blocked.items["100"]!.blocker_candidate_epoch, logicalHead);
+  assert.equal(blocked.items["100"]!.blocker_candidate_head, rawHead);
+  assert.equal(blocked.recovery_attempts.length, 0);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  const observe = exactOpenCandidateObserve(rawHead);
+  observe.getPrCommits = async () => null;
+  await runSupervisorCycle({
+    store: deps, observe,
+    executeRecovery: async () => {
+      recoveryCalls++;
+      return { succeeded: false, evidence: "same raw candidate recovery" };
+    },
+    dispatchItem: async () => {
+      dispatchCalls++;
+      throw new Error("same raw candidate must not be redispatched");
+    },
+  }, "run-1", token, "claude");
+  assert.equal(recoveryCalls, 1);
+  assert.equal(dispatchCalls, 0);
+});
+
+test("blocked-recoverable persists logical and raw boundaries from one fresh production observation (#1568)", async () => {
+  const logicalHead = "a".repeat(40);
+  const rawHead = "b".repeat(40);
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": {
+        ...workflowState,
+        recipes: ["resync_workflow_state", "repair_pipeline_item"],
+        backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
+      },
+    },
+  });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "pending") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  let findPrCalls = 0;
+  let commitCalls = 0;
+  const observe = fakeObserveDeps({
+    async findPrForIssue() { return ++findPrCalls === 1 ? null : 12; },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: rawHead, merge_commit_sha: null };
+    },
+    async getPrChecks() { return [{ bucket: "pass" }]; },
+    async getPrCommits() {
+      if (++commitCalls > 1) return null;
+      return [
+        { oid: logicalHead, messageHeadline: "fix: product behavior" },
+        { oid: rawHead, messageHeadline: "chore: archive OpenSpec change(s) for #100" },
+      ];
+    },
+    async getLocalHead() {
+      return findPrCalls === 1 ? null : { branch: "pipeline/100-fix", sha: rawHead };
+    },
+  }).deps;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict", reason: "candidate requires recovery", stage: "fix-2",
+  });
+  let dispatchCalls = 0;
+  let recoveryCalls = 0;
+  let boundaryWasDurableBeforeClaim = false;
+  const cycleDeps: SupervisorDeps = {
+    store: deps,
+    observe,
+    dispatchItem: async (request) => {
+      dispatchCalls++;
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "blocked_recoverable",
+        evidence: { pr_number: 12, pipeline_run_id: "advance-100" },
+        diagnostic,
+      };
+    },
+    executeRecovery: async () => {
+      recoveryCalls++;
+      const claimed = await readLedger(deps, "run-1");
+      boundaryWasDurableBeforeClaim =
+        claimed.items["100"]!.blocker_candidate_epoch === logicalHead &&
+        claimed.items["100"]!.blocker_candidate_head === rawHead;
+      return { succeeded: false, evidence: "recovery remains owned" };
+    },
+  };
+  await runSupervisorCycle(cycleDeps, "run-1", token, "claude");
+  assert.equal(boundaryWasDurableBeforeClaim, true);
+  assert.equal(recoveryCalls, 1);
+  await runSupervisorCycle(cycleDeps, "run-1", token, "claude");
+  assert.equal(dispatchCalls, 1, "lineage-unobservable raw H is not redispatched as moved");
+  assert.ok(recoveryCalls >= 1);
+});
+
+test("a later attempt raw head cannot override the durable block-boundary raw alias (#1568)", async () => {
+  const logicalHead = "a".repeat(40);
+  const rawHead = "b".repeat(40);
+  const laterAttemptHead = "c".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const active = itemEntry("100", "in_progress");
+  active.last_verified_identity = exactOpenCandidateIdentity(rawHead);
+  active.last_verified_identity.logical_candidate_epoch = logicalHead;
+  const evidence = blockedRecoveryItem("100").history[0]!.evidence!;
+  const { deps } = await setup(contract, testLedger({ "100": active }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "workflow-state", evidence,
+  });
+  const blocked = await readLedger(deps, "run-1", token);
+  const started = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude", action: "resync_workflow_state",
+    candidateIdentity: `repo=acme/widgets|base=main|pr=12|head=${laterAttemptHead}`,
+    candidateEpoch: logicalHead, invariant: "workflow-state",
+    evidenceIdentity: blocked.items["100"]!.evidence_fingerprint!,
+  });
+  assert.equal(started.attempt.outcome, "started");
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  const observe = exactOpenCandidateObserve(rawHead);
+  observe.getPrCommits = async () => null;
+  await runSupervisorCycle({
+    store: deps, observe,
+    executeRecovery: async () => {
+      recoveryCalls++;
+      return { succeeded: false, evidence: "durable raw alias retained" };
+    },
+    dispatchItem: async () => {
+      dispatchCalls++;
+      throw new Error("later attempt raw head must not cause redispatch");
+    },
+  }, "run-1", token, "claude");
+  assert.equal(recoveryCalls, 1);
+  assert.equal(dispatchCalls, 0);
+  assert.equal((await readLedger(deps, "run-1")).items["100"]!.state, "blocked");
+});
+
+for (const conflict of [
+  { name: "a conflicting attempt PR", identity: (head: string) => `repo=acme/widgets|base=main|pr=13|head=${head}` },
+  { name: "multiple exact PR tokens", identity: (head: string) => `repo=acme/widgets|base=main|pr=12|pr=12|head=${head}` },
+] as const) {
+  test(`${conflict.name} makes an explicit block binding ambiguous (#1568)`, async () => {
+    const oldHead = "a".repeat(40);
+    const currentHead = "b".repeat(40);
+    const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+    const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+    const { token } = await acquireLock(deps, "run-1", "claude");
+    const started = await seedCandidateBoundBlock(deps, contract, token, oldHead);
+    const seeded = await readLedger(deps, "run-1", token);
+    seeded.recovery_attempts[0]!.candidate_identity = conflict.identity(oldHead);
+    await writeLedger(deps, seeded, token);
+    let recoveryCalls = 0;
+    let dispatchCalls = 0;
+    await runSupervisorCycle({
+      store: deps,
+      observe: exactOpenCandidateObserve(currentHead),
+      executeRecovery: async () => {
+        recoveryCalls++;
+        throw new Error("ambiguous PR binding must not execute");
+      },
+      dispatchItem: async () => {
+        dispatchCalls++;
+        throw new Error("ambiguous PR binding must not dispatch");
+      },
+    }, "run-1", token, "claude");
+    const finalLedger = await readLedger(deps, "run-1");
+    assert.equal(recoveryCalls, 0);
+    assert.equal(dispatchCalls, 0);
+    assert.equal(finalLedger.items["100"]!.state, "blocked");
+    assert.equal(finalLedger.recovery_attempts.find((attempt) => attempt.attempt_id === started.attempt_id)?.outcome, "started");
+  });
+}
+
+test("a later selected claim with duplicate exact PR tokens cannot execute under a concrete PR (#1568)", async () => {
+  const head = "a".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const first = await seedCandidateBoundBlock(deps, contract, token, head);
+  await completeRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    attemptId: first.attempt_id, succeeded: false, error: "first recovery failed",
+  });
+  const blocked = await readLedger(deps, "run-1", token);
+  const duplicate = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude", action: "resync_workflow_state",
+    candidateIdentity: `repo=acme/widgets|base=main|pr=12|pr=12|head=${head}`,
+    candidateEpoch: head, invariant: "workflow-state",
+    evidenceIdentity: blocked.items["100"]!.evidence_fingerprint!,
+  });
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(head),
+    executeRecovery: async () => {
+      recoveryCalls++;
+      throw new Error("duplicate-PR selected claim must not execute");
+    },
+    dispatchItem: async () => {
+      dispatchCalls++;
+      throw new Error("duplicate-PR selected claim must not dispatch");
+    },
+  }, "run-1", token, "claude");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 0);
+  assert.equal(finalLedger.recovery_attempts.find(
+    (attempt) => attempt.attempt_id === duplicate.attempt.attempt_id
+  )?.outcome, "started");
+});
+
+for (const mutation of ["noncanonical time", "regressed sequence"] as const) {
+  test(`legacy blocker inference rejects ${mutation} authority (#1568)`, async () => {
+    const oldHead = "a".repeat(40);
+    const currentHead = "b".repeat(40);
+    const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+    const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+    const { token } = await acquireLock(deps, "run-1", "claude");
+    await seedCandidateBoundBlock(deps, contract, token, oldHead);
+    const seeded = await readLedger(deps, "run-1", token);
+    delete seeded.items["100"]!.blocker_candidate_epoch;
+    if (mutation === "noncanonical time") seeded.recovery_attempts[0]!.time = "0";
+    else {
+      const original = seeded.recovery_attempts[0]!;
+      for (const field of [
+        "episode_id", "operation", "invariant", "candidate_epoch", "evidence_identity",
+        "attempts_per_strategy", "strategy_cursor", "skipped_strategies", "next_eligible_at",
+      ]) delete (original as unknown as Record<string, unknown>)[field];
+      original.seq = 2;
+      seeded.recovery_attempts.push({ ...original, attempt_id: "rebound-low-seq", seq: 1,
+        time: "2026-07-23T00:00:09.000Z",
+        candidate_identity: `repo=acme/widgets|base=main|pr=12|head=${currentHead}` });
+    }
+    await writeLedger(deps, seeded, token);
+    if (mutation === "regressed sequence") {
+      assert.deepEqual((await readLedger(deps, "run-1", token)).recovery_attempts.map((attempt) => attempt.seq), [2, 1]);
+    }
+    let recoveryCalls = 0;
+    await runSupervisorCycle({ store: deps, observe: exactOpenCandidateObserve(currentHead),
+      executeRecovery: async () => { recoveryCalls++; return { succeeded: false, evidence: "must defer" }; },
+      dispatchItem: async () => { throw new Error("ambiguous authority must not dispatch"); } },
+    "run-1", token, "claude");
+    assert.equal(recoveryCalls, 0);
+  });
+}
+
+test("candidate-superseded re-admission clears a stale stage projection when current stage is absent (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await seedCandidateBoundBlock(deps, contract, token, oldHead);
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead, { stage: null }),
+    executeRecovery: async () => { throw new Error("stale recovery must not execute"); },
+    dispatchItem: async (request) => ({
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "needs_spec",
+      evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+    }),
+  }, "run-1", token, "claude");
+  const finalItem = (await readLedger(deps, "run-1")).items["100"]!;
+  assert.equal(finalItem.current_stage, undefined);
+  assert.equal(finalItem.current_stage_updated_at, undefined);
+  assert.equal(finalItem.current_stage_round, undefined);
+});
+
+test("live advance ownership defers candidate-superseded re-admission before recovery preflight (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await seedCandidateBoundBlock(deps, contract, token, oldHead);
+  let recoveryCalls = 0;
+  let dispatchCalls = 0;
+  await runSupervisorCycleRaw({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    probeLiveAdvance: () => ({ live: true as const, evidence: "lock_held" as const, holder_pid: 42 }),
+    acquireItemAdvanceLock: () => { throw new Error("live probe must prevent lock acquisition"); },
+    executeRecovery: async () => {
+      recoveryCalls++;
+      return { succeeded: false, evidence: "must not execute" };
+    },
+    dispatchItem: async () => {
+      dispatchCalls++;
+      throw new Error("live owner must prevent dispatch");
+    },
+  }, "run-1", token, "claude");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 0);
+  assert.equal(dispatchCalls, 0);
+  assert.equal(finalLedger.items["100"]!.state, "blocked");
+  assert.equal(finalLedger.recovery_attempts[0]!.outcome, "started");
+});
+
+test("candidate-changing repair retains postcondition ownership before ordinary redispatch (#1568)", async () => {
+  const oldHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": { ...workflowState, recipes: ["repair_pipeline_item"] },
+    },
+  });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const started = await seedCandidateBoundBlock(deps, contract, token, oldHead, "repair_pipeline_item");
+  const order: string[] = [];
+  await runSupervisorCycle({
+    store: deps,
+    observe: exactOpenCandidateObserve(currentHead),
+    executeRecovery: async (input) => {
+      order.push("repair");
+      assert.equal(input.attemptId, started.attempt_id);
+      return { succeeded: true, evidence: "repair commit is current", candidateHead: currentHead };
+    },
+    dispatchItem: async (request) => {
+      order.push("dispatch");
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "needs_spec",
+        evidence: { pr_number: 12, pipeline_run_id: "advance-current" },
+      };
+    },
+  }, "run-1", token, "claude");
+  assert.deepEqual(order, ["repair", "dispatch"]);
+  assert.equal((await readLedger(deps, "run-1")).recovery_attempts[0]!.outcome, "recovered");
+});
 
 test("regression #797/#1060: review non-convergence preps unlink then same-sequence repair", async () => {
   const contract = testContract({ items: [{ id: "100", depends_on: [] }] });

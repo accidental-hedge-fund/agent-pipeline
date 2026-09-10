@@ -272,6 +272,13 @@ export interface BlockItemInput {
   engine: LoopEngineName;
   blockerClass: DurableBlockerClass | string;
   evidence: string;
+  /** Candidate epoch observed at the block boundary. When omitted, the
+   *  item's current verified identity supplies the best durable binding.
+   *  An explicitly empty value records that boundary identity was unknown. */
+  blockerCandidateEpoch?: string;
+  /** Raw PR HEAD observed with `blockerCandidateEpoch`. Callers supplying a
+   *  fresh boundary must pass both values from the same observation. */
+  blockerCandidateHead?: string;
   note?: string;
   /** Batch/deferred-stop escape hatch (#530 review 2 finding a7abc98c): when true, this call
    *  still records the item's own block classification even if the ledger already carries a
@@ -333,6 +340,29 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
   item.state = "blocked";
   item.blocked_theme = blockerClass;
   item.evidence_fingerprint = fingerprint;
+  const verifiedIdentity = item.last_verified_identity;
+  const verifiedEpoch = recoveryEpisodeCandidateEpoch(item, verifiedIdentity?.head_sha.trim() ?? "");
+  const hasExplicitBoundary =
+    Object.prototype.hasOwnProperty.call(input, "blockerCandidateEpoch") ||
+    Object.prototype.hasOwnProperty.call(input, "blockerCandidateHead");
+  const candidateEpochInput = hasExplicitBoundary
+    ? input.blockerCandidateEpoch?.trim() ?? ""
+    : verifiedEpoch;
+  const candidateHeadInput = hasExplicitBoundary
+    ? input.blockerCandidateHead?.trim() ?? ""
+    : verifiedIdentity?.head_sha.trim() ?? "";
+  const blockerCandidateEpoch = /^[0-9a-f]{40}$/i.test(candidateEpochInput) ? candidateEpochInput : "";
+  const blockerCandidateHead = blockerCandidateEpoch && /^[0-9a-f]{40}$/i.test(candidateHeadInput)
+    ? candidateHeadInput
+    : "";
+  if (blockerCandidateEpoch) {
+    item.blocker_candidate_epoch = blockerCandidateEpoch;
+    if (blockerCandidateHead) item.blocker_candidate_head = blockerCandidateHead;
+    else delete item.blocker_candidate_head;
+  } else {
+    item.blocker_candidate_epoch = "";
+    delete item.blocker_candidate_head;
+  }
   item.repeated_evidence_count = repeatedCount;
   item.history.push({ time, from: fromState, to: "blocked", engine: input.engine, theme: blockerClass, evidence: input.evidence, note: input.note });
 
@@ -352,6 +382,8 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
     item_id: input.itemId,
     class: blockerClass,
     evidence_fingerprint: fingerprint,
+    blocker_candidate_epoch: blockerCandidateEpoch || null,
+    blocker_candidate_head: blockerCandidateHead || null,
     repeated_evidence_count: repeatedCount,
   });
   if (next.stop && !stopAlreadyRecorded) {

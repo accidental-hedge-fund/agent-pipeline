@@ -112,6 +112,28 @@ The immutable #1568 `driveSupervisor` post-action replay starts with scratch ×2
 
 Baseline-failure evidence should be retained in test names or commit history where practical; production tests themselves assert repaired behavior. No unit test uses live GitHub, git, child processes, or filesystem state outside injected seams.
 
+### 7. Bind blocker evidence to the candidate that produced it
+
+The item ledger records the logical candidate epoch when a block is created. An explicitly unknown
+block-boundary observation stays unbound instead of falling back to a cached pre-dispatch identity.
+For legacy ledgers, only the first attempt strictly after the latest actual `in_progress` to `blocked`
+transition may supply that binding; it must carry a valid candidate binding, and the transition must
+match the current blocker class and fingerprint. Legacy authority requires canonical UTC timestamps
+and strictly increasing unique sequence identities. Ambiguous, inconsistent, or malformed history is not authority.
+
+Recovery preflight compares that binding with fresh engine-owned identity while the existing live-run
+probe and issue-run lock are held. Same-candidate claims keep the #797 replay contract. A started
+candidate-changing repair bound to the blocker candidate keeps its existing postcondition path. A
+different exact, clean, open, advance-still-needed implementation candidate with a positively absent
+blocked label atomically supersedes every started claim from the stale generation, clears its Cooling
+and linkage, updates stage projection, and becomes ordinary dispatchable work. CI remains ordinary
+pipeline evidence, so pending or failed checks do not prevent re-admission. If any identity, cleanliness,
+operation/legacy-PR, or label proof is absent, recovery defers without borrowing the old diagnostic.
+Candidate comparison includes positively known PR identity as well as a bounded logical/raw head pair:
+same-SHA evidence on a different PR is movement, while a recorded raw member preserves same-candidate
+authority when logical lineage later becomes unobservable. The original-candidate repair is the sole
+retained owner; stale siblings are retired before it resumes, and malformed selected claims defer.
+
 ## Risks / Trade-offs
 
 - **[Risk] Digest references could hide a collision or malformed catalog.** → Recompute every digest during parse, reject collisions/unresolved references, and compare the readable render with the expanded artifact.

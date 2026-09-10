@@ -16,6 +16,7 @@ Issue #1568 records three reproduced shared-boundary defects that prevent ordina
 - Allow the captured #1558 terminal diagnostic, which omits historical `pr_head`, to bind through matching run/item identity plus the current observed full head and candidate epoch. Any explicit head, run, item, root, or candidate mismatch fails closed, and classification never creates a Tester pass or binding.
 - Make every pre-action and post-action outer recovery gate agree with the existing Recovery Episode contract: after a failed action, recompute diagnostic-aware applicability and remaining per-strategy budget against the same authoritative episode/progress identity, so a later unspent strategy remains reachable even when the legacy class-budget projection is zero, while exhausted and inapplicable strategies remain bounded.
 - Preserve exact-candidate, authority, independent-review, independent-sibling, lifecycle-ownership, and no-merge contracts. No new scheduler, controller, recovery framework, or public surface is introduced.
+- Bind each mechanical block to its originating candidate. When a later exact, clean, positively unblocked candidate supersedes it, atomically retire that block generation and return the issue to ordinary Pipeline; incomplete movement proof defers and never reuses stale diagnostics.
 
 ## Acceptance Criteria
 
@@ -34,6 +35,7 @@ Issue #1568 records three reproduced shared-boundary defects that prevent ordina
 - [ ] The immutable #1568 `driveSupervisor` replay starts with two scratch and two checkpoint attempts spent and a zero legacy class projection; after one failed recovery action it retains the same episode/progress identity and continues to a later applicable unspent strategy without `strategy_cursor_exhausted`, refunding attempts, or suppressing an independent sibling.
 - [ ] An exhausted strategy remains ineligible, diagnostic-specific recipe filtering still excludes inapplicable recipes, and an episode with no applicable unspent strategy enters bounded owned Cooling rather than an unbounded retry or false human hold.
 - [ ] An independent sibling remains schedulable while another item is Cooling or waiting.
+- [ ] Candidate-bound stale blocker evidence cannot be rebound to a later candidate: same-candidate recovery and original-candidate repair postconditions remain owned, exact clean replacement candidates return to ordinary dispatch, and incomplete replacement observations defer without a new recovery episode.
 - [ ] Boundary regressions use injected I/O only and replay the reproduced renderer, refinement-to-implementation, dispatch-diagnostic, and recovery-eligibility failures without real network, git, or subprocess calls.
 - [ ] Generated host artifacts are refreshed after implementation changes, `npm run ci` passes, and ordinary independent Pipeline review and GitHub CI complete before any separately authorized merge.
 
@@ -56,6 +58,7 @@ None.
 - `openspec-integration`: Bind accepted refinements to the coherent validated OpenSpec artifact that supplies implementation input, and reject no-op or invalid application.
 - `durable-blocker-classification`: Preserve precise child diagnostics across independent forge observation failures and recover them only through trusted linked-run event identity.
 - `recovery-episodes`: Determine eligibility from applicable strategies' remaining per-strategy bounds while preserving episode identity, finite exhaustion, and independent-sibling progress.
+- `durable-run-reconciliation`: Persist blocker candidate identity and safely re-admit an exact replacement candidate without weakening same-candidate recovery.
 
 ## Impact
 
