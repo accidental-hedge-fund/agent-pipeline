@@ -48,6 +48,7 @@ The product SHALL provide ownership-safe cleanup and migration behavior for know
 - **WHEN** a recorded failed synthetic fixture has a null recorded branch SHA
 - **OR** the observed worktree has no ownership identity
 - **OR** the delete mutation cannot enforce the recorded identity atomically
+- **OR** the branch or worktree observer is unavailable
 - **THEN** cleanup SHALL leave that branch or worktree unchanged
 - **AND** SHALL record cleanup debt
 

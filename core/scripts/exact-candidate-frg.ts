@@ -1704,7 +1704,9 @@ export async function cleanupOwnedFailedSyntheticArtifacts(
 
     const branchName = recorded.branch_name;
     const branchTarget = `branch:${branchName}`;
-    if (io.observeBranch) {
+    if (!io.observeBranch) {
+      debtWithoutMutation(branchTarget, "branch observer is unavailable; no mutation attempted");
+    } else {
       try {
         const branch = await io.observeBranch(branchName);
         const expectedSha = slot.pr_head_sha;
@@ -1728,7 +1730,9 @@ export async function cleanupOwnedFailedSyntheticArtifacts(
     const worktreePath = recorded.worktree_path;
     const worktreeIdentity = recorded.worktree_identity;
     const worktreeTarget = `worktree:${worktreePath}`;
-    if (io.observeWorktree) {
+    if (!io.observeWorktree) {
+      debtWithoutMutation(worktreeTarget, "worktree observer is unavailable; no mutation attempted");
+    } else {
       try {
         const worktree = await io.observeWorktree(worktreePath);
         if (worktree === null) {

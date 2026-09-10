@@ -1136,6 +1136,29 @@ test("absent worktree identity does not authorize worktree deletion", async () =
   assert.ok(facts.some((fact) => fact.target.startsWith("worktree:") && /no recorded ownership identity/.test(fact.detail)));
 });
 
+test("absent branch or worktree observer records cleanup debt without mutation", async () => {
+  const record = ownedCleanupRecord();
+  const deleted: string[] = [];
+  const facts = await cleanupOwnedFailedSyntheticArtifacts(record, {
+    now: () => new Date("2026-09-10T00:00:00.000Z"),
+    getIssue: async (issueNumber) => {
+      const slot = record.slots.find((item) => item.issue_number === issueNumber)!;
+      return { body: provenanceBody(record, slot), labels: ["factory-gate"], state: "open" };
+    },
+    getPr: async (prNumber) => {
+      const slot = record.slots.find((item) => item.pr_number === prNumber)!;
+      return { number: prNumber, head_sha: slot.pr_head_sha!, state: "open", merged: false };
+    },
+    deleteBranch: async (name) => { deleted.push(`branch:${name}`); },
+    deleteOwnedWorktree: async (worktreePath) => { deleted.push(`worktree:${worktreePath}`); },
+  });
+  assert.deepEqual(deleted, []);
+  assert.ok(facts.filter((fact) => fact.target.startsWith("branch:")).every((fact) => fact.status === "debt"));
+  assert.ok(facts.filter((fact) => fact.target.startsWith("worktree:")).every((fact) => fact.status === "debt"));
+  assert.ok(facts.some((fact) => fact.target.startsWith("branch:") && /observer is unavailable/.test(fact.detail)));
+  assert.ok(facts.some((fact) => fact.target.startsWith("worktree:") && /observer is unavailable/.test(fact.detail)));
+});
+
 test("ordinary exact-candidate records produce no mutating cleanup actions", async () => {
   const record = ownedCleanupRecord();
   record.outcome = "passed";
