@@ -68,7 +68,7 @@ The candidate SHALL invoke the ordinary pipeline loop with an explicit work list
 
 ### Requirement: FRG SHALL accept only authoritative current-head completion evidence
 
-For each fixture, the release-owned observer SHALL independently obtain current forge and pipeline state proving: the expected issue-template provenance; one current open and unmerged pull request; `pipeline:ready-to-deploy`; current successful required CI for that exact PR head; accepted independent review for that head; and current passed Tester evidence for that head and effective worker configuration. The result SHALL fail closed when any required observer is unavailable or inconsistent. Labels, comments, public hashes, worker-authored booleans, fixture files, process exit, or a run-complete event SHALL NOT independently prove completion.
+For each fixture, the release-owned observer SHALL independently obtain current forge and pipeline state proving: the expected issue-template provenance; one current open and unmerged pull request; `pipeline:ready-to-deploy`; current successful required CI for that exact PR head; accepted independent review whose `reviewed_head_sha` equals that exact current PR head; and current passed Tester evidence for that head and effective worker configuration. The result SHALL fail closed when any required observer is unavailable or inconsistent. Labels, comments, public hashes, worker-authored booleans, fixture files, process exit, or a run-complete event SHALL NOT independently prove completion.
 
 #### Scenario: Current green unmerged head passes
 
@@ -82,6 +82,14 @@ For each fixture, the release-owned observer SHALL independently obtain current 
 - **OR** CI, review, or Tester evidence names a prior or different PR head
 - **THEN** the observer SHALL refuse a pass
 - **AND** SHALL retain the mismatched evidence in the classified result
+
+#### Scenario: Prior-head review remains observable but is not exact-head proof
+
+- **WHEN** review currency qualifies a prior-head review for the current diff or successor head
+- **AND** the review's `reviewed_head_sha` does not equal the current PR head
+- **THEN** the observer MAY retain the currency-qualified review in the classified result
+- **AND** SHALL refuse an exact FRG pass
+- **AND** SHALL NOT classify current-head `changes_requested` from that prior-head review
 
 #### Scenario: Merged fixture does not pass
 

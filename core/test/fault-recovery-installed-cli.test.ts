@@ -3,10 +3,6 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import * as path from "node:path";
 import {
   candidateTestNamesAtCommit,
   INSTALLED_CLI_QUALIFICATION_SCHEMA,
@@ -43,24 +39,24 @@ test("installed CLI coverage module points to the external process qualification
   );
 });
 
-test("candidate test inventory comes from exact commit, not dirty operator files (#1558)", () => {
-  const repo = mkdtempSync(path.join(tmpdir(), "pipeline-candidate-inventory-"));
-  try {
-    mkdirSync(path.join(repo, "core", "test"), { recursive: true });
-    mkdirSync(path.join(repo, "scripts"), { recursive: true });
-    writeFileSync(path.join(repo, "core", "test", "trusted.test.ts"), "export {};\n");
-    execFileSync("git", ["init", "-q"], { cwd: repo });
-    execFileSync("git", ["config", "user.email", "pipeline@example.invalid"], { cwd: repo });
-    execFileSync("git", ["config", "user.name", "Pipeline Test"], { cwd: repo });
-    execFileSync("git", ["add", "core/test/trusted.test.ts"], { cwd: repo });
-    execFileSync("git", ["commit", "-qm", "trusted inventory"], { cwd: repo });
-    const candidate = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
-    writeFileSync(path.join(repo, "core", "test", "operator-only.test.ts"), "export {};\n");
-    assert.deepEqual(candidateTestNamesAtCommit(path.join(repo, "scripts", "pipeline-launcher.mjs"), candidate),
-      ["trusted.test.ts"], "dirty operator-only tests are not part of the trusted candidate inventory");
-  } finally {
-    rmSync(repo, { recursive: true, force: true });
-  }
+test("candidate test inventory parses injected exact-commit ls-tree output (#1558)", () => {
+  let observedRoot = "";
+  let observedCandidate = "";
+  const inventory = candidateTestNamesAtCommit("/operator/scripts/pipeline-launcher.mjs", CANDIDATE, {
+    lsTree: (repoRoot, candidateSha) => {
+      observedRoot = repoRoot;
+      observedCandidate = candidateSha;
+      return [
+        "core/test/z-last.test.ts",
+        "core/test/helpers/not-a-suite.test.ts",
+        "core/test/readme.md",
+        "core/test/a-first.test.ts",
+      ].join("\n");
+    },
+  });
+  assert.equal(observedRoot, "/operator");
+  assert.equal(observedCandidate, CANDIDATE);
+  assert.deepEqual(inventory, ["a-first.test.ts", "z-last.test.ts"]);
   assert.equal(candidateTestNamesAtCommit("relative", CANDIDATE, { lsTree: () => "x" }), null);
   assert.equal(candidateTestNamesAtCommit("/operator/scripts/pipeline-launcher.mjs", CANDIDATE, { lsTree: () => "" }), null);
 });

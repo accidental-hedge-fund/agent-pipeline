@@ -1157,7 +1157,7 @@ function observationPasses(record: ExactCandidateFrgRecord, slot: ExactCandidate
     obs.ci.source === "ci" && obs.ci.required && obs.ci.check_count > 0 && obs.ci.head_sha === head && obs.ci.conclusion === "success" &&
     obs.review.source === "review" && obs.review.independent && obs.review.evidence_subject_valid &&
     obs.review.advance_run_id.trim() !== "" && obs.review.evidence_run_id.trim() !== "" &&
-    obs.review.head_sha === head && obs.review.verdict === "accepted" &&
+    obs.review.head_sha === head && obs.review.reviewed_head_sha === head && obs.review.verdict === "accepted" &&
     obs.tester.source === "tester" && obs.tester.evidence_subject_valid && obs.tester.advance_run_id === slot.advance_run_id &&
     obs.tester.evidence_run_id.trim() !== "" &&
     obs.tester.head_sha === head && obs.tester.conclusion === "passed" && obs.tester.config_digest === record.worker_config.gates_sha256 &&
@@ -1176,7 +1176,9 @@ export function classifyExactCandidateFrgObservation(
       proof.fixture_pr_head_sha === obs.pr.head_sha) return "exact_candidate_regression";
   if ((obs.ingress_claims?.length ?? 0) > 0) return "gate_defect";
   if (obs.review.verdict === "changes_requested" && obs.review.evidence_subject_valid &&
-      obs.review.head_sha === obs.pr.head_sha) return "ordinary_review_revision";
+      obs.review.head_sha === obs.pr.head_sha && obs.review.reviewed_head_sha === obs.pr.head_sha) {
+    return "ordinary_review_revision";
+  }
   if (obs.ci.source === "ci" && obs.ci.required && obs.ci.check_count > 0 &&
       obs.ci.conclusion === "failure" && obs.ci.head_sha === obs.pr.head_sha) return "ordinary_review_revision";
   if (obs.tester.conclusion === "failed" && obs.tester.evidence_subject_valid &&

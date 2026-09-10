@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
+  candidateTestNamesAtCommit,
   INSTALLED_CLI_PROBE_SCHEMA,
   installedCliQualificationArtifactDigest,
   parseInstalledCliQualificationArtifact,
@@ -25,6 +26,32 @@ const candidate = execFileSync("git", ["rev-parse", "HEAD"], {
 }).trim();
 let artifact = null;
 let root = null;
+
+test("candidate test inventory uses the committed tree while the checkout is dirty (#1558)", () => {
+  const inventoryRepo = mkdtempSync(path.join(tmpdir(), "pipeline-candidate-inventory-"));
+  try {
+    mkdirSync(path.join(inventoryRepo, "core", "test"), { recursive: true });
+    mkdirSync(path.join(inventoryRepo, "scripts"), { recursive: true });
+    writeFileSync(path.join(inventoryRepo, "core", "test", "trusted.test.ts"), "export {};\n");
+    execFileSync("git", ["init", "-q"], { cwd: inventoryRepo });
+    execFileSync("git", ["config", "user.email", "pipeline@example.invalid"], { cwd: inventoryRepo });
+    execFileSync("git", ["config", "user.name", "Pipeline Test"], { cwd: inventoryRepo });
+    execFileSync("git", ["add", "core/test/trusted.test.ts"], { cwd: inventoryRepo });
+    execFileSync("git", ["commit", "-qm", "trusted inventory"], { cwd: inventoryRepo });
+    const inventoryCandidate = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: inventoryRepo, encoding: "utf8",
+    }).trim();
+    writeFileSync(path.join(inventoryRepo, "core", "test", "operator-only.test.ts"), "export {};\n");
+
+    assert.deepEqual(
+      candidateTestNamesAtCommit(path.join(inventoryRepo, "scripts", "pipeline-launcher.mjs"), inventoryCandidate),
+      ["trusted.test.ts"],
+      "dirty operator-only tests are not part of the trusted candidate inventory",
+    );
+  } finally {
+    rmSync(inventoryRepo, { recursive: true, force: true });
+  }
+});
 
 test("real candidate launcher produces complete parent-observed qualification", { timeout: 360_000 }, () => {
   root = mkdtempSync(path.join(tmpdir(), "pipeline-real-installed-qualification-"));

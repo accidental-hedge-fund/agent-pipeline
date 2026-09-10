@@ -1718,7 +1718,8 @@ test("production observer derives current checks, independent review, Tester, pr
     ? { status: "ok", evidence: adoptedTester }
     : requestedRun === priorAdvanceRunId ? { status: "ok", evidence: sourceTester } : { status: "missing" };
   const successor = await deps.observeFixture(record, slot);
-  assert.equal(classifyExactCandidateFrgObservation(record, slot, successor), "passed");
+  assert.equal(classifyExactCandidateFrgObservation(record, slot, successor), "gate_defect",
+    "a currency-qualified prior-head review cannot prove an exact current-head FRG pass");
   assert.equal(successor.review.advance_run_id, priorAdvanceRunId);
   assert.equal(successor.review.evidence_run_id, traceRunId);
   assert.equal(successor.review.head_sha, head);
@@ -1731,8 +1732,9 @@ test("production observer derives current checks, independent review, Tester, pr
       harness: "codex", selfReview: false, evidence_subject: priorReviewSubject }] },
   });
   const sameRunArchive = await deps.observeFixture(record, slot);
-  assert.equal(classifyExactCandidateFrgObservation(record, slot, sameRunArchive), "passed",
-    "a final current-head summary may retain the pre-archive review row from the same physical run");
+  assert.equal(sameRunArchive.review.reviewed_head_sha, priorReviewedHead);
+  assert.equal(classifyExactCandidateFrgObservation(record, slot, sameRunArchive), "gate_defect",
+    "even the same physical run cannot use a pre-archive review row as exact-head proof");
   io.readCurrentReviewEvidence = async () => ({
     advanceRunId: priorAdvanceRunId, reviewedHeadSha: priorReviewedHead, reviewedDiffHash: reviewSubject.diff_hash,
     summary: { ...summaryBase, run_id: priorAdvanceRunId, evidence_subject: priorSummarySubject,
@@ -1741,8 +1743,9 @@ test("production observer derives current checks, independent review, Tester, pr
   });
   const successorRevision = await deps.observeFixture(record, slot);
   assert.equal(successorRevision.review.head_sha, head);
-  assert.equal(classifyExactCandidateFrgObservation(record, slot, successorRevision), "ordinary_review_revision",
-    "a subject-valid current-equivalent source review keeps changes requested on the same ordinary pair");
+  assert.equal(successorRevision.review.reviewed_head_sha, priorReviewedHead);
+  assert.equal(classifyExactCandidateFrgObservation(record, slot, successorRevision), "gate_defect",
+    "prior-head changes requested cannot classify the exact current head as needing revision");
   io.readCurrentReviewEvidence = async () => ({
     advanceRunId: priorAdvanceRunId, reviewedHeadSha: priorReviewedHead, reviewedDiffHash: reviewSubject.diff_hash,
     summary: { ...summaryBase, run_id: priorAdvanceRunId,
