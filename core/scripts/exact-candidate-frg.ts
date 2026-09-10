@@ -2342,14 +2342,17 @@ export async function runProductionExactCandidateFrg(
       throw new ExactCandidateFrgGateDefect("release store primary must be a normalized absolute path");
     }
     const deps = createProductionExactCandidateFrgDeps(boundInput, io, releaseStoreRepoDir);
-    const releaseEpochPrefix = `frg-${input.releaseVersion}-`;
-    const relevantEpochIds = (await io.listRecordEpochIds(releaseStoreRepoDir)).filter((id) => id.startsWith(releaseEpochPrefix));
-    const records = (await Promise.all(relevantEpochIds.map((id) =>
-      loadExactCandidateFrgRecord(releaseStoreRepoDir, id, { readFile: io.readFile })))).filter((record): record is ExactCandidateFrgRecord =>
-      record !== null && record.repository === input.repository && record.release_version === input.releaseVersion);
+    const loadRecords = async (): Promise<ExactCandidateFrgRecord[]> => {
+      const releaseEpochPrefix = `frg-${input.releaseVersion}-`;
+      const relevantEpochIds = (await io.listRecordEpochIds(releaseStoreRepoDir)).filter((id) => id.startsWith(releaseEpochPrefix));
+      return (await Promise.all(relevantEpochIds.map((id) =>
+        loadExactCandidateFrgRecord(releaseStoreRepoDir, id, { readFile: io.readFile })))).filter((record): record is ExactCandidateFrgRecord =>
+        record !== null && record.repository === input.repository && record.release_version === input.releaseVersion);
+    };
     let candidate: string;
     try { candidate = exactSha(await io.observeOriginMainSha(input.repoDir), "origin/main"); }
     catch (error) {
+      const records = await loadRecords();
       if (records.some((record) => record.outcome === "passed")) {
         throw new Error(`origin/main observer unavailable while preserving durable pass: ${(error as Error).message}`);
       }
@@ -2360,6 +2363,13 @@ export async function runProductionExactCandidateFrg(
       }
       throw error;
     }
+    if (input.expectedCandidateSha !== undefined &&
+        exactSha(input.expectedCandidateSha, "expected candidate") !== candidate) {
+      throw new ExactCandidateFrgGateDefect(
+        `origin/main moved before exact-candidate FRG admission: expected ${input.expectedCandidateSha}, observed ${candidate}`,
+      );
+    }
+    const records = await loadRecords();
     for (const prior of records.filter((record) => record.candidate.sha !== candidate &&
       !["stale_candidate", "exact_candidate_regression", "gate_defect"].includes(record.outcome))) {
       await finalizeObservedOutcome(prior, deps, "stale_candidate", `origin/main moved from ${prior.candidate.sha} to ${candidate}`);
@@ -2368,6 +2378,39 @@ export async function runProductionExactCandidateFrg(
     const epochId = existing ? existing.epoch_id : nextExactCandidateFrgEpochId(records, input.releaseVersion, candidate);
     return runExactCandidateFrg({ ...boundInput, epochId, expectedCandidateSha: candidate }, deps, existing ?? undefined);
   });
+}
+
+/** Read-only durable proof lookup used when an immutable release tag already exists. */
+export async function observeProductionExactCandidateFrgPass(
+  input: BeginExactCandidateFrgInput,
+  candidateSha: string,
+  io: ProductionExactCandidateFrgIo = defaultProductionExactCandidateFrgIo(input),
+): Promise<ExactCandidateFrgRecord> {
+  const candidate = exactSha(candidateSha, "tagged candidate");
+  const target = await io.validateTargetRuntime(input);
+  if (target.repository !== input.repository) {
+    throw new ExactCandidateFrgGateDefect(`target primary origin ${target.repository} does not match ${input.repository}`);
+  }
+  if (input.operationalDomain !== undefined && input.operationalDomain !== target.domain) {
+    throw new ExactCandidateFrgGateDefect("explicit operational domain does not match the target runtime");
+  }
+  const releaseStoreRepoDir = await io.resolveReleaseStoreRepoDir(input.repoDir);
+  if (!path.isAbsolute(releaseStoreRepoDir) || path.normalize(releaseStoreRepoDir) !== releaseStoreRepoDir) {
+    throw new ExactCandidateFrgGateDefect("release store primary must be a normalized absolute path");
+  }
+  const prefix = `frg-${input.releaseVersion}-`;
+  const ids = (await io.listRecordEpochIds(releaseStoreRepoDir)).filter((id) => id.startsWith(prefix));
+  const records = (await Promise.all(ids.map((id) =>
+    loadExactCandidateFrgRecord(releaseStoreRepoDir, id, { readFile: io.readFile })))).filter(
+      (record): record is ExactCandidateFrgRecord => record !== null && record.repository === input.repository &&
+        record.release_version === input.releaseVersion && record.candidate.sha === candidate && record.outcome !== "stale_candidate",
+    );
+  if (records.length !== 1 || records[0]!.outcome !== "passed") {
+    throw new ExactCandidateFrgGateDefect(
+      `expected exactly one durable passed exact-candidate FRG record for ${candidate}; observed ${records.length}`,
+    );
+  }
+  return verifyExactCandidateFrgResult(records[0], { epoch_id: records[0]!.epoch_id, candidate_sha: candidate });
 }
 
 export function nextExactCandidateFrgEpochId(

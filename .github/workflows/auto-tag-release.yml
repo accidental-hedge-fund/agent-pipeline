@@ -1,4 +1,4 @@
-name: auto-tag-release
+name: auto-tag-release-disabled
 
 # Auto-tags a release-PR merge commit (#411) so `release.yml` can publish the GitHub
 # Release without a trailing manual `git tag` step. This workflow creates and pushes
@@ -30,9 +30,10 @@ name: auto-tag-release
 # post-tag docs commit. Checkout uses the default GITHUB_TOKEN, so non-release
 # pushes to main are unaffected by whether the secret is provisioned.
 
+# Disabled by #1563: `pipeline release VERSION` is the sole tag owner. Retain
+# the obsolete implementation until #1560 removes it after dependency audit.
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -40,6 +41,7 @@ permissions:
 
 jobs:
   auto-tag:
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

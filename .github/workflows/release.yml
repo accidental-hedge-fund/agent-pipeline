@@ -69,7 +69,7 @@ jobs:
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             flag="--prerelease"
           else
-            flag="--latest"
+            flag="--latest --prerelease=false"
           fi
           # Create or update: a force-pushed tag re-triggers this workflow against an
           # existing release (422 on create). Edit it in that case.
@@ -77,6 +77,7 @@ jobs:
             gh release edit "${GITHUB_REF_NAME}" \
               --notes-file /tmp/notes.md \
               --title "${GITHUB_REF_NAME}" \
+              --draft=false \
               $flag
           else
             gh release create "${GITHUB_REF_NAME}" \
@@ -85,3 +86,25 @@ jobs:
               --title "${GITHUB_REF_NAME}" \
               $flag
           fi
+
+      # Sole post-tag docs owner (#1563). The released tag remains fixed at C;
+      # this derived docs commit may advance main and never retargets the tag.
+      - name: Install dependencies for tag-derived docs
+        run: cd core && npm ci --no-audit --no-fund
+
+      - name: Refresh tag-derived docs on main
+        env:
+          RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_TAG_TOKEN" ]; then
+            echo "::error::RELEASE_TAG_TOKEN is required for post-tag docs refresh"
+            exit 1
+          fi
+          released="$(git rev-parse "${GITHUB_REF_NAME}^{}")"
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch origin main
+          git checkout -B main origin/main
+          node scripts/release-docs-refresh.mjs --version "${GITHUB_REF_NAME#v}" --push
+          observed="$(git rev-parse "${GITHUB_REF_NAME}^{}")"
+          test "$observed" = "$released" || { echo "::error::release tag moved during docs refresh"; exit 1; }

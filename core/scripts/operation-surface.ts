@@ -185,7 +185,7 @@ export const OPERATION_SURFACE: readonly OperationSurfaceEntry[] = [
   operation({
     name: "ship",
     desc:
-      "Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.",
+      "Run or inspect one durable milestone shipment: train --merge, then exactly one delegation to the complete release owner. Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.",
     usage:
       "ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json]",
     section: "lifecycle",
@@ -194,9 +194,9 @@ export const OPERATION_SURFACE: readonly OperationSurfaceEntry[] = [
   operation({
     name: "release",
     desc:
-      "Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); finish never tags; ship-end ensure-tag creates vX.Y.Z from on-disk HMAC latest.json when FRG is gitignored; --dry-run reports milestone presence/open issues",
+      "Independently complete a verified SemVer release: validate contained milestone implementations, merge/reuse metadata, run exact-candidate FRG, create/verify annotated tag C, and verify publication. Explicit prepare is bounded and never tags",
     usage:
-      'release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json] | release ensure-tag <X.Y.Z> <merge-oid> --packed-candidate <sha>',
+      'release <version> [--theme "..."] [--dry-run|--json] [--no-edit] | release prepare <version> [--json] | release finish <pr> [--json]',
     section: "lifecycle",
     fast: false,
   }),

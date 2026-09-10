@@ -91,10 +91,7 @@ export function operatorShipIntent(coordinates: ShipCoordinates): ShipIntent {
 
 export const SHIP_AUTHORIZED_ACTIONS = [
   "train_merge",
-  "frg",
-  "release_prepare",
-  "release_finish",
-  "engine_promote",
+  "release_complete",
 ] as const;
 
 export type ShipAuthorizedAction = (typeof SHIP_AUTHORIZED_ACTIONS)[number];
@@ -139,6 +136,7 @@ export type ShipNextAction =
   | "release_finish"
   | "tag"
   | "release_wait"
+  | "release_complete"
   | "engine_promote"
   | "deploy"
   | "complete";
@@ -232,6 +230,13 @@ export interface ShipProgress {
   publication: ShipPublicationEvidence | null;
   promotion: ShipPromotionEvidence | null;
   deployment: ShipDeploymentEvidence | null;
+  /** #1563 complete release command result. SemVer ship ends here. */
+  complete_release?: {
+    version: string;
+    candidate_sha: string;
+    tag: string;
+    published_at: string;
+  } | null;
   lineage: CandidateLineage;
 }
 
@@ -309,6 +314,8 @@ export interface ShipCoordinatorDeps {
   waitForRelease(intent: ShipIntent, release: ShipReleaseFinishEvidence): Promise<ShipPublicationEvidence>;
   convergeEnginePromote(intent: ShipIntent, publication: ShipPublicationEvidence): Promise<ShipPromotionEvidence>;
   convergeDeployment(intent: ShipIntent, promotion: ShipPromotionEvidence): Promise<ShipDeploymentEvidence>;
+  /** Same complete release seam used by direct `pipeline release VERSION`. */
+  convergeCompleteRelease(intent: ShipIntent, train: ShipTrainEvidence): Promise<NonNullable<ShipProgress["complete_release"]>>;
   /**
    * Single `roadmap.release_model` policy. Absent or unknown is SemVer.
    * Do not add a parallel `ship.model` key.
@@ -461,6 +468,7 @@ const EMPTY_PROGRESS: ShipProgress = {
   publication: null,
   promotion: null,
   deployment: null,
+  complete_release: null,
   lineage: { ...EMPTY_CANDIDATE_LINEAGE },
 };
 
@@ -475,6 +483,7 @@ export function emptyShipProgress(): ShipProgress {
     publication: null,
     promotion: null,
     deployment: null,
+    complete_release: null,
     lineage: { ...EMPTY_CANDIDATE_LINEAGE },
   };
 }
@@ -843,6 +852,14 @@ function validateProgress(
       throw new Error("ship reconciliation: live digest does not match the authorized published artifact");
     }
   }
+  if (progress.complete_release) {
+    if (!progress.train || progress.complete_release.version !== intent.version ||
+        progress.complete_release.tag !== expectedTag(intent.version) ||
+        !progress.complete_release.published_at) {
+      throw new Error("ship reconciliation: complete release evidence does not match the integrated train");
+    }
+    requireOid(progress.complete_release.candidate_sha, "complete release candidate_sha");
+  }
   const lineage = projectCandidateLineage(progress);
   if (progress.publication && !lineageHasPriorEdges(lineage, "publication")) {
     throw new Error("ship reconciliation: publication requires a proven origin tag");
@@ -861,15 +878,8 @@ function validateProgress(
 function nextAction(progress: ShipProgress, releaseModel: ShipReleaseModel = "semver"): ShipNextAction {
   if (!progress.train) return "train_merge";
   if (releaseModel === "continuous") return "complete";
-  if (!progress.frg_pack) return "frg_pack";
-  if (!progress.frg) return "frg_score";
-  if (!progress.release) return "release_prepare";
-  if (!progress.release_finish) return "release_finish";
-  if (!progress.tag) return "tag";
-  if (!progress.publication) return "release_wait";
-  if (!progress.promotion) return "engine_promote";
-  if (!progress.deployment) return "deploy";
-  return "complete";
+  if (progress.complete_release) return "complete";
+  return "release_complete";
 }
 
 function sameIntent(a: ShipIntent, b: ShipIntent): boolean {
@@ -1242,37 +1252,15 @@ export async function runShipCoordinator(
     }
     return status;
   }
-  if (!status.frg_pack) {
-    await run("frg_pack", () => deps.convergeFrgPack(expected, status.train!), (frg_pack) => ({ ...status, frg_pack }));
+  if (!status.complete_release) {
+    await run(
+      "release_complete",
+      () => deps.convergeCompleteRelease(expected, status.train!),
+      (complete_release) => ({ ...status, complete_release }),
+    );
     if (waitCheckpoint) return status;
-  }
-  if (!status.frg) {
-    await run("frg_score", () => deps.convergeFrgScore(expected, status.frg_pack!), (frg) => ({ ...status, frg }));
-    if (waitCheckpoint) return status;
-  }
-  if (!status.release) {
-    await run("release_prepare", () => deps.convergeReleasePrepare(expected, status.frg!), (release) => ({ ...status, release }));
-    if (waitCheckpoint) return status;
-  }
-  if (!status.release_finish) {
-    await run("release_finish", () => deps.convergeReleaseFinish(expected, status.release!), (release_finish) => ({ ...status, release_finish }));
-    if (waitCheckpoint) return status;
-  }
-  if (!status.tag) {
-    await run("tag", () => deps.convergeTag(expected, status.release_finish!), (tag) => ({ ...status, tag }));
-    if (waitCheckpoint) return status;
-  }
-  if (!status.publication) {
-    await run("release_wait", () => deps.waitForRelease(expected, status.release_finish!), (publication) => ({ ...status, publication }));
-    if (waitCheckpoint) return status;
-  }
-  if (!status.promotion) {
-    await run("engine_promote", () => deps.convergeEnginePromote(expected, status.publication!), (promotion) => ({ ...status, promotion }));
-    if (waitCheckpoint) return status;
-  }
-  if (!status.deployment) {
-    await run("deploy", () => deps.convergeDeployment(expected, status.promotion!), (deployment) => ({ ...status, deployment }));
-    if (waitCheckpoint) return status;
+    if (status.complete && !wasComplete) await recordEvent(deps, status, "complete", "completed");
+    return status;
   }
   if (!status.complete) status = await persist(deps, status, status, null, { claim: null });
   if (status.complete && !wasComplete) {

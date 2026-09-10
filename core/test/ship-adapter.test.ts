@@ -252,23 +252,29 @@ function operations(overrides: Partial<ShipAdapterOperations> = {}): ShipAdapter
     observeDeployment: async () => deployment,
     deploy: async () => deployment,
     observeRemainingOpenMilestoneIssues: async () => [],
+    completeRelease: async (observedIntent, observedTrain) => ({
+      version: observedIntent.version,
+      candidate_sha: observedTrain.integrated_head_oid,
+      tag: `v${observedIntent.version}`,
+      published_at: "2026-08-10T12:30:00.000Z",
+    }),
     ...overrides,
   };
 }
 
-test("ship adapter reconciliation projects only externally observed typed truth", async () => {
+test("ship adapter reconciliation stops at train and delegates post-train truth", async () => {
   const deps = shipCoordinatorDepsFromOperations(operations(), { state });
 
   const result = await deps.reconcile(intent, checkpoint());
 
   assert.equal(result.train?.integrated_head_oid, head);
-  assert.equal(result.frg_pack?.candidate_head_oid, head);
-  assert.equal(result.frg?.candidate_head_oid, head);
-  assert.equal(result.release?.head_oid, releaseHead);
-  assert.equal(result.release_finish?.merge_commit_oid, mergeHead);
-  assert.deepEqual(result.tag, tagEvidence);
-  assert.deepEqual(result.publication, publication);
-  assert.deepEqual(result.promotion, promotion);
+  assert.equal(result.frg_pack, null);
+  assert.equal(result.frg, null);
+  assert.equal(result.release, null);
+  assert.equal(result.release_finish, null);
+  assert.equal(result.tag, null);
+  assert.equal(result.publication, null);
+  assert.equal(result.promotion, null);
 });
 
 const advancedHead = "f".repeat(40);
@@ -335,7 +341,7 @@ test("pre-FRG reconciliation rebinds completed train to the current advanced bas
   assert.equal(result.release, null);
 });
 
-test("post-FRG reconciliation preserves the qualified and released historical candidate (#1527)", async () => {
+test("post-train reconciliation discards legacy tail checkpoints (#1563)", async () => {
   const savedPack = {
     version: intent.version,
     complete: true as const,
@@ -364,14 +370,13 @@ test("post-FRG reconciliation preserves the qualified and released historical ca
 
   const result = await deps.reconcile(intent, saved);
 
-  assert.strictEqual(result.train, saved.train);
-  assert.strictEqual(result.frg_pack, saved.frg_pack);
-  assert.strictEqual(result.frg, saved.frg);
-  assert.strictEqual(result.release, saved.release);
   assert.equal(result.train?.integrated_head_oid, head);
+  assert.equal(result.frg_pack, null);
+  assert.equal(result.frg, null);
+  assert.equal(result.release, null);
 });
 
-test("reconciliation projects origin tag before GitHub Release publication (#1331)", async () => {
+test("reconciliation never invokes legacy tag/publication/promotion observers (#1563)", async () => {
   const deps = shipCoordinatorDepsFromOperations(operations({
     observePublication: async () => null,
     observePromotion: async () => {
@@ -380,7 +385,7 @@ test("reconciliation projects origin tag before GitHub Release publication (#133
   }), { state });
 
   const result = await deps.reconcile(intent, checkpoint());
-  assert.deepEqual(result.tag, tagEvidence);
+  assert.equal(result.tag, null);
   assert.equal(result.publication, null);
   assert.equal(result.promotion, null);
   assert.equal(result.deployment, null);
@@ -526,7 +531,7 @@ test("observeOriginReleaseTag returns null when origin has no tag (#1331)", asyn
   assert.equal(observed, null);
 });
 
-test("ship adapter revalidates and retains a restart checkpoint after the release advanced base", async () => {
+test("ship adapter revalidates train but does not traverse retained legacy release checkpoints", async () => {
   const observed: string[] = [];
   const savedPack = {
     version: intent.version,
@@ -569,14 +574,14 @@ test("ship adapter revalidates and retains a restart checkpoint after the releas
   const result = await deps.reconcile(intent, saved);
 
   assert.equal(result.train, train);
-  assert.equal(result.frg_pack, savedPack);
-  assert.equal(result.frg, savedFrg);
-  assert.equal(result.release, release);
-  assert.equal(result.release_finish, releaseFinish);
-  assert.deepEqual(observed, [`train:${head}`, "frg:false", `release:${head}`]);
+  assert.equal(result.frg_pack, null);
+  assert.equal(result.frg, null);
+  assert.equal(result.release, null);
+  assert.equal(result.release_finish, null);
+  assert.deepEqual(observed, [`train:${head}`]);
 });
 
-test("ship adapter rejects release head drift after a prepare checkpoint", async () => {
+test("ship adapter ignores unreachable legacy release head drift (#1563)", async () => {
   const saved = checkpoint({
     train,
     frg_pack: {
@@ -600,10 +605,9 @@ test("ship adapter rejects release head drift after a prepare checkpoint", async
     observeRelease: async () => ({ prepare: changed, finish: null }),
   }), { state });
 
-  await assert.rejects(
-    deps.reconcile(intent, saved),
-    /persisted release PR identity changed/,
-  );
+  const result = await deps.reconcile(intent, saved);
+  assert.equal(result.train?.integrated_head_oid, head);
+  assert.equal(result.release, null);
 });
 
 test("ship adapter converges train through the existing train seam only when observation is incomplete", async () => {
@@ -1062,7 +1066,7 @@ async function mintHybridEvidence(opts: {
   return evidence;
 }
 
-test("ship coordinator: after (#N) observeTrain, next_action is frg_pack not train_merge (#1269)", async () => {
+test("ship coordinator delegates once immediately after observed train (#1563)", async () => {
   const store = memoryShipStore();
   let runs = 0;
   const wrap = (deps: ReturnType<typeof shipCoordinatorDepsFromOperations>) => ({
@@ -1082,13 +1086,13 @@ test("ship coordinator: after (#N) observeTrain, next_action is frg_pack not tra
   }), { state: store }));
 
   const status = await runShipCoordinator(intent, null, coordinator);
-  assert.match(status.last_error ?? "", /ship FRG: no release-eligible/);
-  assert.equal(status.lifecycle, "cooling");
+  assert.equal(status.last_error, null);
+  assert.equal(status.lifecycle, "complete");
   assert.equal(runs, 0, "must not invoke runTrain");
   assert.ok(store.status?.train, "train evidence must be persisted");
   assert.equal(store.status?.train?.integrated_head_oid, V13914_MAIN);
-  assert.equal(store.status?.next_action, "frg_pack");
-  assert.equal(store.status?.complete, false);
+  assert.equal(store.status?.next_action, "complete");
+  assert.equal(store.status?.complete, true);
 });
 
 test("observeFrg: missing latest.json for 1.39.14 returns null, not a tag-path throw (#1271)", async () => {
@@ -1207,7 +1211,7 @@ test("observeFrg: missing latest.json fail-closes when base advances during the 
   assert.equal(reads, 2, "must re-read base after the ENOENT evidence observation");
 });
 
-test("ship coordinator: proven train + missing latest.json sets next_action frg_pack (#1271)", async () => {
+test("ship coordinator ignores legacy latest.json after proven train (#1563)", async () => {
   const store = memoryShipStore();
   const emptyFs = memFs();
   let packed = 0;
@@ -1231,14 +1235,14 @@ test("ship coordinator: proven train + missing latest.json sets next_action frg_
 
   const status = await runShipCoordinator(intent13914, null, coordinator);
   assert.equal((status.last_error ?? "").includes("Cannot create or push tag"), false, status.last_error ?? "");
-  assert.match(status.last_error ?? "", /ship FRG: no release-eligible/);
-  assert.equal(status.lifecycle, "cooling");
-  assert.equal(packed, 1, "FRG pack must be the next mutation");
+  assert.equal(status.last_error, null);
+  assert.equal(status.lifecycle, "complete");
+  assert.equal(packed, 0, "legacy FRG pack must be unreachable");
   assert.ok(store.status?.train, "train evidence must be persisted");
   assert.equal(store.status?.train?.integrated_head_oid, head);
-  assert.equal(store.status?.next_action, "frg_pack");
+  assert.equal(store.status?.next_action, "complete");
   assert.equal(store.status?.frg_pack, null);
-  assert.equal(store.status?.complete, false);
+  assert.equal(store.status?.complete, true);
 });
 
 test("observe-null does not skip later ensure-tag; missing latest.json still fail-closes (#1271)", async () => {
@@ -1447,7 +1451,7 @@ test("planTrainFromMilestoneIssues: mixed open + closed R2D stay in one freeze p
   assert.deepEqual([...plan.ordered_issues].sort((a, b) => a - b), [20, 21]);
 });
 
-test("ship adapter remaining-open leftover blocks FRG pack without real gh (#1354)", async () => {
+test("ship adapter delegates milestone gating and never runs legacy FRG pack (#1563)", async () => {
   const store = memoryShipStore();
   let frgPackRuns = 0;
   const deps = shipCoordinatorDepsFromOperations(
@@ -1467,11 +1471,12 @@ test("ship adapter remaining-open leftover blocks FRG pack without real gh (#135
     withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
   };
   const status = await runShipCoordinator(intent, null, coordinator);
-  assert.match(status.last_error ?? "", /milestone v1\.34\.0 still has open issues: #1344/);
-  assert.equal(status.lifecycle, "waiting");
+  assert.equal(status.last_error, null);
+  assert.equal(status.lifecycle, "complete");
   assert.equal(frgPackRuns, 0);
   assert.ok(store.status?.train, "train must still complete");
   assert.equal(store.status?.frg_pack, null);
+  assert.ok(store.status?.complete_release);
 });
 
 test("ship-adapter remaining-open listing reuses merge-queue helpers, not freeze --limit (#1354)", () => {
@@ -1913,7 +1918,7 @@ test("convergeReleaseFinish persists fail without finish on a terminal product f
   assert.equal(reruns, 0);
 });
 
-test("coordinator wait-cap expiry keeps release_finish resumable (#1205)", async () => {
+test("coordinator bypasses legacy release-finish wait through complete-release delegation (#1563)", async () => {
   const store = memoryShipStore();
   store.status = checkpoint({
     ship_key: shipKey(intent),
@@ -1961,12 +1966,12 @@ test("coordinator wait-cap expiry keeps release_finish resumable (#1205)", async
     releaseCheckWait: pendingWait,
   }));
   const checkpointed = await runShipCoordinator(intent, null, waiting);
-  assert.equal(checkpointed.complete, false);
-  assert.equal(checkpointed.next_action, "release_finish");
+  assert.equal(checkpointed.complete, true);
+  assert.equal(checkpointed.next_action, "complete");
   assert.equal(checkpointed.last_error, null);
   assert.equal(checkpointed.release_finish, null);
   assert.equal(finishes, 0);
-  assert.equal(checks, 2);
+  assert.equal(checks, 0);
   assert.ok(!store.events.some((event) => event.status === "failed"));
 
   checks = 0;
@@ -1991,8 +1996,8 @@ test("coordinator wait-cap expiry keeps release_finish resumable (#1205)", async
   assert.equal(result.complete, true);
   assert.equal(result.next_action, "complete");
   assert.equal(result.last_error, null);
-  assert.equal(finishes, 1);
-  assert.equal(checks, 1);
+  assert.equal(finishes, 0);
+  assert.equal(checks, 0);
 });
 
 test("convergeReleaseFinish does not rerun or finish when the release PR head changes during wait (#1205)", async () => {
@@ -2432,7 +2437,7 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
   }
 });
 
-test("unresolvable candidate stops ship before FRG and leaves train evidence", async () => {
+test("ship does not resolve a legacy candidate engine after train (#1563)", async () => {
   const store = memoryShipStore();
   store.status = checkpoint({
     ship_key: shipKey(intent),
@@ -2465,16 +2470,16 @@ test("unresolvable candidate stops ship before FRG and leaves train evidence", a
     withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
   };
   const status = await runShipCoordinator(intent, null, wrapped);
-  assert.match(status.last_error ?? "", /candidate-engine identity defect/);
-  assert.equal(status.lifecycle, "cooling");
+  assert.equal(status.last_error, null);
+  assert.equal(status.lifecycle, "complete");
   assert.equal(preparedInProcess, false);
   assert.equal(store.status?.train?.integrated_head_oid, head);
   assert.equal(store.status?.frg_pack, null);
-  assert.match(store.status?.last_error ?? "", /candidate-engine identity defect/);
-  assert.equal(store.status?.next_action, "frg_pack");
+  assert.equal(store.status?.last_error, null);
+  assert.equal(store.status?.next_action, "complete");
 });
 
-test("unready candidate stops ship before leaf spawn and keeps train evidence (#1344)", async () => {
+test("ship bypasses legacy candidate readiness and leaf spawning after train (#1563)", async () => {
   const store = memoryShipStore();
   store.status = checkpoint({
     ship_key: shipKey(intent),
@@ -2513,16 +2518,16 @@ test("unready candidate stops ship before leaf spawn and keeps train evidence (#
     withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
   };
   const status = await runShipCoordinator(intent, null, wrapped);
-  assert.match(status.last_error ?? "", /readiness defect/);
-  assert.equal(status.lifecycle, "cooling");
-  assert.equal(prepareReturned, true);
+  assert.equal(status.last_error, null);
+  assert.equal(status.lifecycle, "complete");
+  assert.equal(prepareReturned, false);
   assert.equal(spawned.length, 0);
   assert.equal(store.status?.train?.integrated_head_oid, head);
   assert.equal(store.status?.frg_pack, null);
-  assert.match(store.status?.last_error ?? "", /supervised lifecycle/);
+  assert.equal(store.status?.last_error, null);
   assert.doesNotMatch(store.status?.last_error ?? "", /needs-human|DecisionRequest|AuthorityRequest/);
   assert.equal(store.status?.human_authority, false);
-  assert.equal(store.status?.next_action, "frg_pack");
+  assert.equal(store.status?.next_action, "complete");
 });
 
 test("no leaf spawn until resolve-and-prepare returns a ready root (#1344)", async () => {

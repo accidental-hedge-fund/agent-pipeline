@@ -1096,45 +1096,21 @@ test("buildPRBody: includes version, theme, date, and PR list", () => {
   assert.ok(body.includes("#203"), "PR number in body");
   assert.ok(body.includes("Release PR"), "PR title in body");
   assert.ok(body.includes("v1.5.0"), "last tag referenced");
-  assert.ok(body.includes("git tag -a v1.6.0"), "tag instructions in body");
+  assert.ok(body.includes("metadata only"), "metadata-only boundary in body");
 });
 
-test("buildPRBody: states merging is the final step and labels the tag command as a fallback", () => {
+test("buildPRBody: forbids metadata merge from claiming tag authority", () => {
   const body = buildPRBody(SAMPLE_CTX, "v1.5.0");
 
-  assert.ok(
-    /merging this pr is the final step/i.test(body),
-    "states merging is the final step",
-  );
-  assert.ok(
-    /auto-tag|auto-creates|publishes the github release/i.test(body),
-    "describes the automated tag + publish outcome",
-  );
-  assert.ok(/fallback/i.test(body), "labels the manual tag command as a fallback");
-  assert.ok(
-    body.includes(
-      'git tag -a v1.6.0 -m "v1.6.0 — Intake & backlog automation" && git push origin v1.6.0',
-    ),
-    "fallback tag command creates an annotated tag",
-  );
+  assert.match(body, /must not create a tag or GitHub Release/);
+  assert.match(body, /pipeline release 1\.6\.0/);
+  assert.match(body, /exact-candidate FRG/);
+  assert.doesNotMatch(body, /git tag|auto-tag|final step/i);
 });
 
-test("buildPRBody: names RELEASE_TAG_TOKEN and its provisioning in the fallback footer", () => {
+test("buildPRBody: names the bounded prepare-only owner", () => {
   const body = buildPRBody(SAMPLE_CTX, "v1.5.0");
-
-  assert.ok(body.includes("RELEASE_TAG_TOKEN"), "names the RELEASE_TAG_TOKEN secret");
-  assert.ok(
-    /fine-grained pat/i.test(body),
-    "describes the fine-grained PAT provisioning requirement",
-  );
-  assert.ok(
-    /contents:\s*read/i.test(body) && /contents:\s*write/i.test(body),
-    "names the contents: read + contents: write scopes",
-  );
-  assert.ok(
-    /repository actions secret/i.test(body),
-    "states it must be added as a repository Actions secret",
-  );
+  assert.match(body, /bounded `pipeline release prepare` helper/);
 });
 
 test("buildPRBody: uses placeholder when no shipped PRs", () => {
@@ -1968,7 +1944,7 @@ test("CLI: candidate-bound release dry-run rejects before any git mutation (#154
   );
   assert.notEqual(result.status, 0);
   const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.match(combined, /--dry-run cannot be combined with --packed-candidate/);
+  assert.match(combined, /--packed-candidate is reserved for legacy release ensure-tag/);
   assert.equal(fs.existsSync(marker), false, "candidate-bound dry-run must not invoke git");
 });
 

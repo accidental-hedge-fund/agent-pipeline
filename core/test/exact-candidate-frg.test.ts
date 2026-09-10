@@ -1446,6 +1446,21 @@ test("production record discovery ignores unrelated corruption but fails on rele
   await assert.rejects(() => runProductionExactCandidateFrg(input, io), /JSON/);
 });
 
+test("production wrapper rejects movement from the caller-pinned candidate before record or fixture work", async () => {
+  let inventoryCalls = 0;
+  const io = {
+    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: "owner/repo" }),
+    resolveReleaseStoreRepoDir: async () => "/primary",
+    observeOriginMainSha: async () => MOVED,
+    listRecordEpochIds: async () => { inventoryCalls++; return []; },
+  } as unknown as ProductionExactCandidateFrgIo;
+  await assert.rejects(() => runProductionExactCandidateFrg({
+    repoDir: "/linked", repository: "owner/repo", baseBranch: "main",
+    releaseVersion: "1.40.1", expectedCandidateSha: CANDIDATE,
+  }, io), /moved before exact-candidate FRG admission/);
+  assert.equal(inventoryCalls, 0);
+});
+
 test("default production composition freezes the requested profile for target domain and candidate policy", async () => {
   const calls: Array<{ repoPath?: string; profile?: string }> = [];
   const configFor = (repoPath: string, profile: string): PipelineConfig => ({

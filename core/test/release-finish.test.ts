@@ -250,6 +250,8 @@ test("release finish isolation: advance stages do not import release-finish", ()
     "merge_queue_hold.ts",
     // Operator-authorized ship composition; never imported by advance dispatch.
     "ship-adapter.ts",
+    // Independent operator release composition; never imported by advance dispatch.
+    "release-complete.ts",
     "train.ts",
   ]);
   for (const f of fs.readdirSync(stagesDir).filter((x) => x.endsWith(".ts"))) {
