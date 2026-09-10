@@ -83,6 +83,26 @@ An interrupted publication SHALL remain anchored to proven C rather than rebindi
 - **AND** it does not treat a missing head branch as missing provenance
 - **AND** a version string present on main without that validated PR proof fails closed
 
+#### Scenario: Metadata identity is one shared validator
+
+- **WHEN** release rediscovers or freshly observes a metadata PR, including a newly prepared PR and each CI-wait or pre-merge observation
+- **THEN** it accepts title `release: VERSION — THEME` with the exact version prefix and one nonempty single-line theme, including the helper title `release: VERSION — version metadata`
+- **AND** the exact final nonempty body line is `_Prepared by the bounded `pipeline release prepare` helper_` or legacy `_Prepared by `pipeline release`_`
+- **AND** the PR author login equals the freshly observed authenticated GitHub actor case-insensitively; any other nonempty login fails closed so another operator cannot resume that PR
+- **AND** number, head OID, base, headRefName, same-repo owner, state, title, and body are taken from authoritative `pr view`, not list data
+- **AND** a provenance change before merge does not call the merge helper
+
+#### Scenario: Published pending Release survives docs-push main movement
+
+- **WHEN** the annotated tag exists at C
+- **AND** the matching non-draft GitHub Release is published
+- **AND** the exact publisher run is still pending
+- **THEN** release waits and re-observes without recovery dispatch or rerun
+- **AND** origin/main may move from C to D during that wait
+- **AND** completion requires the exact run to reach terminal success
+- **AND** unknown or failed publication remains fail-closed
+- **AND** if origin/main no longer equals C, release re-observes publication before reporting tagged-stale-C; absent, draft, or unpublished state does not excuse that movement
+
 ### Requirement: Package 3 SHALL preserve bounded preparation and delegate ship
 
 Factory and merge-queue callers SHALL retain an explicit prepare-only surface that cannot finish, tag, or publish. The prepare-only map SHALL be: `pipeline release prepare VERSION`; `pipeline factory-release prepare --request`; and `pipeline merge-queue --release-when-complete`. `pipeline release finish <pr>` SHALL remain a metadata-PR merge helper and SHALL NOT tag or publish. Preparation SHALL use a dedicated worktree and SHALL never align, switch, or edit the invoking checkout. `release prepare VERSION --packed-candidate SHA` SHALL reject during argument validation before any Git command. SemVer ship SHALL perform ordinary train integration and then call the same complete release seam exactly once. Continuous ship SHALL stop after integration. Neither release nor SemVer ship completion SHALL install, promote, deploy, or retarget the released tag. Ordinary `advance`, `single`, and `loop` SHALL NOT acquire merge or tag authority through this change.

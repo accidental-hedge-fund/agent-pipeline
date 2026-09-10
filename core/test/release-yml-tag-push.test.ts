@@ -15,12 +15,12 @@ const TUGBOAT = join(__dirname, "../../examples/supervisor/shell/tugboat.sh");
 test("release.yml publishes GitHub Release on v* tag push (#1167)", () => {
   const src = readFileSync(WORKFLOW, "utf8");
   assert.match(src, /^on:\n  push:\n    tags:\n      - "v\*"\n  workflow_dispatch:\n    inputs:\n      tag:\n/m);
-  assert.match(src, /gh release create/);
-  assert.match(src, /--verify-tag/);
-  assert.match(src, /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/tags\/\$\{TAG\}"/);
+  assert.match(src, /node --experimental-strip-types core\/scripts\/publish-github-release\.ts/);
   assert.match(src, /workflow_dispatch:/);
   assert.match(src, /candidate:/);
   assert.doesNotMatch(src, /gh release view .*&>\/dev\/null/);
+  assert.doesNotMatch(src, /^\s*gh release create/m);
+  assert.doesNotMatch(src, /^\s*gh release edit/m);
 });
 
 test("release.yml recovery dispatch shares the push publication job and exact tag/candidate inputs (#1563)", () => {
@@ -58,13 +58,11 @@ test("release.yml order is tag checkout, root/core guards, main=C, publication, 
 test("release.yml rejects a same-C tag whose notes diverge from TAG and C (#1563)", () => {
   const src = readFileSync(WORKFLOW, "utf8");
   const publish = src.slice(src.indexOf("Publish GitHub Release from the annotated tag"));
-  const create = publish.indexOf("gh release create");
-  const edit = publish.indexOf("gh release edit");
-  const mismatch = publish.indexOf("annotation does not match required notes");
-  assert.ok(mismatch >= 0, "publish step must require exact TAG/C notes");
-  assert.ok(create >= 0 && edit >= 0, "publish step must still create or edit the Release");
-  assert.ok(mismatch < create && mismatch < edit, "exact notes must be checked before Release create/edit");
-  assert.match(publish, /Verified exact-candidate release at \$\{candidate\}/);
+  const notesDump = publish.indexOf("git tag -l \"${TAG}\" --format='%(contents)' > /tmp/notes.md");
+  const helper = publish.indexOf("core/scripts/publish-github-release.ts");
+  assert.ok(notesDump >= 0, "publish step must dump annotated notes");
+  assert.ok(helper >= 0, "publish step must invoke the publisher helper");
+  assert.ok(notesDump < helper, "exact notes file must exist before create/edit");
   const C = "c".repeat(40);
   assert.equal(releaseTagNotes("1.2.3", C), `v1.2.3\n\nVerified exact-candidate release at ${C}.`);
   assert.match(publish, /outputs\.candidate/);

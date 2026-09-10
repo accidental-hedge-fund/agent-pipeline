@@ -5,6 +5,7 @@ import {
   classifyPublisherRuns,
   exactHeadCheckRunsState,
   metadataChecksState,
+  parsePublisherRunRows,
   parsePublisherWorkflowRunPages,
   realCompleteReleaseDeps,
   releaseTagNotes,
@@ -71,6 +72,70 @@ function deps(over: Partial<CompleteReleaseDeps> = {}): CompleteReleaseDeps & { 
     ...over,
   };
   return Object.assign(d, { calls });
+}
+
+const METADATA_PROVENANCE = "_Prepared by the bounded `pipeline release prepare` helper_";
+const LEGACY_METADATA_PROVENANCE = "_Prepared by `pipeline release`_";
+
+function metadataPrPayload(over: Record<string, unknown> = {}) {
+  return {
+    number: 31,
+    title: "release: 1.2.3 — version metadata",
+    body: `Version metadata only for v1.2.3.\n\n${METADATA_PROVENANCE}`,
+    baseRefName: "main",
+    headRefName: "release/v1.2.3",
+    headRefOid: A,
+    author: { login: "pipeline-bot", is_bot: true },
+    state: "MERGED",
+    isCrossRepository: false,
+    headRepositoryOwner: { login: "o" },
+    mergeCommit: { oid: C },
+    ...over,
+  };
+}
+
+function metadataObserverCommand(opts: {
+  list: unknown;
+  view: unknown;
+  calls?: string[];
+  checksHead?: string;
+  actor?: string;
+}) {
+  return async (_cwd: string, file: string, args: string[]) => {
+    const joined = args.join(" ");
+    opts.calls?.push(`${file} ${joined}`);
+    if (file === "gh" && args[0] === "api" && args[1] === "user") return opts.actor ?? "pipeline-bot";
+    if (file === "gh" && args[0] === "pr" && args[1] === "list") {
+      assert.ok(args.includes("--search"));
+      assert.ok(!args.includes("--head"));
+      const json = args[args.indexOf("--json") + 1] ?? "";
+      assert.ok(json.includes("body"));
+      assert.ok(json.includes("headRefName"));
+      assert.ok(json.includes("author"));
+      assert.ok(json.includes("isCrossRepository"));
+      assert.ok(json.includes("headRepositoryOwner"));
+      return JSON.stringify(opts.list);
+    }
+    if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+      const json = args[args.indexOf("--json") + 1] ?? "";
+      assert.ok(json.includes("body"));
+      assert.ok(json.includes("headRefName"));
+      assert.ok(json.includes("author"));
+      assert.ok(json.includes("title"));
+      return JSON.stringify(opts.view);
+    }
+    if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+      return JSON.stringify([{
+        check_runs: [{ name: "ci", head_sha: opts.checksHead ?? A, status: "completed", conclusion: "success" }],
+      }]);
+    }
+    if (args[0] === "fetch" && joined.includes("release/v1.2.3")) throw new Error("branch deleted");
+    if (args[0] === "fetch" && joined.includes("pull/31/head")) return "";
+    if (args[0] === "rev-parse" && joined.includes("release-metadata")) return A;
+    if (args[0] === "show" && joined.includes("package.json")) return JSON.stringify({ version: "1.2.3" });
+    if (args[0] === "diff") return "package.json\ncore/package.json";
+    throw new Error(`unexpected ${file} ${joined}`);
+  };
 }
 
 test("complete release orders metadata merge before C/FRG/tag/publication", async () => {
@@ -464,16 +529,11 @@ test("production metadata observer discovers by title and fetches a deleted head
     if (file === "gh" && args[0] === "pr" && args[1] === "list") {
       assert.ok(args.includes("--search"));
       assert.ok(!args.includes("--head"));
-      return JSON.stringify([{
-        number: 31, state: "MERGED", baseRefName: "main", headRefOid: A,
-        mergeCommit: { oid: C }, title: "release: 1.2.3 — version metadata",
-      }]);
+      return JSON.stringify([metadataPrPayload()]);
     }
+    if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
     if (file === "gh" && args[0] === "pr" && args[1] === "view") {
-      return JSON.stringify({
-        number: 31, state: "MERGED", baseRefName: "main", headRefOid: A,
-        mergeCommit: { oid: C }, title: "release: 1.2.3 — version metadata",
-      });
+      return JSON.stringify(metadataPrPayload());
     }
     if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
       return JSON.stringify([{ check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }] }]);
@@ -498,16 +558,11 @@ test("production metadata observer fails closed on empty or wrong-head CI", asyn
   const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
     const joined = args.join(" ");
     if (file === "gh" && args[0] === "pr" && args[1] === "list") {
-      return JSON.stringify([{
-        number: 31, state: "MERGED", baseRefName: "main", headRefOid: A,
-        mergeCommit: { oid: C }, title: "release: 1.2.3 — version metadata",
-      }]);
+      return JSON.stringify([metadataPrPayload()]);
     }
+    if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
     if (file === "gh" && args[0] === "pr" && args[1] === "view") {
-      return JSON.stringify({
-        number: 31, state: "MERGED", baseRefName: "main", headRefOid: A,
-        mergeCommit: { oid: C }, title: "release: 1.2.3 — version metadata",
-      });
+      return JSON.stringify(metadataPrPayload());
     }
     if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
       return JSON.stringify([{ check_runs: [{ name: "ci", head_sha: B, status: "completed", conclusion: "success" }] }]);
@@ -902,13 +957,13 @@ test("finishMetadata requires nonempty green exact-head CI when the PR merges du
       if (args[0] === "rev-parse") return A;
       if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
       if (args[0] === "diff") return "package.json\ncore/package.json";
+      if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
       if (file === "gh" && args[0] === "pr" && args[1] === "view") {
         views++;
-        return JSON.stringify({
+        return JSON.stringify(metadataPrPayload({
           state: views === 1 ? "OPEN" : "MERGED",
-          headRefOid: A,
-          baseRefName: "main",
-        });
+          mergeCommit: views === 1 ? null : { oid: C },
+        }));
       }
       if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
         return JSON.stringify([{ check_runs: views === 1
@@ -935,13 +990,13 @@ test("finishMetadata requires nonempty green exact-head CI when the PR merges du
       if (args[0] === "rev-parse") return A;
       if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
       if (args[0] === "diff") return "package.json\ncore/package.json";
+      if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
       if (file === "gh" && args[0] === "pr" && args[1] === "view") {
         views++;
-        return JSON.stringify({
+        return JSON.stringify(metadataPrPayload({
           state: views === 1 ? "OPEN" : "MERGED",
-          headRefOid: A,
-          baseRefName: "main",
-        });
+          mergeCommit: views === 1 ? null : { oid: C },
+        }));
       }
       if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
         return JSON.stringify([{ check_runs: views === 1
@@ -956,5 +1011,521 @@ test("finishMetadata requires nonempty green exact-head CI when the PR merges du
   });
   assert.equal(finished.state, "MERGED");
   assert.equal(finished.merge_commit_oid, C);
-  assert.equal(finishCalls, 1);
+  assert.equal(finishCalls, 0);
+});
+
+test("resumed publication loop completes after recovery advances main C to D", async () => {
+  let recovered = false;
+  let head = C;
+  const d = deps({
+    async observeOriginHead() { d.calls.push("head"); return head; },
+    async versionsAt() { return { root: "1.2.3", core: "1.2.3" }; },
+    async resolveMilestones() { throw new Error("must not re-read milestone"); },
+    async observeTag() { return { annotated: true, peeled_commit: C, annotation: releaseTagNotes("1.2.3", C) }; },
+    async observePublication() {
+      d.calls.push("publication");
+      if (!recovered) {
+        return { tag: "v1.2.3", draft: true, published_at: null, workflow_conclusion: "failure" as const };
+      }
+      return { tag: "v1.2.3", draft: false, published_at: "2026-09-10T00:00:00Z", workflow_conclusion: "success" as const };
+    },
+    async recoverPublication() {
+      d.calls.push("recover-publication");
+      recovered = true;
+      head = D;
+      return true;
+    },
+    publicationAttempts: 3,
+  });
+  const result = await runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d);
+  assert.equal(result?.candidate_sha, C);
+  assert.equal(result?.already_complete, true);
+  assert.equal(d.calls.filter((call) => call === "recover-publication").length, 1);
+  assert.ok(!d.calls.some((call) => call.startsWith("tag:") || call.startsWith("frg:")));
+});
+
+test("fresh-tag publication loop completes after recovery advances main C to D", async () => {
+  let recovered = false;
+  let afterRecovery = false;
+  const d = deps({
+    async observeOriginHead() {
+      d.calls.push("head");
+      if (afterRecovery) return D;
+      return d.calls.includes("finish-metadata") ? C : B;
+    },
+    async observeTag() {
+      d.calls.push("observe-tag");
+      return d.calls.some((call) => call.startsWith("tag:"))
+        ? { annotated: true, peeled_commit: C, annotation: releaseTagNotes("1.2.3", C) }
+        : null;
+    },
+    async createAnnotatedTag(_tag, candidate) { d.calls.push(`tag:${candidate}`); },
+    async observePublication() {
+      d.calls.push("publication");
+      if (!d.calls.some((call) => call.startsWith("tag:"))) return null;
+      if (!recovered) return null;
+      return { tag: "v1.2.3", draft: false, published_at: "2026-09-10T00:00:00Z", workflow_conclusion: "success" as const };
+    },
+    async recoverPublication() {
+      d.calls.push("recover-publication");
+      recovered = true;
+      afterRecovery = true;
+      return true;
+    },
+    publicationAttempts: 3,
+  });
+  const result = await runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d);
+  assert.equal(result?.candidate_sha, C);
+  assert.equal(d.calls.filter((call) => call === "recover-publication").length, 1);
+  assert.equal(d.calls.filter((call) => call.startsWith("tag:")).length, 1);
+});
+
+test("main movement during post-FRG containment never reaches tag mutation", async () => {
+  let moved = false;
+  const d = deps({
+    async observeOriginHead() {
+      d.calls.push("head");
+      if (moved) return D;
+      return d.calls.includes("finish-metadata") ? C : B;
+    },
+    async commitContained() {
+      d.calls.push("containment");
+      if (d.calls.some((call) => call.startsWith("frg:"))) moved = true;
+      return true;
+    },
+  });
+  await assert.rejects(
+    () => runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d),
+    /moved from candidate/,
+  );
+  assert.ok(!d.calls.some((call) => call.startsWith("tag:")));
+});
+
+const DOCUMENTED_WORKFLOW_CONCLUSIONS = [
+  "action_required", "cancelled", "failure", "neutral", "skipped", "stale", "startup_failure", "success", "timed_out",
+] as const;
+const RETRYABLE_WORKFLOW_CONCLUSIONS = new Set(["failure", "timed_out", "startup_failure"]);
+
+test("publisher classification allows only explicit status/conclusion combinations", () => {
+  const row = (over: Record<string, unknown>) => ({
+    databaseId: 1, attempt: 1, event: "push", headBranch: "v1.2.3", headSha: C,
+    status: "completed", conclusion: "success", ...over,
+  });
+  for (const conclusion of DOCUMENTED_WORKFLOW_CONCLUSIONS) {
+    const classified = classifyPublisherRuns([row({ conclusion })], "v1.2.3", C);
+    if (conclusion === "success") assert.equal(classified.class, "successful", conclusion);
+    else if (RETRYABLE_WORKFLOW_CONCLUSIONS.has(conclusion)) assert.equal(classified.class, "failed", conclusion);
+    else assert.equal(classified.class, "unknown", conclusion);
+  }
+  assert.equal(classifyPublisherRuns([row({ conclusion: "mystery" })], "v1.2.3", C).class, "unknown");
+  assert.equal(classifyPublisherRuns([row({ conclusion: null })], "v1.2.3", C).class, "unknown");
+  assert.equal(classifyPublisherRuns([row({ status: "in_progress", conclusion: "failure" })], "v1.2.3", C).class, "unknown");
+  assert.equal(classifyPublisherRuns([row({ status: "queued", conclusion: null })], "v1.2.3", C).class, "pending");
+  assert.equal(classifyPublisherRuns([row({ status: "waiting", conclusion: null })], "v1.2.3", C).class, "pending");
+});
+
+test("unknown publisher conclusion mystery never reruns or dispatches", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  for (const conclusion of ["mystery", "cancelled", "neutral", null] as const) {
+    const state = {
+      runs: [{
+        databaseId: 9, event: "workflow_dispatch", headBranch: tag, headSha: C,
+        status: "completed", conclusion, attempt: 1,
+      }] as unknown[],
+      ghCalls: [] as string[],
+    };
+    const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+      wait: async () => {},
+      dispatchObserveAttempts: 2,
+      ...memoryPublisherRecovery(),
+      command: publisherCommand(tag, notes, state),
+    });
+    await assert.rejects(() => adapter.recoverPublication(tag, C), /unknown/);
+    assert.equal(
+      state.ghCalls.filter((call) => call.startsWith("run rerun") || call.includes("workflow run")).length,
+      0,
+      String(conclusion),
+    );
+  }
+});
+
+test("publisher workflow total_count must be a JSON number and duplicate run IDs fail closed", () => {
+  const run = {
+    id: 1, event: "push", head_branch: "v1.2.3", head_sha: C,
+    status: "completed", conclusion: "success", run_attempt: 1,
+  };
+  for (const total_count of [null, false, "1", "", "0", Number.NaN]) {
+    assert.throws(
+      () => parsePublisherWorkflowRunPages([{ total_count, workflow_runs: total_count === "1" ? [run] : [] }], "v1.2.3"),
+      /unknown shape/,
+      String(total_count),
+    );
+  }
+  assert.throws(
+    () => parsePublisherWorkflowRunPages([{ total_count: 1, workflow_runs: [run, run] }], "v1.2.3"),
+    /duplicate/,
+  );
+  assert.throws(
+    () => parsePublisherWorkflowRunPages([
+      { total_count: 1, workflow_runs: [run] },
+      { total_count: 1, workflow_runs: [run] },
+    ], "v1.2.3"),
+    /duplicate/,
+  );
+});
+
+test("coerced total_count and duplicate page IDs never dispatch or rerun", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  const run = {
+    id: 1, event: "push", head_branch: "v0.0.1", head_sha: C,
+    status: "completed", conclusion: "success", run_attempt: 1,
+  };
+  const payloads = [
+    [{ total_count: null, workflow_runs: [] }],
+    [{ total_count: false, workflow_runs: [] }],
+    [{ total_count: "0", workflow_runs: [] }],
+    [{ total_count: 2, workflow_runs: [run, run] }],
+    [
+      { total_count: 1, workflow_runs: [run] },
+      { total_count: 1, workflow_runs: [run] },
+    ],
+  ];
+  for (const pages of payloads) {
+    const ghCalls: string[] = [];
+    const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+      wait: async () => {},
+      dispatchObserveAttempts: 2,
+      ...memoryPublisherRecovery(),
+      command: async (cwd, file, args) => {
+        if (file === "gh") ghCalls.push(args.join(" "));
+        if (file === "gh" && isPublisherRunList(args)) return JSON.stringify(pages);
+        return publisherCommand(tag, notes, { runs: [], ghCalls: [] })(cwd, file, args);
+      },
+    });
+    await assert.rejects(() => adapter.recoverPublication(tag, C));
+    assert.equal(
+      ghCalls.filter((call) => call.startsWith("run rerun") || call.includes("workflow run")).length,
+      0,
+      JSON.stringify(pages[0]),
+    );
+  }
+});
+
+test("metadata reuse rejects attacker title match with wrong branch body author or owner", async () => {
+  const attackers = [
+    metadataPrPayload({ headRefName: "attacker/release" }),
+    metadataPrPayload({ body: "looks like a release" }),
+    metadataPrPayload({ author: { login: "", is_bot: false } }),
+    metadataPrPayload({ isCrossRepository: true, headRepositoryOwner: { login: "attacker" } }),
+    metadataPrPayload({ headRepositoryOwner: { login: "attacker" } }),
+  ];
+  for (const view of attackers) {
+    const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+      command: metadataObserverCommand({ list: [metadataPrPayload()], view }),
+    });
+    await assert.rejects(() => adapter.observeMetadata("1.2.3", "main"), /metadata PR/);
+  }
+  const ambiguous = [
+    { title: "release: 1.2.3 extra — version metadata" },
+    { title: "release: 1.2.30 — version metadata" },
+    { title: "release: 1.2.3 — version metadata\nextra" },
+    { title: "release: 1.2.3 — " },
+    { title: "release: 1.2.3 — Factory — extra dash" },
+  ];
+  for (const over of ambiguous) {
+    const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+      command: metadataObserverCommand({
+        list: [metadataPrPayload(over)],
+        view: metadataPrPayload(over),
+      }),
+    });
+    assert.equal(await adapter.observeMetadata("1.2.3", "main"), null, String(over.title));
+  }
+});
+
+test("actual historical PR 1347 is accepted despite deleted source branch", async () => {
+  const view = {
+    number: 1347,
+    title: "release: 1.40.0 — v1.40.0",
+    body: [
+      "## Release: v1.40.0 — v1.40.0",
+      "",
+      "**This PR changes version metadata only.** Merging it must not create a tag or GitHub Release.",
+      "",
+      LEGACY_METADATA_PROVENANCE,
+    ].join("\n"),
+    baseRefName: "main",
+    headRefName: "release/v1.40.0",
+    headRefOid: A,
+    author: { login: "comamitc", is_bot: false },
+    state: "MERGED",
+    isCrossRepository: false,
+    headRepositoryOwner: { login: "accidental-hedge-fund" },
+    mergeCommit: { oid: C },
+  };
+  const calls: string[] = [];
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "accidental-hedge-fund/agent-pipeline" }, {
+    command: async (_cwd, file, args) => {
+      const joined = args.join(" ");
+      if (file === "gh" && args[0] === "api" && args[1] === "user") return "comamitc";
+      if (file === "gh" && args[0] === "pr" && args[1] === "list") {
+        calls.push(`${file} ${joined}`);
+        return JSON.stringify([view]);
+      }
+      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+        calls.push(`${file} ${joined}`);
+        assert.equal(String(args[2]), "1347");
+        const json = args[args.indexOf("--json") + 1] ?? "";
+        assert.equal(json, "number,title,body,baseRefName,headRefName,headRefOid,author,state,isCrossRepository,headRepositoryOwner,mergeCommit");
+        return JSON.stringify(view);
+      }
+      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+        return JSON.stringify([{ check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }] }]);
+      }
+      if (args[0] === "fetch" && joined.includes("release/v1.40.0")) throw new Error("branch deleted");
+      if (args[0] === "fetch" && joined.includes("pull/1347/head")) return "";
+      if (args[0] === "rev-parse" && joined.includes("release-metadata")) return A;
+      if (args[0] === "show") return JSON.stringify({ version: "1.40.0" });
+      if (args[0] === "diff") return "package.json\ncore/package.json";
+      throw new Error(`unexpected ${file} ${joined}`);
+    },
+  });
+  const observed = await adapter.observeMetadata("1.40.0", "main");
+  assert.equal(observed?.pr, 1347);
+  assert.equal(observed?.state, "MERGED");
+  assert.equal(observed?.head_oid, A);
+  assert.ok(calls.some((call) => call.includes("pr view 1347")));
+
+  const mismatchedView = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    command: metadataObserverCommand({
+      list: [metadataPrPayload()],
+      view: metadataPrPayload({ headRefName: "attacker/from-view" }),
+    }),
+  });
+  await assert.rejects(() => mismatchedView.observeMetadata("1.2.3", "main"), /metadata PR/);
+});
+
+test("nonempty wrong metadata author is rejected against the current actor", async () => {
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    command: metadataObserverCommand({
+      list: [metadataPrPayload({ author: { login: "attacker", is_bot: false } })],
+      view: metadataPrPayload({ author: { login: "attacker", is_bot: false } }),
+      actor: "pipeline-bot",
+    }),
+  });
+  await assert.rejects(() => adapter.observeMetadata("1.2.3", "main"), /metadata PR/);
+});
+
+test("provenance marker embedded before an attacker suffix is rejected", async () => {
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    command: metadataObserverCommand({
+      list: [metadataPrPayload()],
+      view: metadataPrPayload({
+        body: `Version metadata only for v1.2.3.\n\n${METADATA_PROVENANCE}\nattacker-owned footer`,
+      }),
+    }),
+  });
+  await assert.rejects(() => adapter.observeMetadata("1.2.3", "main"), /metadata PR/);
+});
+
+test("ordinary themed metadata PR is rediscovered after interruption with zero second gh pr create", async () => {
+  const themed = metadataPrPayload({
+    title: "release: 1.2.3 — Factory reliability",
+    state: "OPEN",
+    mergeCommit: null,
+  });
+  const calls: string[] = [];
+  const command = metadataObserverCommand({ list: [themed], view: themed, calls });
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command });
+  const first = await adapter.observeMetadata("1.2.3", "main");
+  const second = await adapter.observeMetadata("1.2.3", "main");
+  assert.equal(first?.pr, 31);
+  assert.deepEqual(second, first);
+  assert.equal(calls.filter((call) => call.includes("pr create")).length, 0);
+
+  const d = deps({
+    async observeMetadata() { d.calls.push("observe-metadata"); return { pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null }; },
+    async prepareMetadata() { throw new Error("must not create a second metadata PR"); },
+  });
+  await runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d);
+  assert.ok(!d.calls.includes("prepare-metadata"));
+  assert.ok(d.calls.includes("finish-metadata"));
+});
+
+test("finishMetadata rejects provenance change before merge and never calls finishPr", async () => {
+  let views = 0;
+  let finishCalls = 0;
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    publicationAttempts: 3,
+    finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
+    command: async (_cwd, file, args) => {
+      const joined = args.join(" ");
+      if (args[0] === "fetch") return "";
+      if (args[0] === "rev-parse") return A;
+      if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
+      if (args[0] === "diff") return "package.json\ncore/package.json";
+      if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
+      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+        views++;
+        return JSON.stringify(metadataPrPayload({
+          state: "OPEN",
+          mergeCommit: null,
+          body: views === 1
+            ? `Version metadata only for v1.2.3.\n\n${METADATA_PROVENANCE}`
+            : `Version metadata only for v1.2.3.\n\n${METADATA_PROVENANCE}\nattacker-owned footer`,
+        }));
+      }
+      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+        return JSON.stringify([{
+          check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }],
+        }]);
+      }
+      throw new Error(`unexpected ${file} ${joined}`);
+    },
+  });
+  await assert.rejects(
+    () => adapter.finishMetadata({ pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null }),
+    /metadata PR/,
+  );
+  assert.equal(finishCalls, 0);
+  assert.equal(views, 2);
+});
+
+test("published pending Release waits through main C to D without recovery on both paths", async () => {
+  const timeline = [
+    { draft: false, published_at: "2026-09-10T00:00:00Z", workflow_conclusion: "pending" as const, head: C },
+    { draft: false, published_at: "2026-09-10T00:00:00Z", workflow_conclusion: "pending" as const, head: D },
+    { draft: false, published_at: "2026-09-10T00:00:00Z", workflow_conclusion: "success" as const, head: D },
+  ];
+  for (const path of ["existing-tag", "fresh-tag"] as const) {
+    let step = 0;
+    const d = deps({
+      async observeOriginHead() {
+        d.calls.push("head");
+        if (path === "fresh-tag" && !d.calls.some((call) => call.startsWith("tag:"))) {
+          return d.calls.includes("finish-metadata") ? C : B;
+        }
+        return timeline[Math.min(step, timeline.length - 1)]!.head;
+      },
+      async versionsAt(commit) {
+        return commit === B ? { root: "1.2.2", core: "1.2.2" } : { root: "1.2.3", core: "1.2.3" };
+      },
+      async resolveMilestones() {
+        if (path === "existing-tag") throw new Error("must not re-read milestone");
+        return [milestone()];
+      },
+      async observeTag() {
+        if (path === "existing-tag") return { annotated: true, peeled_commit: C, annotation: releaseTagNotes("1.2.3", C) };
+        return d.calls.some((call) => call.startsWith("tag:"))
+          ? { annotated: true, peeled_commit: C, annotation: releaseTagNotes("1.2.3", C) }
+          : null;
+      },
+      async createAnnotatedTag(_tag, candidate) { d.calls.push(`tag:${candidate}`); },
+      async observePublication() {
+        d.calls.push("publication");
+        if (path === "fresh-tag" && !d.calls.some((call) => call.startsWith("tag:"))) return null;
+        const row = timeline[Math.min(step, timeline.length - 1)]!;
+        return { tag: "v1.2.3", draft: row.draft, published_at: row.published_at, workflow_conclusion: row.workflow_conclusion };
+      },
+      async recoverPublication() { throw new Error("must not recover published pending"); },
+      async wait() { d.calls.push("wait"); step++; },
+      publicationAttempts: 4,
+    });
+    const result = await runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d);
+    assert.equal(result?.candidate_sha, C, path);
+    assert.equal(result?.already_complete, true, path);
+    assert.equal(d.calls.filter((call) => call === "recover-publication").length, 0, path);
+    assert.ok(step >= 2, path);
+    if (path === "existing-tag") {
+      assert.ok(!d.calls.some((call) => call.startsWith("frg:") || call.startsWith("tag:")), path);
+    } else {
+      assert.equal(d.calls.filter((call) => call.startsWith("tag:")).length, 1, path);
+      assert.equal(d.calls.filter((call) => call.startsWith("frg:")).length, 1, path);
+    }
+  }
+});
+
+test("publication then head race re-observes before tagged-stale-C", async () => {
+  let pubs = 0;
+  const success = deps({
+    async observeOriginHead() { return D; },
+    async versionsAt() { return { root: "1.2.3", core: "1.2.3" }; },
+    async resolveMilestones() { throw new Error("must not re-read milestone"); },
+    async observeTag() { return { annotated: true, peeled_commit: C, annotation: releaseTagNotes("1.2.3", C) }; },
+    async observePublication() {
+      pubs++;
+      if (pubs < 3) {
+        return { tag: "v1.2.3", draft: false, published_at: "2026-09-10T00:00:00Z", workflow_conclusion: "pending" as const };
+      }
+      return { tag: "v1.2.3", draft: false, published_at: "2026-09-10T00:00:00Z", workflow_conclusion: "success" as const };
+    },
+    async recoverPublication() { throw new Error("must not recover"); },
+  });
+  const completed = await runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, success);
+  assert.equal(completed?.already_complete, true);
+  assert.ok(pubs >= 3);
+
+  pubs = 0;
+  const stale = deps({
+    async observeOriginHead() { return D; },
+    async versionsAt() { return { root: "1.2.3", core: "1.2.3" }; },
+    async resolveMilestones() { throw new Error("must not re-read milestone"); },
+    async observeTag() { return { annotated: true, peeled_commit: C, annotation: releaseTagNotes("1.2.3", C) }; },
+    async observePublication() {
+      pubs++;
+      if (pubs < 3) {
+        return { tag: "v1.2.3", draft: false, published_at: "2026-09-10T00:00:00Z", workflow_conclusion: "pending" as const };
+      }
+      return { tag: "v1.2.3", draft: true, published_at: null, workflow_conclusion: "pending" as const };
+    },
+    async recoverPublication() { throw new Error("must not recover after unpublished main movement"); },
+  });
+  await assert.rejects(() => runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, stale), /tagged-stale-C/);
+  assert.ok(!stale.calls.some((call) => call.startsWith("frg:") || call.startsWith("tag:") || call === "recover-publication"));
+});
+
+test("numeric string workflow-run ids fail closed before success or rerun", async () => {
+  const tag = "v1.2.3";
+  assert.throws(
+    () => parsePublisherRunRows([{
+      databaseId: "11", attempt: 1, event: "push", headBranch: tag, headSha: C,
+      status: "completed", conclusion: "success",
+    }], tag),
+    /malformed/,
+  );
+  assert.throws(
+    () => parsePublisherWorkflowRunPages([{
+      total_count: 1,
+      workflow_runs: [{
+        id: "11", event: "push", head_branch: tag, head_sha: C,
+        status: "completed", conclusion: "success", run_attempt: 1,
+      }],
+    }], tag),
+    /malformed/,
+  );
+  const notes = releaseTagNotes("1.2.3", C);
+  const ghCalls: string[] = [];
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    dispatchObserveAttempts: 2,
+    ...memoryPublisherRecovery(),
+    command: async (cwd, file, args) => {
+      if (file === "gh") ghCalls.push(args.join(" "));
+      if (file === "gh" && isPublisherRunList(args)) {
+        return JSON.stringify([{
+          total_count: 1,
+          workflow_runs: [{
+            id: "11", event: "push", head_branch: tag, head_sha: C,
+            status: "completed", conclusion: "failure", run_attempt: "1",
+          }],
+        }]);
+      }
+      return publisherCommand(tag, notes, { runs: [], ghCalls: [] })(cwd, file, args);
+    },
+  });
+  await assert.rejects(() => adapter.recoverPublication(tag, C), /malformed/);
+  assert.equal(ghCalls.filter((call) => call.startsWith("run rerun") || call.includes("workflow run")).length, 0);
 });

@@ -5556,7 +5556,7 @@ async function main(): Promise<void> {
       if (!opts.dryRun) {
         reportMechanicalFault(defaultRecoverySupervisorReport, {
           operation: prepareOnly ? "release_prepare" : "release_complete",
-          form_id: "release",
+          form_id: prepareOnly ? "release.prepare" : "release",
           message,
           fault: "mechanical",
           ...mintObservationIdentity({ domain: localCfg.domain, repository: localCfg.repo }),

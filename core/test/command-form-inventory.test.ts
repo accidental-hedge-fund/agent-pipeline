@@ -208,6 +208,14 @@ test("prepare-only callers stay bounded and ordinary drives have no merge or tag
   assert.doesNotMatch(PIPELINE_SRC, /alignReleaseCheckoutToCandidate/);
 });
 
+test("prepare-only release faults use inventory form id release.prepare", () => {
+  assert.equal(lookupCommandForm("release.prepare")?.id, "release.prepare");
+  assert.match(
+    PIPELINE_SRC,
+    /operation: prepareOnly \? "release_prepare" : "release_complete",\s*form_id: prepareOnly \? "release\.prepare" : "release"/,
+  );
+});
+
 test("dry-run forms do not inherit supervised-lifecycle from the apply/drive form", () => {
   for (const keyword of ["train", "intake", "decompose", "sweep", "roadmap", "engine-promote", "grill", "release"]) {
     const dry = lookupCommandForm(`${keyword}.dry-run`);
