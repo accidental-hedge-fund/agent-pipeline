@@ -220,6 +220,50 @@ export function fingerprintEvidence(evidence: string): string {
   return normalizeEvidenceIdentity(evidence);
 }
 
+/** Read-only proof that the current item block reached supervisor-owned exhaustion. */
+export function currentWorkflowEngineExhaustion(
+  ledger: LoopLedger,
+  itemId: string,
+): { advanceRunId: string; stage: string | null; prNumber: number | null; headSha: string | null } | null {
+  const item = ledger.items[itemId];
+  if (!item || item.state !== "blocked" || item.blocked_theme !== "workflow-engine-defect" ||
+      typeof item.evidence_fingerprint !== "string" || item.evidence_fingerprint === "" ||
+      typeof item.advance_run_id !== "string" || item.advance_run_id === "") return null;
+  const generation = item.history.at(-1);
+  if (!generation || generation.from !== "in_progress" || generation.to !== "blocked" ||
+      generation.theme !== item.blocked_theme || typeof generation.evidence !== "string" ||
+      fingerprintEvidence(generation.evidence) !== item.evidence_fingerprint) return null;
+  const cooling = ledger.item_cooling?.[itemId] ??
+    (ledger.cooling?.item_id === itemId ? ledger.cooling : null);
+  const identity = item.last_verified_identity;
+  const hasExplicitEpoch = Object.prototype.hasOwnProperty.call(item, "blocker_candidate_epoch");
+  const explicitEpoch = item.blocker_candidate_epoch?.trim() ?? "";
+  const explicitHead = item.blocker_candidate_head?.trim() ?? "";
+  const logicalEpoch = identity && Object.prototype.hasOwnProperty.call(identity, "logical_candidate_epoch")
+    ? identity.logical_candidate_epoch?.trim() ?? ""
+    : "";
+  if (!hasExplicitEpoch || !/^[0-9a-f]{40}$/.test(explicitEpoch) || !/^[0-9a-f]{40}$/.test(explicitHead) ||
+      identity === undefined || explicitHead !== identity.head_sha.trim() ||
+      (logicalEpoch !== "" && explicitEpoch !== logicalEpoch)) return null;
+  const canonicalTime = (value: string): number | null => {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) && new Date(parsed).toISOString() === value ? parsed : null;
+  };
+  const generationTime = canonicalTime(generation.time);
+  const coolingTime = cooling ? canonicalTime(cooling.time) : null;
+  const lifecycleTime = ledger.lifecycle ? canonicalTime(ledger.lifecycle.updated_at) : null;
+  if (!cooling || cooling.item_id !== itemId || cooling.reason !== "strategy_cursor_exhausted" || cooling.theme !== item.blocked_theme ||
+      cooling.candidate_epoch !== explicitEpoch || ledger.lifecycle?.state !== "cooling" ||
+      generationTime === null || coolingTime === null || lifecycleTime === null ||
+      coolingTime <= generationTime || lifecycleTime < coolingTime) return null;
+  return {
+    advanceRunId: item.advance_run_id,
+    stage: typeof item.current_stage === "string" ? item.current_stage : null,
+    prNumber: identity?.pr_number ?? null,
+    headSha: identity?.head_sha.trim() || null,
+  };
+}
+
 /** Stable recovery-action idempotency key. Candidate identity distinguishes
  *  a new head/base or a later block occurrence while retaining the evidence
  *  fingerprint as a fail-closed guard against accidental identity reuse. */

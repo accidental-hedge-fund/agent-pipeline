@@ -56,6 +56,7 @@ import {
 import type { DurableLoopRunHandoff, LoopRunReadyContext } from "./handoff.ts";
 import { LOOP_RUN_HANDOFF_KIND, LOOP_RUN_HANDOFF_SCHEMA_VERSION } from "./handoff.ts";
 import {
+  PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR_ENV,
   PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV,
   packLoopHeartbeatCadenceMs,
 } from "./pack-loop-liveness.ts";
@@ -1952,6 +1953,7 @@ async function executeBlockedRecovery(
     };
     let episode = resumeEpisodeFromAttempts(ledger.recovery_attempts, episodeKey) ?? emptyEpisode(episodeKey, deps.store.now().toISOString());
     const isApplicable = (recipe: RecoveryRecipe): boolean => {
+      if (recipe === "repair_pipeline_item" && deps.store.env[PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR_ENV] === "1") return false;
       return recoveryRecipeApplicability({
         action: recipe,
         blockerClass: item.blocked_theme!,
@@ -1964,7 +1966,8 @@ async function executeBlockedRecovery(
       item.blocked_theme === "review-findings" &&
       lastMatching?.action === "unlink_engine_scratch" &&
       hasCandidateHead &&
-      policy.recipes.includes("repair_pipeline_item");
+      policy.recipes.includes("repair_pipeline_item") &&
+      isApplicable("repair_pipeline_item");
     const forced =
       options?.forceNextAction && isApplicable(options.forceNextAction)
         ? options.forceNextAction
@@ -2109,6 +2112,14 @@ async function executeBlockedRecovery(
       error,
     });
     return { ledger: completed.ledger, attempted: true };
+  }
+
+  if (attempt.action === "repair_pipeline_item" && deps.store.env[PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR_ENV] === "1") {
+    await completeRecoveryAttempt(deps.store, contract, {
+      runId, token, itemId, engine, attemptId: attempt.attempt_id, succeeded: false,
+      error: "repair_pipeline_item is inapplicable during exact-candidate FRG",
+    });
+    return executeBlockedRecovery(deps, contract, runId, token, engine, itemId);
   }
 
   const notBeforeMs = attempt.not_before ? Date.parse(attempt.not_before) : Number.NaN;
@@ -3216,6 +3227,19 @@ export async function runSupervisorCycle(
         cooledItem?.last_verified_identity?.head_sha ?? cooledEpoch,
       );
       if (!staleCooling) {
+        if (ledger.cooling.reason === "strategy_cursor_exhausted") {
+          const lifecycleTime = new Date(Math.max(
+            Date.parse(ledger.cooling.time),
+            deps.store.now().getTime(),
+          )).toISOString();
+          ledger = bindLifecycle(
+            contract,
+            ledger,
+            deriveLifecycleState({ cooling: true, stopReason: "recovery_exhausted", faultClass: "retry-exhaustion" }),
+            lifecycleTime,
+          );
+          await writeLedger(deps.store, ledger, token);
+        }
         await appendActionEvidence(deps.store, runId, token, {
           item_id: ledger.cooling.item_id ?? null,
           action: "noop",
@@ -4701,23 +4725,6 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       resumed: attach.resumed,
     });
 
-    // Advertise identity after exclusive lock, before any dispatch can block (#665).
-    // Inside try so a handoff write failure still releases the exclusive lock.
-    if (input.onRunReady) {
-      const logicalOperationId =
-        typeof contract.logical_operation_id === "string" && contract.logical_operation_id.trim()
-          ? contract.logical_operation_id.trim()
-          : undefined;
-      await input.onRunReady({
-        runId: input.runId,
-        runDir: runDir(deps.store, input.runId),
-        events: runEventsPath(deps.store, input.runId),
-        engine: input.engine,
-        resumed: attach.resumed,
-        ...(logicalOperationId ? { logical_operation_id: logicalOperationId } : {}),
-      });
-    }
-
     const candidateSha =
       (typeof input.candidateSha === "string" && /^[0-9a-f]{40}$/.test(input.candidateSha)
         ? input.candidateSha
@@ -4744,6 +4751,23 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       },
     };
     await writeLoopRunHandoff(deps.store, durableHandoff, token);
+
+    // Publish identity only after its candidate-bound durable counterpart is
+    // crash-recoverable. A public callback failure can then safely reattach.
+    if (input.onRunReady) {
+      const logicalOperationId =
+        typeof contract.logical_operation_id === "string" && contract.logical_operation_id.trim()
+          ? contract.logical_operation_id.trim()
+          : undefined;
+      await input.onRunReady({
+        runId: input.runId,
+        runDir: runDir(deps.store, input.runId),
+        events: runEventsPath(deps.store, input.runId),
+        engine: input.engine,
+        resumed: attach.resumed,
+        ...(logicalOperationId ? { logical_operation_id: logicalOperationId } : {}),
+      });
+    }
 
     heartbeatTimer = setHeartbeat(async () => {
       try {

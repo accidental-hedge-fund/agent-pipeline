@@ -594,7 +594,7 @@ test("getPrDiff: HTTP 406 falls back to files-list composed diff (#1223)", async
   assert.ok(filesCall!.includes("--paginate"));
   assert.ok(filesCall!.includes("--slurp"));
   assert.ok(calls.every((args) => args[0] !== "git"), "fallback must not invoke local git");
-  assert.deepEqual(diffFilePaths(result).sort(), ["bin/empty.dat", "src/a.ts"]);
+  assert.deepEqual(diffFilePaths(result).sort(), ["bin/empty.dat", "bin/old-empty.dat", "src/a.ts"]);
 });
 
 test("getPrDiff: small unified diff uses the fast path only (#1223)", async () => {
@@ -777,7 +777,7 @@ test("getPrDiff: rename uses previous_filename on the a/ side (#1223)", async ()
   };
   const result = await getPrDiff(cfg, 11, { runner, retries: 1 });
   assert.ok(result.includes("diff --git a/old.ts b/new.ts"));
-  assert.deepEqual(diffFilePaths(result), ["new.ts"]);
+  assert.deepEqual(diffFilePaths(result), ["old.ts", "new.ts"]);
 });
 
 test("getPrDiff: space-containing path stays parseable by diffFilePaths (#1223)", async () => {

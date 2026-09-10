@@ -1,9 +1,5 @@
-# installed-cli-fault-qualification Specification
+## ADDED Requirements
 
-## Purpose
-
-Defines deterministic proof that the packaged Pipeline launcher and its public command routes preserve typed fault ownership before a release may create remote FRG fixtures.
-## Requirements
 ### Requirement: Genuine CLI and fault regressions SHALL remain in normal deterministic CI
 
 Removal of installed-CLI qualification from the release path SHALL NOT remove deterministic coverage of ordinary admission, logical-operation accounting, exact-source launcher behavior, process-boundary fault classification, ownership retention, or runtime recovery. Such coverage SHALL run under the normal repository CI gate with injected or closed secret-free seams and SHALL NOT require remote fixture creation, release scoring, or attestation.
@@ -37,3 +33,22 @@ Any remaining qualification or exact-source assertion that compares a materializ
 - **THEN** the inventory assertion SHALL fail
 - **AND** the checker SHALL NOT skip or weaken the assertion to avoid the failure
 
+## REMOVED Requirements
+
+### Requirement: Qualification SHALL execute the staged installed launcher
+
+**Reason**: A release-specific installed-launcher qualification pass is no longer a prerequisite for creating the exact-pair fixtures.
+
+**Migration**: Retain each genuine public-route regression as a normal deterministic CLI test and retire artifact-only choreography.
+
+### Requirement: Qualification SHALL inject and observe faults at the process boundary
+
+**Reason**: The release matrix and qualification artifact are removed; the underlying fault ownership behavior remains product behavior.
+
+**Migration**: Exercise process-boundary and durable-state faults in normal deterministic CI with parent-observed outcomes.
+
+### Requirement: Qualification evidence SHALL be exact-candidate bound and tamper evident
+
+**Reason**: The exact-candidate FRG result directly binds candidate and authoritative fixture evidence without qualification rows or a release matrix.
+
+**Migration**: Use the exact-candidate FRG result for release proof and candidate-root inventory semantics for any retained qualification utility.

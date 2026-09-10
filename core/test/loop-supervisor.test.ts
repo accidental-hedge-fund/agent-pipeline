@@ -29,13 +29,14 @@ import {
   readEvents,
   readLedger,
   readLock,
+  readLoopRunHandoff,
   releaseLock,
   runDir,
   runEventsPath,
   writeLedger,
   type LoopStoreDeps,
 } from "../scripts/loop/store.ts";
-import { DEFAULT_RECOVERY_POLICY, blockItem, completeRecoveryAttempt, fingerprintEvidence, persistOwnedCooling, startRecoveryAttempt } from "../scripts/loop/recovery.ts";
+import { DEFAULT_RECOVERY_POLICY, blockItem, completeRecoveryAttempt, currentWorkflowEngineExhaustion, fingerprintEvidence, persistOwnedCooling, startRecoveryAttempt } from "../scripts/loop/recovery.ts";
 import { buildCoolingRecord, coolingDeadline, coolingRecordForItem, recoveryEpisodeId } from "../scripts/loop/recovery-episodes.ts";
 import { resumeHold } from "../scripts/loop/pause.ts";
 import type { ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
@@ -414,6 +415,8 @@ test("driveSupervisor fires onRunReady once after lock and before any dispatchIt
       runId: "run-1",
       engine: "claude",
       onRunReady: async (ctx) => {
+        assert.equal((await readLoopRunHandoff(deps, "run-1"))?.run_id, "run-1",
+          "durable candidate handoff precedes the public callback");
         order.push("onRunReady");
         readyCtx = ctx;
       },
@@ -2784,6 +2787,7 @@ test("a failed budgeted recovery stays blocked and stops only after the action i
 });
 
 test("an exhausted mechanical item cannot stop an independent sibling before that sibling runs", async () => {
+  const fixtureHead = "a".repeat(40);
   const contract = testContract({
     items: [
       { id: "100", depends_on: [] },
@@ -2791,7 +2795,7 @@ test("an exhausted mechanical item cannot stop an independent sibling before tha
     ],
   });
   const ledger = testLedger({
-    "100": itemEntry("100", "pending"),
+    "100": { ...itemEntry("100", "pending"), advance_run_id: "advance-100" },
     "200": itemEntry("200", "pending"),
   });
   const { deps } = await setup(contract, ledger);
@@ -2813,13 +2817,13 @@ test("an exhausted mechanical item cannot stop an independent sibling before tha
       return issueNumber === 200 && item200Dispatched ? 22 : null;
     },
     async getPrDetail() {
-      return { state: "open", head_ref: "pipeline/200-fix", head_sha: "def456", merge_commit_sha: null };
+      return { state: "open", head_ref: "pipeline/200-fix", head_sha: fixtureHead, merge_commit_sha: null };
     },
     async getPrChecks() {
       return [{ bucket: "pass" }];
     },
     async getLocalHead(issueNumber) {
-      return issueNumber === 100 ? { branch: "pipeline/100-fix", sha: "abc123" } : null;
+      return issueNumber === 100 ? { branch: "pipeline/100-fix", sha: fixtureHead } : null;
     },
   }).deps;
   const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
@@ -2855,18 +2859,24 @@ test("an exhausted mechanical item cannot stop an independent sibling before tha
     "claude",
   );
   assert.equal(siblingCycle.stop, null, "exhaustion remains item-local while the sibling is schedulable");
-  assert.equal((await readLedger(deps, "run-1")).items["200"].state, "ready");
+  const afterSibling = await readLedger(deps, "run-1");
+  assert.equal(afterSibling.items["200"].state, "ready");
+  assert.equal(afterSibling.lifecycle?.state, "active", "item-local exhaustion does not cool the run while a sibling can progress");
   assert.equal(recoveryCalls, 2);
 
-  const terminalCycle = await runSupervisorCycle(
-    { store: deps, observe, dispatchItem, executeRecovery },
-    "run-1",
-    token,
-    "claude",
-  );
-  assert.equal(terminalCycle.stop, null, "the mechanical item stays owned after sibling progress");
-  assert.equal(terminalCycle.cooling, undefined, "later per-strategy recovery remains eligible");
-  assert.equal((await readLedger(deps, "run-1")).items["200"].state, "ready");
+  let terminalCycle;
+  for (let cycle = 0; cycle < 20 && terminalCycle?.cooling?.reason !== "strategy_cursor_exhausted"; cycle++) {
+    terminalCycle = await runSupervisorCycle(
+      { store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+  }
+  assert.equal(terminalCycle?.stop, null, "the mechanical item stays owned after sibling progress");
+  assert.equal(terminalCycle?.cooling?.reason, "strategy_cursor_exhausted");
+  const cooled = await readLedger(deps, "run-1");
+  assert.equal(cooled.items["200"].state, "ready");
+  assert.equal(cooled.lifecycle?.state, "cooling");
+  assert.ok(Date.parse(cooled.lifecycle!.updated_at) >= Date.parse(cooled.cooling!.time));
+  assert.ok(currentWorkflowEngineExhaustion(cooled, "100"),
+    "run-level cooling makes the current exhausted item authoritative once no sibling frontier remains");
 });
 
 test("recovery performs deterministic redispatch before model repair", async () => {

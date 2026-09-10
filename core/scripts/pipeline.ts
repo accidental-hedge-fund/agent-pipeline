@@ -204,6 +204,7 @@ import {
   reportPapercuts,
   papercutsEnabled,
   realPapercutDeps,
+  autoFileAllowed,
   autoFileDurableRunBlockers,
   realAutoFileDeps,
 } from "./stages/papercut.ts";
@@ -315,6 +316,10 @@ import {
   type WorkListDependencyDiscoverDeps,
 } from "./loop/work-list-deps.ts";
 import { isFactoryControlCheckout } from "./production-engine-pin.ts";
+import { workListRunId } from "./loop/work-list-run-id.ts";
+export { workListRunId } from "./loop/work-list-run-id.ts";
+import { validateCandidateTargetPrimary } from "./candidate-target-primary.ts";
+export { validateCandidateTargetPrimary } from "./candidate-target-primary.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
 import {
   formatLoopRunHandoff,
@@ -471,6 +476,8 @@ export interface CliOpts {
   dryRun?: boolean;
   domain?: string;
   repoPath?: string;
+  /** Internal candidate-track binding: canonical primary checkout that owns nested run artifacts. */
+  candidateTargetPrimary?: string;
   base?: string;
   model?: string;
   profile?: string;
@@ -970,6 +977,7 @@ export function buildCmd(): Command {
     .option("--dry-run", "log what would happen without invoking harnesses or modifying GitHub")
     .option("--domain <name>", "override domain name (default: repo dir basename)")
     .option("--repo-path <path>", "override the target repo working tree")
+    .addOption(new Option("--candidate-target-primary <absolute-path>", "internal: candidate-track target run-store owner").hideHelp())
     .option("--base <branch>", "override the base branch (default: from .github/pipeline.yml or 'main')")
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
@@ -1190,11 +1198,6 @@ export function buildCmd(): Command {
  *  across repeated invocations of the same resolved list so a second run
  *  naturally resumes instead of creating a duplicate. Selector provenance is
  *  stored separately on the immutable contract. */
-export function workListRunId(repo: string, engine: LoopEngine, issues: readonly string[]): string {
-  const hash = crypto.createHash("sha256").update(`${repo}:${engine}:${issues.join(",")}`).digest("hex").slice(0, 16);
-  return `loop-${hash}`;
-}
-
 /** Return the selector identity that is stored after a selector resolves to an
  * issue list. Work-list values use the resolved list so range and explicit-list
  * callers keep their existing canonical contract shape. */
@@ -1392,6 +1395,10 @@ export type DispatchItemChildArgOpts = {
   base?: string;
   /** Supervisor-resolved `--domain` so lock/run namespace matches. */
   domain?: string;
+  /** Candidate-track-only canonical primary that owns the pinned run id. */
+  targetRunStoreRepoDir?: string;
+  /** Candidate guard preload; never set for ordinary/pinned execution. */
+  candidateGuardModule?: string;
 };
 
 /** Builds the child-process argv for the per-item nested-advance hand-off.
@@ -1411,10 +1418,12 @@ export function dispatchItemChildArgs(
   repoDir: string,
   opts?: DispatchItemChildArgOpts,
 ): string[] {
-  const args = [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
+  const args = opts?.candidateGuardModule ? ["--import", opts.candidateGuardModule] : [];
+  args.push(scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir);
   if (opts?.base) args.push("--base", opts.base);
   if (opts?.domain) args.push("--domain", opts.domain);
   if (opts?.runId) args.push("--run-id", opts.runId);
+  if (opts?.targetRunStoreRepoDir) args.push("--candidate-target-primary", opts.targetRunStoreRepoDir);
   if (opts?.engineTrack === "pinned" || opts?.engineTrack === "candidate") {
     args.push("--engine-track", opts.engineTrack);
   }
@@ -1663,6 +1672,8 @@ export interface RealDispatchItemDeps {
   childAdvance?: OneItemChildAdvanceInputs;
   /** Persistent run-store owner shared with the nested advance child. */
   resolveRunStoreRepoDir?: typeof resolveRunStoreRepoDir;
+  /** Explicit exact-candidate bridge; absent for every ordinary/pinned loop. */
+  candidateTargetPrimary?: string;
 }
 
 export function realDispatchItem(
@@ -1776,6 +1787,10 @@ export function realDispatchItem(
           execPath,
           dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, {
             ...(pin ? { runId: pin.pipeline_run_id } : {}),
+            ...(deps.candidateTargetPrimary ? { targetRunStoreRepoDir: deps.candidateTargetPrimary } : {}),
+            ...(deps.candidateTargetPrimary && cfg.engine_track === "candidate"
+              ? { candidateGuardModule: path.join(cfg.repo_dir, "scripts", "candidate-process-guard.mjs") }
+              : {}),
             ...(typeof cfg.base_branch === "string" && cfg.base_branch.length > 0
               ? { base: cfg.base_branch }
               : {}),
@@ -2681,6 +2696,7 @@ export function realExecuteRecovery(
       (typeof input.diagnostic.evidence_key === "string" && input.diagnostic.evidence_key.trim()) ||
       `engine-scratch:${issueNumber}:${unlinked.sort().join(",") || "clean"}`;
     const notifySibling = async () => {
+      if (!autoFileAllowed()) return;
       if (deps.onEngineClassRecovered) {
         await deps.onEngineClassRecovered({
           issueNumber,
@@ -2799,6 +2815,9 @@ export function realExecuteRecovery(
   };
 
   return async (input) => {
+    if (input.action === "repair_pipeline_item" && process.env.PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR === "1") {
+      return failed("repair_pipeline_item is inapplicable during exact-candidate FRG");
+    }
     const applicability = recoveryRecipeApplicability({
       action: input.action,
       blockerClass: input.blockerClass,
@@ -3208,6 +3227,8 @@ export interface RunLoopEngineInput {
    */
   follow?: boolean;
   repoDir: string;
+  /** Candidate-track-only canonical primary checkout that owns nested advance artifacts. */
+  targetRunStoreRepoDir?: string;
   /**
    * Resolved `--base` / file default so the supervisor and nested child share
    * one effective base branch (#1327 review 2).
@@ -3375,6 +3396,10 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
   if (input.engineTrack === "pinned" || input.engineTrack === "candidate") {
     cfg = { ...cfg, engine_track: input.engineTrack };
   }
+  if (input.targetRunStoreRepoDir) {
+    const invalid = await validateCandidateTargetPrimary(input.targetRunStoreRepoDir, cfg.repo, gitInWorktree);
+    if (invalid) return { kind: "error", message: invalid };
+  }
 
   let runId: string;
   let resumeExisting = false;
@@ -3515,15 +3540,19 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     return { kind: "error", message: "no selector or --resume run id was provided" };
   }
 
-  const persistentRunStoreRepoDir = await resolveRunStoreRepoDir(cfg.repo_dir, gitInWorktree);
+  const persistentRunStoreRepoDir = input.targetRunStoreRepoDir ??
+    await resolveRunStoreRepoDir(cfg.repo_dir, gitInWorktree);
   const supervisorDeps: SupervisorDeps = {
     store,
     observe: defaultReconcileObserveDeps(cfg),
     dispatchItem: realDispatchItem(cfg, input.engine, {
       childAdvance: input.childAdvance,
       resolveRunStoreRepoDir: async () => persistentRunStoreRepoDir,
+      ...(input.targetRunStoreRepoDir ? { candidateTargetPrimary: input.targetRunStoreRepoDir } : {}),
     }),
-    executeRecovery: realExecuteRecovery(cfg),
+    executeRecovery: realExecuteRecovery(cfg, {
+      resolveRunStoreRepoDir: async () => persistentRunStoreRepoDir,
+    }),
     recoverySleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     getChangedFiles: realGetChangedFiles(cfg),
     // Host-local live-advance probe scope (#770 / #634): run-store discovery +
@@ -3554,7 +3583,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     // resolved config, wrapped so a failure here can never alter the drive
     // result (driveSupervisor's own onDriveEnd call site already swallows any
     // throw — this catch is belt-and-braces).
-    onDriveEnd: cfg.durable_runs.auto_file
+    onDriveEnd: autoFileAllowed() && cfg.durable_runs.auto_file
       ? async () => {
         await autoFileDurableRunBlockers(
           {
@@ -3652,6 +3681,16 @@ export async function runLoopCommand(
   // resolveConfig(), so the preflight stays zero-gh-call on every path.
   const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
   const repoDir = findGitRoot(startDir) ?? startDir;
+  let targetRunStoreRepoDir: string | undefined;
+  if (opts.candidateTargetPrimary !== undefined) {
+    if (opts.engineTrack !== "candidate" || !path.isAbsolute(opts.candidateTargetPrimary) ||
+        path.normalize(opts.candidateTargetPrimary) !== opts.candidateTargetPrimary) {
+      console.error("pipeline loop: --candidate-target-primary requires candidate track and a normalized absolute path");
+      process.exitCode = 1;
+      return;
+    }
+    targetRunStoreRepoDir = opts.candidateTargetPrimary;
+  }
   let attestation: NativeGoalAttestation;
   try {
     attestation = resolveLoopNativeGoalAttestation(repoDir);
@@ -3683,6 +3722,9 @@ export async function runLoopCommand(
     newRun: outcome.args.newRun,
     follow: outcome.args.follow,
     repoDir,
+    baseBranch: opts.base,
+    domainOverride: opts.domain,
+    targetRunStoreRepoDir,
     // Early handoff (#665): emit only on successful drive attach+lock, before
     // first dispatch. Audit and preflight/engine failure paths never set this
     // callback (audit short-circuits inside the engine before attach).

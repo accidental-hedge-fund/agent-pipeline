@@ -49,6 +49,7 @@ import {
 } from "../review-prompt-ceiling.ts";
 import { resolveAdapter } from "../harness-adapters/index.ts";
 import { runTestGate, testerProducerObservationFromGate, type TestGateDeps } from "../testgate.ts";
+import { autoFileAllowed } from "./papercut.ts";
 import {
   buildPriorRoundDigest,
   settledFindings,
@@ -1377,12 +1378,13 @@ export async function advanceReview(
         // A mixed verdict contains a new blocker that has not consumed a repair
         // attempt. Route the complete finding set through the normal fix path.
       } else {
+        const srDetail = `Review ${round} surface-recurrence guard fired on ${firedSurfaces.size} ` +
+          `surface(s) after ${surfaceRounds} consecutive rounds of new-key findings on the ` +
+          `same (file + category) cluster`;
         if (!shouldSurfaceDemote) {
-          const srDetail = `Review ${round} surface-recurrence guard fired on ${firedSurfaces.size} ` +
-            `surface(s) after ${surfaceRounds} consecutive rounds of new-key findings on the ` +
-            `same (file + category) cluster`;
           return blockForMechanicalReviewRecovery(srDetail);
         }
+        if (!autoFileAllowed()) return blockForMechanicalReviewRecovery(srDetail);
 
         const createIssueFn = deps.createIssue ?? defaultCreateIssue(cfg);
         const addIssueCommentFn = deps.addIssueComment ?? defaultAddIssueComment(cfg);
@@ -1466,6 +1468,11 @@ export async function advanceReview(
       const ceilingDetail = `Review ${round} hit the ${roundCap}-round ceiling with ` +
         `${partition.blocking.length} finding(s) still blocking`;
       return blockForMechanicalReviewRecovery(ceilingDetail);
+    }
+    if (!autoFileAllowed()) {
+      return blockForMechanicalReviewRecovery(
+        `Review ${round} hit the ${roundCap}-round ceiling with ${partition.blocking.length} finding(s) still blocking`,
+      );
     }
 
     const createIssueFn = deps.createIssue ?? defaultCreateIssue(cfg);

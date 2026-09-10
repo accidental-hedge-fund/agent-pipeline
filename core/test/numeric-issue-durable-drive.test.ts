@@ -4,6 +4,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -40,6 +41,7 @@ import {
 } from "../scripts/nested-advance.ts";
 import type { AdvanceOpts } from "../scripts/pipeline-run.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
+import { verifyCandidateProcessGuard } from "../../scripts/candidate-process-guard.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PIPELINE_SRC = readFileSync(join(here, "../scripts/pipeline.ts"), "utf8");
@@ -414,6 +416,69 @@ test("realDispatchItem default child script is the nested-advance executor", asy
   assert.equal(spawned.length, 1);
   assert.equal(spawned[0]![0], NESTED_ADVANCE_CHILD_SCRIPT);
   assert.ok(!spawned[0]![0]!.endsWith("pipeline.ts"));
+  assert.equal(spawned[0]!.includes("--candidate-target-primary"), false);
+  assert.equal(spawned[0]!.includes("--import"), false);
+
+  const pinnedSpawned: string[][] = [];
+  const pinned = realDispatchItem({ ...cfg(), engine_track: "pinned" }, "claude", {
+    eventsPathExists: () => true,
+    spawn: ((_cmd: string, args: readonly string[]) => { pinnedSpawned.push([...args]); return fakeSpawnChild(); }) as typeof import("node:child_process").spawn,
+    getIssueDetail: async () => ({ labels: ["pipeline:ready-to-deploy"], state: "open" }) as never,
+    getPrForIssue: async () => 1,
+  });
+  await pinned({ schema: "pipeline/loop-execution@1", item_id: "43", repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude", worktree_policy: "default", done_definition: "pipeline:ready-to-deploy", run_id: "loop-run" });
+  assert.equal(pinnedSpawned[0]!.includes("--candidate-target-primary"), false);
+  assert.equal(pinnedSpawned[0]!.includes("--import"), false);
+});
+
+test("exact-candidate real dispatch preloads the bound guard and dirty C cannot reach nested advance", async () => {
+  const repoRoot = join(here, "../..");
+  const spawned: string[][] = [];
+  const dispatch = realDispatchItem(
+    { ...cfg(), repo_dir: repoRoot, engine_track: "candidate" },
+    "codex",
+    {
+      candidateTargetPrimary: "/target-primary",
+      resolveRunStoreRepoDir: async () => "/target-primary",
+      eventsPathExists: () => true,
+      spawn: ((_cmd: string, args: readonly string[]) => {
+        spawned.push([...args]);
+        return fakeSpawnChild();
+      }) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: ["pipeline:ready-to-deploy"], state: "open" }) as never,
+      getPrForIssue: async () => 1,
+    },
+  );
+  await dispatch({
+    schema: "pipeline/loop-execution@1", item_id: "42", repo: { name: "owner/repo", base_branch: "main" },
+    engine: "codex", worktree_policy: "default", done_definition: "pipeline:ready-to-deploy", run_id: "loop-run",
+  });
+  assert.deepEqual(spawned[0]!.slice(0, 2), ["--import", join(repoRoot, "scripts/candidate-process-guard.mjs")]);
+
+  const sha = "a".repeat(40);
+  const lockfile = Buffer.from("lockfile");
+  const processLock = Buffer.from("lease");
+  const digest = (value: Buffer) => createHash("sha256").update(value).digest("hex");
+  let nestedRuns = 0;
+  const guarded = verifyCandidateProcessGuard({
+    PIPELINE_CANDIDATE_PROCESS_GUARD: "1",
+    PIPELINE_CANDIDATE_PROCESS_ROOT: repoRoot,
+    PIPELINE_CANDIDATE_PROCESS_SHA: sha,
+    PIPELINE_CANDIDATE_PROCESS_READY_RECORD: "/ready",
+    PIPELINE_CANDIDATE_PROCESS_LOCKFILE_DIGEST: digest(lockfile),
+    PIPELINE_CANDIDATE_PROCESS_LOCK: "/lease",
+    PIPELINE_CANDIDATE_PROCESS_LOCK_DIGEST: digest(processLock),
+  }, {
+    realpath: (value: string) => value,
+    readFile: (value: string) => value === "/lease" ? processLock : value === "/ready"
+      ? Buffer.from(JSON.stringify({ schema: "pipeline-candidate-readiness/v1", engineRoot: repoRoot,
+        commitSha: sha, lockfileDigest: digest(lockfile) })) : lockfile,
+    git: (_root: string, args: string[]) => args[0] === "rev-parse" ? `${sha}\n` : " M core/scripts/nested-advance.ts\n",
+  });
+  if (guarded.ok) nestedRuns++;
+  assert.equal(guarded.ok, false);
+  assert.equal(nestedRuns, 0, "candidate guard rejects dirtied C before nested advance can execute");
 });
 
 test("parseNestedAdvanceChildArgv is the inverse of dispatchItemChildArgs", () => {
@@ -427,6 +492,7 @@ test("parseNestedAdvanceChildArgv is the inverse of dispatchItemChildArgs", () =
     engineTrack: "candidate",
     base: "release",
     domain: "alternate",
+    targetRunStoreRepoDir: "/primary",
   });
   const parsed = parseNestedAdvanceChildArgv(args.slice(1));
   assert.equal(parsed.issueNumber, 100);
@@ -441,6 +507,38 @@ test("parseNestedAdvanceChildArgv is the inverse of dispatchItemChildArgs", () =
   assert.equal(parsed.opts.engineTrack, "candidate");
   assert.equal(parsed.baseBranch, "release");
   assert.equal(parsed.domainOverride, "alternate");
+  assert.equal(parsed.targetRunStoreRepoDir, "/primary");
+});
+
+test("candidate nested child pins runAdvance artifacts to the validated target primary", async () => {
+  const args = dispatchItemChildArgs(NESTED_ADVANCE_CHILD_SCRIPT, 100, "codex", "/separate-candidate", {
+    runId: "pin-1", engineTrack: "candidate", targetRunStoreRepoDir: "/target-primary",
+  });
+  let resolvedStore = "";
+  const code = await runNestedAdvanceChild(args.slice(1), {
+    resolveConfig: () => ({ ...cfg(), repo_dir: "/separate-candidate", engine_track: "candidate" }),
+    gitInWorktree: async (_cwd, args) => args[0] === "worktree"
+      ? { stdout: "worktree /target-primary\n\n", stderr: "", code: 0 }
+      : { stdout: "git@github.com:owner/repo.git\n", stderr: "", code: 0 },
+    isKillSwitchActive: () => false,
+    runNestedWholeItemAdvance: async (_cfg, _issue, _opts, deps) => {
+      resolvedStore = await deps!.resolveRunStoreRepoDir!("/separate-candidate", async () => ({ stdout: "", stderr: "", code: 0 }));
+    },
+  });
+  assert.equal(code, 0);
+  assert.equal(resolvedStore, "/target-primary");
+
+  let ran = false;
+  const rejected = await runNestedAdvanceChild(args.slice(1), {
+    resolveConfig: () => ({ ...cfg(), repo_dir: "/separate-candidate", engine_track: "candidate" }),
+    isKillSwitchActive: () => false,
+    gitInWorktree: async (_cwd, gitArgs) => gitArgs[0] === "worktree"
+      ? { stdout: "worktree /target-primary\n\n", stderr: "", code: 0 }
+      : { stdout: "git@github.com:foreign/repo.git\n", stderr: "", code: 0 },
+    runNestedWholeItemAdvance: async () => { ran = true; },
+  });
+  assert.equal(rejected, 2);
+  assert.equal(ran, false);
 });
 
 test("numeric --base and --domain: supervisor and nested child share effective config", async () => {

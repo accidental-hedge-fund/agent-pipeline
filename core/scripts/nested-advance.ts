@@ -7,10 +7,13 @@
 
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
+import * as path from "node:path";
 import { resolveConfig } from "./config.ts";
 import { isKillSwitchActive } from "./lock.ts";
 import { runAdvance, type AdvanceDeps, type AdvanceOpts } from "./pipeline-run.ts";
 import type { PipelineConfig } from "./types.ts";
+import { validateCandidateTargetPrimary } from "./candidate-target-primary.ts";
+import { gitInWorktree } from "./worktree.ts";
 
 /** Absolute path of this child executor. Used as `realDispatchItem` default script. */
 export const NESTED_ADVANCE_CHILD_SCRIPT = fileURLToPath(import.meta.url);
@@ -37,6 +40,7 @@ export interface ParsedNestedAdvanceChildArgv {
   baseBranch?: string;
   /** Supervisor-resolved `--domain`; omitted when the parent did not serialize one. */
   domainOverride?: string;
+  targetRunStoreRepoDir?: string;
 }
 
 /** Inverse of `dispatchItemChildArgs` after the script-path slot. */
@@ -53,6 +57,7 @@ export function parseNestedAdvanceChildArgv(
       base: { type: "string" },
       domain: { type: "string" },
       "run-id": { type: "string" },
+      "candidate-target-primary": { type: "string" },
       "engine-track": { type: "string" },
       once: { type: "boolean" },
       "dry-run": { type: "boolean" },
@@ -77,6 +82,11 @@ export function parseNestedAdvanceChildArgv(
   const sha = typeof values.sha === "string" ? values.sha.trim() : "";
   const base = typeof values.base === "string" ? values.base.trim() : "";
   const domain = typeof values.domain === "string" ? values.domain.trim() : "";
+  const targetRunStoreRepoDir = typeof values["candidate-target-primary"] === "string"
+    ? values["candidate-target-primary"].trim() : "";
+  if (targetRunStoreRepoDir && (!path.isAbsolute(targetRunStoreRepoDir) || path.normalize(targetRunStoreRepoDir) !== targetRunStoreRepoDir || engineTrack !== "candidate")) {
+    throw new Error("nested advance child: --candidate-target-primary requires candidate track and a normalized absolute path");
+  }
   return {
     issueNumber,
     repoPath,
@@ -92,6 +102,7 @@ export function parseNestedAdvanceChildArgv(
     },
     ...(base ? { baseBranch: base } : {}),
     ...(domain ? { domainOverride: domain } : {}),
+    ...(targetRunStoreRepoDir ? { targetRunStoreRepoDir } : {}),
   };
 }
 
@@ -100,6 +111,7 @@ export interface NestedAdvanceChildDeps {
   runNestedWholeItemAdvance?: typeof runNestedWholeItemAdvance;
   isKillSwitchActive?: (domain: string) => boolean;
   writeStderr?: (msg: string) => void;
+  gitInWorktree?: typeof gitInWorktree;
 }
 
 /**
@@ -136,6 +148,10 @@ export async function runNestedAdvanceChild(
   if (parsed.opts.engineTrack === "pinned" || parsed.opts.engineTrack === "candidate") {
     cfg = { ...cfg, engine_track: parsed.opts.engineTrack };
   }
+  if (parsed.targetRunStoreRepoDir) {
+    const invalid = await validateCandidateTargetPrimary(parsed.targetRunStoreRepoDir, cfg.repo, deps.gitInWorktree ?? gitInWorktree);
+    if (invalid) { writeStderr(`pipeline: ${invalid}`); return 2; }
+  }
   const killSwitch = deps.isKillSwitchActive ?? isKillSwitchActive;
   if (killSwitch(cfg.domain)) {
     writeStderr(
@@ -145,7 +161,9 @@ export async function runNestedAdvanceChild(
   }
   const runNested = deps.runNestedWholeItemAdvance ?? runNestedWholeItemAdvance;
   try {
-    await runNested(cfg, parsed.issueNumber, parsed.opts);
+    await runNested(cfg, parsed.issueNumber, parsed.opts, parsed.targetRunStoreRepoDir
+      ? { resolveRunStoreRepoDir: async () => parsed.targetRunStoreRepoDir! }
+      : undefined);
     return 0;
   } catch (err) {
     writeStderr(`pipeline: ${(err as Error).message}`);

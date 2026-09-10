@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { runLoopCommand, buildCmd, maxPositionalsFor, decideNewRunSupersession, planSupersessionMintRepair, type CliOpts, type LoopCliDeps } from "../scripts/pipeline.ts";
+import { runLoopCommand, buildCmd, maxPositionalsFor, decideNewRunSupersession, planSupersessionMintRepair, validateCandidateTargetPrimary, type CliOpts, type LoopCliDeps } from "../scripts/pipeline.ts";
 import { runLoopPreflight as realRunLoopPreflight, MAX_RANGE_SPAN, type LoopPreflightOutcome } from "../scripts/loop-preflight.ts";
 import {
   formatLoopRunHandoff,
@@ -17,7 +17,7 @@ import {
   writeFlushedStdoutLine,
 } from "../scripts/loop/handoff.ts";
 import type { DoctorDeps } from "../scripts/stages/doctor.ts";
-import { COMMAND_REGISTRY } from "../scripts/command-registry.ts";
+import { COMMAND_REGISTRY, validateFlags } from "../scripts/command-registry.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "loop-command-test-"));
 
@@ -446,6 +446,71 @@ test("runLoopCommand — forwards --engine-track candidate to the in-repo superv
   assert.equal(seen, "candidate");
 });
 
+test("runLoopCommand — candidate track alone may pin the canonical target primary for nested runs", async () => {
+  let seen: { target?: string; domain?: string; base?: string } | undefined;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({ ok: true, args: { selector: undefined, resumeRunId: "run-1", audit: false } }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async (input) => {
+      seen = {
+        target: input.targetRunStoreRepoDir,
+        domain: input.domainOverride,
+        base: input.baseBranch,
+      };
+      return { kind: "drive", result: {
+        runId: "run-1", cycles: 0, stop: null, holdOutstanding: false, allDone: true,
+        resumed: true, heldItemIds: [], dispatched: 0, excludedItemIds: [], exclusionReason: null,
+        completion: "all_done",
+      } };
+    },
+  };
+  process.exitCode = undefined;
+  await withCapturedConsole(() => runLoopCommand({
+    resume: "run-1", engineTrack: "candidate", candidateTargetPrimary: "/canonical/primary",
+    domain: "primary-domain", base: "release-main",
+  } as CliOpts, [], deps));
+  assert.deepEqual(seen, {
+    target: "/canonical/primary",
+    domain: "primary-domain",
+    base: "release-main",
+  });
+  assert.equal(process.exitCode, 0);
+  process.exitCode = 0;
+
+  let calls = 0;
+  deps.runLoopEngine = async () => { calls++; throw new Error("must not run"); };
+  process.exitCode = undefined;
+  const relative = await withCapturedConsole(() => runLoopCommand({
+    resume: "run-1", engineTrack: "candidate", candidateTargetPrimary: "../other",
+  } as CliOpts, [], deps));
+  assert.equal(calls, 0);
+  assert.equal(process.exitCode, 1);
+  assert.match(relative.err.join("\n"), /normalized absolute path/);
+  process.exitCode = 0;
+
+  process.exitCode = undefined;
+  const ordinary = await withCapturedConsole(() => runLoopCommand({
+    resume: "run-1", candidateTargetPrimary: "/canonical/primary",
+  } as CliOpts, [], deps));
+  assert.equal(calls, 0);
+  assert.equal(process.exitCode, 1);
+  assert.match(ordinary.err.join("\n"), /requires candidate track/);
+  process.exitCode = 0;
+});
+
+test("candidate target-primary validation rejects linked and cross-repository stores", async () => {
+  const git = async (_cwd: string, args: string[]) => args[0] === "worktree"
+    ? { stdout: "worktree /primary\n\n", stderr: "", code: 0 }
+    : { stdout: "git@github.com:owner/repo.git\n", stderr: "", code: 0 };
+  assert.equal(await validateCandidateTargetPrimary("/linked", "owner/repo", git),
+    "candidate target primary is not the canonical primary checkout");
+  assert.equal(await validateCandidateTargetPrimary("/primary", "owner/repo", git), null);
+  assert.equal(await validateCandidateTargetPrimary("/primary", "other/repo", git),
+    "candidate target primary origin does not match the candidate repository");
+  assert.equal(await validateCandidateTargetPrimary("/primary", "owner/repo", async () => ({ stdout: "", stderr: "failed", code: 1 })),
+    "candidate target primary is not the canonical primary checkout");
+});
+
 // ---------------------------------------------------------------------------
 // 6.8 — a host with no goal-loop skill installed at any root still starts and
 // runs, end to end through runLoopCommand (real runLoopPreflight, fake
@@ -517,6 +582,19 @@ test("COMMAND_REGISTRY.loop — needs no config, no gh auth, and mutates nothing
   assert.equal(loopEntry.needsConfig, false);
   assert.equal(loopEntry.needsGhAuth, false);
   assert.equal(loopEntry.mutatesGitHub, false);
+});
+
+test("top-level flag registry admits the exact-candidate fresh and resume loop bindings", () => {
+  for (const args of [
+    ["loop", "101", "102", "--engine-track", "candidate", "--domain", "canonical-domain",
+      "--candidate-target-primary", "/canonical/primary"],
+    ["loop", "--resume", "loop-exact", "--engine-track", "candidate", "--domain", "canonical-domain",
+      "--candidate-target-primary", "/canonical/primary"],
+  ]) {
+    const cmd = buildCmd();
+    cmd.parseOptions(args);
+    assert.deepEqual(validateFlags(COMMAND_REGISTRY.loop!, cmd), [], args.join(" "));
+  }
 });
 
 // ---------------------------------------------------------------------------

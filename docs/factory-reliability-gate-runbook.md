@@ -1,10 +1,50 @@
-# Factory Reliability Gate (FRG) — runbook (#723 / #757)
+# Factory Reliability Gate (FRG) — runbook (#723 / #757 / #1558)
 
-**Hard rule:** no release tag and no release PR prepared as ready without a recorded
-FRG pass artifact for that version.
+## Exact-candidate pair contract (v1.40.1 package 2)
+
+The release-path FRG proof is one observer-owned
+`pipeline/exact-candidate-frg@1` result. It binds a freshly observed exact
+`origin/main` candidate, the candidate-root manifest/templates and nested
+lockfile, and exactly two ordinary fixture slots: `clean-docs` and
+`clean-openspec`. The prepared candidate invokes the unchanged ordinary loop
+with those two explicit issue numbers. A label or milestone selector is not an
+exact-pair run.
+
+Each fixture is proven only by fresh, authoritative state for its current open,
+unmerged PR head: expected template provenance, `pipeline:ready-to-deploy`,
+green required CI, accepted independent review, and matching Tester and worker
+configuration evidence. Worker pass booleans, comments, labels alone, public
+hashes, installed-CLI qualification, scores, and HMAC attestations do not
+substitute for those observations.
+
+The release-owned record lives under
+`.agent-pipeline/frg/exact-pair/<epoch>.json`, outside fixture branches. It is
+persisted before ownership-safe nonmerge cleanup. Cleanup failure or identity
+mismatch is `cleanup_debt` and cannot invalidate a proven pass. An inconclusive
+observer produces an owned external-condition wait with a named re-observation
+probe; review revisions stay with the ordinary issue lifecycle. A demonstrated
+candidate regression retains the exact evidence. Selector, reconciliation,
+evidence-classifier, gate, or controller faults are gate defects requiring a
+shared class-level correction.
+
+Movement of `origin/main` makes the epoch stale. The old record is never
+rewritten to the new SHA: a new candidate requires a new prepared root, pair,
+ordinary runs, and complete proof. FRG never merges fixture PRs, repairs the
+engine through fixture work, weakens ordinary gates, auto-files repair issues,
+or launches a replacement pair after an unsuccessful observation.
+
+The score/attestation/factory-release material later in this runbook documents
+legacy caller surfaces retained until the package-4 dependency-checked removal.
+It is not release-eligible proof for the exact-pair verifier. Package 3 owns
+complete ship/release integration; package 2 performs no release, tag,
+publication, promotion, installation, or deployment.
+
+**Hard rule:** metadata release-PR preparation and merge may precede FRG. A release
+tag or publication must not proceed without a recorded FRG pass artifact for that
+version.
 
 ```text
-No release tag / release PR → ready
+No release tag / publication
   without a recorded Factory Reliability Gate (FRG) artifact for that version.
 ```
 

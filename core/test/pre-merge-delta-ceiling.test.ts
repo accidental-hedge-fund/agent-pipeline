@@ -22,6 +22,7 @@ import {
 import { findingKey, partitionFindings } from "../scripts/review-policy.ts";
 import { buildPriorRoundDigest, settledFindings } from "../scripts/review-history.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
+import { PIPELINE_SUPPRESS_AUTO_FILE_ENV } from "../scripts/stages/papercut.ts";
 
 const TEST_ACTOR = "pipeline-bot";
 const renderCfg = { marker_footer: "*Automated by Claude Code Pipeline Skill*" } as unknown as PipelineConfig;
@@ -225,6 +226,24 @@ test("enforceReviewShaGate: ceiling_action demote_and_advance demotes below-high
     "the demoted ceiling must bind the candidate it exhausted so exactly one successor can reset it",
   );
   assert.ok(rec.comments.some((c) => /Finding override/.test(c)), "an audited override comment must be recorded for the demoted finding");
+});
+
+test("exact-candidate FRG blocks a pre-merge delta ceiling without filing a follow-up", async (t) => {
+  const prior = process.env[PIPELINE_SUPPRESS_AUTO_FILE_ENV];
+  process.env[PIPELINE_SUPPRESS_AUTO_FILE_ENV] = "1";
+  t.after(() => {
+    if (prior === undefined) delete process.env[PIPELINE_SUPPRESS_AUTO_FILE_ENV];
+    else process.env[PIPELINE_SUPPRESS_AUTO_FILE_ENV] = prior;
+  });
+  const { deps, rec, cfg } = makeDeps({
+    finalBlocking: [MEDIUM_FINDING], maxDeltaRounds: 4, ceilingAction: "demote_and_advance",
+    finalDeltaSha: SHA_HEAD, latestReviewSha: SHA_3,
+  });
+  let out;
+  await quiet(t, async () => { out = await enforceReviewShaGate(cfg, 483, 99, deps); });
+  assert.equal(out!.status, "blocked");
+  assert.equal(out!.blockerKind, "review-findings");
+  assert.equal(rec.createIssueCalls.length, 0);
 });
 
 test("enforceReviewShaGate: a critical outstanding finding hard-parks even under demote_and_advance", async (t) => {

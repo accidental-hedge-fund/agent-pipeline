@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  candidateTestNamesAtCommit,
   INSTALLED_CLI_QUALIFICATION_SCHEMA,
   parseInstalledCliQualificationArtifact,
 } from "../scripts/installed-cli-qualification.ts";
@@ -36,4 +37,26 @@ test("installed CLI coverage module points to the external process qualification
     collectFaultRecoveryCoverageGaps().filter((gap) => gap.class_id.startsWith("installed_cli:")),
     [],
   );
+});
+
+test("candidate test inventory parses injected exact-commit ls-tree output (#1558)", () => {
+  let observedRoot = "";
+  let observedCandidate = "";
+  const inventory = candidateTestNamesAtCommit("/operator/scripts/pipeline-launcher.mjs", CANDIDATE, {
+    lsTree: (repoRoot, candidateSha) => {
+      observedRoot = repoRoot;
+      observedCandidate = candidateSha;
+      return [
+        "core/test/z-last.test.ts",
+        "core/test/helpers/not-a-suite.test.ts",
+        "core/test/readme.md",
+        "core/test/a-first.test.ts",
+      ].join("\n");
+    },
+  });
+  assert.equal(observedRoot, "/operator");
+  assert.equal(observedCandidate, CANDIDATE);
+  assert.deepEqual(inventory, ["a-first.test.ts", "z-last.test.ts"]);
+  assert.equal(candidateTestNamesAtCommit("relative", CANDIDATE, { lsTree: () => "x" }), null);
+  assert.equal(candidateTestNamesAtCommit("/operator/scripts/pipeline-launcher.mjs", CANDIDATE, { lsTree: () => "" }), null);
 });

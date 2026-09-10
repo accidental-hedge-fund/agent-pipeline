@@ -418,6 +418,7 @@ const EXPECTED_CANDIDATE_ENGINE_CONSUMERS = [
   "factory-release.pack-loop.start",
   "factory-release.pack-loop.resume",
   "factory-gate.hybrid-v2",
+  "factory-gate.exact-pair",
   "ship.frg-prepare-observe",
   "ship.stage-adapter",
 ] as const;

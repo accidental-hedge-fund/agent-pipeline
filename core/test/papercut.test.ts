@@ -12,9 +12,11 @@ import {
   autoFilePapercuts,
   autoFileCorrections,
   autoFileDurableRunBlockers,
+  autoFileAllowed,
   AUTO_FILE_PROVENANCE_MARKER,
   CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
   DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER,
+  PIPELINE_SUPPRESS_AUTO_FILE_ENV,
   stampAutoFileAttribution,
   countsTowardCategoryRateCap,
   issueNumberFromUrl,
@@ -24,6 +26,11 @@ import {
 } from "../scripts/stages/papercut.ts";
 import type { OpenImproveIssue } from "../scripts/improve.ts";
 import type { DurableBlockerOccurrence } from "../scripts/loop/store.ts";
+
+test("exact-pair invocation policy suppresses every repair auto-file category", () => {
+  assert.equal(autoFileAllowed({}), true);
+  assert.equal(autoFileAllowed({ [PIPELINE_SUPPRESS_AUTO_FILE_ENV]: "1" }), false);
+});
 
 // ---------------------------------------------------------------------------
 // Fake deps factory

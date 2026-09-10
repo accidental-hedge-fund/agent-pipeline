@@ -13,7 +13,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   FAULT_RECOVERY_MATRIX,
   FAULT_RECOVERY_MATRIX_VERSION,
@@ -508,9 +507,46 @@ export function qualificationArtifactPath(repoDir: string, candidateSha: string)
   return path.join(repoDir, ".agent-pipeline", "qualification", `${candidateSha}.json`);
 }
 
+export interface CandidateTestInventoryDeps {
+  lsTree(repoRoot: string, candidateSha: string): string | null;
+}
+
+const defaultCandidateTestInventoryDeps: CandidateTestInventoryDeps = {
+  lsTree: (repoRoot, candidateSha) => {
+    try {
+      return execFileSync(
+        "git",
+        ["-C", repoRoot, "ls-tree", "-r", "--name-only", candidateSha, "--", "core/test"],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 },
+      );
+    } catch {
+      return null;
+    }
+  },
+};
+
+/** Exact candidate test inventory. Live operator-worktree files are never read. */
+export function candidateTestNamesAtCommit(
+  launcherPath: string,
+  candidateSha: string,
+  deps: CandidateTestInventoryDeps = defaultCandidateTestInventoryDeps,
+): string[] | null {
+  if (!path.isAbsolute(launcherPath) || !EXACT_SHA.test(candidateSha)) return null;
+  const repoRoot = path.resolve(path.dirname(launcherPath), "..");
+  const listed = deps.lsTree(repoRoot, candidateSha);
+  if (listed === null) return null;
+  const names = listed
+    .split(/\r?\n/)
+    .filter((entry) => /^core\/test\/[A-Za-z0-9._-]+\.test\.ts$/.test(entry))
+    .map((entry) => path.posix.basename(entry))
+    .sort();
+  return names.length > 0 && new Set(names).size === names.length ? names : null;
+}
+
 export function parseInstalledCliQualificationArtifact(
   value: unknown,
   candidateSha: string,
+  inventoryDeps: CandidateTestInventoryDeps = defaultCandidateTestInventoryDeps,
 ): InstalledCliQualificationArtifact | null {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
   const o = value as Partial<InstalledCliQualificationArtifact>;
@@ -573,6 +609,8 @@ export function parseInstalledCliQualificationArtifact(
   const operationCells = installedCells();
   const stagedLauncher = stagedLauncherFromProofs(typedProofs);
   if (!stagedLauncher) return null;
+  const candidateTests = candidateTestNamesAtCommit(o.launcher, candidateSha, inventoryDeps);
+  if (!candidateTests) return null;
   const expectedProofCount = requiredMatrixOperations().length * (PROCESS_FAULTS.size + 1) + 4;
   if (typedProofs.length !== expectedProofCount) return null;
   const routeProofs = typedProofs.filter((proof) => requiredMatrixOperations().includes(proof.operation));
@@ -651,9 +689,7 @@ export function parseInstalledCliQualificationArtifact(
     {
       operation: "candidate-core-suite",
       layer: null,
-      testNames: readdirSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../test"))
-        .filter((name) => name.endsWith(".test.ts"))
-        .sort(),
+      testNames: candidateTests,
     },
   ] as const;
   for (const suiteDefinition of suiteDefinitions) {

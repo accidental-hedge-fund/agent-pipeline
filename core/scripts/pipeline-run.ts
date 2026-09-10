@@ -175,7 +175,7 @@ import {
 import { resolvePlanningLeverageSelection } from "./planning-leverage/selection.ts";
 import { toPreMergeOfframpClass } from "./pre-merge-offramp.ts";
 import { buildStageDiagnostic, projectStageDiagnostic } from "./stage-diagnostic.ts";
-import { autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
+import { autoFileAllowed, autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
 import {
   evaluateIssueReadiness,
   gateUnavailableSummary,
@@ -4028,7 +4028,7 @@ export async function runAdvance(
           }
           // Opt-in papercut auto-file (#421): best-effort, gated on resolved
           // config, wrapped so a failure here can never alter the run's outcome.
-          if (cfg.papercuts.enabled && cfg.papercuts.auto_file) {
+          if (autoFileAllowed() && cfg.papercuts.enabled && cfg.papercuts.auto_file) {
             await autoFilePapercuts(
               {
                 repoDir: cfg.repo_dir,
@@ -4043,7 +4043,7 @@ export async function runAdvance(
           // Opt-in correction auto-file (#500): correction_event capture (#499) is
           // unconditional, so this gates only on auto_file (no capture-side enabled flag,
           // unlike papercuts). Best-effort, wrapped so a failure can never alter the run's outcome.
-          if (cfg.corrections.auto_file) {
+          if (autoFileAllowed() && cfg.corrections.auto_file) {
             await autoFileCorrections(
               {
                 repoDir: cfg.repo_dir,

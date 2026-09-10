@@ -4,6 +4,7 @@ import * as os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { realExecuteRecovery } from "../scripts/pipeline.ts";
+import { PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR_ENV } from "../scripts/loop/pack-loop-liveness.ts";
 import { buildEngineFingerprint } from "../scripts/evidence-subject.ts";
 import { rebindTesterEvidenceAfterPr } from "../scripts/rebind-tester-evidence-after-pr.ts";
 import { runDirPath } from "../scripts/run-store.ts";
@@ -69,6 +70,23 @@ test("production recovery delegates repair_pipeline_item with deterministic clai
     diagnostic: input.diagnostic,
   });
   assert.deepEqual(result, { succeeded: true, evidence: "pushed verified repair" });
+});
+
+test("exact-candidate FRG recovery never invokes substantive fixture repair", async (t) => {
+  const prior = process.env[PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR_ENV];
+  process.env[PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR_ENV] = "1";
+  t.after(() => {
+    if (prior === undefined) delete process.env[PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR_ENV];
+    else process.env[PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR_ENV] = prior;
+  });
+  let repairs = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    repairPipelineItem: async () => { repairs++; return { succeeded: true, evidence: "unexpected" }; },
+  });
+  const result = await execute(mechanicalInput());
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /inapplicable during exact-candidate FRG/);
+  assert.equal(repairs, 0);
 });
 
 test("production review recovery delegates substantive repair without clearing the block first", async () => {
@@ -566,7 +584,8 @@ test("rebind_tester_evidence_after_pr executes the shared bind and does not repa
   let repairs = 0;
   let clears = 0;
   let rebindCalls = 0;
-  const execute = realExecuteRecovery(cfg(), {
+  let trustedReadDir = "";
+  const execute = realExecuteRecovery({ ...cfg(), repo_dir: "/separate-candidate" }, {
     clearBlocked: async () => { clears++; },
     repairPipelineItem: async () => {
       repairs++;
@@ -585,11 +604,15 @@ test("rebind_tester_evidence_after_pr executes the shared bind and does not repa
     resolveRunEngineIdentity: async () => persistedEngineIdentity(),
     getPrForIssue: async () => 99,
     getPrDetail: async () => ({ number: 99, head_sha: "a".repeat(40) }) as never,
-    readTrustedSurfaceDecision: async () => ({
+    resolveRunStoreRepoDir: async () => "/target-primary",
+    readTrustedSurfaceDecision: async (runDir) => {
+      trustedReadDir = runDir;
+      return ({
       outcome: "passthrough",
       candidate_sha: "a".repeat(40),
       effective_verifier_hash: "c".repeat(64),
-    }) as never,
+      }) as never;
+    },
   });
   const diagnostic = buildStageDiagnostic({
     reasonCode: "workflow-engine-defect",
@@ -614,6 +637,8 @@ test("rebind_tester_evidence_after_pr executes the shared bind and does not repa
   assert.equal(rebindCalls, 1);
   assert.equal(repairs, 0);
   assert.equal(clears, 1);
+  assert.equal(trustedReadDir, runDirPath("/target-primary", "run-1"),
+    "candidate recovery reads the release-owned target store, never the separate candidate clone");
   assert.match(result.evidence, /rebind_tester_evidence_after_pr/);
 });
 
@@ -1571,6 +1596,32 @@ test("unlink_engine_scratch (#1021): successful recover invokes live sibling fil
   assert.equal(siblingCalls[0]!.issueNumber, 1013);
   assert.equal(siblingCalls[0]!.evidenceKey, "ek-1013-scratch");
   assert.equal(siblingCalls[0]!.action, "unlink_engine_scratch");
+});
+
+test("unlink_engine_scratch exact-candidate FRG suppression skips the live sibling filer", async (t) => {
+  const prior = process.env.PIPELINE_SUPPRESS_AUTO_FILE;
+  process.env.PIPELINE_SUPPRESS_AUTO_FILE = "1";
+  t.after(() => {
+    if (prior === undefined) delete process.env.PIPELINE_SUPPRESS_AUTO_FILE;
+    else process.env.PIPELINE_SUPPRESS_AUTO_FILE = prior;
+  });
+  let statusPhase = 0;
+  let siblingCalls = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/1013", slug: "1013-x", branch: "pipeline/1013-x" } as never),
+    gitInWorktree: async (_path, args) => {
+      if (args[0] === "status") return { stdout: statusPhase++ === 0 ? "?? artifacts/challenge-response-1013.json\n" : "", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    getIssueDetail: async () => ({ number: 1013, type: "issue", title: "t", body: "", state: "open", url: "u", labels: [] }),
+    onEngineClassRecovered: async () => { siblingCalls++; },
+  });
+  const result = await execute({
+    ...mechanicalInput(), itemId: "1013", action: "unlink_engine_scratch", blockerClass: "workflow-engine-defect",
+    diagnostic: buildStageDiagnostic({ reasonCode: "workflow-engine-defect", blockerKind: "harness-failure", reason: "scratch" }),
+  });
+  assert.equal(result.succeeded, true, result.error);
+  assert.equal(siblingCalls, 0);
 });
 
 test("unlink_engine_scratch (#1021): sibling filer throw does not reverse recover", async () => {

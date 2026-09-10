@@ -317,6 +317,8 @@ const TEST_BUILD_GATE_DELTA_OMITTED_NAMES = [
 
 test("testGateOmittedEnvNames includes every name listed in the test-build-gate delta", () => {
   const omitted = new Set(testGateOmittedEnvNames());
+  assert.ok(omitted.has("PIPELINE_SUPPRESS_AUTO_FILE"));
+  assert.ok(omitted.has("PIPELINE_EXACT_FRG_NO_ENGINE_REPAIR"));
   for (const name of TEST_BUILD_GATE_DELTA_OMITTED_NAMES) {
     assert.ok(omitted.has(name), `omitted-name list must include ${name}`);
   }

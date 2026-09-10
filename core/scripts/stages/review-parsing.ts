@@ -1229,14 +1229,25 @@ function extractProseSummary(text: string): string {
 }
 
 /**
- * Extract repo-relative file paths from a unified diff string.
- * Parses `diff --git a/<path> b/<path>` header lines produced by `gh pr diff`.
+ * Extract both repo-relative sides from unified-diff headers. Both sides are
+ * security-significant for renames; Git C-quotes paths containing whitespace
+ * or other unusual bytes.
  */
 export function diffFilePaths(diff: string): string[] {
   const paths = new Set<string>();
   for (const line of diff.split("\n")) {
-    const m = line.match(/^diff --git a\/.+ b\/(.+)$/);
-    if (m) paths.add(m[1]);
+    const quoted = /^diff --git ("a\/(?:\\.|[^"\\])*") ("b\/(?:\\.|[^"\\])*")$/.exec(line);
+    if (quoted) {
+      let decoded = true;
+      for (const encoded of quoted.slice(1)) {
+        try { paths.add((JSON.parse(encoded!) as string).slice(2)); } catch { decoded = false; }
+      }
+      if (!decoded) paths.add("__unparseable_git_diff_header__");
+      continue;
+    }
+    const plain = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+    if (plain) { paths.add(plain[1]!); paths.add(plain[2]!); }
+    else if (line.startsWith("diff --git ")) paths.add("__unparseable_git_diff_header__");
   }
   return [...paths];
 }

@@ -251,6 +251,14 @@ export const CORRECTION_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:correction-
  *  reconciliation never conflates the three auto-file sources. */
 export const DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:durable-run-blocker-auto-filed -->";
 
+/** Internal invocation policy for exact-pair FRG runs, which must never file
+ * repair issues while exercising the ordinary pipeline lifecycle. */
+export const PIPELINE_SUPPRESS_AUTO_FILE_ENV = "PIPELINE_SUPPRESS_AUTO_FILE";
+
+export function autoFileAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[PIPELINE_SUPPRESS_AUTO_FILE_ENV] !== "1";
+}
+
 /**
  * Append engine version+SHA and discovery-channel stamps to an auto-file body
  * (#763). Pure aside from optional identity injection — never removes the

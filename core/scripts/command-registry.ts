@@ -373,6 +373,8 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
       "events",
       "untilTerminal",
       "engineTrack",
+      "domain",
+      "candidateTargetPrimary",
     ]),
     needsConfig: false,
     needsGhAuth: false,
