@@ -176,7 +176,8 @@ import {
   type TerminalLogTee,
 } from "./run-store.ts";
 import { finishReleasePr, realReleaseFinishDeps } from "./stages/release-finish.ts";
-import { realReleaseDeps, runRelease } from "./stages/release.ts";
+import { realReleaseDeps, resolveVersion, runRelease } from "./stages/release.ts";
+import { realCompleteReleaseDeps, runCompleteRelease } from "./stages/release-complete.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import {
   runDecompose,
@@ -4811,7 +4812,7 @@ async function main(): Promise<void> {
   // preflight checks and exits, with no issue number. Distinct from the
   // `--doctor` flag, which gates a real advance run.
   const isDoctorCommand = numArg === "doctor";
-  // `pipeline release <version>` prepares a release PR — no issue number required.
+  // `pipeline release <version>` independently completes a SemVer release.
   const isReleaseCommand = numArg === "release";
   // `pipeline ship` owns one exact, event-authorized release shipment.
   const isShipCommand = numArg === "ship";
@@ -5049,21 +5050,23 @@ async function main(): Promise<void> {
       }
     }
   }
-  // Validate release args early. Subcommands: prepare (`release <version>`),
-  // finish (`release finish <pr>`), or candidate tag (`release ensure-tag`).
+  // Validate release args early. Direct VERSION is complete ownership; bounded
+  // factory callers use `prepare`, while finish/ensure-tag remain legacy seams.
   if (isReleaseCommand) {
     const subEarly = cmd.args[1];
     if (!subEarly) {
       console.error(
-        "pipeline release: a version argument or 'finish <pr>' is required.\n" +
-          "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run|--json] [--no-edit] [--skip-frg]\n" +
+        "pipeline release: a version argument, 'prepare <version>', or 'finish <pr>' is required.\n" +
+          "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run|--json] [--no-edit]\n" +
+          "         pipeline release prepare <X.Y.Z | major | minor | patch> [--no-edit]\n" +
           "         pipeline release finish <pr> [--json]\n" +
           "         pipeline release ensure-tag <X.Y.Z> <merge-commit-oid> --packed-candidate <40-hex>\n" +
           "         [--allow-open-soak-defects \"<reason>\"]\n" +
-          "  Prepare stops at an open release PR (never tags/merges).\n" +
+          "  Direct release merges metadata after exact-head CI, runs exact-candidate FRG, tags, and verifies publication.\n" +
+          "  prepare stops at an open metadata-only PR (never merges, runs FRG, tags, or publishes).\n" +
           "  finish merges an open release PR after checks (never tags).\n" +
-          "  ensure-tag is the ship-end tag owner from on-disk HMAC latest.json when FRG is gitignored.\n" +
-          "  Tag-derived CHANGELOG refresh runs automatically after auto-tag (#978).",
+          "  ensure-tag is a legacy compatibility seam pending deletion in #1560.\n" +
+          "  release.yml alone refreshes tag-derived docs after the complete owner pushes the fixed tag.",
       );
       process.exit(2);
     }
@@ -5094,6 +5097,18 @@ async function main(): Promise<void> {
         );
         process.exit(2);
       }
+    } else if (subEarly === "prepare") {
+      const prepareVersion = cmd.args[2];
+      if (!prepareVersion || (!/^\d+\.\d+\.\d+$/.test(prepareVersion) && !["major", "minor", "patch", "next"].includes(prepareVersion))) {
+        console.error("pipeline release prepare: a version or major|minor|patch|next is required.");
+        process.exit(2);
+      }
+      if (typeof opts.packedCandidate === "string") {
+        console.error(
+          "pipeline release prepare: --packed-candidate is reserved for legacy release ensure-tag.",
+        );
+        process.exit(2);
+      }
     } else if (/^\d+$/.test(subEarly)) {
       console.error(
         `pipeline release: "${subEarly}" looks like an issue/PR number, not a version.\n` +
@@ -5101,11 +5116,13 @@ async function main(): Promise<void> {
           `  Finish:  pipeline release finish <pr>`,
       );
       process.exit(2);
-    } else if (opts.dryRun && typeof opts.packedCandidate === "string") {
+    } else if (typeof opts.packedCandidate === "string") {
       console.error(
-        "pipeline release: --dry-run cannot be combined with --packed-candidate; " +
-          "candidate-bound release preparation requires exact-checkout alignment.",
+        "pipeline release: --packed-candidate is reserved for legacy release ensure-tag.",
       );
+      process.exit(2);
+    } else if (opts.skipFrg) {
+      console.error("pipeline release: --skip-frg is not permitted for complete release.");
       process.exit(2);
     }
   }
@@ -5468,24 +5485,24 @@ async function main(): Promise<void> {
       return;
     }
 
-    const versionArg = cmd.args[1] as string;
+    const prepareOnly = cmd.args[1] === "prepare";
+    const versionArg = (prepareOnly ? cmd.args[2] : cmd.args[1]) as string;
     try {
+      if (!prepareOnly && typeof opts.packedCandidate === "string") {
+        throw new Error("--packed-candidate is reserved for legacy release ensure-tag and cannot be used by complete release");
+      }
+      if (!prepareOnly && opts.skipFrg) {
+        throw new Error("--skip-frg is not permitted for complete release");
+      }
       validateReleaseMachineOutputMode(opts);
     } catch (err) {
       console.error(`pipeline release: ${(err as Error).message}`);
       process.exit(2);
+      return;
     }
     try {
-      if (typeof opts.packedCandidate === "string") {
-        const { alignReleaseCheckoutToCandidate } = await import("./stages/ship-adapter.ts");
-        await alignReleaseCheckoutToCandidate(
-          localCfg.base_branch,
-          opts.packedCandidate,
-          async (args) => {
-            const result = await gitInWorktree(localCfg.repo_dir, args);
-            return result.stdout.trim();
-          },
-        );
+      if (prepareOnly && typeof opts.packedCandidate === "string") {
+        throw new Error("--packed-candidate is reserved for legacy release ensure-tag and cannot be used by release prepare");
       }
       const releaseDeps = realReleaseDeps(localCfg.repo_dir);
       if (opts.json) {
@@ -5494,9 +5511,7 @@ async function main(): Promise<void> {
         releaseDeps.stdout = (message) => console.error(message);
         releaseDeps.stderr = (message) => console.error(message);
       }
-      const result = await runRelease(
-        versionArg,
-        {
+      const prepareOpts = {
           dryRun: opts.dryRun,
           noEdit: opts.edit === false,
           theme: typeof opts.theme === "string" ? opts.theme : undefined,
@@ -5505,20 +5520,43 @@ async function main(): Promise<void> {
               ? opts.allowOpenSoakDefects
               : undefined,
           skipFrg: !!opts.skipFrg,
-        },
-        localCfg,
-        releaseDeps,
-      );
+        };
+      const result = prepareOnly
+        ? opts.dryRun
+          ? await runRelease(versionArg, prepareOpts, localCfg, releaseDeps)
+          : await (async () => {
+              const completeDeps = realCompleteReleaseDeps(localCfg);
+              const head = await completeDeps.observeOriginHead(localCfg.base_branch);
+              const versions = await completeDeps.versionsAt(head);
+              if (versions.root !== versions.core) throw new Error("package versions disagree at origin head");
+              return completeDeps.prepareMetadata(resolveVersion(versionArg, versions.core), localCfg.base_branch, prepareOpts);
+            })()
+        : await runCompleteRelease(
+          versionArg,
+          {
+            dryRun: opts.dryRun,
+            noEdit: opts.edit === false,
+            theme: typeof opts.theme === "string" ? opts.theme : undefined,
+            allowOpenSoakDefects:
+              typeof opts.allowOpenSoakDefects === "string"
+                ? opts.allowOpenSoakDefects
+                : undefined,
+          },
+          localCfg,
+          realCompleteReleaseDeps(localCfg),
+        );
       if (opts.json) {
-        if (!result) throw new Error("release prepare returned no identity");
+        if (!result) throw new Error(prepareOnly ? "release prepare returned no identity" : "release dry-run returned no identity");
         console.log(JSON.stringify(result, null, 2));
+      } else if (!prepareOnly && result) {
+        console.log(`[pipeline release] published ${result.tag} at ${result.candidate_sha} (${result.published_at})`);
       }
     } catch (err) {
       const message = (err as Error).message;
       if (!opts.dryRun) {
         reportMechanicalFault(defaultRecoverySupervisorReport, {
-          operation: "release_prepare",
-          form_id: "release",
+          operation: prepareOnly ? "release_prepare" : "release_complete",
+          form_id: prepareOnly ? "release.prepare" : "release",
           message,
           fault: "mechanical",
           ...mintObservationIdentity({ domain: localCfg.domain, repository: localCfg.repo }),

@@ -167,7 +167,13 @@ test("inspect-list forms match design dispositions", () => {
   expectDisp("grill.status", "read-only");
   expectDisp("grill", "supervised-lifecycle");
   expectDisp("release", "supervised-lifecycle", "protected-authority");
+  expectDisp("release.prepare", "bounded-atomic-administration", "none");
+  expectDisp("release.finish", "supervised-lifecycle", "protected-authority");
+  expectDisp("advance", "supervised-lifecycle", "none");
+  expectDisp("single", "supervised-lifecycle");
+  expectDisp("loop", "supervised-lifecycle");
   expectDisp("factory-release", "supervised-lifecycle");
+  expectDisp("factory-release.prepare", "supervised-lifecycle");
   expectDisp("cleanup", "bounded-atomic-administration");
   expectDisp("remove-worktree", "bounded-atomic-administration");
 });
@@ -187,6 +193,27 @@ test("starting nested drives is not bounded-atomic", () => {
       `${id} starts or drives a run`,
     );
   }
+});
+
+test("prepare-only callers stay bounded and ordinary drives have no merge or tag authority (#1563)", () => {
+  assert.equal(lookupCommandForm("release.prepare")?.authority_requirement, "none");
+  assert.equal(lookupCommandForm("factory-release.prepare")?.authority_requirement, "none");
+  assert.equal(lookupCommandForm("release")?.authority_requirement, "protected-authority");
+  assert.equal(lookupCommandForm("ship")?.authority_requirement, "protected-authority");
+  for (const id of ["advance", "single", "loop"]) {
+    assert.notEqual(lookupCommandForm(id)?.authority_requirement, "protected-authority", id);
+    assert.doesNotMatch(PIPELINE_SRC, new RegExp(`numArg === "${id === "advance" ? "unused" : id}"[\\s\\S]{0,400}runCompleteRelease`));
+  }
+  assert.match(PIPELINE_SRC, /release prepare: --packed-candidate is reserved/);
+  assert.doesNotMatch(PIPELINE_SRC, /alignReleaseCheckoutToCandidate/);
+});
+
+test("prepare-only release faults use inventory form id release.prepare", () => {
+  assert.equal(lookupCommandForm("release.prepare")?.id, "release.prepare");
+  assert.match(
+    PIPELINE_SRC,
+    /operation: prepareOnly \? "release_prepare" : "release_complete",\s*form_id: prepareOnly \? "release\.prepare" : "release"/,
+  );
 });
 
 test("dry-run forms do not inherit supervised-lifecycle from the apply/drive form", () => {

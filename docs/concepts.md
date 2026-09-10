@@ -45,7 +45,7 @@ Hosts (Claude Code `/pipeline`, Codex `$pipeline`, and others) are shims around 
 - Scaffolds `.github/pipeline.yml` with documented defaults
 - Ensures local-only paths under `.agent-pipeline/` are gitignored
 
-Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, `.agent-pipeline/factory-release/`, `.agent-pipeline/grill-proposal.key`, and `.agent-pipeline/grill-proposals/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
+Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, `.agent-pipeline/factory-release/`, `.agent-pipeline/release-publisher-recovery/`, `.agent-pipeline/grill-proposal.key`, and `.agent-pipeline/grill-proposals/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
 
 After `init`, commit the config, label an issue `pipeline:ready`, and run `pipeline N`.
 
@@ -339,18 +339,19 @@ npm run docs:generate
 `npm run docs:check` / `node scripts/generate-docs.mjs --check` fails when committed artifacts are stale (the same freshness contract `build.mjs --check` applies to its generated SKILL/catalog outputs).
 
 **Release / tags:** `CHANGELOG.md` is derived from annotated `vX.Y.Z` tags.
-After a release merge, ship-end `pipeline release ensure-tag` creates and
-pushes `vX.Y.Z` from on-disk HMAC `.agent-pipeline/frg/<X.Y.Z>/latest.json`.
-That path is gitignored, so `auto-tag-release.yml` must not fail the job when
-the merged tree has no `latest.json`. If the tag already exists, auto-tag is a
-successful no-op. After the tag is visible, `node scripts/release-docs-refresh.mjs`
-refreshes the CHANGELOG on the default branch. Operator heal if that step failed:
+After metadata merges, `pipeline release VERSION` freezes C, verifies the
+release-owned exact-candidate pair, then creates the annotated `vX.Y.Z` tag at
+C. The tag-triggered `release.yml` workflow is the sole GitHub Release and
+post-tag docs owner. A docs commit may advance main but never retargets C.
+Operator heal if the docs step failed:
 
 ```bash
 node scripts/release-docs-refresh.mjs --version X.Y.Z --push
 ```
 
-Release prepare (`pipeline release <version>`) does not invent the shipped tag entry (the tag does not exist yet). `pipeline release finish` merges only; it does not tag or publish. Ship-end `pipeline release ensure-tag` owns `vX.Y.Z` when FRG is gitignored.
+The bounded `pipeline release prepare <version>` helper only prepares metadata; it cannot merge, tag, or publish. Direct `pipeline release <version>` completes through verified non-draft publication.
+
+Git cannot atomically create a tag and assert that an unrelated protected `main` ref remains candidate C. Release observes `origin/main = C` immediately before the non-force tag create, re-fetches the remote tag, and has `release.yml` re-check tag identity and `origin/main = C` before publication. Observable movement fails closed as tagged-stale-C. Tags are never force-moved or deleted. The remaining main-observation/tag-create and workflow-observation/publication windows are an unavoidable distributed race, not compare-and-swap atomicity.
 
 ## Operator follow and notify
 
@@ -456,10 +457,10 @@ npx github:accidental-hedge-fund/agent-pipeline update
 
 Carry-forward lessons live in a maintainer-curated `## Lessons / Gotchas` section of the conventions file (`conventions_md_path`, else `CLAUDE.md`). No stage writes that file.
 
-Local-only artifact paths (must stay gitignored): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, and `.agent-pipeline/factory-release/`.
+Local-only artifact paths (must stay gitignored): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, `.agent-pipeline/factory-release/`, and `.agent-pipeline/release-publisher-recovery/`.
 
 Full stage inventory lives in living specs and engine `STAGES`, not in the generated SKILL. Label-inventory terminals are exactly `TERMINAL_STAGES` = `{ready-to-deploy, needs-human}`. `needs-human` projects a current typed-input wait; it is not lifecycle cancellation. Mechanical exhaustion is Cooling. Loop selectors are documented above; see [cli.md](cli.md) for the generated verb inventory.
 
-Release-plan rows live in `ROADMAP.md`. Columns: Release, Bump, Theme, Issues, Why. The unshipped row shape is `| **vX.Y.Z** | bump | theme | issues | why |`. `pipeline release <version>` prepares a release PR from the matching GitHub milestone plan. Release scaffolds a missing unshipped row when the `| *(none)* |` insert sentinel is present, or fails with remediation (file, copy-paste row, restore the sentinel) when it is not. `Ship milestone vX.Y.Z` maps to `pipeline ship --milestone vX.Y.Z`.
+Release-plan rows live in `ROADMAP.md`. Columns: Release, Bump, Theme, Issues, Why. The unshipped row shape is `| **vX.Y.Z** | bump | theme | issues | why |`. `pipeline release prepare <version>` prepares metadata from the matching milestone; direct `pipeline release <version>` completes the verified release. Release scaffolds a missing unshipped row when the `| *(none)* |` insert sentinel is present, or fails with remediation (file, copy-paste row, restore the sentinel) when it is not. `Ship milestone vX.Y.Z` maps to `pipeline ship --milestone vX.Y.Z` and delegates its SemVer tail once.
 
 True-fast commands (`status`, `doctor`, read-only `pipeline loop --audit`) complete in seconds and need no Monitor. `status` completes in seconds. Loop drive/resume and `pipeline train` do not.

@@ -42,3 +42,7 @@ node_modules/
 # Factory-release prepare checkpoints and loop bindings; engine-written,
 # never committed on the factory control checkout.
 .agent-pipeline/factory-release/
+
+# Host-local publisher recovery episodes keyed by release.yml plus tag plus
+# candidate; never committed.
+.agent-pipeline/release-publisher-recovery/

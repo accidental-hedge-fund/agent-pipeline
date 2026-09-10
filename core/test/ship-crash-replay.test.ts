@@ -134,6 +134,12 @@ function completeProgress(): ShipProgress {
       live_digest: MERGE,
       verified: true,
     },
+    complete_release: {
+      version: intent.version,
+      candidate_sha: CANDIDATE,
+      tag: `v${intent.version}`,
+      published_at: "2026-08-10T12:30:00.000Z",
+    },
     lineage: emptyShipProgress().lineage,
   };
   progress.lineage = projectCandidateLineage(progress);
@@ -204,6 +210,10 @@ function crashDeps(store: ReturnType<typeof memoryStore>, observed: ShipProgress
     async convergeDeployment() {
       mutations.push("host-install");
       return structuredClone(progress.deployment!);
+    },
+    async convergeCompleteRelease() {
+      mutations.push("release-complete");
+      return structuredClone(progress.complete_release!);
     },
     async observeRemainingOpenMilestoneIssues() { return []; },
   };
@@ -285,7 +295,7 @@ test("crash after release merge does not remarge (#1331)", async () => {
   assert.ok(!resumed.mutations.includes("release-merge"));
 });
 
-test("crash after origin tag push before publication does not retag (#1331)", async () => {
+test("legacy tag crash state delegates to the complete release owner without retagging (#1563)", async () => {
   const store = memoryStore();
   const first = crashDeps(store);
   first.convergeTag = async () => {
@@ -304,8 +314,8 @@ test("crash after origin tag push before publication does not retag (#1331)", as
   const resumed = crashDeps(store, observed);
   const result = await runShipCoordinator(intent, authorization(), resumed);
   assert.ok(!resumed.mutations.includes("tag-push"));
-  assert.ok(resumed.mutations.includes("github-release"));
-  assert.equal(result.tag?.peeled_commit, MERGE);
+  assert.ok(!resumed.mutations.includes("github-release"));
+  assert.equal(result.complete_release?.candidate_sha, CANDIDATE);
   assert.equal(result.complete, true);
 });
 
@@ -332,7 +342,7 @@ test("crash after tag push / GitHub Release does not retag (#1331)", async () =>
   assert.ok(!resumed.mutations.includes("github-release"));
 });
 
-test("same-version pin retarget does not complete deployment on stale host digest (#1331)", async () => {
+test("same-version pin retarget is outside SemVer ship's complete-release tail (#1563)", async () => {
   const store = memoryStore();
   const first = crashDeps(store);
   first.convergeDeployment = async () => {
@@ -368,11 +378,11 @@ test("same-version pin retarget does not complete deployment on stale host diges
     return result.evidence;
   };
   const result = await runShipCoordinator(intent, authorization(), resumed);
-  assert.equal(result.complete, false);
+  assert.equal(result.complete, true);
   assert.equal(result.deployment, null);
-  assert.equal(result.lifecycle, "cooling");
+  assert.equal(result.lifecycle, "complete");
   assert.ok(!resumed.mutations.includes("host-install"));
-  assert.match(result.last_error ?? "", /production pin no longer matches/);
+  assert.equal(result.last_error, null);
 });
 
 test("crash after pin write does not rewrite the pin (#1331)", async () => {
@@ -413,7 +423,7 @@ test("crash after host install with proven digest does not reinstall (#1331)", a
   assert.equal(result.complete, true);
 });
 
-test("uncertain install stays owned and observes before replay (#1331)", async () => {
+test("legacy uncertain install cannot regain authority after complete-release delegation (#1563)", async () => {
   const store = memoryStore();
   const first = crashDeps(store);
   first.convergeDeployment = async () => {
@@ -421,8 +431,8 @@ test("uncertain install stays owned and observes before replay (#1331)", async (
     throw new Error("install timed out with unknown completeness");
   };
   const crashed = await runShipCoordinator(intent, authorization(), first);
-  assert.equal(crashed.lifecycle, "cooling");
-  assert.equal(crashed.complete, false);
+  assert.equal(crashed.lifecycle, "complete");
+  assert.equal(crashed.complete, true);
   assert.equal(crashed.deployment, null);
   const observed = emptyShipProgress();
   const done = completeProgress();
@@ -442,7 +452,7 @@ test("uncertain install stays owned and observes before replay (#1331)", async (
   };
   await runShipCoordinator(intent, authorization(), resumed);
   assert.equal(observedBeforeReplay, true);
-  assert.equal(resumed.mutations.includes("host-install"), true);
+  assert.equal(resumed.mutations.includes("host-install"), false);
 });
 
 test("crash tests fail if real I/O seams are used (#1331)", async () => {

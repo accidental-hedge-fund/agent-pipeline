@@ -257,6 +257,17 @@ function makeDeps(
       assert.equal(promotion.pin_digest, MERGE);
       return structuredClone(progress.deployment!);
     },
+    async convergeCompleteRelease(releaseIntent, train) {
+      calls.push("release-complete");
+      const remaining = await deps.observeRemainingOpenMilestoneIssues(releaseIntent);
+      assertNoRemainingOpenMilestoneIssues(releaseIntent.milestone, remaining);
+      return {
+        version: "1.34.0",
+        candidate_sha: train.integrated_head_oid,
+        tag: "v1.34.0",
+        published_at: "2026-08-10T12:30:00.000Z",
+      };
+    },
     async observeRemainingOpenMilestoneIssues() {
       deps.remainingOpenCalls += 1;
       return [...deps.remainingOpenIssues];
@@ -338,7 +349,7 @@ test("ship authorization rejects noncanonical, future, expired, and overlong gra
   assert.throws(() => validateBuzzShipAuthorization(overlong, intent, NOW, AUTH_PUBLIC_KEY), /within seven days/);
 });
 
-test("ship coordinator composes the existing capabilities in one fixed order", async () => {
+test("ship coordinator composes train and exactly one complete-release delegation", async () => {
   const store = memoryStore();
   const deps = makeDeps(store);
   const result = await runShipCoordinator(intent, authorization(), deps);
@@ -347,21 +358,14 @@ test("ship coordinator composes the existing capabilities in one fixed order", a
     "reconcile",
     "plan-train",
     "train",
-    "frg-pack",
-    "frg-score",
-    "release-prepare",
-    "release-finish",
-    "tag",
-    "release-wait",
-    "engine-promote",
-    "engine-deploy",
+    "release-complete",
   ]);
   assert.equal(result.complete, true);
   assert.equal(result.next_action, "complete");
   assert.equal(result.ship_key, shipKey(intent));
   assert.equal(result.events_file, `/state/ships/${shipKey(intent)}/events.jsonl`);
   assert.equal(result.authorization_fingerprint, authorization().fingerprint);
-  assert.equal(result.promotion?.installed_version, "1.34.0");
+  assert.equal(result.complete_release?.version, "1.34.0");
   assert.ok(store.writes.every((write) => write.kind === "ship_status"));
   assert.deepEqual(
     store.events.map((event) => `${event.phase}:${event.status}`),
@@ -369,17 +373,36 @@ test("ship coordinator composes the existing capabilities in one fixed order", a
       "train_merge:reconciled",
       "train_merge:reconciled",
       "train_merge:started", "train_merge:completed",
-      "frg_pack:started", "frg_pack:completed",
-      "frg_score:started", "frg_score:completed",
-      "release_prepare:started", "release_prepare:completed",
-      "release_finish:started", "release_finish:completed",
-      "tag:started", "tag:completed",
-      "release_wait:started", "release_wait:completed",
-      "engine_promote:started", "engine_promote:completed",
-      "deploy:started", "deploy:completed",
+      "release_complete:started", "release_complete:completed",
       "complete:completed",
     ],
   );
+});
+
+test("SemVer ship fails closed without the complete-release seam and never falls through", async () => {
+  const store = memoryStore();
+  const deps = makeDeps(store) as ShipCoordinatorDeps & { calls: string[]; convergeCompleteRelease?: ShipCoordinatorDeps["convergeCompleteRelease"] };
+  delete deps.convergeCompleteRelease;
+  const result = await runShipCoordinator(intent, authorization(), deps as ShipCoordinatorDeps);
+  assert.equal(result.complete, false);
+  assert.equal(result.next_action, "release_complete");
+  for (const legacy of ["frg-pack", "frg-score", "release-prepare", "release-finish", "tag", "release-wait", "engine-promote", "engine-deploy"]) {
+    assert.ok(!deps.calls.includes(legacy));
+  }
+});
+
+test("SemVer ship accepts the release owner's post-metadata candidate C", async () => {
+  const store = memoryStore();
+  const deps = makeDeps(store);
+  const postMetadata = "e".repeat(40);
+  deps.convergeCompleteRelease = async () => ({
+    version: intent.version, candidate_sha: postMetadata, tag: `v${intent.version}`,
+    published_at: "2026-08-10T12:30:00.000Z",
+  });
+  const result = await runShipCoordinator(intent, authorization(), deps);
+  assert.equal(result.train?.integrated_head_oid, CANDIDATE);
+  assert.equal(result.complete_release?.candidate_sha, postMetadata);
+  assert.equal(result.complete, true);
 });
 
 test("ship coordinator rechecks authorization expiry before the next phase", async () => {
@@ -414,7 +437,7 @@ test("ship coordinator uses external reconciliation to resume without repeating 
   const result = await runShipCoordinator(intent, authorization(), rerun);
   assert.equal(result.complete, true);
   assert.deepEqual(rerun.calls, ["reconcile"]);
-  assert.equal(store.events.at(-1)?.status, "reconciled");
+  assert.equal(store.events.at(-1)?.status, "completed");
 });
 
 test("ship coordinator atomically persists the accepted train plan before train mutation", async () => {
@@ -469,14 +492,7 @@ test("ship coordinator reuses the frozen train plan after crash instead of repla
   assert.deepEqual(resumed.calls, [
     "reconcile",
     "train",
-    "frg-pack",
-    "frg-score",
-    "release-prepare",
-    "release-finish",
-    "tag",
-    "release-wait",
-    "engine-promote",
-    "engine-deploy",
+    "release-complete",
   ]);
 });
 
@@ -514,7 +530,7 @@ test("ship reconciliation rejects a noncanonical train completion checkpoint", a
   assert.deepEqual(deps.calls, ["reconcile"]);
 });
 
-test("ship coordinator recovers a release side effect that overtook local status", async () => {
+test("ship coordinator delegates recovery of legacy tail state to complete release", async () => {
   const store = memoryStore();
   await seedFrozenTrainPlan(store);
   const progress = completeProgress();
@@ -526,7 +542,7 @@ test("ship coordinator recovers a release side effect that overtook local status
   const deps = makeDeps(store, progress);
 
   const result = await runShipCoordinator(intent, authorization(), deps);
-  assert.deepEqual(deps.calls, ["reconcile", "release-finish", "tag", "release-wait", "engine-promote", "engine-deploy"]);
+  assert.deepEqual(deps.calls, ["reconcile", "release-complete"]);
   assert.equal(result.complete, true);
 });
 
@@ -610,7 +626,7 @@ test("default ship store atomically publishes typed status and appends exact-run
     assert.equal(store.statusFile(shipKey(intent)), path.join(root, "ships", shipKey(intent), "status.json"));
     assert.equal(result.events_file, store.eventsFile(shipKey(intent)));
     const eventLines = (await fs.readFile(result.events_file, "utf8")).trim().split("\n");
-    assert.equal(eventLines.length, 21);
+    assert.equal(eventLines.length, 7);
     assert.equal((JSON.parse(eventLines.at(-1)!) as ShipPhaseEvent).phase, "complete");
     assert.deepEqual(
       (await fs.readdir(path.dirname(store.statusFile(shipKey(intent))))).sort(),
@@ -682,7 +698,7 @@ test("ship persist does not set human_authority from error-message regex (#1331)
   assert.equal(result.last_error, null);
 });
 
-test("ship coordinator pending wait-cap expiry stays resumable (#1205)", async () => {
+test("ship coordinator does not retain a second release-finish wait path (#1563)", async () => {
   const store = memoryStore();
   const waiting = makeDeps(store);
   waiting.convergeReleaseFinish = async () => {
@@ -692,18 +708,14 @@ test("ship coordinator pending wait-cap expiry stays resumable (#1205)", async (
     );
   };
   const checkpoint = await runShipCoordinator(intent, authorization(), waiting);
-  assert.equal(checkpoint.complete, false);
-  assert.equal(checkpoint.next_action, "release_finish");
+  assert.equal(checkpoint.complete, true);
+  assert.equal(checkpoint.next_action, "complete");
   assert.equal(checkpoint.last_error, null);
   assert.equal(checkpoint.human_authority, false);
   assert.equal(checkpoint.release_finish, null);
-  assert.equal(checkpoint.release?.pr, 1001);
+  assert.equal(checkpoint.release, null);
   assert.ok(!store.events.some((event) => event.status === "failed"));
-  assert.ok(store.events.some((event) =>
-    event.phase === "release_finish" &&
-    event.status === "started" &&
-    /still pending/.test(event.detail ?? ""),
-  ));
+  assert.ok(!store.events.some((event) => event.phase === "release_finish"));
 
   const observed = completeProgress();
   observed.release_finish = null;
@@ -716,7 +728,7 @@ test("ship coordinator pending wait-cap expiry stays resumable (#1205)", async (
   assert.equal(result.complete, true);
   assert.equal(result.next_action, "complete");
   assert.equal(result.last_error, null);
-  assert.ok(resumed.calls.includes("release-finish"));
+  assert.ok(!resumed.calls.includes("release-complete"), "completed release is not delegated twice");
   assert.ok(!resumed.calls.includes("train"));
 });
 
@@ -843,11 +855,8 @@ async function seedCompletedTrain(
   store: ReturnType<typeof memoryStore>,
 ): Promise<void> {
   const deps = makeDeps(store);
-  deps.convergeFrgPack = async () => {
-    throw new Error("stop after train");
-  };
   const parked = await runShipCoordinator(intent, authorization(), deps);
-  assert.match(parked.last_error ?? "", /stop after train/);
+  assert.equal(parked.complete, true);
   assert.ok(store.status?.train);
   assert.equal(store.status?.frg_pack, null);
 }
@@ -882,12 +891,12 @@ test("ship remaining-open: train is not gated by leftover open issues (#1354)", 
 test("ship remaining-open: leftover issues block release prepare (#1354)", async () => {
   const store = memoryStore();
   const first = makeDeps(store);
-  first.convergeReleasePrepare = async () => {
+  first.convergeCompleteRelease = async () => {
     throw new Error("stop after frg score");
   };
   const stopped = await runShipCoordinator(intent, authorization(), first);
   assert.match(stopped.last_error ?? "", /stop after frg score/);
-  assert.ok(store.status?.frg);
+  assert.ok(store.status?.train);
   assert.equal(store.status?.release, null);
 
   const blocked = makeDeps(store, {
@@ -906,12 +915,12 @@ test("ship remaining-open: leftover issues block release prepare (#1354)", async
 test("ship remaining-open: leftover issues block release finish (#1354)", async () => {
   const store = memoryStore();
   const first = makeDeps(store);
-  first.convergeReleaseFinish = async () => {
+  first.convergeCompleteRelease = async () => {
     throw new Error("stop after release prepare");
   };
   const stopped = await runShipCoordinator(intent, authorization(), first);
   assert.match(stopped.last_error ?? "", /stop after release prepare/);
-  assert.ok(store.status?.release);
+  assert.ok(store.status?.train);
   assert.equal(store.status?.release_finish, null);
 
   const blocked = makeDeps(store, {
@@ -930,12 +939,12 @@ test("ship remaining-open: leftover issues block release finish (#1354)", async 
 test("ship remaining-open: leftover issues block engine-promote (#1354)", async () => {
   const store = memoryStore();
   const first = makeDeps(store);
-  first.convergeEnginePromote = async () => {
+  first.convergeCompleteRelease = async () => {
     throw new Error("stop after publication");
   };
   const stopped = await runShipCoordinator(intent, authorization(), first);
   assert.match(stopped.last_error ?? "", /stop after publication/);
-  assert.ok(store.status?.publication);
+  assert.ok(store.status?.train);
   assert.equal(store.status?.promotion, null);
 
   const blocked = makeDeps(store, {
@@ -952,15 +961,15 @@ test("ship remaining-open: leftover issues block engine-promote (#1354)", async 
 test("ship remaining-open: resume re-observes after completed FRG pack (#1354)", async () => {
   const store = memoryStore();
   const first = makeDeps(store);
-  first.convergeFrgScore = async () => {
+  first.convergeCompleteRelease = async () => {
     throw new Error("stop after frg pack");
   };
   const stopped = await runShipCoordinator(intent, authorization(), first);
   assert.match(stopped.last_error ?? "", /stop after frg pack/);
-  assert.ok(store.status?.frg_pack);
+  assert.ok(store.status?.train);
   assert.equal(store.status?.frg, null);
   const firstObservations = first.remainingOpenCalls;
-  assert.ok(firstObservations >= 1);
+  assert.equal(firstObservations, 0, "ship itself does not own the complete release's milestone observer");
 
   const resumed = makeDeps(store, {
     ...emptyProgress(),
@@ -975,14 +984,14 @@ test("ship remaining-open: resume re-observes after completed FRG pack (#1354)",
   assert.ok(!resumed.calls.includes("frg-pack"));
 });
 
-test("ship remaining-open: zero open issues still reaches FRG pack (#1354)", async () => {
+test("ship remaining-open: zero open issues reaches the complete release seam (#1563)", async () => {
   const store = memoryStore();
   await seedCompletedTrain(store);
   const deps = makeDeps(store, { ...emptyProgress(), train: completeProgress().train });
   deps.remainingOpenIssues = [];
   const result = await runShipCoordinator(intent, authorization(), deps);
-  assert.ok(deps.calls.includes("frg-pack"));
-  assert.equal(result.frg_pack?.loop_run_id, "loop-1");
+  assert.ok(deps.calls.includes("release-complete"));
+  assert.equal(result.complete_release?.version, "1.34.0");
   assert.deepEqual(store.status?.train_plan, { ordered_issues: [901, 902] });
 });
 
@@ -1039,7 +1048,7 @@ test("publication prerequisite requires a proven origin tag (#1331)", () => {
   assert.equal(lineageHasPriorEdges(lineage, "publication"), false);
 });
 
-test("tag mutation records a distinct tag operation from publication wait (#1331)", async () => {
+test("tag/publication failure remains one complete-release operation (#1563)", async () => {
   const store = memoryStore();
   await seedFrozenTrainPlan(store);
   const progress = completeProgress();
@@ -1048,17 +1057,17 @@ test("tag mutation records a distinct tag operation from publication wait (#1331
   progress.promotion = null;
   progress.deployment = null;
   const deps = makeDeps(store, progress);
-  deps.convergeTag = async () => {
+  deps.convergeCompleteRelease = async () => {
     throw new Error("tag push timed out");
   };
   deps.waitForRelease = async () => {
     throw new Error("must not wait for publication during tag mutation");
   };
   const result = await runShipCoordinator(intent, authorization(), deps);
-  assert.equal(result.next_action, "tag");
+  assert.equal(result.next_action, "release_complete");
   assert.equal(result.complete, false);
-  assert.equal(result.active_claim?.operation, "tag");
-  assert.ok(store.events.some((event) => event.phase === "tag" && event.status === "started"));
+  assert.equal(result.active_claim?.operation, "release_complete");
+  assert.ok(store.events.some((event) => event.phase === "release_complete" && event.status === "started"));
   assert.ok(!store.events.some((event) => event.phase === "release_wait"));
   assert.equal(deps.calls.includes("release-wait"), false);
 });
@@ -1076,21 +1085,16 @@ test("publication without an origin tag cannot complete (#1331)", async () => {
   assert.equal(store.status?.publication, null);
 });
 
-test("missing observer proof cannot complete a post-ready phase (#1331)", async () => {
+test("missing complete-release observer proof fails the one delegated phase (#1563)", async () => {
   const store = memoryStore();
   await seedFrozenTrainPlan(store);
   const deps = makeDeps(store);
-  deps.waitForRelease = async () => ({
-    version: intent.version,
-    tag: "v1.34.0",
-    published: true,
-    artifact_digest: "",
-  });
+  deps.convergeCompleteRelease = async () => { throw new Error("complete release observer proof is missing"); };
   const result = await runShipCoordinator(intent, authorization(), deps);
   assert.equal(result.complete, false);
   assert.equal(result.publication, null);
   assert.equal(result.lifecycle, "cooling");
-  assert.match(result.last_error ?? "", /artifact_digest|reconciliation|OID|digest/i);
+  assert.match(result.last_error ?? "", /observer proof is missing/i);
   const tag = shipPhaseInvariant("tag");
   assert.match(tag.observer, /origin annotated tag/);
   assert.match(tag.side_effect_identity, /origin annotated tag/);
@@ -1106,16 +1110,16 @@ test("ship status view names phase, candidate, and next action without mutations
   const view = projectShipStatusView(result);
   assert.equal(view.phase, "complete");
   assert.equal(view.next_action, "complete");
-  assert.equal(view.candidate, MERGE);
+  assert.equal(view.candidate, CANDIDATE);
   assert.equal(view.human_authority, false);
   assert.equal(view.lifecycle, "complete");
-  assert.equal(view.lineage.release_merge_result?.identity, MERGE);
+  assert.equal(view.lineage.integrated_candidate?.identity, CANDIDATE);
 });
 
 test("canonical human-authority diagnostic still projects the status bit (#1331)", async () => {
   const store = memoryStore();
   const deps = makeDeps(store);
-  deps.convergeReleasePrepare = async () => {
+  deps.convergeCompleteRelease = async () => {
     const err = new Error("needs-human: missing-authority for milestone release") as Error & {
       diagnostic: ReturnType<typeof buildStageDiagnostic>;
     };
@@ -1191,7 +1195,8 @@ test("semver remains the default when roadmap.release_model is absent (#1331)", 
   const result = await runShipCoordinator(intent, authorization(), deps);
   assert.equal(result.release_model, "semver");
   assert.equal(result.complete, true);
-  assert.ok(deps.calls.includes("frg-pack"));
-  assert.ok(deps.calls.includes("engine-promote"));
-  assert.ok(deps.calls.includes("engine-deploy"));
+  assert.ok(deps.calls.includes("release-complete"));
+  assert.ok(!deps.calls.includes("frg-pack"));
+  assert.ok(!deps.calls.includes("engine-promote"));
+  assert.ok(!deps.calls.includes("engine-deploy"));
 });

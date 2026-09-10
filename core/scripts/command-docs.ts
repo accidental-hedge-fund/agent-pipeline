@@ -78,7 +78,7 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   ship: {
     summary:
-      "Run or inspect one durable milestone shipment (train --merge, then SemVer FRG/release/tag/promote/deploy or continuous complete-at-integration). Status is a RecoverySupervisor projection. Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.",
+      "Run or inspect one durable milestone shipment (train --merge, then one complete release call for SemVer; continuous completes at integration). No install, promotion, or deployment is performed.",
     usage:
       "ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json]",
     documented: true,

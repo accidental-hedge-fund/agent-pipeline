@@ -120,6 +120,15 @@ export const FACTORY_RELEASE_ARTIFACT: ArtifactContractEntry = {
     "Factory-release prepare checkpoints and loop bindings; engine-written, never committed on the factory control checkout.",
 };
 
+/** Host-local publisher recovery episodes (#1563). Keyed by `release.yml` plus
+ *  exact tag plus exact C so an unobserved dispatch stays a durable wait.
+ *  Stored under the primary worktree so sibling worktrees share one episode. */
+export const RELEASE_PUBLISHER_RECOVERY_ARTIFACT: ArtifactContractEntry = {
+  name: "release-publisher-recovery",
+  comment:
+    "Host-local publisher recovery episodes keyed by release.yml plus tag plus candidate (#1563); stored under the primary worktree so sibling worktrees share one episode; never committed.",
+};
+
 /** Host-local HMAC key for grill-proposal.v1 envelopes (#1072). */
 export const GRILL_PROPOSAL_KEY_ARTIFACT: ArtifactContractEntry = {
   name: "grill-proposal.key",
@@ -149,6 +158,7 @@ export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   FRG_ARTIFACT,
   HARNESS_OWNERSHIP_ARTIFACT,
   FACTORY_RELEASE_ARTIFACT,
+  RELEASE_PUBLISHER_RECOVERY_ARTIFACT,
   GRILL_PROPOSAL_KEY_ARTIFACT,
   GRILL_PROPOSALS_ARTIFACT,
 ];

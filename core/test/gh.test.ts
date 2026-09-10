@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   activeChangeIdsFromContentsEntries,
   ghChildEnv,
+  isAuthoritativeReleaseNotFound,
   isGithubAuthOrPermissionError,
   isHttp404Signal,
   isPrDiffTooLargeError,
@@ -96,6 +97,16 @@ test("isGithubAuthOrPermissionError: 401/403/auth wording", () => {
   assert.equal(isGithubAuthOrPermissionError("HTTP 403: Resource not accessible by integration"), true);
   assert.equal(isGithubAuthOrPermissionError("authentication required"), true);
   assert.equal(isGithubAuthOrPermissionError("HTTP 404: Not Found"), false);
+});
+
+test("isAuthoritativeReleaseNotFound: only non-auth HTTP 404", () => {
+  assert.equal(isAuthoritativeReleaseNotFound("HTTP 404: Not Found"), true);
+  assert.equal(isAuthoritativeReleaseNotFound("gh: Not Found (HTTP 404)"), true);
+  assert.equal(isAuthoritativeReleaseNotFound("HTTP 401: Bad credentials"), false);
+  assert.equal(isAuthoritativeReleaseNotFound("HTTP 403: Resource not accessible by integration"), false);
+  assert.equal(isAuthoritativeReleaseNotFound("HTTP 500 Internal Server Error"), false);
+  assert.equal(isAuthoritativeReleaseNotFound("release not found"), false);
+  assert.equal(isAuthoritativeReleaseNotFound("network timeout"), false);
 });
 
 test("shouldTreatContents404AsEmpty: only when tip root ok and 404 not auth-shaped", () => {

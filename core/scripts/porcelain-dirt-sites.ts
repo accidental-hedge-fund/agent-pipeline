@@ -58,6 +58,13 @@ export interface PorcelainDirtSiteEntry {
  */
 export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
   {
+    site_id: "stages.release-complete-metadata-worktree",
+    module: "scripts/stages/release-complete.ts",
+    disposition: "explicit-exception",
+    notes:
+      "The independent release owner requires an exactly clean dedicated metadata worktree before reuse; any porcelain entry fails closed and is never classified as ignorable (#1563)",
+  },
+  {
     site_id: "stages.pre-merge-openspec-archive",
     module: "scripts/stages/pre-merge-openspec-archive.ts",
     disposition: "uses-shared-classifier",

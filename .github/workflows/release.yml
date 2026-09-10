@@ -1,15 +1,23 @@
 name: release
 
-# Publish a GitHub Release whenever a version tag is pushed. The maintainer still
-# owns the version bump (release PR), the merge, and the annotated tag push — this
-# only automates the mechanical "tag → GitHub Release" step so `releases/latest`
-# and the Releases list (which Pipeline Desk reads) can never lag behind the tags.
-# Release notes are extracted explicitly from the annotated tag message via
-# `git tag -l --format='%(contents)'` and passed via --notes-file.
+# Publish a GitHub Release for an annotated vX.Y.Z tag at exact candidate C.
+# Tag push and a bounded recovery workflow_dispatch share this one job.
+# The CLI never creates or edits a Release. Post-tag docs may advance main
+# and never retarget the released tag.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact annotated tag (vX.Y.Z)
+        required: true
+        type: string
+      candidate:
+        description: Exact 40-hex candidate SHA C
+        required: true
+        type: string
 
 permissions:
   contents: write # required to create GitHub Releases
@@ -22,66 +30,105 @@ jobs:
         with:
           fetch-depth: 0 # full history + tags so the annotation is available
 
-      - name: Fetch the annotated tag object (actions/checkout peels it to a commit)
-        # actions/checkout@v4 materializes refs/tags/${GITHUB_REF_NAME} pointing at the
-        # underlying commit rather than the annotated tag object. Re-fetch with --force so
-        # git cat-file and git tag --format='%(contents)' see the real tag object.
-        run: git fetch origin --force "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+      - name: Resolve tag and candidate
+        id: identity
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_CANDIDATE: ${{ inputs.candidate }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG}"
+            C="$(printf '%s' "${INPUT_CANDIDATE}" | tr '[:upper:]' '[:lower:]')"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            C="$(git rev-parse HEAD)"
+          fi
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::tag ${TAG} is not vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          if ! printf '%s' "$C" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::candidate ${C} is not an exact 40-hex SHA"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "candidate=${C}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch and check out the annotated tag
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.identity.outputs.tag }}"
+          git fetch origin --force "refs/tags/${TAG}:refs/tags/${TAG}"
+          git checkout --detach "refs/tags/${TAG}"
 
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
 
-      - name: Guard — tag must match package.json version
+      - name: Guard annotated tag, package versions, and origin/main
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          pkg="$(node -p "require('./package.json').version")"
-          if [ "$tag" != "$pkg" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${pkg}"
+          set -euo pipefail
+          TAG="${{ steps.identity.outputs.tag }}"
+          C="${{ steps.identity.outputs.candidate }}"
+          obj_type="$(git cat-file -t "${TAG}")"
+          if [ "$obj_type" != "tag" ]; then
+            echo "::error::${TAG} is a lightweight tag (object type: ${obj_type}). Push an annotated tag (-a)."
             exit 1
           fi
-
-      - name: Guard — tag must be annotated (not lightweight)
-        run: |
-          obj_type="$(git cat-file -t "${GITHUB_REF_NAME}")"
-          if [ "$obj_type" != "tag" ]; then
-            echo "::error::${GITHUB_REF_NAME} is a lightweight tag (object type: ${obj_type}). Push an annotated tag (-a) so release notes can be extracted from the tag message."
+          peeled="$(git rev-parse "${TAG}^{}")"
+          if [ "$peeled" != "$C" ]; then
+            echo "::error::${TAG} peels to ${peeled}, expected candidate ${C}"
+            exit 1
+          fi
+          ver="${TAG#v}"
+          root="$(node -p "require('./package.json').version")"
+          core="$(node -p "require('./core/package.json').version")"
+          if [ "$root" != "$ver" ] || [ "$core" != "$ver" ]; then
+            echo "::error::tag ${TAG} does not match root (${root}) and core (${core}) package versions"
+            exit 1
+          fi
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
+          main="$(git rev-parse origin/main)"
+          if [ "$main" != "$C" ]; then
+            echo "::error::origin/main ${main} is not candidate ${C}; refusing publication. Tags are never force-moved or deleted. This is the documented non-atomic tag-boundary race; Git cannot atomically create a tag while asserting an unrelated protected main ref remains C."
             exit 1
           fi
 
       - name: Publish GitHub Release from the annotated tag
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          C: ${{ steps.identity.outputs.candidate }}
         run: |
-          # Extract the annotation message explicitly and pass via --notes-file,
-          # bypassing --notes-from-tag which resolved to the commit message instead
-          # of the tag annotation on the GitHub Actions runner.
-          git tag -l "${GITHUB_REF_NAME}" --format='%(contents)' > /tmp/notes.md
-          # Reject an empty OR whitespace-only annotation. A whitespace-only message is a
-          # non-zero-size file (e.g. a lone newline) that a `-s` size check would accept,
-          # publishing a blank Release body. Require at least one non-whitespace character.
-          if ! grep -q '[^[:space:]]' /tmp/notes.md; then
-            echo "::error::${GITHUB_REF_NAME} has an empty or whitespace-only annotation message. Annotate the tag with release notes before pushing."
+          set -euo pipefail
+          git tag -l "${TAG}" --format='%(contents)' > /tmp/notes.md
+          node --experimental-strip-types core/scripts/publish-github-release.ts
+
+      # Sole post-tag docs owner (#1563). Check out current main before installing
+      # dependencies. The released tag remains fixed at C.
+      - name: Check out current main before docs
+        run: |
+          set -euo pipefail
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
+          git checkout -B main origin/main
+
+      - name: Install dependencies for tag-derived docs
+        run: cd core && npm ci --no-audit --no-fund
+
+      - name: Refresh tag-derived docs on main
+        env:
+          RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_TAG_TOKEN" ]; then
+            echo "::error::RELEASE_TAG_TOKEN is required for post-tag docs refresh"
             exit 1
           fi
-          # A pre-release tag (e.g. v1.2.0-rc.1) is marked prerelease and must NOT
-          # take the Latest badge; a normal vX.Y.Z tag becomes Latest.
-          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
-            flag="--prerelease"
-          else
-            flag="--latest"
-          fi
-          # Create or update: a force-pushed tag re-triggers this workflow against an
-          # existing release (422 on create). Edit it in that case.
-          if gh release view "${GITHUB_REF_NAME}" &>/dev/null; then
-            gh release edit "${GITHUB_REF_NAME}" \
-              --notes-file /tmp/notes.md \
-              --title "${GITHUB_REF_NAME}" \
-              $flag
-          else
-            gh release create "${GITHUB_REF_NAME}" \
-              --verify-tag \
-              --notes-file /tmp/notes.md \
-              --title "${GITHUB_REF_NAME}" \
-              $flag
-          fi
+          released="$(git rev-parse "${TAG}^{}")"
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${{ github.repository }}.git"
+          node scripts/release-docs-refresh.mjs --version "${TAG#v}" --push
+          observed="$(git rev-parse "${TAG}^{}")"
+          test "$observed" = "$released" || { echo "::error::release tag moved during docs refresh"; exit 1; }

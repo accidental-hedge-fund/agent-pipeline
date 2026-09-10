@@ -80,6 +80,8 @@ export interface ReleaseOpts {
    * no longer a hard dependency of milestone ship. Default false (gate on).
    */
   skipFrg?: boolean;
+  /** Internal: preparation runs inside a dedicated disposable worktree. */
+  dedicatedWorktree?: boolean;
 }
 
 /** Stable machine-readable identity of the release PR created by prepare. */
@@ -1701,17 +1703,11 @@ export function buildPRBody(
     ...waiverSection,
     "---",
     "",
-    "**Merging this PR is the final step.** It auto-tags the merge commit " +
-      `(annotated \`v${version}\`) and publishes the GitHub Release — no manual follow-up needed.`,
+    "**This PR changes version metadata only.** Merging it must not create a tag or GitHub Release.",
     "",
-    "_Fallback only_ — if the automation doesn't run (e.g. a missing/misconfigured tag-push credential), tag manually with an **annotated** tag (`release.yml` rejects lightweight tags):",
-    "```",
-    `git tag -a v${version} -m "v${version} — ${theme}" && git push origin v${version}`,
-    "```",
+    `After its exact-head checks and merge are proven, the same \`pipeline release ${version}\` invocation freezes candidate C, runs the exact-candidate FRG, and alone owns annotated tag \`v${version}\` plus publication verification.`,
     "",
-    "The automation requires the `RELEASE_TAG_TOKEN` repository secret (a fine-grained PAT with `contents: read` + `contents: write` on this repository, added as a repository Actions secret). If this is the first release on this repo, confirm it's provisioned — otherwise the auto-tag workflow falls back to the manual step above.",
-    "",
-    "_Prepared by `pipeline release`_",
+    "_Prepared by the bounded `pipeline release prepare` helper_",
   ].join("\n");
 }
 
@@ -2115,6 +2111,10 @@ export async function runRelease(
   };
   const restoreBaseAfterFailedStage = (): void => {
     restoreManagedFiles();
+    if (opts.dedicatedWorktree) {
+      d.stderr(`[pipeline release] aborted in dedicated metadata worktree; caller checkout was not switched.`);
+      return;
+    }
     const checkoutBase = d.runCommand("git", ["checkout", baseBranch], { cwd: repoDir });
     if (checkoutBase.code !== 0) {
       d.stderr(

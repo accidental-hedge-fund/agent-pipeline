@@ -138,7 +138,7 @@ test("merge/train/ship/recover-parked are supervised; dry-run and ship status ar
 test("release and factory-release mechanical observations stay owned", () => {
   const obs = mechanicalFaultObservation({
     operation: "release_prepare",
-    form_id: "release",
+    form_id: "release.prepare",
     message: "gh failed",
     domain: "test",
     logical_operation_id: "lop-release-test",
@@ -146,7 +146,9 @@ test("release and factory-release mechanical observations stay owned", () => {
   assert.equal(obs.owned, true);
   assert.equal(obs.complete, false);
   assert.equal(obs.human_owned, false);
+  assert.equal(obs.form_id, "release.prepare");
   assert.equal(lookupCommandForm("release")?.execution_disposition, "supervised-lifecycle");
+  assert.equal(lookupCommandForm("release.prepare")?.execution_disposition, "bounded-atomic-administration");
   assert.equal(lookupCommandForm("factory-release")?.execution_disposition, "supervised-lifecycle");
 });
 
@@ -233,7 +235,7 @@ test("release mechanical fault persists RecoverySupervisor ownership", () => {
   try {
     reportMechanicalFault(recoverySupervisorObservationSink(dir), {
       operation: "release_prepare",
-      form_id: "release",
+      form_id: "release.prepare",
       message: "gh failed",
       fault: "mechanical",
       domain: "test",
@@ -245,10 +247,10 @@ test("release mechanical fault persists RecoverySupervisor ownership", () => {
     assert.equal(persisted[0]!.owned, true);
     assert.equal(persisted[0]!.complete, false);
     assert.equal(persisted[0]!.human_owned, false);
-    assert.equal(persisted[0]!.form_id, "release");
+    assert.equal(persisted[0]!.form_id, "release.prepare");
     assert.equal(persisted[0]!.domain, "test");
     assert.equal(persisted[0]!.logical_operation_id, "lop-release-persist");
-    assert.equal(persisted[0]!.observation_id, "lop-release-persist:release:release_prepare");
+    assert.equal(persisted[0]!.observation_id, "lop-release-persist:release.prepare:release_prepare");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -603,6 +605,23 @@ test("grill isolated admission fault persists one recovery record even if CLI re
   }
 });
 
+test("release prepare mechanical fault uses production form_id release.prepare", () => {
+  const src = readFileSync(join(__dirname, "../scripts/pipeline.ts"), "utf8");
+  assert.match(src, /form_id: prepareOnly \? "release\.prepare" : "release"/);
+  const obs = reportMechanicalFault(memoryObservationSink().reportObservation, {
+    operation: "release_prepare",
+    form_id: "release.prepare",
+    message: "gh failed",
+    fault: "mechanical",
+    domain: "test",
+    logical_operation_id: "lop-release-prepare-form",
+    repository: "owner/repo",
+  });
+  assert.equal(obs.form_id, "release.prepare");
+  assert.equal(obs.operation, "release_prepare");
+  assert.equal(obs.owned, true);
+});
+
 test("engine-promote and grill CLI do not re-report an adapter-observed fault", () => {
   const src = readFileSync(join(__dirname, "../scripts/pipeline.ts"), "utf8");
   assert.doesNotMatch(src, /pipeline grill exited/);
@@ -620,7 +639,7 @@ test("persistOperationObservation refuses an anonymous observation", () => {
         persistOperationObservation({
           schema_version: 1,
           operation: "release_prepare",
-          form_id: "release",
+          form_id: "release.prepare",
           domain: "",
           logical_operation_id: "",
           repository: null,

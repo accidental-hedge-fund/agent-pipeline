@@ -111,6 +111,7 @@ import {
 } from "./train.ts";
 import { realMergeDeps } from "./merge.ts";
 import { realReleaseDeps, runRelease } from "./release.ts";
+import { realCompleteReleaseDeps, runCompleteRelease } from "./release-complete.ts";
 import {
   finishReleasePr,
   parseReleasePrTitle,
@@ -225,6 +226,8 @@ export interface ShipAdapterOperations {
    * every post-train FRG / release / promote boundary.
    */
   observeRemainingOpenMilestoneIssues(intent: ShipIntent): Promise<readonly number[]>;
+  /** SemVer terminal delegation. One call owns metadata through publication. */
+  completeRelease?(intent: ShipIntent, train: ShipTrainEvidence): Promise<NonNullable<ShipProgress["complete_release"]>>;
 }
 
 export interface RealShipCoordinatorDepsOptions {
@@ -751,6 +754,11 @@ export function shipCoordinatorDepsFromOperations(
         : train;
       rememberTrain(progress.train);
 
+      // #1563: the complete release seam owns every post-train observation.
+      // Ship deliberately does not consult legacy FRG/release/tag/pin/deploy
+      // artifacts; a restart calls release once and lets it reconcile C.
+      if (operations.completeRelease) return progress;
+
       // Once a later authorized stage exists, the release merge may have
       // advanced base. Reconciliation still verifies the retained FRG artifact
       // against its candidate but does not reapply the pre-release base-tip gate.
@@ -937,6 +945,12 @@ export function shipCoordinatorDepsFromOperations(
       throw new Error(
         "ship deployment: live digest observer proof is missing; a version string alone does not complete",
       );
+    },
+    async convergeCompleteRelease(intent, train) {
+      if (!operations.completeRelease) {
+        throw new Error("ship release: complete release delegation seam is unavailable; legacy tail is disabled");
+      }
+      return operations.completeRelease(intent, train);
     },
   };
 }
@@ -1302,6 +1316,21 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
           return String(stdout);
         },
       );
+    },
+    async completeRelease(intent, train) {
+      const result = await runCompleteRelease(
+        intent.version,
+        { noEdit: true },
+        { repo_dir: opts.repoDir, repo: intent.repository, base_branch: intent.base_branch, release_model: "semver" },
+        realCompleteReleaseDeps({ repo_dir: opts.repoDir, repo: intent.repository, base_branch: intent.base_branch }),
+      );
+      if (!result) throw new Error("ship release: complete release returned no identity");
+      return {
+        version: result.version,
+        candidate_sha: result.candidate_sha,
+        tag: result.tag,
+        published_at: result.published_at,
+      };
     },
     observeTrain,
     async runTrain(intent, plannedIssues) {

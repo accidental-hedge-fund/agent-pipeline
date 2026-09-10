@@ -77,8 +77,9 @@ Supervisors SHOULD parse operator text into one of these intents. Prefer
 | Integrate train | same + `and merge` / `integrate` | add `--merge` |
 | Status | `status`, `train status` | last train JSON, or `pipeline status <N>` / loop logs |
 | Stop | `stop` | stop the host process / systemd unit running train; do not invent force-merge cleanup |
-| Release prepare | `release prepare 1.34.0` | `pipeline release 1.34.0 --no-edit` (opens PR; no merge/tag) |
-| Release finish | `release finish 123` | `pipeline release finish 123` (merge release PR only; workflows tag) |
+| Release complete | `release 1.34.0` | `pipeline release 1.34.0 --no-edit` (metadata, FRG, tag, publication) |
+| Release prepare | `release prepare 1.34.0` | `pipeline release prepare 1.34.0 --no-edit` (opens PR; no merge/tag) |
+| Release finish | `release finish 123` | `pipeline release finish 123` (merge metadata PR only; does not tag) |
 | Engine promote | `engine-promote 1.34.0` | `pipeline engine-promote --for 1.34.0` (pin + install to **all** hosts by default after published Release; `--host <name>` to scope) |
 
 **Merge is opt-in.** Never default `--merge` from a vague “run the milestone”
@@ -227,8 +228,9 @@ widen release authority.
 
 ## Release finish JSON (`schema_version: 1`)
 
-`pipeline release <X.Y.Z> --no-edit --json` emits one prepare identity after it
-creates and re-reads the release PR:
+`pipeline release prepare <X.Y.Z> --no-edit --json` emits one prepare identity after it
+creates and re-reads the metadata PR. Direct `pipeline release <X.Y.Z>` is the
+complete owner and emits `kind: "release_complete"` after verified publication.
 
 ```json
 {
@@ -259,14 +261,11 @@ not scrape human output or search for a title match.
 }
 ```
 
-Does **not** create git tags or GitHub Releases. After finish, ship-end
-composers invoke candidate `pipeline release ensure-tag` from on-disk HMAC
-`latest.json`. The engine presents `PIPELINE_FRG_ATTESTATION_KEY_FILE` as
-`PIPELINE_FRG_ATTESTATION_KEY` for HMAC-verify (`factory-gate --from-run`,
-`release ensure-tag`, and in-engine `pipeline ship` attestor / ensure-tag
-children). Tugboat may keep the same wrap as defense in depth. `.agent-pipeline/frg/` is gitignored, so auto-tag must not stall
-the ship for a missing tree file. `release.yml` still publishes the GitHub
-Release after the annotated `v*` tag exists.
+Does **not** create git tags or GitHub Releases. `pipeline release finish` remains
+a metadata-PR merge helper. Complete publication is `pipeline release VERSION`
+or SemVer `pipeline ship --milestone`, which delegates to that command once.
+`release.yml` is the sole GitHub Release publisher after the annotated `v*` tag
+exists. Legacy `release ensure-tag` remains a compatibility seam pending #1560.
 
 ## Hermes production (Phase 2b)
 
@@ -282,7 +281,7 @@ not the product owner. #1001 / #971 do not ban in-engine ship.
 
 | Script | Role |
 |---|---|
-| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → SemVer FRG pack → release → finish → ensure-tag → promote → digest deploy; continuous completes at exact-candidate integration). Status is a RecoverySupervisor projection. Mechanical faults stay Cooling or wait. |
+| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → exactly one complete release delegation for SemVer; continuous completes at exact-candidate integration). Status is a RecoverySupervisor projection. Mechanical faults stay Cooling or wait. |
 
 All-integrated milestones (every freeze-eligible issue closed at
 `pipeline:ready-to-deploy` with merged PRs contained in base) do **not** stop
