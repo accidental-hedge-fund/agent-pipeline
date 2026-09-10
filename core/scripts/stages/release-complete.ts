@@ -154,7 +154,8 @@ export interface PublisherRecoveryEpisode {
   workflow: "release.yml";
   tag: string;
   candidate: string;
-  state: "dispatched";
+  state: "dispatched" | "rerun_requested";
+  run_id?: number;
 }
 
 export const TAGGED_STALE_C_MESSAGE =
@@ -757,6 +758,21 @@ export function assertReleaseManagedMetadataPaths(files: readonly string[]): voi
   }
 }
 
+/** Authoritative PR file list; remains valid after merge-commit, squash, rebase, and source-branch deletion. */
+export function parsePullRequestChangedFiles(raw: unknown, pr: number): string[] {
+  const rows = flattenPages(raw, `metadata PR #${pr} files`);
+  return rows.map((value, index) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`pipeline release: metadata PR #${pr} file ${index} returned unknown shape`);
+    }
+    const filename = (value as Record<string, unknown>).filename;
+    if (typeof filename !== "string" || filename.length === 0) {
+      throw new Error(`pipeline release: metadata PR #${pr} file ${index} is missing filename`);
+    }
+    return filename;
+  });
+}
+
 function publisherRecoveryPath(repoDir: string, tag: string, candidate: string): string {
   const id = createHash("sha256")
     .update(`release.yml\n${tag}\n${candidate.toLowerCase()}`)
@@ -779,11 +795,25 @@ export function parsePublisherRecoveryEpisode(
     : "";
   if (
     row.schema_version !== 1 || row.workflow !== "release.yml" || typeof row.tag !== "string" ||
-    row.tag !== expected.tag || storedCandidate !== candidate || row.state !== "dispatched"
+    row.tag !== expected.tag || storedCandidate !== candidate
   ) {
     throw new Error(`pipeline release: publisher recovery episode for ${expected.tag} at ${candidate} is malformed`);
   }
-  return { schema_version: 1, workflow: "release.yml", tag: expected.tag, candidate, state: "dispatched" };
+  if (row.state === "dispatched") {
+    return { schema_version: 1, workflow: "release.yml", tag: expected.tag, candidate, state: "dispatched" };
+  }
+  const runId = jsonSafeInteger(row.run_id, 1);
+  if (row.state !== "rerun_requested" || runId === null) {
+    throw new Error(`pipeline release: publisher recovery episode for ${expected.tag} at ${candidate} is malformed`);
+  }
+  return {
+    schema_version: 1,
+    workflow: "release.yml",
+    tag: expected.tag,
+    candidate,
+    state: "rerun_requested",
+    run_id: runId,
+  };
 }
 
 /** Production adapter. Tests inject the complete seam and never touch git/GitHub. */
@@ -856,7 +886,13 @@ export function realCompleteReleaseDeps(
       await fs.promises.rename(tmp, dest);
     }
     const readBack = await loadPublisherRecoveryEpisode(episode.tag, episode.candidate);
-    if (!readBack || readBack.tag !== episode.tag || readBack.candidate !== episode.candidate || readBack.state !== "dispatched") {
+    if (
+      !readBack ||
+      readBack.tag !== episode.tag ||
+      readBack.candidate !== episode.candidate ||
+      readBack.state !== episode.state ||
+      (episode.state === "rerun_requested" && readBack.run_id !== episode.run_id)
+    ) {
       throw new Error(`pipeline release: publisher recovery episode for ${episode.tag} at ${episode.candidate} failed read-back`);
     }
   }
@@ -944,8 +980,11 @@ export function realCompleteReleaseDeps(
       if (versions.root !== version || versions.core !== version) {
         throw new Error(`pipeline release: metadata PR #${parsed.pr} does not set both package versions to ${version}`);
       }
-      const changed = (await git(["diff", "--name-only", `origin/${branch}...${parsed.head_oid}`])).split("\n").filter(Boolean);
-      try { assertReleaseManagedMetadataPaths(changed); }
+      const filesRaw = JSON.parse(await gh([
+        "api", "--paginate", "--slurp",
+        `repos/${repository}/pulls/${parsed.pr}/files?per_page=100`,
+      ])) as unknown;
+      try { assertReleaseManagedMetadataPaths(parsePullRequestChangedFiles(filesRaw, parsed.pr)); }
       catch { throw new Error(`pipeline release: metadata PR #${parsed.pr} contains non-release-managed paths`); }
       if (parsed.state === "MERGED") {
         const checksRaw = JSON.parse(await gh([
@@ -1060,7 +1099,15 @@ export function realCompleteReleaseDeps(
         await waitFn(RELEASE_PUBLICATION_WAIT_MS);
       }
       const preMerge = await observeManaged();
-      if (preMerge.state === "MERGED") return preMerge;
+      if (preMerge.state === "MERGED") {
+        const mergedChecksRaw = JSON.parse(await gh([
+          "api", `repos/${repository}/commits/${release.head_oid}/check-runs?per_page=100`, "--paginate", "--slurp",
+        ])) as unknown;
+        if (exactHeadCheckRunsState(mergedChecksRaw, release.head_oid) !== "pass") {
+          throw new Error(`pipeline release: metadata PR #${release.pr} has no nonempty green exact-head CI at ${release.head_oid}`);
+        }
+        return preMerge;
+      }
       const finished = await finishPr(release.pr, { pr: release.pr, version: release.version, base: release.base, head_oid: release.head_oid });
       if (!finished.mergeCommitOid) throw new Error("pipeline release: metadata merge returned no merge commit");
       return { ...preMerge, state: "MERGED", merge_commit_oid: finished.mergeCommitOid };
@@ -1163,6 +1210,23 @@ export function realCompleteReleaseDeps(
         if (newest.attempt > 1) {
           throw new Error(`pipeline release: exact ${tag} publisher run ${newest.databaseId} already reran (attempt ${newest.attempt})`);
         }
+        const episode = await loadPublisherRecoveryEpisode(tag, candidate);
+        if (episode?.state === "rerun_requested") {
+          if (episode.run_id !== newest.databaseId) {
+            throw new Error(
+              `pipeline release: publisher recovery episode for ${tag} at ${candidate} records rerun of run ${episode.run_id}, not ${newest.databaseId}`,
+            );
+          }
+          return true;
+        }
+        await persistPublisherRecoveryEpisode({
+          schema_version: 1,
+          workflow: "release.yml",
+          tag,
+          candidate: exactOid(candidate, `${tag} publisher recovery candidate`),
+          state: "rerun_requested",
+          run_id: newest.databaseId,
+        });
         await gh(["run", "rerun", String(newest.databaseId), "--repo", repository]);
         return true;
       }

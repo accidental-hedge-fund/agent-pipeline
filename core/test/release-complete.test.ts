@@ -129,11 +129,14 @@ function metadataObserverCommand(opts: {
         check_runs: [{ name: "ci", head_sha: opts.checksHead ?? A, status: "completed", conclusion: "success" }],
       }]);
     }
+    if (file === "gh" && args[0] === "api" && joined.includes("/pulls/") && joined.includes("/files")) {
+      return JSON.stringify([[{ filename: "package.json" }, { filename: "core/package.json" }]]);
+    }
     if (args[0] === "fetch" && joined.includes("release/v1.2.3")) throw new Error("branch deleted");
     if (args[0] === "fetch" && joined.includes("pull/31/head")) return "";
     if (args[0] === "rev-parse" && joined.includes("release-metadata")) return A;
     if (args[0] === "show" && joined.includes("package.json")) return JSON.stringify({ version: "1.2.3" });
-    if (args[0] === "diff") return "package.json\ncore/package.json";
+    if (args[0] === "diff") return "";
     throw new Error(`unexpected ${file} ${joined}`);
   };
 }
@@ -538,13 +541,16 @@ test("production metadata observer discovers by title and fetches a deleted head
     if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
       return JSON.stringify([{ check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }] }]);
     }
+    if (file === "gh" && args[0] === "api" && joined.includes("/pulls/") && joined.includes("/files")) {
+      return JSON.stringify([[{ filename: "package.json" }, { filename: "core/package.json" }]]);
+    }
     if (args[0] === "fetch" && joined.includes("release/v1.2.3")) throw new Error("branch deleted");
     if (args[0] === "fetch" && joined.includes("pull/31/head")) return "";
     if (args[0] === "rev-parse" && joined.includes("release-metadata")) return A;
     if (args[0] === "show" && joined.includes("package.json")) {
       return JSON.stringify({ version: "1.2.3" });
     }
-    if (args[0] === "diff") return "package.json\ncore/package.json";
+    if (args[0] === "diff") return "";
     throw new Error(`unexpected ${file} ${joined}`);
   } });
   const observed = await adapter.observeMetadata("1.2.3", "main");
@@ -552,6 +558,45 @@ test("production metadata observer discovers by title and fetches a deleted head
   assert.equal(observed?.state, "MERGED");
   assert.equal(observed?.head_oid, A);
   assert.ok(calls.some((call) => call.includes("pull/31/head")));
+  assert.ok(calls.some((call) => call.includes("/pulls/31/files")));
+  assert.ok(!calls.some((call) => call.includes("diff --name-only")));
+});
+
+test("already-merged metadata reuse proves files after merge-commit squash and rebase", async () => {
+  for (const strategy of ["merge-commit", "squash", "rebase"] as const) {
+    const calls: string[] = [];
+    const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+      command: async (_cwd, file, args) => {
+        const joined = args.join(" ");
+        calls.push(`${file} ${joined}`);
+        if (file === "gh" && args[0] === "pr" && args[1] === "list") {
+          return JSON.stringify([metadataPrPayload()]);
+        }
+        if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
+        if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+          return JSON.stringify(metadataPrPayload());
+        }
+        if (file === "gh" && args[0] === "api" && joined.includes("/pulls/") && joined.includes("/files")) {
+          return JSON.stringify([[{ filename: "package.json" }, { filename: "core/package.json" }]]);
+        }
+        if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+          return JSON.stringify([{ check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }] }]);
+        }
+        if (args[0] === "fetch") return "";
+        if (args[0] === "rev-parse") return A;
+        if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
+        if (args[0] === "diff") {
+          throw new Error(`${strategy}: triple-dot against current main is empty after merge`);
+        }
+        throw new Error(`unexpected ${file} ${joined}`);
+      },
+    });
+    const observed = await adapter.observeMetadata("1.2.3", "main");
+    assert.equal(observed?.pr, 31, strategy);
+    assert.equal(observed?.state, "MERGED", strategy);
+    assert.ok(calls.some((call) => call.includes("/pulls/31/files")), strategy);
+    assert.ok(!calls.some((call) => /\bdiff\b/.test(call)), strategy);
+  }
 });
 
 test("production metadata observer fails closed on empty or wrong-head CI", async () => {
@@ -567,10 +612,13 @@ test("production metadata observer fails closed on empty or wrong-head CI", asyn
     if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
       return JSON.stringify([{ check_runs: [{ name: "ci", head_sha: B, status: "completed", conclusion: "success" }] }]);
     }
+    if (file === "gh" && args[0] === "api" && joined.includes("/pulls/") && joined.includes("/files")) {
+      return JSON.stringify([[{ filename: "package.json" }, { filename: "core/package.json" }]]);
+    }
     if (args[0] === "fetch") return "";
     if (args[0] === "rev-parse") return A;
     if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
-    if (args[0] === "diff") return "package.json\ncore/package.json";
+    if (args[0] === "diff") return "";
     throw new Error(`unexpected ${file} ${joined}`);
   } });
   await assert.rejects(() => adapter.observeMetadata("1.2.3", "main"), /no nonempty green exact-head CI/);
@@ -695,6 +743,44 @@ test("publisher recovery dispatches once when remote runs are absent and reruns 
   await assert.rejects(() => adapter.recoverPublication(tag, C), /already reran/);
 });
 
+test("publisher recovery waits for delayed attempt visibility and does not rerun twice", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  const store = memoryPublisherRecovery();
+  const ghCalls: string[] = [];
+  let reruns = 0;
+  const command = async (cwd: string, file: string, args: string[]) => {
+    if (file === "gh") ghCalls.push(args.join(" "));
+    if (file === "gh" && args[0] === "run" && args[1] === "rerun") {
+      reruns++;
+      return "";
+    }
+    return publisherCommand(tag, notes, {
+      runs: [{
+        databaseId: 9, event: "workflow_dispatch", headBranch: tag, headSha: C,
+        status: "completed", conclusion: "failure", attempt: 1,
+      }],
+      ghCalls: [],
+    })(cwd, file, args);
+  };
+  const first = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    ...store,
+    command,
+  });
+  assert.equal(await first.recoverPublication(tag, C), true);
+  assert.equal(reruns, 1);
+
+  const second = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    ...store,
+    command,
+  });
+  assert.equal(await second.recoverPublication(tag, C), true);
+  assert.equal(reruns, 1);
+  assert.equal(ghCalls.filter((call) => call.startsWith("run rerun")).length, 1);
+});
+
 test("publisher recovery does not dispatch when an exact-identity run already exists", async () => {
   const tag = "v1.2.3";
   const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
@@ -723,6 +809,7 @@ test("publisher recovery classifies the exact run after paginating past 100 work
   };
   const ghCalls: string[] = [];
   const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    ...memoryPublisherRecovery(),
     command: async (cwd, file, args) => {
       if (file === "gh") ghCalls.push(args.join(" "));
       if (file === "gh" && isPublisherRunList(args)) {
@@ -1014,6 +1101,84 @@ test("finishMetadata requires nonempty green exact-head CI when the PR merges du
   assert.equal(finishCalls, 0);
 });
 
+test("finishMetadata reloads exact-head CI when merge lands after a green snapshot", async () => {
+  let views = 0;
+  let checkReads = 0;
+  let finishCalls = 0;
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    publicationAttempts: 3,
+    finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
+    command: async (_cwd, file, args) => {
+      const joined = args.join(" ");
+      if (args[0] === "fetch") return "";
+      if (args[0] === "rev-parse") return A;
+      if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
+      if (args[0] === "diff") return "package.json\ncore/package.json";
+      if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
+      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+        views++;
+        return JSON.stringify(metadataPrPayload({
+          state: views === 1 ? "OPEN" : "MERGED",
+          mergeCommit: views === 1 ? null : { oid: C },
+        }));
+      }
+      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+        checkReads++;
+        return JSON.stringify([{
+          check_runs: checkReads === 1
+            ? [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }]
+            : [{ name: "ci", head_sha: A, status: "in_progress", conclusion: null }],
+        }]);
+      }
+      throw new Error(`unexpected ${file} ${joined}`);
+    },
+  });
+  await assert.rejects(
+    () => adapter.finishMetadata({ pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null }),
+    /no nonempty green exact-head CI/,
+  );
+  assert.equal(finishCalls, 0);
+  assert.equal(checkReads, 2);
+
+  views = 0;
+  checkReads = 0;
+  const failing = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, {
+    wait: async () => {},
+    publicationAttempts: 3,
+    finishReleasePr: async () => { finishCalls++; return { mergeCommitOid: C }; },
+    command: async (_cwd, file, args) => {
+      const joined = args.join(" ");
+      if (args[0] === "fetch") return "";
+      if (args[0] === "rev-parse") return A;
+      if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
+      if (args[0] === "diff") return "package.json\ncore/package.json";
+      if (file === "gh" && args[0] === "api" && args[1] === "user") return "pipeline-bot";
+      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+        views++;
+        return JSON.stringify(metadataPrPayload({
+          state: views === 1 ? "OPEN" : "MERGED",
+          mergeCommit: views === 1 ? null : { oid: C },
+        }));
+      }
+      if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+        checkReads++;
+        return JSON.stringify([{
+          check_runs: checkReads === 1
+            ? [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }]
+            : [{ name: "ci", head_sha: A, status: "completed", conclusion: "failure" }],
+        }]);
+      }
+      throw new Error(`unexpected ${file} ${joined}`);
+    },
+  });
+  await assert.rejects(
+    () => failing.finishMetadata({ pr: 31, version: "1.2.3", base: "main", head_oid: A, state: "OPEN", merge_commit_oid: null }),
+    /no nonempty green exact-head CI/,
+  );
+  assert.equal(finishCalls, 0);
+});
+
 test("resumed publication loop completes after recovery advances main C to D", async () => {
   let recovered = false;
   let head = C;
@@ -1284,11 +1449,14 @@ test("actual historical PR 1347 is accepted despite deleted source branch", asyn
       if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
         return JSON.stringify([{ check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }] }]);
       }
+      if (file === "gh" && args[0] === "api" && joined.includes("/pulls/") && joined.includes("/files")) {
+        return JSON.stringify([[{ filename: "package.json" }, { filename: "core/package.json" }]]);
+      }
       if (args[0] === "fetch" && joined.includes("release/v1.40.0")) throw new Error("branch deleted");
       if (args[0] === "fetch" && joined.includes("pull/1347/head")) return "";
       if (args[0] === "rev-parse" && joined.includes("release-metadata")) return A;
       if (args[0] === "show") return JSON.stringify({ version: "1.40.0" });
-      if (args[0] === "diff") return "package.json\ncore/package.json";
+      if (args[0] === "diff") return "";
       throw new Error(`unexpected ${file} ${joined}`);
     },
   });

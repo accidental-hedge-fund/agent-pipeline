@@ -12,7 +12,7 @@ Completed retries SHALL reconcile tag C before mutable main or milestone state a
 
 An interrupted publication SHALL remain anchored to proven C rather than rebinding to later main or rerunning fixtures. After a tag exists at C, observable origin/main movement that blocks publication SHALL report a durable tagged-stale-C incomplete result: no retag, no tag delete, no fixture recreation, and no rebinding to later main. That incomplete result SHALL remain distinct from a completed annotated tag plus successful non-draft publication whose later docs refresh advanced main.
 
-`release.yml` SHALL be the single publication and recovery owner. Publisher recovery SHALL use one durable state machine keyed by workflow identity `release.yml` plus exact tag plus exact C, classifying remote runs as absent, pending, failed, or successful. Observation of that remote run set SHALL query the workflow-run API for `release.yml` plus exact candidate SHA and paginate to completion. A truncated or incomplete page SHALL fail closed. Absence MAY be concluded only after that exact-identity set is proven complete. Bounds SHALL come from that remote run set, not from local process flags. The CLI SHALL persist a recovery episode keyed by that same workflow, tag, and C before issuing a missing-run dispatch, and SHALL reload it on a later invocation. When that episode records an unobserved dispatch and exhaustive remote observation is still absent, recovery SHALL wait rather than dispatch again. An exact-C push or recovery-dispatch run may receive at most one rerun when remote evidence shows it failed and has not already been rerun. A missing exact-identity run may receive one bounded exact-C recovery `workflow_dispatch` to that same workflow after re-verifying the remote annotated tag, and only while origin/main still equals C. The CLI SHALL NOT implement a second Release creator/editor. Release absence may be concluded only from a status-aware authoritative not-found response for that exact tag; authentication, authorization, network, rate-limit, malformed response, and 5xx failures are unknown and fail closed.
+`release.yml` SHALL be the single publication and recovery owner. Publisher recovery SHALL use one durable state machine keyed by workflow identity `release.yml` plus exact tag plus exact C, classifying remote runs as absent, pending, failed, or successful. Observation of that remote run set SHALL query the workflow-run API for `release.yml` plus exact candidate SHA and paginate to completion. A truncated or incomplete page SHALL fail closed. Absence MAY be concluded only after that exact-identity set is proven complete. Bounds SHALL come from that remote run set, not from local process flags. The CLI SHALL persist a recovery episode keyed by that same workflow, tag, and C before issuing a missing-run dispatch, and SHALL reload it on a later invocation. When that episode records an unobserved dispatch and exhaustive remote observation is still absent, recovery SHALL wait rather than dispatch again. An exact-C push or recovery-dispatch run may receive at most one rerun when remote evidence shows it failed and has not already been rerun. The CLI SHALL persist a recovery episode keyed by that same workflow, tag, C, and workflow run ID before issuing `gh run rerun`, and SHALL reload it on a later invocation. When that episode records an unobserved rerun for that run ID and remote evidence still shows the failed first attempt, recovery SHALL wait and re-observe rather than rerunning again. A missing exact-identity run may receive one bounded exact-C recovery `workflow_dispatch` to that same workflow after re-verifying the remote annotated tag, and only while origin/main still equals C. The CLI SHALL NOT implement a second Release creator/editor. Release absence may be concluded only from a status-aware authoritative not-found response for that exact tag; authentication, authorization, network, rate-limit, malformed response, and 5xx failures are unknown and fail closed.
 
 #### Scenario: Complete release orders authority
 
@@ -60,6 +60,7 @@ An interrupted publication SHALL remain anchored to proven C rather than rebindi
 - **AND** that classification paginates the exact-identity workflow-run set to completion rather than treating a 100-row page as the complete set
 - **AND** it reruns or boundedly dispatches `release.yml` for that exact tag and C using remote evidence as the only bound
 - **AND** a missing-run dispatch is recorded in a durable recovery episode before the workflow run, and a later invocation with that episode still absent waits instead of dispatching again
+- **AND** a failed exact run is recorded in a durable recovery episode keyed by workflow, tag, C, and run ID before `gh run rerun`, and a later invocation that still observes that failed first attempt waits instead of rerunning again
 - **AND** `release.yml` re-verifies the remote annotated tag identity before creating or editing the Release
 - **AND** no CLI-side or second workflow publication implementation is used
 
@@ -75,6 +76,22 @@ An interrupted publication SHALL remain anchored to proven C rather than rebindi
 - **THEN** release proves its exact head changes only release-managed files and sets both root and core versions to VERSION
 - **AND** it proves at least one nonempty green CI result belongs to that exact immutable head
 - **AND** it proves the resulting merge commit is contained in frozen C before fixtures
+
+#### Scenario: Already-merged metadata reuse survives merge-commit squash and rebase
+
+- **WHEN** the metadata PR is already merged by merge-commit, squash, or rebase
+- **AND** GitHub may have deleted `release/vVERSION`
+- **THEN** release proves the release-managed changed-file scope from authoritative PR file data
+- **AND** it does not compare the merged PR head to the current base tip
+- **AND** an empty triple-dot diff against current main is not treated as missing provenance
+
+#### Scenario: Merge-during-wait re-reads exact-head CI
+
+- **WHEN** metadata exact-head CI is observed green while the PR is still open
+- **AND** a later observation finds the PR already MERGED
+- **THEN** release immediately reloads check runs at that exact head
+- **AND** it requires a nonempty exact-head pass before continuing
+- **AND** a later pending or failing exact-head check fails closed
 
 #### Scenario: Metadata reuse survives deleted source branch
 
