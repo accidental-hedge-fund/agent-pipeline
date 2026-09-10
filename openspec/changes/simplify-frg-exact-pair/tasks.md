@@ -42,4 +42,4 @@
 - [x] 7.2 Run `node scripts/build.mjs` after all `core/` edits and verify `node scripts/build.mjs --check` reports every generated host SKILL fresh.
 - [x] 7.3 Run `npm run ci` from the repository root and verify the complete core, generated-artifact, install-smoke, OpenSpec, docs, and scripts gates pass.
 - [x] 7.4 Obtain independent standards and spec reviews, address every blocking finding with focused regression coverage, and verify both reviewers approve the final diff.
-- [ ] 7.5 Push the implementation PR and verify GitHub PR CI is green without running live synthetic fixtures or performing release, merge, tag, publication, promotion, installation, or deployment actions.
+- [x] 7.5 Push the implementation PR and verify GitHub PR CI is green without running live synthetic fixtures or performing release, merge, tag, publication, promotion, installation, or deployment actions.
