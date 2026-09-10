@@ -251,6 +251,18 @@ _Avoid_: incident test list, optional coverage sample, helper-stamped lifecycle 
 A detached `pipeline train --merge` for one milestone. That process is the ship.
 _Avoid_: Buzz thread as the ship, playbook as the definition, `pipeline 702` / `single` lock as a live ship
 
+**direct-release**:
+The independent `pipeline release` command that performs the complete SemVer release contract for an exact candidate. Direct release does not deploy, promote, or install.
+_Avoid_: ship as the release command, historical optional-FRG as the live procedure
+
+**ship-final-delegation**:
+Ship completion that finishes the approved release contract by delegating to independent release and does not deploy, promote, or install.
+_Avoid_: ship-promotion as the live command, finish as a second release engine
+
+**historical-failed-ship-evidence**:
+Failed or prior ship, FRG, scorer, or attestor ledgers and files that remain as superseded history. They are not current-candidate authority and are not a prerequisite for a new release.
+_Avoid_: historical pass as current-candidate authority, deleting diagnostic evidence to reset budgets
+
 **Live-ship probe**:
 A live pid whose cmdline is that `train --merge` (or the tugboat that owns it). Only this may refuse a second detach.
 _Avoid_: `playbook.pid` + `kill -0`, any issue lock
