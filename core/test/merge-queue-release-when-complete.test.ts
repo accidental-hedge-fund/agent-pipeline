@@ -240,7 +240,7 @@ test("hook: prepare path wires only runRelease (no tag/merge/publish deps)", asy
   assert.equal(deps.releaseCalls.length, 1);
   assert.deepEqual(Object.keys(deps.releaseCalls[0].opts).sort(), ["noEdit"]);
   assert.equal(
-    "tag" in deps || "publish" in deps || "mergeReleasePr" in deps,
+    "tag" in deps || "publish" in deps || "mergeReleasePr" in deps || "runCompleteRelease" in deps,
     false,
   );
 });

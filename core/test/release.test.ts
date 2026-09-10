@@ -1948,6 +1948,33 @@ test("CLI: candidate-bound release dry-run rejects before any git mutation (#154
   assert.equal(fs.existsSync(marker), false, "candidate-bound dry-run must not invoke git");
 });
 
+test("CLI: 'pipeline release prepare --packed-candidate' rejects during argv validation before git (#1563)", () => {
+  const repoDir = makeTempRepo();
+  const marker = path.join(repoDir, "git-called");
+  const binDir = path.join(repoDir, "bin");
+  fs.mkdirSync(binDir);
+  const gitPath = path.join(binDir, "git");
+  fs.writeFileSync(gitPath, `#!/bin/sh\n: > '${marker}'\nexit 99\n`);
+  fs.chmodSync(gitPath, 0o755);
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      PIPELINE_SCRIPT,
+      "release",
+      "prepare",
+      "1.40.1",
+      "--packed-candidate",
+      "a".repeat(40),
+    ],
+    { cwd: repoDir, encoding: "utf8", env: { ...process.env, PATH: binDir } },
+  );
+  assert.notEqual(result.status, 0);
+  const combined = (result.stdout ?? "") + (result.stderr ?? "");
+  assert.match(combined, /--packed-candidate is reserved for legacy release ensure-tag/);
+  assert.equal(fs.existsSync(marker), false, "packed prepare must not invoke git");
+});
+
 test("CLI: 'pipeline release ensure-tag' without version and oid exits non-zero", () => {
   const result = spawnSync(
     process.execPath,

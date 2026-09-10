@@ -13,11 +13,42 @@ const TUGBOAT = join(__dirname, "../../examples/supervisor/shell/tugboat.sh");
 
 test("release.yml publishes GitHub Release on v* tag push (#1167)", () => {
   const src = readFileSync(WORKFLOW, "utf8");
-  assert.match(src, /^on:\n  push:\n    tags:\n      - "v\*"\n/m);
+  assert.match(src, /^on:\n  push:\n    tags:\n      - "v\*"\n  workflow_dispatch:\n    inputs:\n      tag:\n/m);
   assert.match(src, /gh release create/);
   assert.match(src, /--verify-tag/);
-  assert.match(src, /gh release view/);
-  assert.doesNotMatch(src, /workflow_dispatch/);
+  assert.match(src, /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/tags\/\$\{TAG\}"/);
+  assert.match(src, /workflow_dispatch:/);
+  assert.match(src, /candidate:/);
+  assert.doesNotMatch(src, /gh release view .*&>\/dev\/null/);
+});
+
+test("release.yml recovery dispatch shares the push publication job and exact tag/candidate inputs (#1563)", () => {
+  const src = readFileSync(WORKFLOW, "utf8");
+  assert.match(src, /description: Exact annotated tag \(vX\.Y\.Z\)/);
+  assert.match(src, /description: Exact 40-hex candidate SHA C/);
+  assert.match(src, /required: true/);
+  assert.equal((src.match(/^jobs:\n  release:/m) ?? []).length, 1);
+  assert.match(src, /GITHUB_EVENT_NAME.*workflow_dispatch/);
+});
+
+test("release.yml order is tag checkout, root/core guards, main=C, publication, main checkout, install, docs (#1563)", () => {
+  const src = readFileSync(WORKFLOW, "utf8");
+  const tagCheckout = src.indexOf("Fetch and check out the annotated tag");
+  const guards = src.indexOf("Guard annotated tag, package versions, and origin/main");
+  const rootVersion = src.indexOf("require('./package.json').version");
+  const coreVersion = src.indexOf("require('./core/package.json').version");
+  const mainEqualsC = src.indexOf("origin/main ${main} is not candidate ${C}");
+  const publish = src.indexOf("Publish GitHub Release from the annotated tag");
+  const mainCheckout = src.indexOf("Check out current main before docs");
+  const install = src.indexOf("Install dependencies for tag-derived docs");
+  const docs = src.indexOf("Refresh tag-derived docs on main");
+  const order = [tagCheckout, guards, rootVersion, coreVersion, mainEqualsC, publish, mainCheckout, install, docs];
+  assert.ok(order.every((index) => index >= 0), `missing workflow steps: ${JSON.stringify(order)}`);
+  for (let i = 1; i < order.length; i++) {
+    assert.ok(order[i]! > order[i - 1]!, `workflow step order broken at index ${i}`);
+  }
+  assert.ok(src.indexOf("npm ci") > mainCheckout, "dependency install must follow main checkout");
+  assert.match(src, /non-atomic/);
 });
 
 test("tugboat wait-release does not create GitHub Releases (#1167)", () => {

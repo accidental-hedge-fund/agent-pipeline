@@ -13,6 +13,8 @@ import {
   exactCandidateFrgLoopArgv,
   exactCandidateFrgResultPath,
   observeExactCandidateFrgPair,
+  observeProductionExactCandidateFrgPass,
+  discoverExactCandidateFrgPairIssues,
   parseExactCandidateFrgRecord,
   persistExactCandidateFrgRecord,
   loadExactCandidateFrgRecord,
@@ -2115,4 +2117,74 @@ test("same-host release/FRG exclusion releases on failure and refuses contention
   })), /boom/);
   assert.deepEqual(events, ["acquire", "run", "release"]);
   await assert.rejects(() => withReleaseFrgExclusion("owner-repo", async () => undefined, () => ({ acquire: () => false, release: () => {} })), /already held/);
+});
+
+test("tagged retry discovers exactly one forge pair and never treats local pass as proof", async () => {
+  const { record } = await begun();
+  record.loop_run_id = CANONICAL_LOOP;
+  record.loop_dispatch_certainty = "known_complete";
+  record.outcome = "passed";
+  record.slots.forEach((slot, index) => {
+    slot.issue_number = 101 + index;
+    slot.create_certainty = "known_complete";
+    slot.advance_run_id = `advance-${index + 1}`;
+    slot.pr_number = 301 + index;
+    slot.pr_head_sha = String(index + 1).repeat(40);
+    slot.observation = passingObservation(record, index);
+  });
+  const issues = record.slots.map((slot, index) => ({
+    number: 101 + index,
+    body: templateBodyForTest(record, slot),
+    state: "open" as const,
+  }));
+  const discovered = discoverExactCandidateFrgPairIssues(issues, CANDIDATE, record.release_version);
+  assert.equal(discovered.epoch_id, record.epoch_id);
+  assert.equal(discovered.slots["clean-docs"].issue_number, 101);
+  assert.equal(discovered.slots["clean-openspec"].issue_number, 102);
+  assert.throws(() => discoverExactCandidateFrgPairIssues([], CANDIDATE, record.release_version), /exactly one exact-pair epoch/);
+  assert.throws(() => discoverExactCandidateFrgPairIssues([issues[0]!], CANDIDATE, record.release_version), /exactly one clean-openspec/);
+
+  let created = 0;
+  const input = {
+    repoDir: "/linked", repository: record.repository, baseBranch: record.base_branch,
+    releaseVersion: record.release_version, operationalDomain: "agent-pipeline",
+  };
+  const noRecordIo = {
+    now: () => new Date(),
+    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: record.repository }),
+    resolveReleaseStoreRepoDir: async () => "/primary",
+    listRecordEpochIds: async () => [],
+    listIssues: async () => issues,
+    createIssue: async () => { created++; return 999; },
+    readFile: async () => null,
+  } as unknown as ProductionExactCandidateFrgIo;
+  await assert.rejects(
+    () => observeProductionExactCandidateFrgPass(input, CANDIDATE, noRecordIo),
+    /refusing to create a replacement pair/,
+  );
+  assert.equal(created, 0);
+
+  let observedIssues = 0;
+  const staleLocalIo = {
+    now: () => new Date(),
+    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: record.repository }),
+    resolveReleaseStoreRepoDir: async () => "/primary",
+    listRecordEpochIds: async () => [record.epoch_id],
+    listIssues: async () => issues,
+    createIssue: async () => { created++; return 999; },
+    readFile: async (file: string) => file.endsWith(`${record.epoch_id}.json`) ? JSON.stringify(record) : candidateTemplateForPath(file),
+    resolveCandidatePolicy: async () => ({
+      repository: record.repository, baseBranch: record.base_branch, domain: "github.com/owner/repo",
+      implementer: "claude", reviewer: "codex", gatesSha256: record.worker_config.gates_sha256,
+      reviewPolicyHashes: { standard: "2".repeat(64), lowRiskRound2: "7".repeat(64) },
+    }),
+    getIssue: async () => { observedIssues++; throw new Error("forge unavailable"); },
+    writeRecord: async () => undefined,
+  } as unknown as ProductionExactCandidateFrgIo;
+  await assert.rejects(
+    () => observeProductionExactCandidateFrgPass(input, CANDIDATE, staleLocalIo),
+    /forge unavailable/,
+  );
+  assert.ok(observedIssues > 0, "local passed JSON must be re-observed from forge");
+  assert.equal(created, 0);
 });

@@ -171,13 +171,10 @@ non-claude profile.
 ### Phase sequence (fixed)
 
 1. `pipeline train --milestone vX.Y.Z --merge --json` (complete gate + resume)
-2. FRG pack: uncredentialed `pipeline factory-release prepare --request <abs-off-repo.json> --json` (`$TMPDIR`, `AGENT_PIPELINE_STATE_HOME`, or Tugboat `$RUN_DIR` — never `$REPO_DIR`), then (when unsigned) `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a separate credentialed child **once** for that unchanged checkpoint. The attestor writes HMAC `latest.json` with distinct `run_id` **B** joined to unsigned **A** by top-level `factory_release_binding` before sign. Re-invoke the same prepare request once. Pack-done is prepare `complete`. Absent or rejected observe after that tick fails the pack and names **A**, **B**, and the miss reason. While prepare is `in_progress` and the bound pack loop is live (`lock.json` pid alive or ledger not terminal), wait is wait-until-terminal with a heartbeat. A CI-length poll cap (about 20 minutes) is not pack-fail. Re-detach is not the resume path. Wait-budget expiry may fail the pack only when the bound loop is not live. `"attest"` does not inherit that live-loop uncap.
-3. `pipeline release X.Y.Z --no-edit` (**bare** version — leading `v` is invalid; **no** `--skip-frg`)
-4. In-engine `pipeline ship` waits until open release PR checks are green before `release finish` (`ship-release-check-wait`: `gh pr checks --json name,state,bucket,link`; never `conclusion`). Classification is `green` / `pending` / `rerun` / `fail`. `pending` keeps waiting in the coordinator (same-argv retry may resume). A first flake-eligible `test` fail requests one bounded `gh run rerun --failed` per head SHA (budget at most two), then waits again. Non-test product fails STOP and do not finish. Bare `pipeline release finish` stays one-shot fail-closed; **ship** owns the wait. Tugboat may keep calling `release-checks-green.py`; Tugboat is not the only waiter. After merge, refresh installed Tugboat and `release-checks-green.py` from `examples/supervisor/shell/`.
-5. `pipeline release finish <pr>` (only after the waiter classifies `green`, or when finish evidence is already observed)
-6. `pipeline release ensure-tag <X.Y.Z> <mergeCommitOid> --packed-candidate <integrated_candidate.git_sha>` (candidate engine; on-disk HMAC `latest.json`)
-7. Wait until GitHub Release `vX.Y.Z` is published (non-draft)
-8. `pipeline engine-promote --for X.Y.Z --host all` (or `ENGINE_PROMOTE_HOST` override; **no** `--skip-frg`). Completes only when the live installed digest matches the authorized published artifact. Install or verify failure does **not** roll the pin back; use `pipeline factory-pin rollback`.
+2. `pipeline ship --milestone vX.Y.Z` runs that train, then delegates once to `pipeline release X.Y.Z` for SemVer. Continuous ship stops after integration. Release validates contained milestone work, prepares or reuses metadata, runs exact-candidate FRG, tags C, and waits for the `release.yml` publisher plus a non-draft GitHub Release. No install, promotion, or deployment is a ship or release completion prerequisite.
+3. Direct `pipeline release X.Y.Z --no-edit` (**bare** version — leading `v` is invalid; **no** `--skip-frg`) is the same complete owner without train.
+4. Bounded prepare-only callers remain `pipeline release prepare`, `pipeline factory-release prepare --request`, and merge-queue `--release-when-complete`. `pipeline release finish <pr>` merges a metadata PR and does not tag.
+5. Legacy Tugboat `release ensure-tag` remains a compatibility seam pending #1560. `release.yml` is the sole GitHub Release publisher.
 
 Hardened behaviors (preserve):
 
@@ -191,11 +188,12 @@ Hardened behaviors (preserve):
 
 ## FRG pack is part of thin ship
 
-Default Tugboat sequence is train → FRG pack → release (no `--skip-frg`) →
-finish → `release ensure-tag` → publication wait → promote. **Train and
-engine-promote use the production-pin CLI** (`$PIPELINE`). **After
-train-complete, FRG pack, `pipeline release`, `release finish`, and
-`release ensure-tag` use the candidate engine** at the FRG-bound SHA
+Default native ship sequence is train → one complete `pipeline release VERSION`
+call. Continuous mode is integration-only. **Train uses the production-pin CLI**
+(`$PIPELINE`). Direct release and SemVer ship do not promote or install. Legacy
+Tugboat FRG-pack / finish / `release ensure-tag` / promote remains a
+compatibility composer pending #1560. When that composer still runs candidate
+verbs, they use the candidate engine at the FRG-bound SHA
 (`SHIP_END_CLI` = `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"`).
 That stable launcher uses same-process exec both to enter Node >=24 when a
 runtime bootstrap is needed and then to enter the candidate core CLI. It does

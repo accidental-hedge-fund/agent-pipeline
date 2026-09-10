@@ -171,6 +171,11 @@ export const COMMAND_FORM_INVENTORY: readonly CommandForm[] = [
   // --- Release / factory / engine ---
   supervised("release", "release", "protected-authority"),
   readOnly("release.dry-run", "release"),
+  boundedAtomic(
+    "release.prepare",
+    "release",
+    `${NO_RUN_OWNER} Opens a metadata PR; never merges, tags, or publishes.`,
+  ),
   supervised("release.finish", "release", "protected-authority"),
   supervised("release.ensure-tag", "release", "protected-authority"),
   readOnly("engine-promote.dry-run", "engine-promote"),

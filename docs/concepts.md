@@ -351,6 +351,8 @@ node scripts/release-docs-refresh.mjs --version X.Y.Z --push
 
 The bounded `pipeline release prepare <version>` helper only prepares metadata; it cannot merge, tag, or publish. Direct `pipeline release <version>` completes through verified non-draft publication.
 
+Git cannot atomically create a tag and assert that an unrelated protected `main` ref remains candidate C. Release observes `origin/main = C` immediately before the non-force tag create, re-fetches the remote tag, and has `release.yml` re-check tag identity and `origin/main = C` before publication. Observable movement fails closed as tagged-stale-C. Tags are never force-moved or deleted. The remaining main-observation/tag-create and workflow-observation/publication windows are an unavoidable distributed race, not compare-and-swap atomicity.
+
 ## Operator follow and notify
 
 Generated host SKILLs carry the compact contract. This page keeps the operator detail that left those essays.

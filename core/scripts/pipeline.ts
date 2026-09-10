@@ -5103,6 +5103,12 @@ async function main(): Promise<void> {
         console.error("pipeline release prepare: a version or major|minor|patch|next is required.");
         process.exit(2);
       }
+      if (typeof opts.packedCandidate === "string") {
+        console.error(
+          "pipeline release prepare: --packed-candidate is reserved for legacy release ensure-tag.",
+        );
+        process.exit(2);
+      }
     } else if (/^\d+$/.test(subEarly)) {
       console.error(
         `pipeline release: "${subEarly}" looks like an issue/PR number, not a version.\n` +
@@ -5496,15 +5502,7 @@ async function main(): Promise<void> {
     }
     try {
       if (prepareOnly && typeof opts.packedCandidate === "string") {
-        const { alignReleaseCheckoutToCandidate } = await import("./stages/ship-adapter.ts");
-        await alignReleaseCheckoutToCandidate(
-          localCfg.base_branch,
-          opts.packedCandidate,
-          async (args) => {
-            const result = await gitInWorktree(localCfg.repo_dir, args);
-            return result.stdout.trim();
-          },
-        );
+        throw new Error("--packed-candidate is reserved for legacy release ensure-tag and cannot be used by release prepare");
       }
       const releaseDeps = realReleaseDeps(localCfg.repo_dir);
       if (opts.json) {

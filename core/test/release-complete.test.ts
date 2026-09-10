@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   assertReleaseManagedMetadataPaths,
+  classifyPublisherRuns,
+  exactHeadCheckRunsState,
   metadataChecksState,
   realCompleteReleaseDeps,
   releaseTagNotes,
@@ -182,10 +184,10 @@ test("completed retry returns the same observer-reconciled identity without reru
   assert.ok(d.calls.includes(`observe-frg:${C}`), "retry verifies the durable exact-C FRG proof");
 });
 
-test("existing tag with interrupted publisher resumes without main, milestone, or FRG", async () => {
+test("existing tag with interrupted publisher resumes without milestone or FRG while main equals C", async () => {
   let recovered = false;
   const d = deps({
-    async observeOriginHead() { throw new Error("main moved/unavailable"); },
+    async observeOriginHead() { d.calls.push("head"); return C; },
     async versionsAt() { return { root: "1.2.3", core: "1.2.3" }; },
     async resolveMilestones() { throw new Error("must not re-read milestone"); },
     async observeTag() { return { annotated: true, peeled_commit: C, annotation: releaseTagNotes("1.2.3", C) }; },
@@ -230,17 +232,23 @@ test("dry-run validates milestone but performs no release mutations", async () =
   assert.ok(!d.calls.some((x) => x.startsWith("frg:") || x.startsWith("tag:")));
 });
 
-test("publisher proof binds push event, tag branch, and exact C", () => {
+test("publisher proof binds push or workflow_dispatch, tag branch, and exact C", () => {
+  const base = { databaseId: 1, attempt: 1, status: "completed", conclusion: "success" };
   const rows = [
-    { event: "workflow_dispatch", headBranch: "v1.2.3", headSha: C, status: "completed", conclusion: "success" },
-    { event: "push", headBranch: "main", headSha: C, status: "completed", conclusion: "success" },
-    { event: "push", headBranch: "v1.2.3", headSha: B, status: "completed", conclusion: "success" },
+    { ...base, event: "workflow_dispatch", headBranch: "v1.2.3", headSha: C },
+    { ...base, databaseId: 2, event: "push", headBranch: "main", headSha: C },
+    { ...base, databaseId: 3, event: "push", headBranch: "v1.2.3", headSha: B },
   ];
-  assert.equal(selectExactPublisherConclusion(rows, "v1.2.3", C), "pending");
-  rows.push({ event: "push", headBranch: "v1.2.3", headSha: C, status: "completed", conclusion: "failure" });
-  assert.equal(selectExactPublisherConclusion(rows, "v1.2.3", C), "failure");
-  rows.push({ event: "push", headBranch: "v1.2.3", headSha: C, status: "completed", conclusion: "success" });
   assert.equal(selectExactPublisherConclusion(rows, "v1.2.3", C), "success");
+  assert.equal(classifyPublisherRuns(rows, "v1.2.3", C).class, "successful");
+  const failedOnly = [
+    { databaseId: 4, attempt: 1, event: "push", headBranch: "v1.2.3", headSha: C, status: "completed", conclusion: "failure" },
+  ];
+  assert.equal(selectExactPublisherConclusion(failedOnly, "v1.2.3", C), "failure");
+  assert.equal(classifyPublisherRuns([], "v1.2.3", C).class, "absent");
+  assert.equal(classifyPublisherRuns([
+    { databaseId: 5, attempt: 1, event: "push", headBranch: "v1.2.3", headSha: C, status: "in_progress", conclusion: null },
+  ], "v1.2.3", C).class, "pending");
 });
 
 test("metadata adapter requires nonempty exact-head green checks", () => {
@@ -332,9 +340,9 @@ test("production publication observer does not misclassify downstream 404 as rel
   const notes = releaseTagNotes("1.2.3", C);
   const deps = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
     const joined = args.join(" ");
-    if (file === "gh" && args[0] === "release") return JSON.stringify({
-      tagName: tag, isDraft: false, isPrerelease: false, publishedAt: "2026-09-10T00:00:00Z",
-      body: notes, name: tag, url: "https://github.test/o/r/releases/tag/v1.2.3",
+    if (file === "gh" && args[0] === "api" && joined.includes("releases/tags/")) return JSON.stringify({
+      tag_name: tag, draft: false, prerelease: false, published_at: "2026-09-10T00:00:00Z",
+      body: notes, name: tag, html_url: "https://github.test/o/r/releases/tag/v1.2.3",
     });
     if (file === "gh" && args[0] === "run") throw new Error("HTTP 404 from workflow runs API");
     if (args[0] === "ls-remote") return `${A}\trefs/tags/${tag}\n${C}\trefs/tags/${tag}^{}`;
@@ -346,4 +354,211 @@ test("production publication observer does not misclassify downstream 404 as rel
     throw new Error(`unexpected ${file} ${joined}`);
   } });
   await assert.rejects(() => deps.observePublication(tag), /HTTP 404 from workflow runs API/);
+});
+
+test("version on main without metadata PR proof fails closed", async () => {
+  const d = deps({
+    async observeOriginHead() { return C; },
+    async versionsAt() { return { root: "1.2.3", core: "1.2.3" }; },
+    async observeMetadata() { return null; },
+  });
+  await assert.rejects(
+    () => runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d),
+    /without a validated release-managed metadata PR/,
+  );
+  assert.ok(!d.calls.includes("prepare-metadata"));
+  assert.ok(!d.calls.some((x) => x.startsWith("frg:") || x.startsWith("tag:")));
+});
+
+test("tagged-stale-C stays incomplete without retag when main moved", async () => {
+  const d = deps({
+    async observeOriginHead() { return D; },
+    async versionsAt() { return { root: "1.2.3", core: "1.2.3" }; },
+    async resolveMilestones() { throw new Error("must not re-read milestone"); },
+    async observeTag() { return { annotated: true, peeled_commit: C, annotation: releaseTagNotes("1.2.3", C) }; },
+    async observePublication() {
+      return { tag: "v1.2.3", draft: true, published_at: null, workflow_conclusion: "pending" };
+    },
+    async recoverPublication() { throw new Error("must not recover after stale-C"); },
+  });
+  await assert.rejects(() => runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d), /tagged-stale-C/);
+  assert.ok(!d.calls.some((x) => x.startsWith("frg:") || x.startsWith("tag:")));
+});
+
+test("completed tag plus later docs refresh does not report tagged-stale-C", async () => {
+  const d = deps({
+    async observeOriginHead() { throw new Error("completed release must not consult later main"); },
+    async versionsAt() { return { root: "1.2.3", core: "1.2.3" }; },
+    async resolveMilestones() { throw new Error("completed release must not re-read mutable milestone"); },
+    async observeTag() { return { annotated: true, peeled_commit: C, annotation: releaseTagNotes("1.2.3", C) }; },
+    async observePublication() {
+      return { tag: "v1.2.3", draft: false, published_at: "2026-09-10T00:00:00Z", workflow_conclusion: "success" };
+    },
+  });
+  const result = await runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d);
+  assert.equal(result?.already_complete, true);
+  assert.equal(result?.candidate_sha, C);
+});
+
+test("exact-head check-runs require nonempty green results at the immutable head", () => {
+  assert.equal(exactHeadCheckRunsState({ check_runs: [] }, C), "pending");
+  assert.equal(exactHeadCheckRunsState({
+    check_runs: [{ name: "ci", head_sha: B, status: "completed", conclusion: "success" }],
+  }, C), "pending");
+  assert.equal(exactHeadCheckRunsState({
+    check_runs: [{ name: "ci", head_sha: C, status: "completed", conclusion: "success" }],
+  }, C), "pass");
+  assert.equal(exactHeadCheckRunsState({
+    check_runs: [{ name: "ci", head_sha: C, status: "completed", conclusion: "failure" }],
+  }, C), "fail");
+  assert.equal(exactHeadCheckRunsState({
+    check_runs: [{ name: "ci", head_sha: C, status: "in_progress", conclusion: null }],
+  }, C), "pending");
+});
+
+test("production metadata observer discovers by title and fetches a deleted head", async () => {
+  const calls: string[] = [];
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
+    const joined = args.join(" ");
+    calls.push(`${file} ${joined}`);
+    if (file === "gh" && args[0] === "pr" && args[1] === "list") {
+      assert.ok(args.includes("--search"));
+      assert.ok(!args.includes("--head"));
+      return JSON.stringify([{
+        number: 31, state: "MERGED", baseRefName: "main", headRefOid: A,
+        mergeCommit: { oid: C }, title: "release: 1.2.3 — version metadata",
+      }]);
+    }
+    if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+      return JSON.stringify({
+        number: 31, state: "MERGED", baseRefName: "main", headRefOid: A,
+        mergeCommit: { oid: C }, title: "release: 1.2.3 — version metadata",
+      });
+    }
+    if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+      return JSON.stringify([{ check_runs: [{ name: "ci", head_sha: A, status: "completed", conclusion: "success" }] }]);
+    }
+    if (args[0] === "fetch" && joined.includes("release/v1.2.3")) throw new Error("branch deleted");
+    if (args[0] === "fetch" && joined.includes("pull/31/head")) return "";
+    if (args[0] === "rev-parse" && joined.includes("release-metadata")) return A;
+    if (args[0] === "show" && joined.includes("package.json")) {
+      return JSON.stringify({ version: "1.2.3" });
+    }
+    if (args[0] === "diff") return "package.json\ncore/package.json";
+    throw new Error(`unexpected ${file} ${joined}`);
+  } });
+  const observed = await adapter.observeMetadata("1.2.3", "main");
+  assert.equal(observed?.pr, 31);
+  assert.equal(observed?.state, "MERGED");
+  assert.equal(observed?.head_oid, A);
+  assert.ok(calls.some((call) => call.includes("pull/31/head")));
+});
+
+test("production metadata observer fails closed on empty or wrong-head CI", async () => {
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
+    const joined = args.join(" ");
+    if (file === "gh" && args[0] === "pr" && args[1] === "list") {
+      return JSON.stringify([{
+        number: 31, state: "MERGED", baseRefName: "main", headRefOid: A,
+        mergeCommit: { oid: C }, title: "release: 1.2.3 — version metadata",
+      }]);
+    }
+    if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+      return JSON.stringify({
+        number: 31, state: "MERGED", baseRefName: "main", headRefOid: A,
+        mergeCommit: { oid: C }, title: "release: 1.2.3 — version metadata",
+      });
+    }
+    if (file === "gh" && args[0] === "api" && joined.includes("check-runs")) {
+      return JSON.stringify([{ check_runs: [{ name: "ci", head_sha: B, status: "completed", conclusion: "success" }] }]);
+    }
+    if (args[0] === "fetch") return "";
+    if (args[0] === "rev-parse") return A;
+    if (args[0] === "show") return JSON.stringify({ version: "1.2.3" });
+    if (args[0] === "diff") return "package.json\ncore/package.json";
+    throw new Error(`unexpected ${file} ${joined}`);
+  } });
+  await assert.rejects(() => adapter.observeMetadata("1.2.3", "main"), /no nonempty green exact-head CI/);
+});
+
+test("production Release lookup treats only non-auth HTTP 404 as absence", async () => {
+  const tag = "v1.2.3";
+  const absent = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
+    if (file === "gh" && args[0] === "api") throw new Error("HTTP 404: Not Found");
+    throw new Error(`unexpected ${file} ${args.join(" ")}`);
+  } });
+  assert.equal(await absent.observePublication(tag), null);
+
+  const auth = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
+    if (file === "gh" && args[0] === "api") throw new Error("HTTP 403: Resource not accessible by integration");
+    throw new Error(`unexpected ${file} ${args.join(" ")}`);
+  } });
+  await assert.rejects(() => auth.observePublication(tag), /observation is unknown/);
+
+  const network = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
+    if (file === "gh" && args[0] === "api") throw new Error("connection reset");
+    throw new Error(`unexpected ${file} ${args.join(" ")}`);
+  } });
+  await assert.rejects(() => network.observePublication(tag), /observation is unknown/);
+
+  const prose = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
+    if (file === "gh" && args[0] === "api") throw new Error("release not found");
+    throw new Error(`unexpected ${file} ${args.join(" ")}`);
+  } });
+  await assert.rejects(() => prose.observePublication(tag), /observation is unknown/);
+});
+
+test("publisher recovery dispatches once when remote runs are absent and reruns a failed attempt 1", async () => {
+  const tag = "v1.2.3";
+  const notes = releaseTagNotes("1.2.3", C);
+  const ghCalls: string[] = [];
+  let runs: unknown[] = [];
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
+    const joined = args.join(" ");
+    if (file === "gh") ghCalls.push(joined);
+    if (file === "gh" && args[0] === "run" && args[1] === "list") return JSON.stringify(runs);
+    if (file === "gh" && args[0] === "workflow") return "";
+    if (file === "gh" && args[0] === "run" && args[1] === "rerun") return "";
+    if (args[0] === "fetch" && args.includes("origin") && args.includes("main")) return "";
+    if (joined === "rev-parse origin/main") return C;
+    if (args[0] === "ls-remote") return `${A}\trefs/tags/${tag}\n${C}\trefs/tags/${tag}^{}`;
+    if (args[0] === "fetch") return "";
+    if (joined === `rev-parse refs/pipeline/release-observe/${tag}`) return A;
+    if (joined === `cat-file -t refs/pipeline/release-observe/${tag}`) return "tag";
+    if (joined === `rev-parse refs/pipeline/release-observe/${tag}^{}`) return C;
+    if (args[0] === "for-each-ref") return notes;
+    throw new Error(`unexpected ${file} ${joined}`);
+  } });
+  assert.equal(await adapter.recoverPublication(tag, C), true);
+  assert.ok(ghCalls.some((call) => call.includes("workflow run release.yml") && call.includes(`--ref ${tag}`) && call.includes(`tag=${tag}`) && call.includes(`candidate=${C}`)));
+
+  ghCalls.length = 0;
+  runs = [{
+    databaseId: 9, event: "workflow_dispatch", headBranch: tag, headSha: C,
+    status: "completed", conclusion: "failure", attempt: 1,
+  }];
+  assert.equal(await adapter.recoverPublication(tag, C), true);
+  assert.ok(ghCalls.some((call) => call.startsWith("run rerun 9")));
+  assert.ok(!ghCalls.some((call) => call.includes("workflow run")));
+
+  runs = [{
+    databaseId: 9, event: "workflow_dispatch", headBranch: tag, headSha: C,
+    status: "completed", conclusion: "failure", attempt: 2,
+  }];
+  await assert.rejects(() => adapter.recoverPublication(tag, C), /already reran/);
+});
+
+test("publisher recovery does not dispatch when an exact-identity run already exists", async () => {
+  const tag = "v1.2.3";
+  const adapter = realCompleteReleaseDeps({ repo_dir: "/repo", repo: "o/r" }, { command: async (_cwd, file, args) => {
+    if (file === "gh" && args[0] === "run" && args[1] === "list") {
+      return JSON.stringify([{
+        databaseId: 11, event: "push", headBranch: tag, headSha: C,
+        status: "in_progress", conclusion: null, attempt: 1,
+      }]);
+    }
+    if (file === "gh" && args[0] === "workflow") throw new Error("must not dispatch");
+    throw new Error(`unexpected ${file} ${args.join(" ")}`);
+  } });
+  assert.equal(await adapter.recoverPublication(tag, C), false);
 });

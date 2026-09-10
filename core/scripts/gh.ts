@@ -1229,6 +1229,14 @@ export function isGithubAuthOrPermissionError(stderr: string): boolean {
 }
 
 /**
+ * True only for an authoritative exact-tag Release 404 that is not auth-shaped.
+ * Auth, rate-limit, network, malformed, and 5xx remain unknown and must fail closed.
+ */
+export function isAuthoritativeReleaseNotFound(stderr: string): boolean {
+  return isHttp404Signal(stderr) && !isGithubAuthOrPermissionError(stderr);
+}
+
+/**
  * Whether a failed `openspec/changes` Contents list may be treated as empty.
  * Only when the error is a 404-class signal, is **not** auth/permission-shaped,
  * **and** a tip-root Contents probe already succeeded (proves the tip is listable

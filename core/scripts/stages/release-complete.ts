@@ -18,6 +18,7 @@ import {
 } from "../exact-candidate-frg.ts";
 import { finishReleasePr, realReleaseFinishDeps } from "./release-finish.ts";
 import { withLock } from "../lock.ts";
+import { isAuthoritativeReleaseNotFound } from "../gh.ts";
 import {
   realReleaseDeps,
   resolveVersion,
@@ -67,10 +68,25 @@ export interface PublishedReleaseObservation {
   workflow_conclusion: "success" | "failure" | "pending" | "unknown";
 }
 
+export type PublisherRemoteClass = "absent" | "pending" | "failed" | "successful";
+
+export interface PublisherRunRow {
+  databaseId: number;
+  event: string;
+  headBranch: string;
+  headSha: string;
+  status: string;
+  conclusion: string | null;
+  attempt: number;
+}
+
 export interface PublisherRecoveryObservation {
   exact_run_id: number | null;
   conclusion: "success" | "failure" | "pending";
 }
+
+export const TAGGED_STALE_C_MESSAGE =
+  "pipeline release: tagged-stale-C: origin/main moved after the annotated tag and publication is not a verified success. Tags are never force-moved or deleted. Git cannot atomically create a tag while asserting an unrelated protected main ref remains C; this is the documented non-atomic tag-boundary race.";
 
 export interface CompleteReleaseResult {
   schema_version: 1;
@@ -210,12 +226,15 @@ async function runCompleteReleaseLocked(
         tag: `v${version}`, published_at: publication.published_at, already_complete: true,
       };
     }
-    // Tag C is immutable release identity even while its publisher is pending,
-    // failed, or left a draft. Resume only that publisher; never re-enter
-    // mutable milestone/metadata/fixture/tag phases for a tagged candidate.
+    // Tag C is immutable even while publication is incomplete. Later main
+    // movement without a verified Release is tagged-stale-C, not a docs-refresh
+    // completion, and never retags or recreates fixtures.
+    const taggedHead = exactOid(await deps.observeOriginHead(base), `origin/${base}`);
+    if (taggedHead !== taggedCandidate) throw new Error(TAGGED_STALE_C_MESSAGE);
     const attempts = deps.publicationAttempts ?? RELEASE_PUBLICATION_ATTEMPTS;
-    let recoveryAttempted = false;
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      const stillHead = exactOid(await deps.observeOriginHead(base), `origin/${base}`);
+      if (stillHead !== taggedCandidate) throw new Error(TAGGED_STALE_C_MESSAGE);
       const resumed = await deps.observePublication(`v${version}`);
       if (resumed && !resumed.draft && resumed.published_at && resumed.workflow_conclusion === "success") {
         return {
@@ -224,7 +243,7 @@ async function runCompleteReleaseLocked(
           tag: `v${version}`, published_at: resumed.published_at, already_complete: true,
         };
       }
-      if (!recoveryAttempted) recoveryAttempted = await deps.recoverPublication(`v${version}`, taggedCandidate);
+      await deps.recoverPublication(`v${version}`, taggedCandidate);
       if (attempt < attempts) await deps.wait(RELEASE_PUBLICATION_WAIT_MS);
     }
     throw new Error(`pipeline release: timed out resuming publisher for v${version} at ${taggedCandidate}`);
@@ -239,7 +258,12 @@ async function runCompleteReleaseLocked(
   if (beforePrepare.root !== beforePrepare.core) throw new Error("pipeline release: package versions disagree before metadata preparation");
   if (compareVersions(beforePrepare.core, version) > 0) throw new Error(`pipeline release: origin/${base} already has newer version ${beforePrepare.core}`);
 
-  if (beforePrepare.core !== version && !metadata) {
+  if (!metadata) {
+    if (beforePrepare.core === version || beforePrepare.root === version) {
+      throw new Error(
+        `pipeline release: origin/${base} already has v${version} without a validated release-managed metadata PR`,
+      );
+    }
     const prepared = await deps.prepareMetadata(version, base, { ...opts, noEdit: true, skipFrg: true });
     metadata = { ...prepared, state: "OPEN", merge_commit_oid: null };
     assertMetadataIdentity(metadata, version, base);
@@ -300,13 +324,14 @@ async function runCompleteReleaseLocked(
   }
 
   const attempts = deps.publicationAttempts ?? RELEASE_PUBLICATION_ATTEMPTS;
-  let recoveryAttempted = false;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    const stillHead = exactOid(await deps.observeOriginHead(base), `origin/${base}`);
+    if (stillHead !== candidate) throw new Error(TAGGED_STALE_C_MESSAGE);
     const publication = await deps.observePublication(tag);
     if (publication) {
       if (publication.tag !== tag) throw new Error("pipeline release: GitHub Release tag identity changed");
       if (publication.draft || !publication.published_at || publication.workflow_conclusion !== "success") {
-        if (!recoveryAttempted) recoveryAttempted = await deps.recoverPublication(tag, candidate);
+        await deps.recoverPublication(tag, candidate);
         if (attempt === attempts) throw new Error(`pipeline release: GitHub Release ${tag} remains draft or unpublished`);
       } else {
         return {
@@ -315,7 +340,9 @@ async function runCompleteReleaseLocked(
           tag, published_at: publication.published_at, already_complete: true,
         };
       }
-    } else if (!recoveryAttempted) recoveryAttempted = await deps.recoverPublication(tag, candidate);
+    } else {
+      await deps.recoverPublication(tag, candidate);
+    }
     if (attempt < attempts) await deps.wait(RELEASE_PUBLICATION_WAIT_MS);
   }
   throw new Error(`pipeline release: timed out waiting for published GitHub Release ${tag}`);
@@ -336,8 +363,13 @@ export async function runCompleteRelease(
 }
 
 async function command(cwd: string, file: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync(file, args, { cwd, timeout: 120_000, maxBuffer: 50 * 1024 * 1024 });
-  return String(stdout).trim();
+  try {
+    const { stdout } = await execFileAsync(file, args, { cwd, timeout: 120_000, maxBuffer: 50 * 1024 * 1024 });
+    return String(stdout).trim();
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & { stderr?: string; stdout?: string };
+    throw new Error([err.message, String(err.stderr ?? ""), String(err.stdout ?? "")].filter(Boolean).join("\n"));
+  }
 }
 
 function parseObject(stdout: string, label: string): Record<string, unknown> {
@@ -352,23 +384,62 @@ function flattenPages(value: unknown, label: string): unknown[] {
   return value.flatMap((page) => Array.isArray(page) ? page : [page]);
 }
 
+export function parsePublisherRunRows(rows: unknown, tag: string): PublisherRunRow[] {
+  if (!Array.isArray(rows)) throw new Error(`pipeline release: ${tag} publisher workflow list returned unknown shape`);
+  return rows.map((value, index) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`pipeline release: ${tag} publisher run ${index} returned unknown shape`);
+    }
+    const row = value as Record<string, unknown>;
+    const databaseId = Number(row.databaseId);
+    const attempt = Number(row.attempt);
+    const headSha = String(row.headSha ?? "").toLowerCase();
+    if (!Number.isSafeInteger(databaseId) || databaseId <= 0 || !Number.isSafeInteger(attempt) || attempt < 1 ||
+        typeof row.event !== "string" || typeof row.headBranch !== "string" || !OID_RE.test(headSha) ||
+        typeof row.status !== "string" || (row.conclusion !== null && typeof row.conclusion !== "string")) {
+      throw new Error(`pipeline release: ${tag} publisher run ${index} is malformed`);
+    }
+    return {
+      databaseId, event: row.event, headBranch: row.headBranch, headSha, status: row.status,
+      conclusion: row.conclusion === null ? null : String(row.conclusion), attempt,
+    };
+  });
+}
+
+export function exactPublisherRuns(rows: readonly PublisherRunRow[], tag: string, candidate: string): PublisherRunRow[] {
+  const sha = candidate.toLowerCase();
+  return rows.filter((row) =>
+    (row.event === "push" || row.event === "workflow_dispatch") &&
+    row.headBranch === tag && row.headSha === sha);
+}
+
+export function classifyPublisherRuns(
+  rows: unknown,
+  tag: string,
+  candidate: string,
+): { class: PublisherRemoteClass; exact: PublisherRunRow[] } {
+  const parsed = parsePublisherRunRows(rows, tag);
+  if (parsed.length >= 100) {
+    throw new Error(`pipeline release: ${tag} publisher workflow list is truncated`);
+  }
+  const exact = exactPublisherRuns(parsed, tag, candidate);
+  if (exact.some((row) => row.status === "completed" && row.conclusion === "success")) {
+    return { class: "successful", exact };
+  }
+  if (exact.length === 0) return { class: "absent", exact };
+  if (exact.some((row) => row.status !== "completed")) return { class: "pending", exact };
+  return { class: "failed", exact };
+}
+
 export function selectExactPublisherConclusion(
   rows: unknown,
   tag: string,
   candidate: string,
 ): "success" | "failure" | "pending" {
-  if (!Array.isArray(rows)) throw new Error(`pipeline release: ${tag} publisher workflow list returned unknown shape`);
-  const exact = rows.filter((value) => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-    const row = value as Record<string, unknown>;
-    return row.event === "push" && row.headBranch === tag && String(row.headSha ?? "").toLowerCase() === candidate;
-  });
-  if (exact.some((value) => {
-    const row = value as Record<string, unknown>;
-    return row.status === "completed" && row.conclusion === "success";
-  })) return "success";
-  if (exact.length === 0 || exact.some((value) => (value as Record<string, unknown>).status !== "completed")) return "pending";
-  return "failure";
+  const classified = classifyPublisherRuns(rows, tag, candidate);
+  if (classified.class === "successful") return "success";
+  if (classified.class === "failed") return "failure";
+  return "pending";
 }
 
 export function metadataChecksState(rows: unknown): "pending" | "pass" | "fail" {
@@ -382,6 +453,61 @@ export function metadataChecksState(rows: unknown): "pending" | "pass" | "fail" 
   });
   if (buckets.some((bucket) => bucket === "fail" || bucket === "cancel")) return "fail";
   return buckets.every((bucket) => bucket === "pass" || bucket === "skipping") ? "pass" : "pending";
+}
+
+export function exactHeadCheckRunsState(raw: unknown, headOid: string): "pending" | "pass" | "fail" {
+  const head = headOid.toLowerCase();
+  const pages = Array.isArray(raw) ? raw : [raw];
+  const runs = pages.flatMap((page) => {
+    if (!page || typeof page !== "object" || Array.isArray(page)) {
+      throw new Error("pipeline release: exact-head check-runs returned unknown shape");
+    }
+    const list = (page as Record<string, unknown>).check_runs;
+    if (!Array.isArray(list)) throw new Error("pipeline release: exact-head check-runs returned unknown shape");
+    return list;
+  });
+  const exact = runs.filter((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("pipeline release: exact-head check-run returned unknown shape");
+    }
+    return String((value as Record<string, unknown>).head_sha ?? "").toLowerCase() === head;
+  });
+  if (exact.length === 0) return "pending";
+  const conclusions = exact.map((value) => {
+    const row = value as Record<string, unknown>;
+    return { status: String(row.status ?? ""), conclusion: String(row.conclusion ?? "") };
+  });
+  if (conclusions.some((row) => row.status === "completed" && ["failure", "cancelled", "timed_out", "startup_failure"].includes(row.conclusion))) {
+    return "fail";
+  }
+  if (conclusions.every((row) => row.status === "completed" && (row.conclusion === "success" || row.conclusion === "skipped" || row.conclusion === "neutral"))) {
+    return conclusions.some((row) => row.conclusion === "success") ? "pass" : "pending";
+  }
+  return "pending";
+}
+
+async function fetchMetadataHead(
+  git: (args: string[], cwd?: string) => Promise<string>,
+  pr: number,
+  version: string,
+  headOid: string,
+): Promise<void> {
+  const dest = `refs/pipeline/release-metadata/v${version}`;
+  try {
+    await git(["fetch", "--force", "origin", `pull/${pr}/head:${dest}`]);
+  } catch {
+    try {
+      await git(["fetch", "--force", "origin", `${headOid}:${dest}`]);
+    } catch (error) {
+      throw new Error(
+        `pipeline release: metadata PR #${pr} head ${headOid} is not retrievable after source-branch deletion: ${(error as Error).message}`,
+      );
+    }
+  }
+  const fetched = exactOid(await git(["rev-parse", dest]), "fetched metadata head");
+  if (fetched !== headOid) {
+    throw new Error(`pipeline release: metadata PR #${pr} fetched head ${fetched} does not match immutable head ${headOid}`);
+  }
 }
 
 export function assertReleaseManagedMetadataPaths(files: readonly string[]): void {
@@ -457,16 +583,49 @@ export function realCompleteReleaseDeps(
       return { root: String(root.version ?? ""), core: String(core.version ?? "") };
     },
     async observeMetadata(version, branch) {
-      const raw = JSON.parse(await gh(["pr", "list", "--repo", repository, "--state", "all", "--head", `release/v${version}`, "--json", "number,state,baseRefName,headRefOid,mergeCommit,title", "--limit", "100"])) as unknown;
+      const raw = JSON.parse(await gh([
+        "pr", "list", "--repo", repository, "--state", "all",
+        "--search", `release: ${version}`,
+        "--json", "number,state,baseRefName,headRefOid,mergeCommit,title",
+        "--limit", "100",
+      ])) as unknown;
       if (!Array.isArray(raw)) throw new Error("pipeline release: metadata PR list returned unknown shape");
       const matches = raw.filter((x) => x && typeof x === "object" && String((x as Record<string, unknown>).title ?? "").startsWith(`release: ${version} —`));
       if (matches.length > 1) throw new Error(`pipeline release: multiple metadata PRs claim v${version}`);
       if (matches.length === 0) return null;
       const row = matches[0] as Record<string, unknown>;
-      const state = String(row.state);
+      const prNumber = Number(row.number);
+      if (!Number.isSafeInteger(prNumber) || prNumber <= 0) throw new Error(`pipeline release: metadata PR for v${version} has invalid identity`);
+      const viewed = parseObject(await gh([
+        "pr", "view", String(prNumber), "--repo", repository,
+        "--json", "number,state,baseRefName,headRefOid,mergeCommit,title",
+      ]), `metadata PR #${prNumber}`);
+      const state = String(viewed.state);
       if (state !== "OPEN" && state !== "MERGED") throw new Error(`pipeline release: metadata PR for v${version} is closed without merge`);
-      const merge = row.mergeCommit && typeof row.mergeCommit === "object" ? String((row.mergeCommit as Record<string, unknown>).oid ?? "") : null;
-      return { pr: Number(row.number), version, base: String(row.baseRefName), head_oid: String(row.headRefOid), state, merge_commit_oid: merge || null };
+      const headOid = exactOid(String(viewed.headRefOid ?? ""), `metadata PR #${prNumber} head`);
+      const merge = viewed.mergeCommit && typeof viewed.mergeCommit === "object"
+        ? String((viewed.mergeCommit as Record<string, unknown>).oid ?? "") : null;
+      await fetchMetadataHead(git, prNumber, version, headOid);
+      const versions = await this.versionsAt(headOid);
+      if (versions.root !== version || versions.core !== version) {
+        throw new Error(`pipeline release: metadata PR #${prNumber} does not set both package versions to ${version}`);
+      }
+      const changed = (await git(["diff", "--name-only", `origin/${branch}...${headOid}`])).split("\n").filter(Boolean);
+      try { assertReleaseManagedMetadataPaths(changed); }
+      catch { throw new Error(`pipeline release: metadata PR #${prNumber} contains non-release-managed paths`); }
+      if (state === "MERGED") {
+        const checksRaw = JSON.parse(await gh([
+          "api", `repos/${repository}/commits/${headOid}/check-runs?per_page=100`, "--paginate", "--slurp",
+        ])) as unknown;
+        if (exactHeadCheckRunsState(checksRaw, headOid) !== "pass") {
+          throw new Error(`pipeline release: metadata PR #${prNumber} has no nonempty green exact-head CI at ${headOid}`);
+        }
+        exactOid(merge ?? "", "metadata merge commit");
+      }
+      return {
+        pr: prNumber, version, base: String(viewed.baseRefName), head_oid: headOid,
+        state: state as "OPEN" | "MERGED", merge_commit_oid: merge || null,
+      };
     },
     async prepareMetadata(version, branch, opts) {
       const primary = primaryWorktreeFromPorcelain(await git(["worktree", "list", "--porcelain"]));
@@ -528,16 +687,12 @@ export function realCompleteReleaseDeps(
       return result;
     },
     async finishMetadata(release) {
-      await git(["fetch", "origin", `refs/heads/release/v${release.version}:refs/pipeline/release-metadata/v${release.version}`]);
-      const fetchedHead = exactOid(await git(["rev-parse", `refs/pipeline/release-metadata/v${release.version}`]), "fetched metadata head");
-      if (fetchedHead !== exactOid(release.head_oid, "metadata PR head")) {
-        throw new Error(`pipeline release: metadata PR #${release.pr} head changed before validation`);
-      }
-      const versions = await this.versionsAt(fetchedHead);
+      await fetchMetadataHead(git, release.pr, release.version, exactOid(release.head_oid, "metadata PR head"));
+      const versions = await this.versionsAt(release.head_oid);
       if (versions.root !== release.version || versions.core !== release.version) {
         throw new Error(`pipeline release: metadata PR #${release.pr} does not set both package versions to ${release.version}`);
       }
-      const changed = (await git(["diff", "--name-only", `origin/${release.base}...${fetchedHead}`]))
+      const changed = (await git(["diff", "--name-only", `origin/${release.base}...${release.head_oid}`]))
         .split("\n").filter(Boolean);
       try { assertReleaseManagedMetadataPaths(changed); }
       catch { throw new Error(`pipeline release: metadata PR #${release.pr} contains non-release-managed paths`); }
@@ -547,16 +702,10 @@ export function realCompleteReleaseDeps(
           throw new Error(`pipeline release: metadata PR #${release.pr} identity changed during CI wait`);
         }
         if (observed.state === "MERGED") break;
-        let checksRaw: string;
-        try {
-          checksRaw = await gh(["pr", "checks", String(release.pr), "--repo", repository, "--json", "name,bucket"]);
-        } catch (error) {
-          const message = (error as Error).message;
-          if (/no checks reported/i.test(message)) checksRaw = "[]";
-          else throw error;
-        }
-        const checks = JSON.parse(checksRaw);
-        const checkState = metadataChecksState(checks);
+        const checksRaw = JSON.parse(await gh([
+          "api", `repos/${repository}/commits/${release.head_oid}/check-runs?per_page=100`, "--paginate", "--slurp",
+        ])) as unknown;
+        const checkState = exactHeadCheckRunsState(checksRaw, release.head_oid);
         if (checkState === "fail") {
           throw new Error(`pipeline release: metadata PR #${release.pr} has failing checks at exact head ${release.head_oid}`);
         }
@@ -630,41 +779,59 @@ export function realCompleteReleaseDeps(
     async observePublication(tag) {
       let releaseRaw: string;
       try {
-        releaseRaw = await gh(["release", "view", tag, "--repo", repository, "--json", "tagName,isDraft,isPrerelease,publishedAt,body,name,url"]);
+        releaseRaw = await gh(["api", `repos/${repository}/releases/tags/${tag}`]);
       } catch (err) {
         const message = (err as Error).message;
-        if (/release not found/i.test(message)) return null;
-        throw err;
+        if (isAuthoritativeReleaseNotFound(message)) return null;
+        throw new Error(`pipeline release: GitHub Release ${tag} observation is unknown: ${message}`);
       }
       {
         const row = parseObject(releaseRaw, `GitHub Release ${tag}`);
-        if (String(row.tagName) !== tag || typeof row.isDraft !== "boolean" || typeof row.isPrerelease !== "boolean" ||
-            (row.publishedAt !== null && typeof row.publishedAt !== "string") || typeof row.body !== "string" ||
-            typeof row.name !== "string" || typeof row.url !== "string") {
+        const tagName = String(row.tag_name ?? "");
+        const htmlUrl = String(row.html_url ?? "");
+        if (tagName !== tag || typeof row.draft !== "boolean" || typeof row.prerelease !== "boolean" ||
+            (row.published_at !== null && typeof row.published_at !== "string") || typeof row.body !== "string" ||
+            typeof row.name !== "string" || !htmlUrl.trim()) {
           throw new Error(`pipeline release: GitHub Release ${tag} returned unknown shape`);
         }
         const tagObservation = await this.observeTag(tag);
         if (!tagObservation) throw new Error(`pipeline release: GitHub Release ${tag} exists without an observable tag`);
-        if (row.isPrerelease || !row.url.trim() || row.name !== tag || row.body.trim() !== tagObservation.annotation.trim()) {
+        if (row.prerelease || row.name !== tag || String(row.body).trim() !== tagObservation.annotation.trim()) {
           throw new Error(`pipeline release: GitHub Release ${tag} metadata/notes do not match its annotated tag`);
         }
-        const runs = JSON.parse(await gh(["run", "list", "--repo", repository, "--workflow", "release.yml", "--event", "push", "--branch", tag, "--json", "headSha,headBranch,event,status,conclusion", "--limit", "20"])) as unknown;
+        const runs = JSON.parse(await gh([
+          "run", "list", "--repo", repository, "--workflow", "release.yml",
+          "--json", "databaseId,event,headBranch,headSha,status,conclusion,attempt", "--limit", "100",
+        ])) as unknown;
         const conclusion = selectExactPublisherConclusion(runs, tag, tagObservation.peeled_commit);
-        return { tag, draft: row.isDraft, published_at: row.publishedAt as string | null, workflow_conclusion: conclusion };
+        return { tag, draft: row.draft, published_at: row.published_at as string | null, workflow_conclusion: conclusion };
       }
     },
     async recoverPublication(tag, candidate) {
-      const runs = JSON.parse(await gh(["run", "list", "--repo", repository, "--workflow", "release.yml", "--event", "push", "--branch", tag, "--json", "databaseId,headSha,headBranch,event,status,conclusion", "--limit", "20"])) as unknown;
-      if (!Array.isArray(runs)) throw new Error(`pipeline release: ${tag} publisher workflow list returned unknown shape`);
-      const exact = runs.filter((value) => value && typeof value === "object" && !Array.isArray(value) &&
-        (value as Record<string, unknown>).event === "push" && (value as Record<string, unknown>).headBranch === tag &&
-        String((value as Record<string, unknown>).headSha ?? "").toLowerCase() === candidate &&
-        (value as Record<string, unknown>).status === "completed") as Record<string, unknown>[];
-      const rerunnable = exact.find((value) => value.conclusion !== "success") ?? exact.find((value) => value.conclusion === "success");
-      if (!rerunnable) return false;
-      const id = Number(rerunnable.databaseId);
-      if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`pipeline release: failed ${tag} publisher has invalid run identity`);
-      await gh(["run", "rerun", String(id), "--repo", repository]);
+      const runs = JSON.parse(await gh([
+        "run", "list", "--repo", repository, "--workflow", "release.yml",
+        "--json", "databaseId,event,headBranch,headSha,status,conclusion,attempt", "--limit", "100",
+      ])) as unknown;
+      const classified = classifyPublisherRuns(runs, tag, candidate);
+      if (classified.class === "successful" || classified.class === "pending") return false;
+      if (classified.class === "failed") {
+        const newest = [...classified.exact].sort((a, b) => b.databaseId - a.databaseId)[0]!;
+        if (newest.attempt > 1) {
+          throw new Error(`pipeline release: exact ${tag} publisher run ${newest.databaseId} already reran (attempt ${newest.attempt})`);
+        }
+        await gh(["run", "rerun", String(newest.databaseId), "--repo", repository]);
+        return true;
+      }
+      const tagObservation = await this.observeTag(tag);
+      if (!tagObservation?.annotated || exactOid(tagObservation.peeled_commit, `${tag} peeled commit`) !== candidate) {
+        throw new Error(`pipeline release: refusing recovery dispatch; remote ${tag} is not the annotated tag at ${candidate}`);
+      }
+      const head = exactOid(await this.observeOriginHead(base), `origin/${base}`);
+      if (head !== candidate) throw new Error(TAGGED_STALE_C_MESSAGE);
+      await gh([
+        "workflow", "run", "release.yml", "--repo", repository, "--ref", tag,
+        "-f", `tag=${tag}`, "-f", `candidate=${candidate}`,
+      ]);
       return true;
     },
     wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
