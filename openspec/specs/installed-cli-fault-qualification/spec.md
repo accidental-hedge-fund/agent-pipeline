@@ -3,55 +3,37 @@
 ## Purpose
 
 Defines deterministic proof that the packaged Pipeline launcher and its public command routes preserve typed fault ownership before a release may create remote FRG fixtures.
-
 ## Requirements
+### Requirement: Genuine CLI and fault regressions SHALL remain in normal deterministic CI
 
-### Requirement: Qualification SHALL execute the staged installed launcher
+Removal of installed-CLI qualification from the release path SHALL NOT remove deterministic coverage of ordinary admission, logical-operation accounting, exact-source launcher behavior, process-boundary fault classification, ownership retention, or runtime recovery. Such coverage SHALL run under the normal repository CI gate with injected or closed secret-free seams and SHALL NOT require remote fixture creation, release scoring, or attestation.
 
-Candidate qualification SHALL spawn the staged installed `pipeline` launcher as a child process for numeric drive, `single`, `loop`, `train`, `merge`, merge queue, `ship`, and every supervised disposition in the operation inventory. A registry lookup, direct helper call, test filename, or generated test title SHALL NOT count as installed-CLI execution. Qualification SHALL use a closed, secret-free probe mode that performs no network, GitHub mutation, git mutation, model call, release, merge, or deployment.
+#### Scenario: Release qualification machinery is absent but regressions still bite
 
-#### Scenario: Simulator-only coverage fails
+- **WHEN** a launcher route loses exact-source behavior, a fault becomes false-human or ownerless-terminal, or logical-operation accounting becomes incorrect
+- **THEN** a normal deterministic CI test SHALL fail
+- **AND** the failure SHALL NOT depend on generating an installed-qualification artifact for release
 
-- **WHEN** the claimed installed-CLI layer only resolves command registry entries and calls an in-process fault simulator
-- **THEN** qualification SHALL fail
-- **AND** no installed-CLI executed row SHALL be emitted
+#### Scenario: Choreography-only tests are retired
 
-#### Scenario: Public routes cross the launcher boundary
+- **WHEN** a test's only observable subject is the deleted release qualification, matrix scoring, or attestation choreography
+- **THEN** that test SHALL be removed rather than preserved as a requirement
+- **AND** user-visible CLI or recovery assertions from it SHALL be migrated to the normal deterministic suite
 
-- **WHEN** candidate qualification passes
-- **THEN** every required public or supervised operation SHALL have been invoked through the staged installed launcher
-- **AND** the evidence SHALL identify the exact argv route and observed child-process result
-- **AND** the complete staged candidate core suite SHALL have exited successfully
+### Requirement: Exact-candidate inventory assertions SHALL enumerate the trusted candidate
 
-### Requirement: Qualification SHALL inject and observe faults at the process boundary
+Any remaining qualification or exact-source assertion that compares a materialized exact-HEAD candidate with an expected test or module inventory SHALL derive both sides from that trusted candidate root and commit. It SHALL NOT enumerate live dirty files from the operator working directory. The assertion SHALL remain enforced.
 
-The qualifier SHALL exercise every required operation/fault route through actual child process behavior or a structured durable-state probe. It SHALL observe nonzero exit, signal, timeout, malformed output, partial state, observer failure, and other declared fault classes without trusting the child to declare its own pass. The parent SHALL derive typed outcomes, require ownership retention, and reject false-human, ownerless-terminal, supervisor-STOP, unauthorized-mutation, or replayed-side-effect observations. A failure in any route SHALL block the qualification artifact even when that route is not part of the smaller representative row set credited by FRG.
+#### Scenario: Dirty operator test does not contaminate exact HEAD
 
-#### Scenario: Process death is parent-observed
+- **WHEN** an uncommitted test file exists under the operator checkout's `core/test`
+- **AND** deterministic validation materializes and checks the exact current HEAD candidate
+- **THEN** the uncommitted file SHALL NOT appear in the candidate's expected inventory
+- **AND** normal `npm run ci` SHALL NOT fail for an inventory mismatch caused solely by that file
 
-- **WHEN** a qualification child exits nonzero, receives a signal, or exceeds its timeout
-- **THEN** the parent qualifier SHALL observe that process result directly
-- **AND** the child SHALL NOT self-attest the row as passed
+#### Scenario: Candidate inventory defect still fails
 
-#### Scenario: Unsafe disposition fails qualification
+- **WHEN** the trusted candidate itself omits or adds an inventory item inconsistently with the asserted contract
+- **THEN** the inventory assertion SHALL fail
+- **AND** the checker SHALL NOT skip or weaken the assertion to avoid the failure
 
-- **WHEN** any case produces false human authority, an ownerless terminal, terminal supervisor STOP, unauthorized mutation, or a replayed side effect
-- **THEN** the qualification artifact SHALL record that row as failed
-- **AND** release preparation SHALL remain blocked
-
-### Requirement: Qualification evidence SHALL be exact-candidate bound and tamper evident
-
-Qualification SHALL write one canonical artifact containing schema version, candidate SHA, launcher identity, matrix version, bounded proof for every required operation/fault route, successful complete-suite proof, one concretely observed representative result for every required lifecycle-class/coverage-layer pair, and a deterministic content digest. Consumers SHALL validate the digest, exact candidate SHA, complete proof and representative sets, allowed values, expected typed terminals, successful proof process status, and absence of duplicates before producing executed matrix rows. Missing, stale, malformed, partial, duplicate, or digest-mismatched evidence SHALL receive no coverage. A common supervisor observation SHALL NOT be expanded into synthetic per-operation executed rows.
-
-#### Scenario: Exact artifact produces rows
-
-- **WHEN** a complete artifact has a valid digest, successful route/suite proofs, and candidate SHA `C`
-- **THEN** its passing cases SHALL produce binder-valid installed-CLI executed rows for `C`
-- **AND** those rows SHALL retain their operation, fault, entrypoint, host, layer, lifecycle class, and observed terminal
-- **AND** the emitted rows SHALL be limited to the closed lifecycle-class/coverage-layer representative set
-
-#### Scenario: Stale or fabricated artifact fails
-
-- **WHEN** an artifact names another SHA, omits a required proof or representative, duplicates evidence, records an unsuccessful proof process, changes content after digesting, or contains a row not emitted by launcher qualification
-- **THEN** the artifact SHALL be rejected in full
-- **AND** FRG SHALL report missing candidate qualification

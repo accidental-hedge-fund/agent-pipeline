@@ -4,126 +4,6 @@
 
 Define the release-blocking Factory Reliability Gate, its evidence and attestation contracts, and the candidate-bound lifecycle that proves the pipeline can complete representative work safely before a version ships.
 ## Requirements
-### Requirement: Every release version SHALL require a recorded Factory Reliability Gate pass
-
-The pipeline SHALL treat a **Factory Reliability Gate (FRG)** pass as a mandatory precondition for
-shipping any release version (patch, minor, or major). An FRG pass for version `X.Y.Z` SHALL be a
-recorded, machine-readable evidence artifact that names that version, a unique `run_id`, an overall
-`pass: true` outcome, and the scoreboard metrics required by this capability. Unit CI success
-(`npm run ci`) alone SHALL NOT satisfy the FRG precondition. Optional two-item pilots and
-ad-hoc self-dev soaks SHALL NOT substitute for an FRG pass unless they are executed through the
-FRG driver and produce a conforming FRG evidence artifact for that version.
-
-#### Scenario: Green unit CI without FRG is insufficient for release precondition
-
-- **WHEN** `npm run ci` is green for a candidate release version `X.Y.Z`
-- **AND** no FRG evidence artifact with `version: X.Y.Z` and `pass: true` exists
-- **THEN** the FRG precondition for `X.Y.Z` SHALL be unsatisfied
-- **AND** the missing FRG SHALL be distinguishable from a recorded FRG failure
-
-#### Scenario: Recorded FRG pass satisfies the precondition for that version only
-
-- **WHEN** an FRG evidence artifact exists with `version: 1.29.1`, `pass: true`, a non-empty
-  `run_id`, a non-empty durable `loop_run_id`, and validated fixed-pack provenance (`pack_id`)
-- **THEN** the FRG precondition for version `1.29.1` SHALL be satisfied
-- **AND** the FRG precondition for a different version `1.30.0` SHALL remain unsatisfied until a
-  separate pass artifact for `1.30.0` exists
-
-#### Scenario: Offline score without live loop is not release-eligible
-
-- **WHEN** an operator or test scores FRG fixtures offline (for example `scoreInput`) without a
-  non-empty durable `loop_run_id` and validated fixed-pack `pack_id`
-- **THEN** the driver SHALL NOT treat the result as release-eligible `pass: true` evidence
-- **AND** runtime validation SHALL reject `pass: true` artifacts that omit live-loop provenance
-- **AND** offline scoring SHALL NOT persist evidence by default
-
----
-
-### Requirement: The FRG SHALL exercise a fixed multi-item scenario pack
-
-Every FRG run (live Layer B) SHALL exercise a **fixed scenario pack** that proves multi-item
-composition behavior, not only single-issue advance. The pack SHALL include at least the following
-named scenarios (ids stable for scoring and tests):
-
-1. `capacity-blocked-retain` — capacity under blocked retain does not false-block eligible work as
-   needs-human solely for capacity
-2. `resume-mid-flight` — supervisor kill/resume leaves every in-flight item with a live next action;
-   no permanent dead `pr_opened` strand
-3. `openspec-multi-change` — partial archive / foreign active change: archive result and residual
-   still-active check agree
-4. `implement-lockfile-dirt` — implement leaving uncommitted lockfile after HEAD advances is folded
-   or cleaned without human-blocking known lock dirt at zero attempts
-5. `local-docs-parity` — docs/generator checks that would fail on CI fail before PR open (or before
-   ready-to-deploy)
-6. `clean-item-throughput` — at least K easy items reach `pipeline:ready-to-deploy` without
-   engine-class block
-7. `blocker-taxonomy` — scoreboard of engine-class vs product-class vs human-authority; engine-class
-   rate above threshold fails the gate
-8. `pr-supersession` — a stale second PR for the same issue does not remain open after a new head
-9. `release-plan-row` — release-cut path has plan-row present or scaffolded and documents the tag path
-10. `empty-depends-on-stack-honesty` — items with empty `depends_on` that still stack OpenSpec
-    changes across branches produce a warn or fail (process honesty)
-
-The pack SHALL NOT require the full product milestone as its work-list. Exact numeric thresholds
-for K, capacity stress N, and maximum engine-class rate SHALL be defined in the FRG runbook as
-numbers and SHALL be checked by the FRG driver.
-
-#### Scenario: Scenario pack inventory is fixed and named
-
-- **WHEN** the FRG runbook and driver configuration are inspected
-- **THEN** they SHALL list the stable scenario ids above (or a documented superset)
-- **AND** each id SHALL map to pass criteria that are numeric or boolean, not free-form narrative only
-
-#### Scenario: Product milestone is not required as the work-list
-
-- **WHEN** an operator runs the live FRG for a release version
-- **THEN** the driver SHALL select a dedicated synthetic work-list, labeled fixtures, or a known
-  reliability-selector pack
-- **AND** SHALL NOT require the full product milestone backlog to be in-scope for a valid FRG run
-
-#### Scenario: Empty depends_on stacking is surfaced
-
-- **WHEN** the live FRG work-list contains items with empty `depends_on` that still introduce stacked
-  OpenSpec changes across branches during the run
-- **THEN** the FRG report SHALL record a warn or fail for scenario
-  `empty-depends-on-stack-honesty`
-- **AND** SHALL NOT silently omit that condition from the scoreboard
-
-#### Scenario: Unobserved required scenarios fail the gate
-
-- **WHEN** the FRG driver scores a run and any **required-live** pack scenario
-  (`clean-item-throughput`, `blocker-taxonomy`,
-  `empty-depends-on-stack-honesty`) or the required OpenSpec-bearing
-  composition item lacks verifiable live/ledger/derived evidence (status
-  `not_observed`)
-- **THEN** the report SHALL set overall `pass: false`
-- **AND** SHALL NOT treat throughput-only success as a release-usable FRG pass
-- **AND** `not_observed` SHALL fail required-live only
-- **AND** a Layer A-allowed id MAY remain unobserved on the live loop when a
-  valid same-candidate TAP hash proves that closed probe
-
-#### Scenario: Required scenarios cannot be skipped without failing the gate
-
-- **WHEN** a required pack scenario is recorded with status `skip`
-- **THEN** the driver SHALL treat that scenario as failing overall pass
-- **AND** SHALL NOT accept caller status overrides of `skip` as pass-permitting for Layer B
-  required scenarios
-
-#### Scenario: Capacity stress N is machine-validated from observations
-
-- **WHEN** scenario `capacity-blocked-retain` claims status `pass`
-- **AND** its observed blocked-retain count is missing or strictly less than threshold N
-  (`capacity_stress_n`)
-- **THEN** the driver SHALL set that scenario to `fail` (or refuse overall `pass: true`)
-- **AND** SHALL NOT accept a bare status override as proof that capacity stress was exercised
-
-#### Scenario: Non-pack durable loop is refused as FRG evidence
-
-- **WHEN** an operator runs the FRG driver with `--from-run` against a durable loop whose contract
-  selector is not the versioned FRG fixed pack (for example a product milestone or ad-hoc work-list)
-- **THEN** the driver SHALL refuse to write a passing FRG evidence artifact for a release version
-- **AND** SHALL surface that the run is not the fixed factory-gate pack
-
 ### Requirement: FRG Layer A hermetic scenarios SHALL run in CI without real I/O
 
 The repository SHALL provide hermetic composition tests (Layer A) for FRG scenario classes that can
@@ -155,64 +35,6 @@ naming a tracking issue — silent gaps SHALL NOT be permitted.
 - **THEN** the test SHALL fail
 
 ---
-
-### Requirement: FRG Layer B live driver SHALL produce machine-readable pass or fail evidence
-
-The pipeline SHALL provide a scripted FRG driver command (for example `pipeline factory-gate` or
-`pipeline release-check --for <version>`) that starts a multi-item durable loop against the fixed
-scenario pack (or documented selector), uses documented concurrency settings, and writes an
-immutable evidence report. The report SHALL be parseable as a single JSON object (file and/or
-stdout with `--json`) containing at least: `schema_version`, `version`, `run_id`, `pass` (boolean),
-`scenarios` (per-scenario outcomes), `scoreboard` (including engine-class / product-class /
-human-authority counts or rates), and `thresholds` applied. The driver SHALL exit non-zero when
-`pass` is false or when required evidence cannot be produced. Pass/fail SHALL be machine-checkable
-from durable loop ledger and events where possible; human judgment SHALL be limited to
-intentionally injected product-class holds defined by the pack.
-
-#### Scenario: Driver emits a parseable pass report
-
-- **WHEN** the live FRG driver completes a successful pack run for version `1.29.1`
-- **THEN** it SHALL write evidence including `version: "1.29.1"`, a unique `run_id`, `pass: true`,
-  per-scenario outcomes, and a scoreboard
-- **AND** `JSON.parse` of the machine-readable report SHALL succeed
-
-#### Scenario: Incomplete evidence schema is rejected
-
-- **WHEN** an FRG evidence artifact claims `pass: true` but omits the required named scenario
-  inventory, numeric thresholds, scoreboard metrics, or timestamps, or declares `pass: true` while
-  any **required-live** scenario is `fail`, `not_observed`, or `skip`, or while any Layer
-  A-allowed scenario is `fail` or `skip`, or while any Layer A-allowed scenario is
-  `not_observed` without a valid same-candidate TAP proof, or omits a non-empty durable
-  `loop_run_id` or validated fixed-pack `pack_id`, or claims capacity pass without observed ≥ N
-- **THEN** runtime validation SHALL reject the artifact as unparsable against the expected FRG schema
-- **AND** the release FRG precondition SHALL remain unsatisfied
-
-#### Scenario: Engine-class rate above threshold fails the gate
-
-- **WHEN** the live FRG scoreboard computes an engine-class blocker rate strictly greater than the
-  runbook threshold
-- **THEN** the report SHALL set `pass: false`
-- **AND** the driver SHALL exit non-zero
-- **AND** the report SHALL name the threshold and observed rate
-
-#### Scenario: Clean-item throughput below K fails the gate
-
-- **WHEN** fewer than K pack items reach `pipeline:ready-to-deploy` without an engine-class block
-- **THEN** the report SHALL set `pass: false` for scenario `clean-item-throughput`
-- **AND** the overall `pass` SHALL be false
-
-#### Scenario: Driver reuses the durable loop runtime
-
-- **WHEN** the live FRG driver starts a multi-item run
-- **THEN** it SHALL drive the shipped durable loop / `pipeline:loop` composition path
-- **AND** SHALL NOT create a second authoritative ledger, lock namespace, or alternate advance engine
-  for the pack items
-
-#### Scenario: Same driver and runbook are reused across releases
-
-- **WHEN** operators run FRG for version `X.Y.Z` and later for version `X.Y+1.0` (or next release)
-- **THEN** both runs SHALL use the same FRG driver entrypoint and runbook procedure
-- **AND** each version SHALL have its own evidence artifact keyed by that version
 
 ### Requirement: The FRG runbook SHALL document procedure, thresholds, and evidence layout
 
@@ -757,52 +579,6 @@ computable engine-class rate path (via item classification) and to the trend led
 
 ---
 
-### Requirement: Release-eligible FRG evidence SHALL carry a producer HMAC attestation
-
-A release-eligible FRG evidence artifact with `pass: true` SHALL include
-`integrity.attestation` with algorithm `hmac-sha256-v1` and a MAC over a canonical payload
-binding every field that can affect release eligibility, at minimum: `schema_version`,
-`version`, `run_id`, `loop_run_id`, `pack_id`, `pass`, `thresholds`, `scenarios`,
-`scoreboard`, `composition`, `operation_reliability`, recovery aggregates (when present), scoreboard fingerprint, and
-composition fingerprint. The driver SHALL mint the MAC only when the producer key
-`PIPELINE_FRG_ATTESTATION_KEY` is available. Release-eligibility validation used by auto-tag
-(and any shared tag/release validator) SHALL require the same env key and SHALL reject
-evidence when the key is missing, the attestation is absent, or the MAC does not verify
-(including when eligibility-defining fields were mutated after mint while fingerprints stay
-intact). Self-consistent scoreboard/composition fingerprints alone SHALL NOT satisfy the tag
-path: hand-authored JSON that recomputes public hashes without the producer secret SHALL fail
-validation.
-
-#### Scenario: Mint without producer key is not release-eligible
-
-- **WHEN** the FRG driver scores a pack that would otherwise meet composition and numeric
-  criteria
-- **AND** `PIPELINE_FRG_ATTESTATION_KEY` is unset and no explicit attestation key is supplied
-- **THEN** the driver SHALL NOT emit release-eligible `pass: true`
-- **AND** `integrity.attestation` SHALL be omitted
-
-#### Scenario: Tag validation rejects forged MAC or missing key
-
-- **WHEN** auto-tag (or `validateReleaseEligibleFrgEvidence`) validates evidence for version
-  `X.Y.Z`
-- **AND** the artifact is schema-complete and fingerprint-consistent but the attestation MAC
-  is missing, forged, or signed under a different key than `PIPELINE_FRG_ATTESTATION_KEY`
-- **THEN** validation SHALL fail closed
-- **AND** no tag create/push path that depends on that validation SHALL proceed
-
-#### Scenario: Matching producer key accepts attested evidence
-
-- **WHEN** evidence was minted with key K and includes a valid `integrity.attestation`
-- **AND** tag validation uses the same key K
-- **AND** all other release-eligibility criteria pass
-- **THEN** validation SHALL accept the evidence as release-eligible
-
-#### Scenario: Mutating operation_reliability after mint fails verification
-
-- **WHEN** release-eligible evidence was minted with a valid MAC
-- **AND** a caller later changes an `operation_reliability` numerator, denominator, or integrity count while leaving public fingerprints intact
-- **THEN** tag and release-eligibility validation SHALL fail closed
-
 ### Requirement: FRG Layer B SHALL be the designated candidate-track soak for promote eligibility
 
 A live FRG Layer B run that exercises a release candidate engine build SHALL execute and record
@@ -978,22 +754,6 @@ The attestation request SHALL contain only versioned identity fields, wrapper-ap
 - **WHEN** candidate output includes a pass claim, MAC, signer identity, or other field outside the unsigned artifact contract
 - **THEN** the wrapper and trusted attestor SHALL ignore or reject that field according to the closed schema
 - **AND** only a policy result recomputed by the trusted attestor MAY be signed
-
-### Requirement: Durable post-pilot FRG generation SHALL create a fresh candidate pack from the exact integrated base
-
-For every release version after v1.33.0, the engine SHALL generate FRG evidence by instantiating a fresh fixed-pack instance bound to the exact integrated candidate commit, the target release version, the pack manifest identity, and a unique run id. The generator SHALL refuse issues, observations, loop runs, or evidence artifacts that are bound to an earlier release version, a different manifest hash, a different candidate commit, or a different run. An earlier release’s FRG pass SHALL NOT satisfy a later release’s request.
-
-#### Scenario: Fresh pack for a new release version
-
-- **WHEN** durable FRG generation runs for version `1.34.0` at integrated candidate commit `C`
-- **THEN** it SHALL create or reconcile a new pack instance bound to `1.34.0` and `C`
-- **AND** it SHALL NOT reuse pack issues or observations from version `1.33.0` as release-eligible evidence for `1.34.0`
-
-#### Scenario: Stale candidate or foreign run is refused
-
-- **WHEN** supplied evidence names a different candidate commit, version, or run than the active request
-- **THEN** the generator or scorer SHALL refuse release-eligible pass for that request
-- **AND** it SHALL exit non-zero or return a non-complete status that blocks release preparation
 
 ### Requirement: The durable FRG generator SHALL construct all probes and refuse caller-authored pass claims
 
@@ -2561,63 +2321,6 @@ This requirement does not collapse production `A` and `B` into one `run_id`. It 
 - **THEN** the attestor SHALL fail closed
 - **AND** it SHALL NOT persist HMAC-pass `latest.json`
 
-### Requirement: Nested pack-loop launch SHALL hand off the existing candidate lease
-
-A nested pack-loop launch SHALL safely adopt and hand off its exact-candidate ship coordinator's existing process lease.
-When the coordinator launches `factory-release prepare` under a candidate
-process guard and prepare launches or resumes the same
-candidate's detached pack loop, the nested start SHALL adopt the live parent
-lease only when its guard, canonical root, exact SHA, readiness record, lock
-digest, and direct-parent process identity all match. It SHALL revalidate the
-candidate at the nested start boundary and transfer the lease record to the
-acknowledged detached supervisor through an atomic, exclusively created
-handoff record while keeping the child-guard-bound parent lock immutable. The
-acknowledged supervisor PID SHALL equal the spawned child PID. One exclusive
-claim SHALL serialize inherited launch and handoff against another launch and
-stale-owner reclamation. Transfer SHALL finish before the child is detached; a
-failed transfer SHALL stop and reap the child. A failed or non-detached nested start SHALL
-leave parent ownership intact. Partial, forged, stale, unreadable, wrong-root,
-wrong-SHA, or wrong-parent inherited evidence SHALL fail closed and SHALL NOT
-fall back to acquiring a fresh lease. An invocation without inherited guard
-fields MAY acquire the ordinary fresh candidate lease.
-
-#### Scenario: Ship prepare hands its lease to a new pack loop
-
-- **WHEN** ship starts candidate `factory-release prepare` with a valid process guard
-- **AND** prepare dispatches the same candidate's request-bound pack loop
-- **THEN** the nested launch SHALL start without contending with its own parent
-- **AND** the process lease SHALL be transferred to the acknowledged loop supervisor PID
-- **AND** the immutable parent-lock digest SHALL remain valid before and after transfer
-- **AND** a competing nested launch or stale-owner reclaimer SHALL NOT start while the claim is held
-
-#### Scenario: Bound-loop resume uses the same handoff contract
-
-- **WHEN** guarded candidate prepare resumes its bound pack loop
-- **THEN** resume SHALL adopt and transfer the matching parent lease under the same checks
-
-#### Scenario: Invalid inherited evidence does not weaken exclusivity
-
-- **WHEN** any inherited guard field or direct-parent identity is invalid
-- **THEN** the nested candidate process SHALL NOT start
-- **AND** the parent lease SHALL remain intact
-
-### Requirement: The immutable ship lease owner SHALL observe its live pack handoff
-
-While a detached pack-loop supervisor holds a valid, live candidate lease handoff, the candidate boundary SHALL permit the exact immutable parent-lock owner to re-enter only the dedicated `ship.frg-prepare-observe` candidate boundary to run the next request-bound prepare observation tick. Re-entry SHALL require the same owner PID and nonempty process-start identity, canonical engine root, exact candidate SHA, readiness proof, parent lock digest, and unchanged live handoff. PID-only identity SHALL NOT authorize re-entry. The observation boundary SHALL reject any leaf other than `factory-release prepare`. The observation lease SHALL NOT replace or remove either record and SHALL NOT be transferable. Other candidate consumers, another process, and malformed, stale, or mismatched evidence SHALL remain excluded. A guarded observation child SHALL still fail closed if it attempts a nested candidate start while the live handoff exists.
-
-#### Scenario: Ship polls the pack loop it detached
-
-- **WHEN** the immutable ship coordinator starts another candidate prepare tick
-- **AND** its exact-candidate detached pack supervisor still holds the verified handoff
-- **THEN** the prepare observation child SHALL start under the unchanged parent-lock proof
-- **AND** observer release SHALL preserve both the parent lock and handoff
-- **AND** the observer SHALL NOT transfer the lease or start another nested candidate process
-
-#### Scenario: A contender cannot use observer re-entry
-
-- **WHEN** the candidate consumer is not `ship.frg-prepare-observe`, the leaf is not `factory-release prepare`, or the current PID and nonempty process-start identity do not exactly match the immutable parent-lock owner
-- **THEN** acquisition SHALL remain unavailable while the detached handoff is live
-
 ### Requirement: Pack provenance presence SHALL NOT reject a bound from-run attestation
 
 Factory Reliability Gate (FRG) attestation observation SHALL NOT treat `pack_provenance != null` as sufficient grounds to reject HMAC-pass `--from-run` evidence. `pack_provenance` SHALL still fail closed when its own validation fails. `pack_provenance` SHALL NOT substitute for HMAC-covered `factory_release_binding`. A from-run score that includes both `pack_provenance` and a matching `factory_release_binding` SHALL remain observable as accepted when the rest of the binding holds.
@@ -3064,22 +2767,6 @@ When Factory Reliability Gate unique-operation scoring runs as a phase of an adm
 
 ---
 
-### Requirement: Deterministic candidate qualification SHALL precede remote fixture creation
-
-Factory-release preparation SHALL run or re-observe exact-candidate installed-CLI qualification before creating a remote FRG fixture issue or PR. Missing or failed qualification SHALL stop at a typed preflight defect with the artifact path and failed cells. It SHALL NOT create, replace, or dispatch a remote fixture pack. A passing qualification artifact SHALL be reused idempotently for the same candidate.
-
-#### Scenario: Qualification failure creates no fixtures
-
-- **WHEN** exact-candidate installed-CLI qualification is missing, stale, malformed, or has a failed required case
-- **THEN** factory-release preparation SHALL fail before its first remote fixture mutation
-- **AND** no successor fixture pair SHALL be created
-
-#### Scenario: Passing qualification is reused
-
-- **WHEN** the same candidate and matrix version are prepared again after qualification passed
-- **THEN** preparation SHALL validate and reuse the existing artifact
-- **AND** it SHALL NOT rerun qualification or create an additional fixture pair solely to rediscover local faults
-
 ### Requirement: Remote FRG SHALL be one final candidate-bound canary
 
 After deterministic qualification passes, a release candidate MAY create at most one active remote fixture pair. A canary failure SHALL retain its pack identity and artifacts for replay and diagnosis. Automatic retry SHALL reconcile or resume that same pack; it SHALL NOT manufacture a fresh pair for the unchanged candidate. A changed candidate SHALL require new deterministic qualification before one successor canary is permitted, and the prior pack SHALL be reconciled first.
@@ -3132,4 +2819,24 @@ The `factory-gate-v1` pack SHALL retain exactly its existing `clean-docs` and `c
 - **WHEN** this change is implemented and verified
 - **THEN** validation SHALL operate on the two checked-in template assets and injected deterministic inputs
 - **AND** SHALL NOT create, dispatch, merge, close, or otherwise mutate a live fake issue or pull request
+
+### Requirement: Release-path FRG verification SHALL consume the exact-candidate pair result
+
+The release-path FRG verifier SHALL accept only a conforming observer-owned result from the `exact-candidate-frg` capability for the expected candidate epoch and exact candidate SHA. It SHALL NOT require or accept a scenario score, threshold, installed-CLI qualification artifact, HMAC attestation, factory-release prepare request, nested candidate lease transfer, owner-observation handoff, or re-observation state machine as substitute proof. Remaining legacy callers MAY continue to exist only until their dependency-checked retirement package; the new release-path gate SHALL NOT invoke them.
+
+#### Scenario: Exact-pair result satisfies the new verification contract
+
+- **WHEN** a release-path caller verifies a conforming result that proves both intended fixtures for its exact candidate and epoch
+- **THEN** verification SHALL accept that single result without prepare, score, attest, or re-observe dependencies
+
+#### Scenario: Legacy release artifact cannot satisfy the new gate
+
+- **WHEN** a caller presents only an old score report, pass boolean, qualification matrix, attestation, pack-loop binding, or public hash
+- **THEN** the exact-candidate FRG verification contract SHALL remain unsatisfied
+
+#### Scenario: Remaining caller does not justify parallel machinery
+
+- **WHEN** a legacy caller has not yet been removed by the later retirement package
+- **THEN** it SHALL NOT be added as a dependency of the exact-candidate pair path
+- **AND** the implementation SHALL NOT maintain two release-eligible FRG state machines
 
