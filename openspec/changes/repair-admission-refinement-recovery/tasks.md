@@ -39,5 +39,5 @@
 
 - [x] 6.1 Run focused injected-I/O tests for `grill-with-docs-admission`, `grill-then-ready`, planning/prompt (including durable OpenSpec human-feedback acknowledgement), dispatch, `loop-selector`, and `loop-supervisor`; run the retained #1558, #1568, and planning-snapshot replay commands against the candidate and verify no test performs real network, git, or subprocess operations.
 - [x] 6.2 Run `node scripts/build.mjs` after all remaining `core/` edits and verify `node scripts/build.mjs --check` reports every generated host SKILL fresh without creating or committing `plugin/`.
-- [ ] 6.3 Run `npm run ci` from the repository root after the remaining changes and verify core tests, host build freshness, install smoke, OpenSpec validation, conditional docs freshness, and scripts checks all pass.
-- [ ] 6.4 Complete ordinary independent Pipeline reviews and GitHub CI on the exact candidate and verify they are green; stop at ready-to-deploy because merge, release, tag, publication, installation, and deployment require separate authorization.
+- [x] 6.3 Run `npm run ci` from the repository root after the remaining changes and verify core tests, host build freshness, install smoke, OpenSpec validation, conditional docs freshness, and scripts checks all pass.
+- [x] 6.4 Complete ordinary independent Pipeline reviews and GitHub CI on the exact candidate and verify they are green; stop at ready-to-deploy because merge, release, tag, publication, installation, and deployment require separate authorization.
