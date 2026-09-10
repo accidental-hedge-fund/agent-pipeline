@@ -391,6 +391,20 @@ test("result parser enforces exact slots and one candidate epoch", async () => {
     outcome_detail: "fixture outcomes: passed,passed",
     failed_synthetic: { classified_at: "2026-09-08T20:00:00.000Z", classification: "known_failed_synthetic" },
   }), /failed synthetic classification cannot apply/);
+  const classifiedWithoutProvenance = structuredClone(record);
+  classifiedWithoutProvenance.outcome = "gate_defect";
+  classifiedWithoutProvenance.outcome_detail = "inventory conflict";
+  classifiedWithoutProvenance.gate_evidence = [{
+    source: "controller", slot_id: null, issue_number: null, pr_number: null,
+    candidate_sha: record.candidate.sha, observed_head_sha: null, fact: "inventory conflict",
+  }];
+  classifiedWithoutProvenance.failed_synthetic = {
+    classified_at: "2026-09-08T20:00:00.000Z", classification: "known_failed_synthetic",
+  };
+  assert.throws(
+    () => parseExactCandidateFrgRecord(classifiedWithoutProvenance),
+    /synthetic-fixture provenance/,
+  );
 });
 
 test("begin selects fresh origin/main and loads all inputs beneath the prepared candidate", async () => {
@@ -855,18 +869,12 @@ test("normalized ingress contradictions are retained in the persisted slot obser
   assert.deepEqual(persisted.at(-1)?.slots[0].observation?.ingress_claims, ["ordinary-summary:worker-role-mismatch"]);
 });
 
-test("failed synthetic classification is persisted before cleanup", async () => {
+test("failed FRG without synthetic-fixture provenance is not classified as known failed synthetic", async () => {
   const order: string[] = [];
-  const classifiedPersists: ExactCandidateFrgRecord[] = [];
   const { record, deps } = await begun({
     persist: async (saved) => {
       if (saved.outcome !== "gate_defect") return;
-      classifiedPersists.push(structuredClone(saved));
-      order.push(
-        saved.failed_synthetic?.classification === "known_failed_synthetic"
-          ? (saved.cleanup.length ? "persist-classified-cleanup" : "persist-classified")
-          : "persist-unclassified",
-      );
+      order.push(saved.failed_synthetic?.classification === "known_failed_synthetic" ? "persist-classified" : "persist-unclassified");
     },
     cleanup: async (cleanupInput) => {
       order.push(cleanupInput.failed_synthetic?.classification === "known_failed_synthetic" ? "cleanup-classified" : "cleanup-unclassified");
@@ -890,7 +898,46 @@ test("failed synthetic classification is persisted before cleanup", async () => 
   };
   const result = await observeExactCandidateFrgPair(record, deps);
   assert.equal(result.outcome, "gate_defect");
+  assert.equal(result.failed_synthetic ?? null, null);
+  assert.deepEqual(order, ["persist-unclassified", "cleanup-unclassified", "persist-unclassified"]);
+});
+
+test("failed synthetic classification is persisted before cleanup", async () => {
+  const order: string[] = [];
+  const classifiedPersists: ExactCandidateFrgRecord[] = [];
+  const { record, deps } = await begun({
+    persist: async (saved) => {
+      if (saved.outcome !== "gate_defect") return;
+      classifiedPersists.push(structuredClone(saved));
+      order.push(
+        saved.failed_synthetic?.classification === "known_failed_synthetic"
+          ? (saved.cleanup.length ? "persist-classified-cleanup" : "persist-classified")
+          : "persist-unclassified",
+      );
+    },
+    cleanup: async (cleanupInput) => {
+      order.push(cleanupInput.failed_synthetic?.classification === "known_failed_synthetic" ? "cleanup-classified" : "cleanup-unclassified");
+      return cleanupInput.slots.filter((slot) => slot.issue_number !== null).map((slot) => ({
+        target: `issue:${slot.issue_number}`, status: "debt" as const,
+        detail: "classification snapshot", observed_at: "2026-09-08T20:02:00.000Z",
+      }));
+    },
+  });
+  const created = await reconcileExactCandidateFrgPair(record, deps);
+  created.loop_run_id = CANONICAL_LOOP;
+  created.loop_dispatch_certainty = "known_complete";
+  created.slots.forEach((slot, index) => {
+    slot.advance_run_id = `advance-${index + 1}`;
+  });
+  deps.observeFixture = async (current, slot) => {
+    const observation = passingObservation(current, slot.id === "clean-docs" ? 0 : 1);
+    if (slot.id === "clean-docs") observation.ingress_claims = ["ordinary-summary:worker-role-mismatch"];
+    return observation;
+  };
+  const result = await observeExactCandidateFrgPair(created, deps);
+  assert.equal(result.outcome, "gate_defect");
   assert.equal(result.failed_synthetic?.classification, "known_failed_synthetic");
+  assert.ok(result.slots.every((slot) => slot.synthetic_fixture?.source === "synthetic_fixture_create"));
   assert.deepEqual(order, ["persist-classified", "cleanup-classified", "persist-classified-cleanup"]);
   assert.equal(classifiedPersists[0]?.failed_synthetic?.classification, "known_failed_synthetic");
   assert.equal(classifiedPersists[0]?.cleanup.length, 0);
@@ -934,6 +981,7 @@ test("production cleanup records deterministic debt when the remote has no condi
     slot.pr_number = 301 + index;
     slot.pr_head_sha = String(index + 1).repeat(40);
     slot.observation = passingObservation(record, index);
+    slot.synthetic_fixture = syntheticFixtureProvenance(101 + index);
   });
   let issueReads = 0;
   const io = {
@@ -959,6 +1007,16 @@ test("production cleanup records deterministic debt when the remote has no condi
   assert.ok(facts.some((fact) => /cannot enforce observed provenance atomically/.test(fact.detail)));
 });
 
+function syntheticFixtureProvenance(issueNumber: number) {
+  return {
+    persisted_at: "2026-09-10T00:00:00.000Z",
+    source: "synthetic_fixture_create" as const,
+    branch_name: `pipeline/${issueNumber}-frg`,
+    worktree_path: `.worktrees/pipeline-${issueNumber}-frg`,
+    worktree_identity: `issue:${issueNumber}`,
+  };
+}
+
 function ownedCleanupRecord(): ExactCandidateFrgRecord {
   return {
     slots: [
@@ -968,6 +1026,7 @@ function ownedCleanupRecord(): ExactCandidateFrgRecord {
         provenance_id: "prov-docs",
         pr_number: 301,
         pr_head_sha: "1".repeat(40),
+        synthetic_fixture: syntheticFixtureProvenance(101),
       },
       {
         id: "clean-openspec",
@@ -975,6 +1034,7 @@ function ownedCleanupRecord(): ExactCandidateFrgRecord {
         provenance_id: "prov-openspec",
         pr_number: 302,
         pr_head_sha: "2".repeat(40),
+        synthetic_fixture: syntheticFixtureProvenance(102),
       },
     ],
     epoch_id: "frg-1.40.1-aaaaaaaaaaaa",
@@ -1006,12 +1066,21 @@ test("owned failed synthetic identity can be cleaned after identity match", asyn
       const slot = record.slots.find((item) => item.issue_number === issueNumber)!;
       return { name, sha: slot.pr_head_sha! };
     },
-    deleteBranch: async (name) => { closed.push(`branch:${name}`); },
+    deleteBranch: async (name, expectedSha) => {
+      const issueNumber = Number(name.match(/pipeline\/(\d+)-frg/)?.[1]);
+      const slot = record.slots.find((item) => item.issue_number === issueNumber)!;
+      assert.equal(expectedSha, slot.pr_head_sha);
+      closed.push(`branch:${name}`);
+    },
     observeWorktree: async (worktreePath) => {
       const issueNumber = Number(worktreePath.match(/pipeline-(\d+)-frg/)?.[1]);
       return { path: worktreePath, owned: true, identity: `issue:${issueNumber}` };
     },
-    deleteOwnedWorktree: async (worktreePath) => { closed.push(`worktree:${worktreePath}`); },
+    deleteOwnedWorktree: async (worktreePath, expectedIdentity) => {
+      const issueNumber = Number(worktreePath.match(/pipeline-(\d+)-frg/)?.[1]);
+      assert.equal(expectedIdentity, `issue:${issueNumber}`);
+      closed.push(`worktree:${worktreePath}`);
+    },
   });
   assert.deepEqual(closed, [
     "branch:pipeline/101-frg", "worktree:.worktrees/pipeline-101-frg",
@@ -1021,6 +1090,50 @@ test("owned failed synthetic identity can be cleaned after identity match", asyn
   assert.ok(facts.filter((fact) => fact.target.startsWith("branch:") || fact.target.startsWith("worktree:")).every((fact) => fact.status === "cleaned"));
   assert.ok(facts.some((fact) => /cannot enforce observed provenance atomically/.test(fact.detail)));
   assert.ok(!facts.some((fact) => /operator completed live cleanup/i.test(fact.detail)));
+});
+
+test("null recorded branch SHA does not authorize branch deletion", async () => {
+  const record = ownedCleanupRecord();
+  record.slots.forEach((slot) => { slot.pr_head_sha = null; });
+  const deleted: string[] = [];
+  const facts = await cleanupOwnedFailedSyntheticArtifacts(record, {
+    now: () => new Date("2026-09-10T00:00:00.000Z"),
+    getIssue: async (issueNumber) => {
+      const slot = record.slots.find((item) => item.issue_number === issueNumber)!;
+      return { body: provenanceBody(record, slot), labels: ["factory-gate"], state: "open" };
+    },
+    getPr: async (prNumber) => ({ number: prNumber, head_sha: "9".repeat(40), state: "open", merged: false }),
+    observeBranch: async (name) => ({ name, sha: "9".repeat(40) }),
+    deleteBranch: async (name) => { deleted.push(`branch:${name}`); },
+    observeWorktree: async () => null,
+    deleteOwnedWorktree: async (worktreePath) => { deleted.push(`worktree:${worktreePath}`); },
+  });
+  assert.deepEqual(deleted, []);
+  assert.ok(facts.filter((fact) => fact.target.startsWith("branch:")).every((fact) => fact.status === "debt"));
+  assert.ok(facts.some((fact) => fact.target.startsWith("branch:") && /branch SHA is null/.test(fact.detail)));
+});
+
+test("absent worktree identity does not authorize worktree deletion", async () => {
+  const record = ownedCleanupRecord();
+  const deleted: string[] = [];
+  const facts = await cleanupOwnedFailedSyntheticArtifacts(record, {
+    now: () => new Date("2026-09-10T00:00:00.000Z"),
+    getIssue: async (issueNumber) => {
+      const slot = record.slots.find((item) => item.issue_number === issueNumber)!;
+      return { body: provenanceBody(record, slot), labels: ["factory-gate"], state: "open" };
+    },
+    getPr: async (prNumber) => {
+      const slot = record.slots.find((item) => item.pr_number === prNumber)!;
+      return { number: prNumber, head_sha: slot.pr_head_sha!, state: "open", merged: false };
+    },
+    observeBranch: async () => null,
+    deleteBranch: async (name) => { deleted.push(`branch:${name}`); },
+    observeWorktree: async (worktreePath) => ({ path: worktreePath, owned: true }),
+    deleteOwnedWorktree: async (worktreePath) => { deleted.push(`worktree:${worktreePath}`); },
+  });
+  assert.deepEqual(deleted, []);
+  assert.ok(facts.filter((fact) => fact.target.startsWith("worktree:")).every((fact) => fact.status === "debt"));
+  assert.ok(facts.some((fact) => fact.target.startsWith("worktree:") && /no recorded ownership identity/.test(fact.detail)));
 });
 
 test("ordinary exact-candidate records produce no mutating cleanup actions", async () => {

@@ -194,6 +194,7 @@ export interface ExactCandidateFrgSlot {
   pr_head_sha: string | null;
   observation: ExactCandidateFrgObservation | null;
   failure_evidence?: ExactCandidateFrgFailureEvidence | null;
+  synthetic_fixture?: ExactCandidateSyntheticFixtureProvenance | null;
 }
 
 export interface ExactCandidateFrgFailureEvidence {
@@ -217,6 +218,14 @@ export interface ExactCandidateFrgCleanupFact {
 export interface ExactCandidateFailedSyntheticClassification {
   classified_at: string;
   classification: "known_failed_synthetic";
+}
+
+export interface ExactCandidateSyntheticFixtureProvenance {
+  persisted_at: string;
+  source: "synthetic_fixture_create";
+  branch_name: string;
+  worktree_path: string;
+  worktree_identity: string;
 }
 
 const FAILED_SYNTHETIC_CLEANUP_OUTCOMES = ["gate_defect", "exact_candidate_regression", "stale_candidate"] as const;
@@ -367,10 +376,10 @@ export interface ProductionExactCandidateFrgIo {
   listPrsAnyState(input: BeginExactCandidateFrgInput, issueNumber: number): Promise<{ numbers: number[]; truncated: boolean }>;
   listOpenPrs(input: BeginExactCandidateFrgInput, issueNumber: number): Promise<number[]>;
   getPr(input: BeginExactCandidateFrgInput, prNumber: number): Promise<{ number: number; head_sha: string; base_ref: string; state: string; merged: boolean }>;
-  deleteBranch?(name: string): Promise<void>;
+  deleteBranch?(name: string, expectedSha: string): Promise<void>;
   observeBranch?(name: string): Promise<{ name: string; sha: string } | null>;
   observeWorktree?(worktreePath: string): Promise<{ path: string; owned: boolean; identity?: string } | null>;
-  deleteOwnedWorktree?(worktreePath: string): Promise<void>;
+  deleteOwnedWorktree?(worktreePath: string, expectedIdentity: string): Promise<void>;
   getRequiredChecks(input: BeginExactCandidateFrgInput, prNumber: number): Promise<RequiredCheck[]>;
   getPrDiff(input: BeginExactCandidateFrgInput, prNumber: number): Promise<string>;
   readAdvanceSummary(input: BeginExactCandidateFrgInput, advanceRunId: string): Promise<ExactAdvanceSummary | null>;
@@ -689,6 +698,16 @@ function parseSlot(value: unknown, expected: ExactCandidateFrgSlotId, epoch: str
       throw new Error(`slot ${expected}.failure_evidence is malformed or crosses the recorded candidate/run`);
     }
   }
+  if (slot.synthetic_fixture !== undefined && slot.synthetic_fixture !== null) {
+    canonicalIso(slot.synthetic_fixture.persisted_at, `slot ${expected}.synthetic_fixture.persisted_at`);
+    if (slot.synthetic_fixture.source !== "synthetic_fixture_create") {
+      throw new Error(`slot ${expected}.synthetic_fixture.source is malformed`);
+    }
+    nonEmpty(slot.synthetic_fixture.branch_name, `slot ${expected}.synthetic_fixture.branch_name`);
+    nonEmpty(slot.synthetic_fixture.worktree_path, `slot ${expected}.synthetic_fixture.worktree_path`);
+    nonEmpty(slot.synthetic_fixture.worktree_identity, `slot ${expected}.synthetic_fixture.worktree_identity`);
+    if (slot.issue_number === null) throw new Error(`slot ${expected}.synthetic_fixture requires a recorded issue identity`);
+  }
   return slot;
 }
 
@@ -775,6 +794,9 @@ export function parseExactCandidateFrgRecord(value: unknown): ExactCandidateFrgR
     }
     if (!isFailedSyntheticCleanupOutcome(record.outcome)) {
       throw new Error("failed synthetic classification cannot apply to this outcome");
+    }
+    if (!hasPersistedSyntheticFixtureProvenance(record)) {
+      throw new Error("failed synthetic classification requires persisted synthetic-fixture provenance");
     }
   }
   if (record.reconciliation_evidence !== undefined) {
@@ -974,6 +996,7 @@ export async function reconcileExactCandidateFrgPair(
       slot.issue_number = positiveIssue(await deps.createFixture({ record, slot, title, body }), `${slot.id} create result`);
       slot.create_certainty = "known_complete";
       record.updated_at = iso(deps.now());
+      stampSyntheticFixtureProvenance(slot, slot.issue_number, record.updated_at);
       await deps.persist(record);
     } catch (error) {
       try { matches = await deps.listFixtureMatches(record); }
@@ -992,6 +1015,7 @@ export async function reconcileExactCandidateFrgPair(
         slot.issue_number = positiveIssue(recovered[0]!.issue_number, `${slot.id} recovered issue`);
         slot.create_certainty = "known_complete";
         record.updated_at = iso(deps.now());
+        stampSyntheticFixtureProvenance(slot, slot.issue_number, record.updated_at);
         await deps.persist(record);
         continue;
       }
@@ -1230,7 +1254,7 @@ async function persistOutcome(
   record.outcome_detail = detail;
   record.external_wait = wait;
   record.updated_at = iso(deps.now());
-  if (isFailedSyntheticCleanupOutcome(outcome)) {
+  if (isFailedSyntheticCleanupOutcome(outcome) && hasPersistedSyntheticFixtureProvenance(record)) {
     if (record.failed_synthetic == null) {
       record.failed_synthetic = { classified_at: record.updated_at, classification: "known_failed_synthetic" };
     }
@@ -1544,13 +1568,33 @@ export interface OwnedSyntheticCleanupIo {
   getIssue(issueNumber: number): Promise<{ body: string; labels: string[]; state: "open" | "closed" }>;
   getPr?(prNumber: number): Promise<{ number: number; head_sha: string; state: string; merged: boolean }>;
   observeBranch?(name: string): Promise<{ name: string; sha: string } | null>;
-  deleteBranch?(name: string): Promise<void>;
+  deleteBranch?(name: string, expectedSha: string): Promise<void>;
   observeWorktree?(worktreePath: string): Promise<{ path: string; owned: boolean; identity?: string } | null>;
-  deleteOwnedWorktree?(worktreePath: string): Promise<void>;
+  deleteOwnedWorktree?(worktreePath: string, expectedIdentity: string): Promise<void>;
+}
+
+function slotHasSyntheticFixtureProvenance(slot: ExactCandidateFrgSlot): boolean {
+  return slot.synthetic_fixture?.source === "synthetic_fixture_create";
+}
+
+function hasPersistedSyntheticFixtureProvenance(record: ExactCandidateFrgRecord): boolean {
+  return record.slots.some(slotHasSyntheticFixtureProvenance);
+}
+
+function stampSyntheticFixtureProvenance(slot: ExactCandidateFrgSlot, issueNumber: number, persistedAt: string): void {
+  if (slotHasSyntheticFixtureProvenance(slot)) return;
+  slot.synthetic_fixture = {
+    persisted_at: persistedAt,
+    source: "synthetic_fixture_create",
+    branch_name: recordedFixtureBranch(issueNumber),
+    worktree_path: recordedFixtureWorktree(issueNumber),
+    worktree_identity: `issue:${issueNumber}`,
+  };
 }
 
 function isPersistedFailedSynthetic(record: ExactCandidateFrgRecord): boolean {
-  return record.failed_synthetic?.classification === "known_failed_synthetic";
+  return record.failed_synthetic?.classification === "known_failed_synthetic"
+    && hasPersistedSyntheticFixtureProvenance(record);
 }
 
 function recordedFixtureBranch(issueNumber: number): string {
@@ -1573,10 +1617,12 @@ function issueIdentityMatches(record: ExactCandidateFrgRecord, slot: ExactCandid
 /**
  * Ownership-safe cleanup of known failed synthetic artifacts.
  * Mutates only identities that still match recorded provenance after an
- * explicit persisted failed-synthetic classification. GitHub issue/PR close
- * cannot enforce observed provenance atomically, so those targets become
- * cleanup debt. Simulated test results prove product behavior only; they
- * are not operator live cleanup.
+ * explicit persisted failed-synthetic classification that itself requires
+ * synthetic-fixture provenance from the fixture create path. Branch and
+ * worktree deletion require a recorded non-null identity and pass that
+ * identity to the mutation. GitHub issue/PR close cannot enforce observed
+ * provenance atomically, so those targets become cleanup debt. Simulated
+ * test results prove product behavior only; they are not operator live cleanup.
  */
 export async function cleanupOwnedFailedSyntheticArtifacts(
   record: ExactCandidateFrgRecord,
@@ -1612,6 +1658,14 @@ export async function cleanupOwnedFailedSyntheticArtifacts(
       debtWithoutMutation(`issue:unknown`, "slot has no recorded issue identity; no mutation attempted");
       continue;
     }
+    if (!slotHasSyntheticFixtureProvenance(slot)) {
+      debtWithoutMutation(`issue:${issueNumber}`, "slot lacks persisted synthetic-fixture provenance; no mutation attempted");
+      if (slot.pr_number !== null) {
+        debtWithoutMutation(`pr:${slot.pr_number}`, "slot lacks persisted synthetic-fixture provenance; no mutation attempted");
+      }
+      continue;
+    }
+    const recorded = slot.synthetic_fixture!;
     const issueTarget = `issue:${issueNumber}`;
     try {
       const issue = await io.getIssue(issueNumber);
@@ -1648,7 +1702,7 @@ export async function cleanupOwnedFailedSyntheticArtifacts(
       }
     }
 
-    const branchName = recordedFixtureBranch(issueNumber);
+    const branchName = recorded.branch_name;
     const branchTarget = `branch:${branchName}`;
     if (io.observeBranch) {
       try {
@@ -1656,12 +1710,14 @@ export async function cleanupOwnedFailedSyntheticArtifacts(
         const expectedSha = slot.pr_head_sha;
         if (branch === null) {
           push(branchTarget, "cleaned", "owned fixture branch already absent; no mutation");
-        } else if (expectedSha !== null && branch.sha !== expectedSha) {
+        } else if (expectedSha === null) {
+          debtWithoutMutation(branchTarget, "recorded synthetic branch SHA is null; no mutation attempted");
+        } else if (branch.name !== branchName || branch.sha !== expectedSha) {
           debtWithoutMutation(branchTarget, "recorded synthetic branch identity no longer matches; no mutation attempted");
         } else if (!io.deleteBranch) {
           debtWithoutMutation(branchTarget, "ownership-safe cleanup requires a conditional remote mutation; no mutation attempted");
         } else {
-          await io.deleteBranch(branchName);
+          await io.deleteBranch(branchName, expectedSha);
           push(branchTarget, "cleaned", "deleted owned failed synthetic branch after identity match");
         }
       } catch (error) {
@@ -1669,19 +1725,22 @@ export async function cleanupOwnedFailedSyntheticArtifacts(
       }
     }
 
-    const worktreePath = recordedFixtureWorktree(issueNumber);
+    const worktreePath = recorded.worktree_path;
+    const worktreeIdentity = recorded.worktree_identity;
     const worktreeTarget = `worktree:${worktreePath}`;
     if (io.observeWorktree) {
       try {
         const worktree = await io.observeWorktree(worktreePath);
         if (worktree === null) {
           push(worktreeTarget, "cleaned", "owned fixture worktree already absent; no mutation");
-        } else if (!worktree.owned || worktree.path !== worktreePath || (worktree.identity !== undefined && worktree.identity !== `issue:${issueNumber}`)) {
+        } else if (worktree.identity === undefined || worktree.identity.trim() === "") {
+          debtWithoutMutation(worktreeTarget, "observed worktree has no recorded ownership identity; no mutation attempted");
+        } else if (!worktree.owned || worktree.path !== worktreePath || worktree.identity !== worktreeIdentity) {
           debtWithoutMutation(worktreeTarget, "target is not the recorded owned synthetic worktree; no mutation attempted");
         } else if (!io.deleteOwnedWorktree) {
           debtWithoutMutation(worktreeTarget, "ownership-safe cleanup requires a conditional remote mutation; no mutation attempted");
         } else {
-          await io.deleteOwnedWorktree(worktreePath);
+          await io.deleteOwnedWorktree(worktreePath, worktreeIdentity);
           push(worktreeTarget, "cleaned", "removed owned failed synthetic worktree after identity match");
         }
       } catch (error) {
