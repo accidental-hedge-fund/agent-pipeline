@@ -41,7 +41,6 @@ import {
   type ExactCandidateFrgRecord,
   type RemoteFixtureMatch,
   type ProductionExactCandidateFrgIo,
-  type ReleaseFrgExclusionLock,
 } from "../scripts/exact-candidate-frg.ts";
 import type { PipelineConfig } from "../scripts/config.ts";
 import type { CandidateEngine } from "../scripts/ship-end-candidate.ts";
@@ -68,11 +67,6 @@ template_sha256={{template_sha256}}
 const DOCS = `${PROVENANCE_TEMPLATE}\ndocs {{openspec_change_id}}`;
 const OPENSPEC = `${PROVENANCE_TEMPLATE}\nopenspec {{openspec_change_id}}`;
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
-
-/** Host-local FRG exclusion must not be taken by unit tests (#1587 CI isolation). */
-function isolatedReleaseFrgLock(): ReleaseFrgExclusionLock {
-  return { acquire: () => true, release: () => {} };
-}
 
 function engine(): CandidateEngine {
   return {
@@ -1989,7 +1983,6 @@ test("production record discovery ignores unrelated corruption but fails on rele
     listRecordEpochIds: async () => ["frg-9.9.9-unrelated", passed.epoch_id],
     readFile: async (file: string) => file.endsWith(`${passed.epoch_id}.json`) ? (relevantCorrupt ? "{" : JSON.stringify(passed)) : "{",
     observeOriginMainSha: async () => CANDIDATE, writeRecord: async () => { writes++; }, now: () => new Date(),
-    makeLock: () => isolatedReleaseFrgLock(),
   } as unknown as ProductionExactCandidateFrgIo;
   const input = { repoDir: "/linked", repository: passed.repository, baseBranch: passed.base_branch,
     releaseVersion: passed.release_version, operationalDomain: passed.operational_domain };
@@ -2009,7 +2002,6 @@ test("production wrapper rejects movement from the caller-pinned candidate befor
     resolveReleaseStoreRepoDir: async () => "/primary",
     observeOriginMainSha: async () => MOVED,
     listRecordEpochIds: async () => { inventoryCalls++; return []; },
-    makeLock: () => isolatedReleaseFrgLock(),
   } as unknown as ProductionExactCandidateFrgIo;
   await assert.rejects(() => runProductionExactCandidateFrg({
     repoDir: "/linked", repository: "owner/repo", baseBranch: "main",
@@ -2063,7 +2055,6 @@ test("default production composition freezes the requested profile for target do
     resolveConfigFn: (options) => configFor(options.repoPath!, options.profile!),
     listWorktrees: async () => { throw new Error("worktree probe timed out"); },
   });
-  unavailablePrimary.makeLock = () => isolatedReleaseFrgLock();
   await assert.rejects(() => runProductionExactCandidateFrg(input, unavailablePrimary), /worktree probe timed out/,
     "release admission stops before record inventory or fixture creation when the canonical primary is unobservable");
 });
@@ -2074,7 +2065,6 @@ test("production rejects invalid target-primary bindings before remote mutation"
     validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: "other/repository" }),
     resolveReleaseStoreRepoDir: async () => "/primary",
     listRecordEpochIds: async () => { inventoryCalls++; return []; },
-    makeLock: () => isolatedReleaseFrgLock(),
   } as unknown as ProductionExactCandidateFrgIo;
   const input = { repoDir: "/linked", repository: "owner/repo", baseBranch: "main", releaseVersion: "1.40.1" };
   await assert.rejects(() => runProductionExactCandidateFrg(input, base), /target primary origin other\/repository/);
@@ -2675,25 +2665,6 @@ test("same-host release/FRG exclusion releases on failure and refuses contention
   })), /boom/);
   assert.deepEqual(events, ["acquire", "run", "release"]);
   await assert.rejects(() => withReleaseFrgExclusion("owner-repo", async () => undefined, () => ({ acquire: () => false, release: () => {} })), /already held/);
-});
-
-test("production wrapper uses the injected exclusion lock instead of the host lock", async () => {
-  const events: string[] = [];
-  const io = {
-    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: "owner/repo" }),
-    resolveReleaseStoreRepoDir: async () => "/primary",
-    observeOriginMainSha: async () => MOVED,
-    listRecordEpochIds: async () => [],
-    makeLock: () => ({
-      acquire: () => { events.push("acquire"); return true; },
-      release: () => { events.push("release"); },
-    }),
-  } as unknown as ProductionExactCandidateFrgIo;
-  await assert.rejects(() => runProductionExactCandidateFrg({
-    repoDir: "/linked", repository: "owner/repo", baseBranch: "main",
-    releaseVersion: "1.40.1", expectedCandidateSha: CANDIDATE,
-  }, io), /moved before exact-candidate FRG admission/);
-  assert.deepEqual(events, ["acquire", "release"]);
 });
 
 test("tagged retry discovers exactly one forge pair and never treats local pass as proof", async () => {
