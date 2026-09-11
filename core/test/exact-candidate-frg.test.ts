@@ -55,13 +55,6 @@ const CANDIDATE = "a".repeat(40);
 const MOVED = "b".repeat(40);
 const ROOT = "/candidate";
 const CANONICAL_LOOP = workListRunId("owner/repo", "claude", ["101", "102"]);
-// runProductionExactCandidateFrg acquires a real /tmp lock for target.domain.
-// Tests must not use the host production domain (agent-pipeline).
-const UNIT_FRG_LOCK_DOMAIN = "exact-candidate-frg-unit";
-const unitFrgLock = (): { acquire: () => boolean; release: () => void } => ({
-  acquire: () => true,
-  release: () => {},
-});
 const PROVENANCE_TEMPLATE = `<!-- pipeline-frg-instance@1
 pack_id={{pack_id}}
 manifest_version={{manifest_version}}
@@ -1980,7 +1973,7 @@ test("production record discovery ignores unrelated corruption but fails on rele
   record.loop_dispatch_certainty = "known_complete";
   record.slots.forEach((slot, index) => { slot.issue_number = 101 + index; slot.create_certainty = "known_complete"; slot.advance_run_id = `advance-${index + 1}`; });
   const passed = await observeExactCandidateFrgPair(record, deps);
-  passed.operational_domain = UNIT_FRG_LOCK_DOMAIN;
+  passed.operational_domain = "agent-pipeline";
   passed.cleanup = passed.slots.map((slot) => ({ target: `issue:${slot.issue_number}`, status: "debt", detail: "deferred", observed_at: passed.updated_at }));
   passed.cleanup_debt = true;
   let relevantCorrupt = false;
@@ -1990,7 +1983,6 @@ test("production record discovery ignores unrelated corruption but fails on rele
     listRecordEpochIds: async () => ["frg-9.9.9-unrelated", passed.epoch_id],
     readFile: async (file: string) => file.endsWith(`${passed.epoch_id}.json`) ? (relevantCorrupt ? "{" : JSON.stringify(passed)) : "{",
     observeOriginMainSha: async () => CANDIDATE, writeRecord: async () => { writes++; }, now: () => new Date(),
-    makeReleaseFrgLock: unitFrgLock,
   } as unknown as ProductionExactCandidateFrgIo;
   const input = { repoDir: "/linked", repository: passed.repository, baseBranch: passed.base_branch,
     releaseVersion: passed.release_version, operationalDomain: passed.operational_domain };
@@ -2006,11 +1998,10 @@ test("production record discovery ignores unrelated corruption but fails on rele
 test("production wrapper rejects movement from the caller-pinned candidate before record or fixture work", async () => {
   let inventoryCalls = 0;
   const io = {
-    validateTargetRuntime: async () => ({ domain: UNIT_FRG_LOCK_DOMAIN, repository: "owner/repo" }),
+    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: "owner/repo" }),
     resolveReleaseStoreRepoDir: async () => "/primary",
     observeOriginMainSha: async () => MOVED,
     listRecordEpochIds: async () => { inventoryCalls++; return []; },
-    makeReleaseFrgLock: unitFrgLock,
   } as unknown as ProductionExactCandidateFrgIo;
   await assert.rejects(() => runProductionExactCandidateFrg({
     repoDir: "/linked", repository: "owner/repo", baseBranch: "main",
@@ -2071,16 +2062,15 @@ test("default production composition freezes the requested profile for target do
 test("production rejects invalid target-primary bindings before remote mutation", async () => {
   let inventoryCalls = 0;
   const base = {
-    validateTargetRuntime: async () => ({ domain: UNIT_FRG_LOCK_DOMAIN, repository: "other/repository" }),
+    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: "other/repository" }),
     resolveReleaseStoreRepoDir: async () => "/primary",
     listRecordEpochIds: async () => { inventoryCalls++; return []; },
-    makeReleaseFrgLock: unitFrgLock,
   } as unknown as ProductionExactCandidateFrgIo;
   const input = { repoDir: "/linked", repository: "owner/repo", baseBranch: "main", releaseVersion: "1.40.1" };
   await assert.rejects(() => runProductionExactCandidateFrg(input, base), /target primary origin other\/repository/);
   assert.equal(inventoryCalls, 0);
 
-  base.validateTargetRuntime = async () => ({ domain: UNIT_FRG_LOCK_DOMAIN, repository: "owner/repo" });
+  base.validateTargetRuntime = async () => ({ domain: "agent-pipeline", repository: "owner/repo" });
   base.resolveReleaseStoreRepoDir = async () => "../not-canonical";
   await assert.rejects(() => runProductionExactCandidateFrg(input, base), /normalized absolute path/);
   assert.equal(inventoryCalls, 0);
@@ -2666,30 +2656,6 @@ test("ordinary loop terminal exits 1 and 2 preserve canonical stdout while launc
   assert.equal(recoverExpectedExactCandidateLoopExit({ exitCode: 2, stdout }), stdout);
   assert.equal(recoverExpectedExactCandidateLoopExit({ exitCode: 1, stdout: "not a handoff" }), null);
   assert.equal(recoverExpectedExactCandidateLoopExit({ exitCode: 127, stdout }), null);
-});
-
-test("production wrapper uses the injected release/FRG exclusion, not the host lock", async () => {
-  const events: string[] = [];
-  const io = {
-    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: "owner/repo" }),
-    resolveReleaseStoreRepoDir: async () => "../not-canonical",
-    makeReleaseFrgLock: () => ({
-      acquire: () => { events.push("acquire"); return true; },
-      release: () => { events.push("release"); },
-    }),
-  } as unknown as ProductionExactCandidateFrgIo;
-  await assert.rejects(() => runProductionExactCandidateFrg({
-    repoDir: "/linked", repository: "owner/repo", baseBranch: "main", releaseVersion: "1.40.1",
-  }, io), /normalized absolute path/);
-  assert.deepEqual(events, ["acquire", "release"]);
-
-  await assert.rejects(() => runProductionExactCandidateFrg({
-    repoDir: "/linked", repository: "owner/repo", baseBranch: "main", releaseVersion: "1.40.1",
-  }, {
-    ...io,
-    makeReleaseFrgLock: () => ({ acquire: () => false, release: () => { events.push("held-release"); } }),
-  }), /already held/);
-  assert.deepEqual(events, ["acquire", "release"]);
 });
 
 test("same-host release/FRG exclusion releases on failure and refuses contention", async () => {
