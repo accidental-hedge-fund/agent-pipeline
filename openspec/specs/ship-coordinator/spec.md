@@ -5,21 +5,19 @@
 Provide one small, restart-safe Pipeline command that composes existing train,
 recovery, FRG, release, publication, and engine-promotion capabilities. Channel
 adapters stay thin, and systemd remains the host process supervisor.
-
 ## Requirements
-
 ### Requirement: The CLI SHALL provide one explicit ship coordinator
 
-The CLI SHALL expose `pipeline ship --milestone vX.Y.Z` as the operator product command. When the milestone title is a semantic version (`vX.Y.Z` or `X.Y.Z`), the coordinator SHALL derive the release version from that title and SHALL NOT require a separate `--for` flag. It SHALL compose the existing integrated train in merge mode, bounded Pipeline recovery, candidate-bound FRG validation, release prepare and finish, publication verification, and `engine-promote`. It SHALL NOT reimplement stage dispatch, merge gates, FRG scoring, release mutation, retry taxonomy, or install behavior.
+The CLI SHALL expose `pipeline ship --milestone vX.Y.Z` as the operator product command. When the milestone title is a semantic version (`vX.Y.Z` or `X.Y.Z`), the coordinator SHALL derive the release version from that title and SHALL NOT require a separate `--for` flag. It SHALL compose the existing integrated train in merge mode, bounded Pipeline recovery, and ship-final-delegation: exactly one call to independently complete `pipeline release`. It SHALL NOT reimplement stage dispatch, merge gates, release mutation, or retry taxonomy. It SHALL NOT compose factory-pack FRG, `release finish`, `release ensure-tag`, `engine-promote`, installation, promotion, or deployment as the live tail.
 
 The command SHALL remain loop-isolated: `advance`, `single`, and `loop` SHALL never invoke it. Operator invocation of `pipeline ship --milestone` SHALL be sufficient authority to compose those existing loop-isolated surfaces. The command SHALL NOT require `--authorization` or a signed grant document.
 
-The coordinator SHALL execute this phase order for a semver milestone: `train --merge` → (semver) `release` → wait until the release PR checks are green → `release finish` → wait until GitHub Release `vX.Y.Z` is published → `engine-promote`. It SHALL NOT invent a second merge policy.
+The coordinator SHALL execute this phase order for a semver milestone: `train --merge` → exactly one complete-release delegation. Continuous ship SHALL stop after integration. It SHALL NOT invent a second merge policy. Historical optional-FRG, finish, and ship-promotion sequences SHALL remain identifiable as historical and SHALL NOT be the live procedure.
 
 #### Scenario: One command composes existing lifecycle utilities
 
 - **WHEN** an operator runs `pipeline ship --milestone v1.39.3`
-- **THEN** the coordinator SHALL call the existing Pipeline implementations for each lifecycle phase
+- **THEN** the coordinator SHALL call the existing Pipeline implementations for train and complete release
 - **AND** it SHALL NOT create a second issue scheduler, merge implementation, FRG scorer, release builder, or model router
 
 #### Scenario: Milestone-only argv does not require a grant document
@@ -34,7 +32,11 @@ The coordinator SHALL execute this phase order for a semver milestone: `train --
   `pipeline:ready-to-deploy`
 - **THEN** it SHALL still stop without invoking the ship coordinator
 
----
+#### Scenario: SemVer ship delegates once without promotion
+
+- **WHEN** SemVer train integration completes
+- **THEN** ship SHALL invoke complete release once and accept its post-metadata candidate `C`
+- **AND** ship SHALL perform no separate factory-pack FRG, finish, tag, publication, promotion, installation, or deployment orchestration
 
 ### Requirement: Ship state SHALL be typed, atomic, and restart-safe
 
@@ -156,70 +158,6 @@ state. It SHALL NOT invent `single` or `loop`.
 - **THEN** the host SHALL stop and report that human-authority state
 - **AND** it SHALL NOT re-invoke ship as if the stop were a dead-holder interrupt
 
-### Requirement: Ship FRG generation for post-pilot releases SHALL use the durable engine path
-
-For target release versions after v1.33.0, the ship coordinator and any ship FRG adapter it composes (including host `pipeline-ship-frg` when used) SHALL generate release-eligible FRG evidence through the durable engine path: `pipeline factory-release prepare --request <absolute-request.json> --json` (or an in-process equivalent that implements the same protocol and shared `runRelease` handoff). They SHALL NOT use a synthetic trivial docs/fixture-only pack as release-eligible FRG generation for those versions. When FRG evidence is missing at release-prepare time, ship SHALL invoke that durable path automatically; a genuine FRG failure SHALL stop ship before release finalization. Omitted HMAC on a structurally eligible terminal pack SHALL NOT be a genuine FRG failure. That tick SHALL be attestation wait: the coordinator SHALL run `pipeline factory-gate --for <X.Y.Z> --from-run <bound-loop>` in a separate credentialed child and SHALL re-invoke the same prepare request. It SHALL NOT stop the ship as `frg_not_eligible` for omitted HMAC only.
-
-#### Scenario: Missing FRG auto-generates via durable prepare for 1.34+
-
-- **WHEN** an authorized ship for version `1.34.0` reaches release preparation and no release-eligible FRG pass artifact exists for `1.34.0`
-- **THEN** ship SHALL invoke the durable `factory-release prepare` path (or equivalent) from the exact integrated candidate
-- **AND** it SHALL NOT mint release-eligible evidence from a trivial docs-only synthetic pack
-
-#### Scenario: Genuine FRG failure stops ship before release finalization
-
-- **WHEN** durable FRG generation for the ship version returns failure or non-complete status because required evidence is missing or structurally ineligible (`pass: false` that is not omitted-HMAC-only)
-- **THEN** ship SHALL stop before release-PR finalization mutations that require a pass
-- **AND** status SHALL name the FRG defect
-
-#### Scenario: Omitted HMAC is attestation wait not genuine failure
-
-- **WHEN** candidate `factory-release prepare` scores a terminal structurally eligible pack without HMAC
-- **THEN** ship SHALL treat the tick as attestation wait
-- **AND** it SHALL NOT stop the ship as `frg_not_eligible`
-- **AND** it SHALL invoke `pipeline factory-gate --for <X.Y.Z> --from-run <bound-loop>` in a child other than prepare
-- **AND** that child SHALL have the producer credential
-
-#### Scenario: Complete durable prepare supplies typed release identity
-
-- **WHEN** `factory-release prepare` returns `status: "complete"` with typed version, PR, base, head, and FRG run id
-- **THEN** ship SHALL store that identity as the release prepare result
-- **AND** later finalization SHALL revalidate against the observed GitHub and FRG state before merge or promotion
-
-### Requirement: Ship durable FRG handoff SHALL remain restart-safe and non-duplicating
-
-When ship drives the durable FRG and prepare protocol, every entry after crash, timeout, or restart SHALL re-observe pack, FRG run, attestation, branch, release PR, and head state before any create mutation. Duplicate ticks with the same ship coordinates and request binding SHALL NOT create a second pack, second attestation, second release branch, or second release PR.
-
-#### Scenario: Restart after awaiting attestation continues without new pack
-
-- **WHEN** ship stopped after unsigned FRG artifacts exist and status was `awaiting_frg_attestation`
-- **AND** a restart runs the same ship coordinates and request binding
-- **THEN** ship SHALL re-observe the existing pack and artifacts
-- **AND** it SHALL NOT create a second pack for the same binding
-
-#### Scenario: Restart after complete prepare does not open a second PR
-
-- **WHEN** ship stopped after a complete prepare with a known release PR identity
-- **AND** a restart re-enters release preparation
-- **THEN** ship SHALL reconcile the existing PR identity
-- **AND** it SHALL NOT open a second release pull request for the same version binding
-
-### Requirement: Ship coordinator promote phase SHALL install to all hosts by default
-
-When the in-engine ship coordinator (`pipeline ship`) reaches the engine-promote phase and the operator has not scoped the install host, the coordinator SHALL promote and install using effective host selector `all` so every installer-managed outer-host skill tree receives the released engine. The coordinator SHALL NOT leave Claude, Grok, or OpenCode on a prior release solely because the promote call omitted a host option and inherited a codex-only default.
-
-#### Scenario: Authorized ship promote uses multi-host install default
-
-- **WHEN** an authorized `pipeline ship` completes publication and runs engine promote for version `X.Y.Z`
-- **AND** the operator has not scoped promote to a single host
-- **THEN** the composed engine-promote install SHALL use host selector `all`
-- **AND** the install command or promote result recorded for that phase SHALL include `--host all` (or an equivalent explicit multi-host selector)
-
-#### Scenario: Ship promote does not silent-default to codex only
-
-- **WHEN** the ship coordinator promote path invokes engine-promote without an operator host override
-- **THEN** the effective install host SHALL NOT be `codex` alone as an implicit omitted-host default
-
 ### Requirement: Ship interrupt with a dead holder SHALL resume the same item
 
 The coordinator SHALL treat a dead harness, SIGTERM, host reboot, or network drop mid-stage as a resume-eligible interrupt when the prior holder is dead. It SHALL continue the same ledger item from its last durable stage using the worktree, live labels, and ship ledger. It SHALL NOT classify that interrupt as `workflow-engine-defect`. It SHALL NOT burn a `restart_workflow_engine` class budget. It SHALL NOT STOP the ship with `supervisor_no_progress` solely because the prior holder is dead.
@@ -246,24 +184,24 @@ When the composed `train --merge` would plan or implement any milestone item whi
 
 ### Requirement: Ship coordinator post-train phases SHALL execute the candidate engine
 
-After `train --merge` is complete or resumed complete, in-engine `pipeline ship` SHALL run Factory Reliability Gate (FRG) pack (`factory-release prepare` and `factory-gate`), `pipeline release`, `release finish`, and any coordinator-invoked tag on the candidate engine bound to the SHA being released. The candidate engine SHALL be the control checkout at that SHA, or an explicit candidate install of that SHA. The coordinator SHALL obtain that root from the shared asynchronous resolve-and-prepare seam. Identity-only resolution SHALL NOT authorize leaf spawn.
+After `train --merge` is complete or resumed complete, in-engine `pipeline ship` SHALL run ship-final-delegation on the candidate engine bound to the SHA being released: exactly one independently complete `pipeline release`. The candidate engine SHALL be the control checkout at that SHA, or an explicit candidate install of that SHA. The coordinator SHALL obtain that root from the shared asynchronous resolve-and-prepare seam. Identity-only resolution SHALL NOT authorize leaf spawn. The live tail SHALL NOT run factory-pack FRG (`factory-release prepare` and `factory-gate`), `release finish`, or `release ensure-tag`.
 
-When the operator started `pipeline ship` from the previous production-pin CLI, the coordinator SHALL keep that pin process as the durable coordinator and SHALL spawn the candidate engine for leaf post-train verbs (`factory-release prepare`, `factory-gate`, `release`, `release finish`, and `release ensure-tag`). After a successful candidate `factory-gate`, the coordinator SHALL re-invoke the same candidate `factory-release prepare --request <absolute-request.json> --json` once. When that prepare returns `status: "complete"`, the FRG pack phase SHALL return. When that prepare still returns `status: "awaiting_frg_attestation"` because observation is absent or rejected, the FRG pack phase SHALL fail closed and SHALL name unsigned `frg_run_id` `A`, observed `latest.json` `run_id` `B` when present, and the observe miss reason. It SHALL NOT spawn factory-gate again for that unchanged checkpoint. It SHALL NOT return from the FRG pack phase at the first attestation checkpoint. It SHALL NOT treat the later standalone `pipeline release` leaf as a substitute for that complete checkpoint. `release ensure-tag` SHALL run the candidate's `ensureAnnotatedReleaseTag`; it SHALL NOT import that helper from the production-pin process. It SHALL NOT re-exec `pipeline ship`. It SHALL NOT rerun train. It SHALL NOT keep executing those leaf verbs inside the production-pin process when that process source SHA differs from the candidate. Train and `engine-promote` SHALL remain on the production pin.
+When the operator started `pipeline ship` from the previous production-pin CLI, the coordinator SHALL keep that pin process as the durable coordinator and SHALL spawn the candidate engine for the complete-release leaf. It SHALL NOT re-exec `pipeline ship`. It SHALL NOT rerun train. Train SHALL remain on the production pin. `engine-promote` SHALL NOT be part of the live ship tail.
 
-The coordinator SHALL fail closed before those ship-end verbs if it cannot resolve-and-prepare a matching runnable candidate engine. A failed resolution or failed candidate readiness SHALL persist the train checkpoint and SHALL NOT start FRG pack or release mutation. Setup failure, abandoned ownership, and lock uncertainty SHALL remain supervised lifecycle states (bounded treatment, Cooling, or External-condition wait) and SHALL NOT become generic blocked, needs-human, or terminal mechanical failure. They SHALL NOT create a DecisionRequest or AuthorityRequest. This requirement does not authorize `--skip-frg` as the default. It does not authorize promote before GitHub Release publication. It does not add a new recover recipe, `auto_merge`, a merge stage, or a special ship of the readiness gate.
+The coordinator SHALL fail closed before the complete-release leaf if it cannot resolve-and-prepare a matching runnable candidate engine. A failed resolution or failed candidate readiness SHALL persist the train checkpoint and SHALL NOT start release mutation. Setup failure, abandoned ownership, and lock uncertainty SHALL remain supervised lifecycle states (bounded treatment, Cooling, or External-condition wait) and SHALL NOT become generic blocked, needs-human, or terminal mechanical failure. They SHALL NOT create a DecisionRequest or AuthorityRequest. This requirement does not authorize `--skip-frg` as the default. It does not add a new recover recipe, `auto_merge`, a merge stage, or a special ship of the readiness gate.
 
 #### Scenario: Production-pin ship switches to candidate after train
 
-- **WHEN** an operator runs production-pin `pipeline ship --milestone v1.39.5`
-- **AND** train completes with FRG-bound candidate SHA `C` whose version is `1.39.5`
-- **THEN** the coordinator SHALL spawn `factory-release prepare` and `pipeline release` on the candidate engine at `C`
-- **AND** it SHALL NOT open the release PR using the `1.39.4` production-pin `release.ts`
+- **WHEN** an operator runs production-pin `pipeline ship --milestone v1.40.1`
+- **AND** train completes with candidate SHA `C` whose version is `1.40.1`
+- **THEN** the coordinator SHALL spawn complete `pipeline release` on the candidate engine at `C`
+- **AND** it SHALL NOT open a metadata PR using the prior production-pin release helper as a second release engine
 
 #### Scenario: Unresolvable candidate stops ship before release
 
 - **WHEN** train is complete
-- **AND** the coordinator cannot resolve a candidate engine matching the FRG-bound SHA
-- **THEN** ship SHALL stop before `pipeline factory-release prepare` and before `pipeline release`
+- **AND** the coordinator cannot resolve a candidate engine matching the bound SHA
+- **THEN** ship SHALL stop before complete `pipeline release`
 - **AND** status SHALL name the candidate-engine identity defect
 - **AND** persisted train evidence SHALL remain so a retry does not retrain
 
@@ -276,27 +214,28 @@ The coordinator SHALL fail closed before those ship-end verbs if it cannot resol
 
 #### Scenario: Candidate FRG pack converges prepare after attestation
 
-- **WHEN** candidate `factory-release prepare --request <absolute-request.json> --json` returns `status: "awaiting_frg_attestation"`
-- **AND** candidate `factory-gate --for <X.Y.Z> --from-run <loop_run_id>` succeeds
-- **THEN** the coordinator SHALL re-invoke the same candidate `factory-release prepare` with that unchanged request once
-- **AND** when that prepare returns `status: "complete"`, the FRG pack phase SHALL return
-- **AND** when that prepare still returns `status: "awaiting_frg_attestation"`, the FRG pack phase SHALL fail closed
-- **AND** it SHALL NOT spawn factory-gate again for that unchanged checkpoint
-- **AND** it SHALL NOT treat the later standalone `pipeline release` leaf as a substitute for that complete checkpoint
+- **WHEN** historical factory-pack FRG text is read
+- **THEN** that factory-pack prepare and factory-gate sequence SHALL be identifiable as historical
+- **AND** the live post-train tail SHALL NOT spawn `factory-release prepare` or `factory-gate`
 
 #### Scenario: Coordinator-invoked tag runs candidate ensure-tag
 
-- **WHEN** the pin coordinator waits for publication after a merged release
-- **AND** the pin process SHA differs from the FRG-bound candidate SHA
-- **THEN** the coordinator SHALL spawn `release ensure-tag <X.Y.Z> <merge-commit-oid>` on the candidate launcher
-- **AND** it SHALL NOT call the production-pin process's imported `ensureAnnotatedReleaseTag`
+- **WHEN** historical `release ensure-tag` text is read
+- **THEN** that ensure-tag sequence SHALL be identifiable as historical
+- **AND** the live post-train tail SHALL NOT spawn `release ensure-tag`
+
+#### Scenario: Live tail does not run factory-pack or ensure-tag
+
+- **WHEN** SemVer train is complete and ship enters the post-train tail
+- **THEN** ship SHALL invoke complete release once
+- **AND** it SHALL NOT spawn `factory-release prepare`, `factory-gate`, `release finish`, or `release ensure-tag` as the live procedure
 
 #### Scenario: Unready candidate stops ship before leaf spawn
 
 - **WHEN** train is complete
-- **AND** a candidate-engine root matches the FRG-bound SHA
+- **AND** a candidate-engine root matches the bound SHA
 - **AND** resolve-and-prepare fails to prove candidate readiness
-- **THEN** ship SHALL stop before `pipeline factory-release prepare` and before `pipeline release`
+- **THEN** ship SHALL stop before complete `pipeline release`
 - **AND** persisted train evidence SHALL remain so a retry does not retrain
 - **AND** no candidate leaf command SHALL have spawned
 
@@ -306,79 +245,6 @@ The coordinator SHALL fail closed before those ship-end verbs if it cannot resol
 - **THEN** the outcome SHALL be a supervised lifecycle state (bounded treatment, Cooling, or External-condition wait)
 - **AND** it SHALL NOT be generic blocked, needs-human, or terminal mechanical failure
 - **AND** it SHALL NOT create a DecisionRequest or AuthorityRequest solely for that failure
-
-### Requirement: Candidate ensure-tag SHALL prove the supplied OID is the merged release
-
-`pipeline release ensure-tag` SHALL re-observe the version's release PR before creating a missing annotated tag. It SHALL require that pull request to be merged with a merge commit exactly equal to the supplied OID. It SHALL fail closed and SHALL NOT create or push `v<X.Y.Z>` when that proof is absent. Before creating a missing tag it SHALL also validate on-disk `.agent-pipeline/frg/<X.Y.Z>/latest.json` as release-eligible (`pass: true` and valid HMAC) and SHALL require HMAC `candidate_git_sha` (`factory_release_binding.candidate_git_sha` if present and HMAC-attested, else `pack_provenance.candidate_git_sha`) to equal the caller-supplied `--packed-candidate` 40-hex SHA. `factory_release_binding` SHALL be part of the FRG HMAC canonical payload when present. An unauthenticated `factory_release_binding` overlay SHALL fail closed and SHALL NOT retarget the packed candidate. A present but invalid binding SHALL NOT fall back to another carrier. That packed SHA SHALL be this ship's independent Factory Reliability Gate (FRG)-bound identity: factory-release request `integrated_candidate.git_sha` or `ShipTrainEvidence.integrated_head_oid`. The HMAC artifact SHALL NOT be the authority for "this ship." The command SHALL fail closed when `--packed-candidate` is missing or is not 40-hex. It SHALL NOT require that packed candidate SHA to equal the merge commit. It SHALL NOT rewrite `latest.json`. It SHALL NOT require the file to exist in the git tree. HMAC `candidate_git_sha` SHALL be taken from the same HMAC-validated `latest.json` snapshot (one file read). The helper SHALL NOT reopen `latest.json` after validation to bind `--packed-candidate`.
-
-An existing `v<X.Y.Z>` SHALL succeed only when origin has an annotated tag whose peeled commit equals the merge commit. A local-only annotated tag SHALL NOT be treated as published: the helper SHALL observe origin in a temporary ref and, if origin lacks the tag, SHALL push the verified local tag. A lightweight tag or a tag on a different commit (local or remote) SHALL fail closed. The command SHALL NOT force-update or delete the tag. If a concurrent push creates the remote tag, the command SHALL re-observe origin and succeed only if that tag is the correct annotated tag on the merge commit.
-
-#### Scenario: Unrelated OID is rejected
-
-- **WHEN** `pipeline release ensure-tag 1.39.5 <oid> --packed-candidate <C>` runs
-- **AND** `<oid>` is a valid 40-hex commit
-- **AND** the v1.39.5 release PR merge commit is a different OID
-- **THEN** the command SHALL fail closed
-- **AND** it SHALL NOT create or push `v1.39.5`
-
-#### Scenario: Missing on-disk HMAC latest.json is rejected
-
-- **WHEN** `pipeline release ensure-tag 1.39.5 <merge-oid> --packed-candidate <C>` runs
-- **AND** the merge OID is the v1.39.5 release PR merge commit
-- **AND** on-disk `.agent-pipeline/frg/1.39.5/latest.json` is absent
-- **THEN** the command SHALL fail closed
-- **AND** it SHALL NOT create or push `v1.39.5`
-
-#### Scenario: Unbound HMAC candidate_git_sha is rejected
-
-- **WHEN** on-disk `latest.json` is otherwise release-eligible
-- **AND** `--packed-candidate` is this ship's `integrated_candidate.git_sha` `C`
-- **AND** HMAC `candidate_git_sha` is a 40-hex SHA that is not `C`
-- **THEN** the command SHALL fail closed
-- **AND** it SHALL NOT create or push `v1.39.5`
-
-#### Scenario: Packed candidate may differ from the merge commit
-
-- **WHEN** `--packed-candidate` is `C`
-- **AND** HMAC `candidate_git_sha` equals `C`
-- **AND** the merged release PR merge commit is `M`
-- **AND** `C` and `M` differ
-- **THEN** the command SHALL create and push annotated tag `v1.39.5` on peeled `M`
-- **AND** it SHALL NOT tag `C` instead of `M`
-
-#### Scenario: Wrong existing tag fails closed
-
-- **WHEN** `refs/tags/v1.39.5` already exists as a lightweight tag or peels to a commit other than the merge
-- **THEN** the command SHALL fail closed
-- **AND** it SHALL NOT force-update or delete the tag
-
-#### Scenario: HMAC candidate SHA comes from the validated snapshot
-
-- **WHEN** `pipeline release ensure-tag` validates on-disk `latest.json`
-- **AND** a concurrent writer replaces that file after the HMAC-valid read
-- **THEN** `--packed-candidate` SHALL be compared to `candidate_git_sha` from the validated snapshot
-- **AND** the helper SHALL NOT reopen `latest.json` for that comparison
-
-#### Scenario: Unauthenticated factory_release_binding overlay is rejected
-
-- **WHEN** on-disk `latest.json` is HMAC-valid for packed candidate `A`
-- **AND** a writer adds or changes `factory_release_binding.candidate_git_sha` to `B` after signing
-- **THEN** `pipeline release ensure-tag` SHALL fail closed
-- **AND** it SHALL NOT create or push `v1.39.5`
-
-#### Scenario: Local annotated tag with no remote tag is pushed
-
-- **WHEN** local `refs/tags/v1.39.5` is an annotated tag on the merge commit
-- **AND** origin has no `refs/tags/v1.39.5`
-- **THEN** the command SHALL push the verified local tag
-- **AND** SHALL NOT return success as if the tag were already published
-
-#### Scenario: Wrong remote tag still fails closed after a local tag exists
-
-- **WHEN** local `refs/tags/v1.39.5` is the correct annotated tag
-- **AND** origin has a lightweight tag or a tag on a different commit
-- **THEN** the command SHALL fail closed
-- **AND** it SHALL NOT force-update or delete the tag
 
 ### Requirement: In-engine ship FRG pack wait SHALL outlive the bound pack loop
 
@@ -905,3 +771,14 @@ When a post-ready ship phase fails, times out, or is interrupted, `pipeline ship
 - **THEN** the coordinator SHALL record the mutation under operation `tag`
 - **AND** it SHALL NOT reuse `release_wait` for that tag mutation
 - **AND** GitHub Release publication wait SHALL remain `release_wait`
+
+### Requirement: Historical optional-FRG, finish, and ship-promotion SHALL remain identifiable as historical
+
+Historical optional-FRG, `release finish` as a tag or publish owner, `release ensure-tag`, and ship-promotion instructions SHALL remain identifiable as historical. They SHALL NOT be the live `pipeline ship` procedure. Exact-candidate FRG SHALL remain owned by independently complete release. `engine-promote` SHALL remain a separate operator command and SHALL NOT be invoked by live ship-final-delegation.
+
+#### Scenario: Historical ship-promotion is not the live tail
+
+- **WHEN** an operator reads the live ship procedure
+- **THEN** the procedure SHALL end at complete-release delegation
+- **AND** factory-pack FRG, finish, ensure-tag, promotion, and install SHALL be identifiable as historical rather than required live steps
+

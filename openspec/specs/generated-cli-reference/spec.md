@@ -2,9 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change docs-generate-cli-config-reference. Update Purpose after archive.
-
 ## Requirements
-
 ### Requirement: CLI reference documentation SHALL be generated from the command registry
 
 The repository SHALL provide a deterministic generator that emits the human CLI reference document `docs/cli.md` from `COMMAND_REGISTRY` (and its co-located documentation metadata). Every registry command marked as documented SHALL appear in the generated reference with at least a usage synopsis and a one-line summary. Registry keywords marked undocumented or hidden SHALL NOT appear in the generated reference. The generator SHALL NOT invent commands that are absent from the registry.
@@ -153,3 +151,20 @@ The generated `docs/cli.md` entry for `pipeline override` SHALL state that the e
 - **WHEN** `docs/cli.md` describes override only as disposing a finding and auto-resuming, with no operator-supplied qualifier
 - **THEN** the docs generator check mode SHALL fail
 - **AND** `node scripts/build.mjs --check` SHALL still be the sole host-SKILL freshness gate
+
+### Requirement: Generated CLI catalog SHALL present the live release contract
+
+The generated `docs/cli.md` entry for `release` SHALL present independent `pipeline release VERSION` as direct-release: the complete SemVer contract for an exact candidate. The generated entry for `ship` SHALL present SemVer completion as ship-final-delegation to that independent release. Neither entry SHALL present historical optional-FRG, finish-as-tag-or-publish-owner, or ship-promotion as the live command contract. Explicit `release prepare` SHALL remain documented as the bounded metadata helper. If `release finish` remains listed, its summary SHALL identify it as a metadata-PR merge helper or as historical, and SHALL NOT describe it as the live complete-release command.
+
+#### Scenario: Release catalog names direct-release
+
+- **WHEN** `docs/cli.md` is generated from the current catalog
+- **THEN** the `release` entry SHALL present `pipeline release VERSION` as the independently complete SemVer contract
+- **AND** it SHALL NOT present optional-FRG, finish, or ship-promotion as the live complete-release command
+
+#### Scenario: Ship catalog names ship-final-delegation
+
+- **WHEN** `docs/cli.md` is generated from the current catalog
+- **THEN** the `ship` entry SHALL present SemVer completion as exactly one delegation to independent release
+- **AND** it SHALL NOT present install, promotion, or deployment as part of that command
+
