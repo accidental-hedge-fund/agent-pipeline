@@ -387,6 +387,12 @@ export interface ProductionExactCandidateFrgIo {
   readCurrentReviewEvidence(
     input: BeginExactCandidateFrgInput, issueNumber: number, prNumber: number, headSha: string, diffHash: string,
   ): Promise<{ advanceRunId: string; summary: ExactAdvanceSummary; reviewedHeadSha: string; reviewedDiffHash: string } | null>;
+  /**
+   * Test seam for same-host release/FRG exclusion. Production omits this and
+   * uses the host-local `PipelineLock`. Unit tests must inject a fake lock so
+   * they never contend with a live release/FRG process on the same machine.
+   */
+  makeLock?(lockDomain: string): ReleaseFrgExclusionLock;
 }
 
 export interface CandidateOrdinaryLoopExecution {
@@ -2639,7 +2645,7 @@ export async function runProductionExactCandidateFrg(
     const existing = selectExactCandidateFrgExistingRecord(records, candidate);
     const epochId = existing ? existing.epoch_id : nextExactCandidateFrgEpochId(records, input.releaseVersion, candidate);
     return runExactCandidateFrg({ ...boundInput, epochId, expectedCandidateSha: candidate }, deps, existing ?? undefined);
-  });
+  }, io.makeLock);
 }
 
 export interface DiscoveredExactCandidateFrgPair {
