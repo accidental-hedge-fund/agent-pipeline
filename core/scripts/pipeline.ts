@@ -2906,11 +2906,43 @@ export function realExecuteRecovery(
         const readTs = deps.readTrustedSurfaceDecision ?? readTrustedSurfaceDecision;
         let trustedSurface = runDir ? await readTs(runDir).catch(() => null) : null;
         let pushedHeadSha: string | null = null;
+        let wt: Awaited<ReturnType<typeof getWorktree>> = null;
         try {
-          const wt = await getWorktree(cfg, issueNumber);
+          wt = await getWorktree(cfg, issueNumber);
           if (wt) pushedHeadSha = await gitHead(wt.path);
         } catch {
           pushedHeadSha = null;
+        }
+        const livePrHeadShaForAlign = normalizeFullSha(prDetail?.head_sha);
+        if (
+          wt &&
+          livePrHeadShaForAlign &&
+          pushedHeadSha &&
+          pushedHeadSha !== livePrHeadShaForAlign
+        ) {
+          const fetch = await gitInWt(
+            wt.path,
+            ["fetch", "--update-head-ok", "origin", livePrHeadShaForAlign],
+            { ignoreFailure: true },
+          );
+          const checkout = await gitInWt(
+            wt.path,
+            ["checkout", "--force", livePrHeadShaForAlign],
+            { ignoreFailure: true },
+          );
+          if (checkout.code !== 0) {
+            return failed(
+              `rebind_tester_evidence_after_pr: cannot checkout linked PR head ${livePrHeadShaForAlign}` +
+                `${checkout.stderr.trim() ? `: ${checkout.stderr.trim()}` : ""}` +
+                `${fetch.code !== 0 && fetch.stderr.trim() ? `; fetch: ${fetch.stderr.trim()}` : ""}`,
+            );
+          }
+          pushedHeadSha = await gitHead(wt.path);
+          if (normalizeFullSha(pushedHeadSha) !== livePrHeadShaForAlign) {
+            return failed(
+              `rebind_tester_evidence_after_pr: worktree HEAD ${pushedHeadSha} still disagrees with linked PR head ${livePrHeadShaForAlign} after checkout`,
+            );
+          }
         }
         const persistedEngine = runDir
           ? await (deps.resolveRunEngineIdentity ?? resolveRunEngineIdentity)(runDir, () => undefined)
