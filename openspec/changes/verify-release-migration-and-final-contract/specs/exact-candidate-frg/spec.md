@@ -37,6 +37,14 @@ The product SHALL provide ownership-safe cleanup and migration behavior for know
 - **THEN** the product SHALL NOT persist `known_failed_synthetic` classification
 - **AND** cleanup SHALL produce no mutating cleanup actions
 
+#### Scenario: Failed outcome does not infer synthetic classification
+
+- **WHEN** an exact-candidate FRG records `gate_defect`, `exact_candidate_regression`, or `stale_candidate`
+- **AND** the record has persisted synthetic-fixture provenance from the fixture create path
+- **AND** the record has no persisted failed-synthetic classification
+- **THEN** the product SHALL NOT persist `known_failed_synthetic` classification from that outcome
+- **AND** cleanup SHALL produce no mutating cleanup actions
+
 #### Scenario: Ordinary exact-candidate records are not mutated
 
 - **WHEN** cleanup receives an exact-candidate record that lacks persisted failed-synthetic classification

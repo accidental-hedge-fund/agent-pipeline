@@ -1254,11 +1254,11 @@ async function persistOutcome(
   record.outcome_detail = detail;
   record.external_wait = wait;
   record.updated_at = iso(deps.now());
-  if (isFailedSyntheticCleanupOutcome(outcome) && hasPersistedSyntheticFixtureProvenance(record)) {
-    if (record.failed_synthetic == null) {
-      record.failed_synthetic = { classified_at: record.updated_at, classification: "known_failed_synthetic" };
-    }
-  } else {
+  // Keep an explicit classification only when fixture-create provenance already
+  // exists. Never infer known_failed_synthetic from the FRG outcome itself.
+  if (!(record.failed_synthetic?.classification === "known_failed_synthetic"
+      && isFailedSyntheticCleanupOutcome(outcome)
+      && hasPersistedSyntheticFixtureProvenance(record))) {
     record.failed_synthetic = null;
   }
   await deps.persist(record);
@@ -1594,6 +1594,7 @@ function stampSyntheticFixtureProvenance(slot: ExactCandidateFrgSlot, issueNumbe
 
 function isPersistedFailedSynthetic(record: ExactCandidateFrgRecord): boolean {
   return record.failed_synthetic?.classification === "known_failed_synthetic"
+    && isFailedSyntheticCleanupOutcome(record.outcome)
     && hasPersistedSyntheticFixtureProvenance(record);
 }
 

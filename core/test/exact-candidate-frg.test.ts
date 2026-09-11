@@ -902,6 +902,51 @@ test("failed FRG without synthetic-fixture provenance is not classified as known
   assert.deepEqual(order, ["persist-unclassified", "cleanup-unclassified", "persist-unclassified"]);
 });
 
+test("failed FRG does not infer known failed synthetic from outcome even with fixture provenance", async () => {
+  const mutated: string[] = [];
+  const { record, deps } = await begun({
+    cleanup: async (cleanupInput) => cleanupOwnedFailedSyntheticArtifacts(cleanupInput, {
+      now: () => new Date("2026-09-10T00:00:00.000Z"),
+      getIssue: async (issueNumber) => {
+        mutated.push(`issue:${issueNumber}`);
+        return { body: "", labels: [], state: "open" };
+      },
+      getPr: async (prNumber) => {
+        mutated.push(`pr:${prNumber}`);
+        return { number: prNumber, head_sha: "1".repeat(40), state: "open", merged: false };
+      },
+      observeBranch: async (name) => {
+        mutated.push(`branch-read:${name}`);
+        return { name, sha: "1".repeat(40) };
+      },
+      deleteBranch: async (name) => { mutated.push(`branch:${name}`); },
+      observeWorktree: async (worktreePath) => {
+        mutated.push(`worktree-read:${worktreePath}`);
+        return { path: worktreePath, owned: true, identity: "issue:101" };
+      },
+      deleteOwnedWorktree: async (worktreePath) => { mutated.push(`worktree:${worktreePath}`); },
+    }),
+  });
+  const created = await reconcileExactCandidateFrgPair(record, deps);
+  created.loop_run_id = CANONICAL_LOOP;
+  created.loop_dispatch_certainty = "known_complete";
+  created.slots.forEach((slot, index) => {
+    slot.advance_run_id = `advance-${index + 1}`;
+  });
+  deps.observeFixture = async (current, slot) => {
+    const observation = passingObservation(current, slot.id === "clean-docs" ? 0 : 1);
+    if (slot.id === "clean-docs") observation.ingress_claims = ["ordinary-summary:worker-role-mismatch"];
+    return observation;
+  };
+  const result = await observeExactCandidateFrgPair(created, deps);
+  assert.equal(result.outcome, "gate_defect");
+  assert.ok(result.slots.every((slot) => slot.synthetic_fixture?.source === "synthetic_fixture_create"));
+  assert.equal(result.failed_synthetic ?? null, null);
+  assert.deepEqual(mutated, []);
+  assert.ok(result.cleanup.every((fact) => fact.status === "debt"));
+  assert.ok(result.cleanup.every((fact) => /not a persisted known failed synthetic artifact/.test(fact.detail)));
+});
+
 test("failed synthetic classification is persisted before cleanup", async () => {
   const order: string[] = [];
   const classifiedPersists: ExactCandidateFrgRecord[] = [];
@@ -924,6 +969,13 @@ test("failed synthetic classification is persisted before cleanup", async () => 
     },
   });
   const created = await reconcileExactCandidateFrgPair(record, deps);
+  created.outcome = "gate_defect";
+  created.outcome_detail = "explicit failed-synthetic classification";
+  created.gate_evidence = [{
+    source: "controller", slot_id: null, issue_number: null, pr_number: null,
+    candidate_sha: created.candidate.sha, observed_head_sha: null, fact: "explicit failed-synthetic classification",
+  }];
+  created.failed_synthetic = { classified_at: "2026-09-08T20:01:00.000Z", classification: "known_failed_synthetic" };
   created.loop_run_id = CANONICAL_LOOP;
   created.loop_dispatch_certainty = "known_complete";
   created.slots.forEach((slot, index) => {
@@ -1187,6 +1239,36 @@ test("ordinary exact-candidate records produce no mutating cleanup actions", asy
     deleteOwnedWorktree: async (worktreePath) => { mutated.push(`worktree:${worktreePath}`); },
   });
   assert.equal(issueReads, 0);
+  assert.deepEqual(mutated, []);
+  assert.ok(facts.every((fact) => fact.status === "debt"));
+  assert.ok(facts.every((fact) => /not a persisted known failed synthetic artifact/.test(fact.detail)));
+});
+
+test("successful exact-candidate records do not mutate even with leftover failed-synthetic classification", async () => {
+  const record = ownedCleanupRecord();
+  record.outcome = "passed";
+  const mutated: string[] = [];
+  const facts = await cleanupOwnedFailedSyntheticArtifacts(record, {
+    now: () => new Date("2026-09-10T00:00:00.000Z"),
+    getIssue: async (issueNumber) => {
+      mutated.push(`issue:${issueNumber}`);
+      return { body: provenanceBody(record, record.slots.find((item) => item.issue_number === issueNumber)!), labels: [], state: "open" };
+    },
+    getPr: async (prNumber) => {
+      mutated.push(`pr:${prNumber}`);
+      return { number: prNumber, head_sha: "1".repeat(40), state: "open", merged: false };
+    },
+    observeBranch: async (name) => {
+      mutated.push(`branch-read:${name}`);
+      return { name, sha: "1".repeat(40) };
+    },
+    deleteBranch: async (name) => { mutated.push(`branch:${name}`); },
+    observeWorktree: async (worktreePath) => {
+      mutated.push(`worktree-read:${worktreePath}`);
+      return { path: worktreePath, owned: true, identity: "issue:101" };
+    },
+    deleteOwnedWorktree: async (worktreePath) => { mutated.push(`worktree:${worktreePath}`); },
+  });
   assert.deepEqual(mutated, []);
   assert.ok(facts.every((fact) => fact.status === "debt"));
   assert.ok(facts.every((fact) => /not a persisted known failed synthetic artifact/.test(fact.detail)));
