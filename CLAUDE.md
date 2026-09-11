@@ -52,7 +52,10 @@ review steps must follow.
 
 ## Build & test
 
-- Tests: `node --test --experimental-strip-types test/*.test.ts` (from `core/`). Run all via
+- Tests: `npm test` (from `core/`). Direct single-file runs must include
+  `node --import ./test/helpers/isolated-observability.ts --test --experimental-strip-types test/<name>.test.ts`
+  so synthetic inbox and invocation-context writes stay in memory, not the installed
+  host telemetry exporter. Run all via
   `npm test` (core) or `npm run ci` (full gate) from root. There is **no `tsc` step** — types are
   stripped, not checked, so a type-only guarantee (e.g. `Record<keyof I, …>`) is NOT enforced at
   runtime; back such invariants with a real runtime test.

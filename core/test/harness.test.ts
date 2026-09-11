@@ -12,6 +12,7 @@
 // no model). Built-in harness shapes are not spawned here (that would run the
 // real claude/codex CLIs); they are unchanged code branches.
 
+import "./helpers/isolated-observability.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";

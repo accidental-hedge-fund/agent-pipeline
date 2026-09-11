@@ -4,6 +4,7 @@
 // throwing fake that proves the unreachable-provider path fails without a live
 // network dependency.
 
+import "./helpers/isolated-observability.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -19,6 +20,7 @@ import {
   STAGES,
 } from "../scripts/types.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+import { defaultRunStoreDeps } from "../scripts/run-store.ts";
 
 // ---------------------------------------------------------------------------
 // Stage-set invariants (#314 task 2.4) — types are stripped at runtime, so the
@@ -713,7 +715,13 @@ test("invokeExternalExecutor: rate-limit (429) is retried and observed in proven
   assert.equal(result.executor_provenance?.rate_limited, true);
 });
 
-test("invokeExternalExecutor: model-endpoint request payload is recorded in accounting evidence with headers by name only, never a resolved secret (#434)", async () => {
+test("invokeExternalExecutor: model-endpoint request payload is recorded in accounting evidence with headers by name only, never a resolved secret (#434)", async (t) => {
+  const captured: unknown[] = [];
+  const ambientSink = t.mock.method(defaultRunStoreDeps, "accountingSink", async () => {});
+  const runStoreDeps = {
+    ...defaultRunStoreDeps,
+    accountingSink: async (_dir: string, record: unknown) => { captured.push(record); },
+  };
   process.env.OPENROUTER_API_KEY = "or-secret-value";
   process.env.OPENROUTER_REFERER = "https://super-secret-referer.internal";
   const fs = await import("node:fs");
@@ -745,7 +753,7 @@ test("invokeExternalExecutor: model-endpoint request payload is recorded in acco
       "review-1",
       a,
       "prompt",
-      { timeoutSec: 5, accounting: { runDir, issue: 43, stage: "review-1", modelSlot: "review" } },
+      { timeoutSec: 5, accounting: { runDir, issue: 43, stage: "review-1", modelSlot: "review", runStoreDeps } },
       { fetchImpl },
     );
 
@@ -754,6 +762,9 @@ test("invokeExternalExecutor: model-endpoint request payload is recorded in acco
     assert.ok(!eventsRaw.includes("https://super-secret-referer.internal"));
     const accountingLine = eventsRaw.split("\n").find((l) => l.includes("stage_accounting"));
     const parsed = JSON.parse(accountingLine!);
+    assert.equal(ambientSink.mock.callCount(), 0, "mocked provider usage must never reach the ambient exporter");
+    assert.equal(captured.length, 1, "the injected sink still receives final accounting");
+    assert.equal((captured[0] as { cost_usd: number }).cost_usd, 0.01);
     assert.equal(parsed.provider_auth_class, "api-key:model-endpoint");
     assert.equal(parsed.upstream_provider, "OpenAI");
     assert.equal(parsed.request_id, "gen-1");
