@@ -176,6 +176,16 @@ function finishMetadataCommand(opts: {
   };
 }
 
+test("complete release ignores historical HMAC latest.json and does not deploy", async () => {
+  const src = fs.readFileSync(new URL("../scripts/stages/release-complete.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(src, /lookupFrgPass|validateFrgEvidenceFileForTag|latest\.json/);
+  assert.doesNotMatch(src, /engine-promote|enginePromote|installHost|deploy\(/);
+  const d = deps();
+  const result = await runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d);
+  assert.equal(result?.candidate_sha, C);
+  assert.equal(d.calls.some((call) => /promote|install|deploy/.test(call)), false);
+});
+
 test("complete release orders metadata merge before C/FRG/tag/publication", async () => {
   const d = deps();
   const result = await runCompleteRelease("1.2.3", {}, { repo_dir: "/repo", repo: "o/r" }, d);

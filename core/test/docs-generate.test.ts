@@ -169,6 +169,29 @@ describe("command-docs metadata", () => {
     );
   });
 
+  test("live release and ship catalog present direct-release and ship-final-delegation (#1564)", () => {
+    const release = OPERATION_SURFACE.find((op) => op.name === "release");
+    const ship = OPERATION_SURFACE.find((op) => op.name === "ship");
+    assert.ok(release);
+    assert.ok(ship);
+    assert.match(release.desc, /Direct-release/i);
+    assert.match(release.desc, /metadata-PR merge helper/i);
+    assert.match(release.desc, /Neither path deploys, promotes, or installs/i);
+    assert.doesNotMatch(release.desc, /optional-FRG|skip-frg|ship-promotion|engine-promote/i);
+    assert.match(ship.desc, /ship-final-delegation/i);
+    assert.match(ship.desc, /exactly one complete-release/i);
+    assert.match(ship.desc, /Neither path deploys, promotes, or installs/i);
+    assert.doesNotMatch(ship.desc, /optional-FRG|release finish|engine-promote|ship-promotion/i);
+    const md = renderCliMarkdown();
+    const releaseSection = md.split("#### `release`")[1]?.split("####")[0] ?? "";
+    const shipSection = md.split("#### `ship`")[1]?.split("####")[0] ?? "";
+    assert.match(releaseSection, /Direct-release/);
+    assert.match(releaseSection, /metadata-PR merge helper/);
+    assert.doesNotMatch(releaseSection, /optional-FRG|skip-frg|ship-promotion/);
+    assert.match(shipSection, /Ship-final-delegation/);
+    assert.doesNotMatch(shipSection, /optional-FRG|release finish|engine-promote|ship-promotion/);
+  });
+
   test("OPERATION_SURFACE drives the default CLI catalog", () => {
     const status = OPERATION_SURFACE.find((op) => op.name === "status");
     assert.ok(status);

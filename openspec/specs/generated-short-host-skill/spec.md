@@ -2,9 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change generate-short-host-skill. Update Purpose after archive.
-
 ## Requirements
-
 ### Requirement: Repository SHALL keep one shared orchestration-contract source
 
 The repository SHALL keep `core/scripts/host-skill.ts` as the single committed one-pager renderer. Its single deep interface SHALL include `renderHostSkill(options?)`, which returns the complete host-neutral SKILL bytes and MAY receive `operationSurface` and `manifests` for deterministic in-process tests. When omitted, those inputs SHALL default to `OPERATION_SURFACE` and `loadOuterHostManifestsPreferHosts()`. The module SHALL export one issue-locked `SKILL_HOST_IDS` tuple containing exactly `claude`, `codex`, `grok`, and `opencode`; that tuple SHALL be the sole generated-host membership source and SHALL NOT contain notify values or lifecycle behavior. The renderer SHALL select those IDs in tuple order, require exactly one manifest for each selected ID, fail closed on missing or duplicate selected IDs, and exclude non-selected manifests such as OMP. It SHALL derive the displayed notify values only from each selected manifest's `material_progress_notify.mapping`; it SHALL NOT own or hardcode a parallel host/surface/tool map. The module SHALL state the follow/notify contract: capture `run_id` from the durable loop handoff as `loop_run_id` for mutating `pipeline <N>`, `pipeline single`, and `pipeline loop`; use `pipeline loop logs <loop-run-id> --events --follow` as the primary follow; after linkage use `pipeline logs <advance-run-id> --events --follow` for the linked child advance; reattach after an interrupted follow; stop only the matching advance follow on advance `run_complete`; stop the loop-scoped set on `loop_run_complete`, `loop_run_stopped`, or supervisor exit; surface the terminal reason and final summary; and forbid the follower or observer from invoking a merge-capable command. Generated SKILLs SHALL retain `pipeline <N>` as the default numeric issue/PR drive syntax and SHALL NOT recommend a raw-advance bypass. Issue #971 SHALL be able to call that same interface without copying a host SKILL essay. This change SHALL NOT add Hermes or OpenClaw install logic.
@@ -317,3 +315,20 @@ A co-located unit test SHALL fail when any of the four generated host SKILLs, or
 - **WHEN** the test inspects Claude, Codex, Grok, and OpenCode generated SKILLs
 - **THEN** each file SHALL fail the same assertions if inferred override is again the autonomous next action
 - **AND** a single-host-only assertion SHALL NOT be sufficient
+
+### Requirement: Generated host SKILL verb tables SHALL present the live release contract
+
+The four generated host SKILL verb tables SHALL present independent `pipeline release` as direct-release and SemVer `pipeline ship --milestone` completion as ship-final-delegation. They SHALL NOT present historical optional-FRG, finish-as-tag-or-publish-owner, or ship-promotion as the live command contract. They SHALL NOT present install, promotion, or deployment as part of release or ship. Compact policy SHALL continue to map `Ship milestone vX.Y.Z` to `pipeline ship --milestone vX.Y.Z` without a grant file.
+
+#### Scenario: Host SKILL release row is direct-release
+
+- **WHEN** a reader opens any of the four generated host SKILLs
+- **THEN** the `release` verb row SHALL present independent complete SemVer release for an exact candidate
+- **AND** it SHALL NOT present optional-FRG, finish, or ship-promotion as the live command
+
+#### Scenario: Host SKILL ship row is ship-final-delegation
+
+- **WHEN** a reader opens any of the four generated host SKILLs
+- **THEN** the `ship` verb row SHALL present train then exactly one complete-release delegation
+- **AND** it SHALL NOT present install, promotion, or deployment as part of that verb
+

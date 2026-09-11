@@ -76,7 +76,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `release`
 
 - **Usage:** `pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] | pipeline release prepare <version> [--json] | pipeline release finish <pr> [--json]`
-- **Summary:** Independently complete a verified SemVer release: validate contained milestone implementations, merge/reuse metadata, run exact-candidate FRG, create/verify annotated tag C, and verify publication. Explicit prepare is bounded and never tags
+- **Summary:** Direct-release: independently complete the SemVer contract for an exact candidate (milestone, metadata, exact-candidate FRG, annotated tag C, publication). Explicit prepare is the bounded metadata helper and never tags. release finish is a metadata-PR merge helper, not the live complete-release command. Neither path deploys, promotes, or installs
 
 #### `remove-worktree`
 
@@ -86,7 +86,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `ship`
 
 - **Usage:** `pipeline ship --milestone vX.Y.Z [--json] | pipeline ship status --milestone vX.Y.Z [--json]`
-- **Summary:** Run or inspect one durable milestone shipment: train --merge, then exactly one delegation to the complete release owner. Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.
+- **Summary:** Ship-final-delegation: train --merge, then exactly one complete-release call. Direct-release and this tail complete the same SemVer contract. Neither path deploys, promotes, or installs. Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.
 
 #### `status`
 

@@ -50,11 +50,14 @@ Harvested invariants (still product goals):
 3. **Thin multi-platform supervisor bootstrap** — done: [supervisor.md](./supervisor.md),
    [`examples/supervisor/`](../examples/supervisor/), Hermes production runbook
    [runbooks/hermes-supervisor-deployment.md](./runbooks/hermes-supervisor-deployment.md).
-4. **Release finish** — `pipeline release finish <pr>` merges a prepared release PR
-   (never tags; workflows tag/publish).
-5. **Self-host pin/install** — `pipeline engine-promote --for X.Y.Z`: verify GitHub
-   Release, promote production pin (FRG-gated), install exact tag, verify version;
-   roll pin back if install fails.
+4. **Release finish (historical)** — `pipeline release finish <pr>` remains a
+   metadata-PR merge helper (never tags; workflows tag/publish). It is not the
+   live complete-release command. Direct-release is `pipeline release VERSION`.
+5. **Self-host pin/install (historical as a ship tail)** — `pipeline engine-promote --for X.Y.Z`
+   remains a separate operator command: verify GitHub Release, promote production
+   pin, install exact tag, verify version. Generic install/verify failure does not
+   roll the pin back; use `pipeline factory-pin rollback`. Live ship-final-delegation
+   does not promote or install.
 
 ## What stays in core
 
@@ -67,6 +70,12 @@ Harvested invariants (still product goals):
 Older pilot design and host runbooks may remain as **historical** notes only.
 They are not the install or startup path.
 
-## Thin ship and FRG (2026-08-10)
+## Historical thin ship and optional-FRG (2026-08-10)
 
-Milestone ship uses `train --merge` → `release --skip-frg` → `release finish` → `engine-promote --skip-frg`. FRG remains an explicit optional command (`factory-gate` / durable `factory-release prepare`), not a hard dependency of cutting a release after a successful integrate train.
+This 2026-08-10 sequence is **historical**. It is not the live procedure.
+Historical milestone ship used `train --merge` → `release --skip-frg` →
+`release finish` → `engine-promote --skip-frg`. Live ship-final-delegation is
+`train --merge` then exactly one complete `pipeline release VERSION` call.
+Direct-release is that same complete owner. Neither live path deploys, promotes,
+or installs. Historical factory-pack FRG (`factory-gate` / durable
+`factory-release prepare`) is not the live exact-candidate proof.

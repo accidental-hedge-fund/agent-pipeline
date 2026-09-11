@@ -70,8 +70,11 @@ PRs and skip the already-integrated set in the same run. Freeze does not invent
 a second integrated classifier; a closed ready-to-deploy issue without a merged
 contained PR still hits train merge-mode fail-closed law.
 
-A missing FRG pass is **not** recovered by `--skip-frg` on a non-claude profile.
-Run the pack on a native-`/goal` engine, then score it:
+Live exact-candidate FRG is owned by complete `pipeline release`. The following
+factory-pack recovery is **historical** and is not the live direct-release or
+ship-final-delegation procedure. A missing historical factory-pack FRG pass is
+**not** recovered by `--skip-frg` on a non-claude profile. Historical recovery
+ran the pack on a native-`/goal` engine, then scored it:
 
 ```bash
 pipeline loop --label factory-gate --profile claude

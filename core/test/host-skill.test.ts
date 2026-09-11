@@ -403,6 +403,20 @@ describe("renderHostSkill contract", () => {
     );
   });
 
+  test("verb table presents direct-release and ship-final-delegation (#1564)", () => {
+    const table = skill.split("## Operations")[1]?.split("## Follow")[0] ?? "";
+    assert.match(table, /Direct-release/);
+    assert.match(table, /Ship-final-delegation/);
+    assert.match(table, /metadata-PR merge helper/);
+    assert.doesNotMatch(table, /optional-FRG|skip-frg|ship-promotion/);
+    const releaseLine = table.split("\n").find((line) => line.includes("pipeline release <version>")) ?? "";
+    const shipLine = table.split("\n").find((line) => line.includes("pipeline ship --milestone vX.Y.Z")) ?? "";
+    assert.match(releaseLine, /Neither path deploys, promotes, or installs/);
+    assert.match(shipLine, /Neither path deploys, promotes, or installs/);
+    assert.doesNotMatch(releaseLine, /engine-promote|ship-promotion|optional-FRG/i);
+    assert.doesNotMatch(shipLine, /engine-promote|ship-promotion|release finish|optional-FRG/i);
+  });
+
   test("compact policy preserves merge-authority boundary", () => {
     assert.match(skill, /autonomous\nthrough `pipeline:ready-to-deploy` and never merge or deploy/);
     assert.match(skill, /`pipeline merge <pr>`/);
