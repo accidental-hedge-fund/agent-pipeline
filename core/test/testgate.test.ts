@@ -95,7 +95,12 @@ const failResult: RunTestsResult = { passed: false, output: "FAIL: 1 test failed
 for (const enabled of [false, true]) {
   test(`test gate forwards resolved observability to command and fix accounting (enabled=${enabled})`, async () => {
     const cfg = cfgWith({ max_attempts: 1 });
-    cfg.observability = { enabled, exporter: { type: "file", directory: "/telemetry/test" } };
+    cfg.observability = {
+      enabled,
+      traffic_class: "synthetic",
+      execution_purpose: "test",
+      exporter: { type: "file", directory: "/telemetry/test" },
+    };
     const exported: Array<PipelineConfig["observability"] | undefined> = [];
     const invocations: InvokeOptions[] = [];
     const runStoreDeps: RunStoreDeps = {
@@ -105,12 +110,23 @@ for (const enabled of [false, true]) {
       accountingSink: async (_dir, _record, config) => { exported.push(config); },
     };
     let commands = 0;
+    let afterFix = false;
+    const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
     const out = await runTestGate(cfg, 42, "/wt", {
       detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
       runTests: async () => commands++ === 0 ? failResult : passResult,
-      invoke: async (_h, _dir, _prompt, options) => { invocations.push(options!); return okInvoke(); },
-      ...cleanGitDeps(),
-    }, "42-test", "test-gate", undefined, "/runs/42-test", runStoreDeps);
+      invoke: async (_h, _dir, _prompt, options) => {
+        afterFix = true;
+        invocations.push(options!);
+        return okInvoke();
+      },
+      gitHead: async () =>
+        afterFix
+          ? "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          : "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
+    }, "42-test", "test-gate", undefined, runDir, runStoreDeps);
     assert.equal(out.passed, true);
     assert.equal(commands, 2);
     assert.deepEqual(exported, [cfg.observability, cfg.observability]);
