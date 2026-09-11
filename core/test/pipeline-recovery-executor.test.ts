@@ -716,13 +716,24 @@ test("rebind_tester_evidence_after_pr refreshes stale pre-PR trusted surface", a
   assert.deepEqual(reboundTrustedSurface, freshDecision);
 });
 
-test("rebind_tester_evidence_after_pr passes pushed worktree HEAD for the mismatch guard", async () => {
+test("rebind_tester_evidence_after_pr checkouts linked PR head when worktree is behind", async () => {
   const pushed = "a".repeat(40);
   const prHead = "b".repeat(40);
+  let head = pushed;
+  const gitArgs: string[][] = [];
   let receivedPushed: string | null | undefined;
+  let receivedPr: string | null | undefined;
   const execute = realExecuteRecovery(cfg(), {
     getOnDiskForIssue: async () => ({ path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never),
-    gitHead: async () => pushed,
+    gitHead: async () => head,
+    gitInWorktree: async (_cwd, args) => {
+      gitArgs.push([...args]);
+      if (args[0] === "checkout" && args.includes(prHead)) {
+        head = prHead;
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
     resolveRunEngineIdentity: async () => persistedEngineIdentity(),
     getPrForIssue: async () => 99,
     getPrDetail: async () => ({ number: 99, head_sha: prHead } as never),
@@ -733,34 +744,22 @@ test("rebind_tester_evidence_after_pr passes pushed worktree HEAD for the mismat
     }) as never,
     rebindTesterEvidenceAfterPr: async (input) => {
       receivedPushed = input.pushedHeadSha ?? null;
+      receivedPr = input.prHeadSha ?? null;
       return {
-        ok: false,
-        code: "tester_rebind_pr_head_mismatch",
-        summary: `tester rebind: linked PR head ${prHead} disagrees with pushed head ${pushed}`,
+        ok: true,
+        action: "reproduce",
         candidateSha: prHead,
-        evidence: null,
-        diagnostic: buildStageDiagnostic({
-          reasonCode: "workflow-engine-defect",
-          blockerKind: "harness-failure",
-          reason: "mismatch",
-          stage: "design-gate",
-        }),
-        blocker: {
-          schema_version: 1,
-          kind: "tester_rebind_blocker",
-          code: "tester_rebind_pr_head_mismatch",
-          candidate_sha: prHead,
-          pr: 99,
-          summary: "mismatch",
-        },
+        evidence: { candidate_sha: prHead } as never,
+        suiteCommandInvoked: true,
       };
     },
+    clearBlocked: async () => {},
   });
   const diagnostic = buildStageDiagnostic({
     reasonCode: "workflow-engine-defect",
     blockerKind: "harness-failure",
     reason: "required implementation evidence role, observed missing",
-    stage: "design-gate",
+    stage: "fix-1",
     evidenceOrdering: {
       kind: "tester_rebind_after_pr",
       required_role: "implementation",
@@ -775,9 +774,55 @@ test("rebind_tester_evidence_after_pr passes pushed worktree HEAD for the mismat
     blockerClass: "workflow-engine-defect",
     diagnostic,
   });
-  assert.equal(receivedPushed, pushed);
+  assert.equal(result.succeeded, true, result.error ?? result.evidence);
+  assert.equal(receivedPr, prHead);
+  assert.equal(receivedPushed, prHead);
+  assert.ok(gitArgs.some((args) => args[0] === "fetch"));
+  assert.ok(gitArgs.some((args) => args[0] === "checkout" && args.includes(prHead)));
+});
+
+test("rebind_tester_evidence_after_pr fail-closes when linked PR head cannot be checked out", async () => {
+  const pushed = "a".repeat(40);
+  const prHead = "b".repeat(40);
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never),
+    gitHead: async () => pushed,
+    gitInWorktree: async (_cwd, args) => {
+      if (args[0] === "checkout") {
+        return { stdout: "", stderr: "pathspec did not match", code: 1 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    resolveRunEngineIdentity: async () => persistedEngineIdentity(),
+    getPrForIssue: async () => 99,
+    getPrDetail: async () => ({ number: 99, head_sha: prHead } as never),
+    readTrustedSurfaceDecision: async () => ({
+      outcome: "passthrough",
+      candidate_sha: prHead,
+      effective_verifier_hash: "c".repeat(64),
+    }) as never,
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "required implementation evidence role, observed missing",
+    stage: "fix-1",
+    evidenceOrdering: {
+      kind: "tester_rebind_after_pr",
+      required_role: "implementation",
+      observed_role: "missing",
+      trusted_surface_outcome: "passthrough",
+      pr_head: prHead,
+    },
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "rebind_tester_evidence_after_pr",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
   assert.equal(result.succeeded, false);
-  assert.match(result.error ?? "", /tester_rebind_pr_head_mismatch/);
+  assert.match(result.error ?? "", /cannot checkout linked PR head/);
 });
 
 test("rebind_tester_evidence_after_pr binds a subject-less passed record with pinned engine identity", async () => {
