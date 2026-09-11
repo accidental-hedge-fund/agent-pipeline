@@ -82,6 +82,7 @@ export interface BuildStageAccountingRecordInput {
   requestId?: string | null;
   finishReason?: string | null;
   retryCount?: number | null;
+  httpStatus?: number | null;
   rateLimited?: boolean | null;
   effortSupport?: string | null;
   requestPayload?: Record<string, unknown> | null;
@@ -230,6 +231,7 @@ export function buildStageAccountingRecord(input: BuildStageAccountingRecordInpu
     ...(cleanOptionalString(input.requestId ?? null) !== null ? { request_id: cleanOptionalString(input.requestId ?? null) } : {}),
     ...(cleanOptionalString(input.finishReason ?? null) !== null ? { finish_reason: cleanOptionalString(input.finishReason ?? null) } : {}),
     ...(finiteNonNegative(input.retryCount) !== null ? { retry_count: nonNegativeInteger(input.retryCount) } : {}),
+    ...(Number.isInteger(input.httpStatus) && input.httpStatus! >= 100 && input.httpStatus! <= 599 ? { http_status: input.httpStatus! } : {}),
     ...(typeof input.rateLimited === "boolean" ? { rate_limited: input.rateLimited } : {}),
     ...(cleanOptionalString(input.effortSupport ?? null) !== null ? { effort_support: cleanOptionalString(input.effortSupport ?? null) } : {}),
     ...(input.requestPayload ? { request_payload: sanitizeDeep(input.requestPayload) } : {}),
@@ -308,6 +310,7 @@ export function sanitizeStageAccountingRecord(record: StageAccountingRecord): St
   if (finishReason !== null) cleaned.finish_reason = finishReason;
   const retryCount = finiteNonNegative(record.retry_count);
   if (retryCount !== null) cleaned.retry_count = nonNegativeInteger(retryCount);
+  if (Number.isInteger(record.http_status) && record.http_status! >= 100 && record.http_status! <= 599) cleaned.http_status = record.http_status;
   if (typeof record.rate_limited === "boolean") cleaned.rate_limited = record.rate_limited;
   const effortSupport = cleanOptionalString(record.effort_support ?? null);
   if (effortSupport !== null) cleaned.effort_support = effortSupport;

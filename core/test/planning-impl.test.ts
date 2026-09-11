@@ -16,7 +16,7 @@ import {
 } from "../scripts/stages/planning.ts";
 import { verifyPlanRevisionOutput } from "../scripts/verify-harness-commits.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
-import type { HarnessResult } from "../scripts/harness.ts";
+import type { HarnessResult, InvokeOptions } from "../scripts/harness.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 function msgsDeps(messages: string[]): VerifyDeps {
@@ -45,6 +45,27 @@ function cfgWithImplementing(alias: string): PipelineConfig {
     implementation_timeout: 2400,
     models: { planning: "sonnet", implementing: alias, review: "opus", fix: "sonnet" },
   } as unknown as PipelineConfig;
+}
+
+for (const enabled of [false, true]) {
+  test(`planning and implementing forward resolved observability configuration (enabled=${enabled})`, async () => {
+    const cfg = {
+      ...cfgWithImplementing("sonnet"),
+      repo_dir: "/repo",
+      observability: { enabled, exporter: { type: "file" as const, directory: "/telemetry/custom" } },
+    };
+    const calls: InvokeOptions[] = [];
+    const deps: PlanStepDeps = {
+      invoke: async (_h, _dir, _prompt, options) => {
+        calls.push(options!);
+        return okResult();
+      },
+    };
+    await invokeImplementer("claude", "/wt", "implement", cfg, {}, deps);
+    await invokePlanStep("claude", "/wt", "plan", cfg, {}, deps);
+    assert.equal(calls.length, 2);
+    for (const options of calls) assert.equal(options.pipelineConfig, cfg);
+  });
 }
 
 test("invokeImplementer: passes cfg.models.implementing to the harness when no CLI override (#70)", async () => {

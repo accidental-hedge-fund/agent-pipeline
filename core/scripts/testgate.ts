@@ -815,6 +815,7 @@ export async function runTestGate(
           prHeadSha,
         }),
         runStoreDeps,
+        cfg.observability,
       ).catch(() => {});
     }
     return res;
@@ -1072,6 +1073,7 @@ export async function runTestGate(
     const fixModel = cfg.models.fix;
     const invokeFix = () =>
       invokeFn(harness, wtPath, prompt, {
+        pipelineConfig: cfg,
         timeoutSec: cfg.fix_timeout,
         model: fixModel,
         sandbox: cfg.harness_sandbox,

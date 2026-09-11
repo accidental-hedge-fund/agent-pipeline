@@ -179,7 +179,7 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
         cfg.harnesses.implementer,
         cfg.repo_dir,
         prompt,
-        { stream: true, model: cfg.models.implementing },
+        { pipelineConfig: cfg, stream: true, model: cfg.models.implementing },
       );
       return { success: result.success, output: result.stdout };
     },
@@ -190,6 +190,7 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
         cfg.repo_dir,
         prompt,
         {
+          pipelineConfig: cfg,
           stream: true,
           model: resolveReviewerModelForHarness(
             cfg.harnesses.reviewerModel ?? cfg.models.review,

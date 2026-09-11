@@ -6,6 +6,8 @@
 import * as path from "node:path";
 import { writeFlushedStdoutLine } from "./loop/handoff.ts";
 import { isLogicalOperationId, mintLogicalOperationId } from "./logical-operation.ts";
+import { createLifecycleObservationSink } from "./observability.ts";
+import type { ObservabilityConfig } from "./types.ts";
 import {
   RUN_SCHEMA_VERSION,
   appendEvent,
@@ -239,8 +241,10 @@ export async function initTrainRunStore(input: {
   now?: () => Date;
   logicalOperationId?: string | null;
   mintLogicalOperationId?: () => string;
+  observability?: ObservabilityConfig;
 }): Promise<TrainRunStoreInit> {
-  const store = input.store ?? defaultRunStoreDeps;
+  const store = { ...(input.store ?? defaultRunStoreDeps),
+    observabilitySink: input.store?.observabilitySink ?? createLifecycleObservationSink(input.observability) };
   const logicalOperationId =
     typeof input.logicalOperationId === "string" && input.logicalOperationId.trim()
       ? input.logicalOperationId.trim()

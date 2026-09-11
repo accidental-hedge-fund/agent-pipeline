@@ -380,6 +380,7 @@ async function runEvalFixRound(
     invoke: async () => {
       const fixModel = cfg.models.fix;
       return deps.invoke(harness, wtPath, prompt, {
+        pipelineConfig: cfg,
         timeoutSec: cfg.fix_timeout,
         model: fixModel,
         sandbox: cfg.harness_sandbox,
@@ -646,7 +647,7 @@ export async function advanceEval(
           makeCommandRecord(cfg.eval_gate.command, 1, 0, lastResult.output),
         ).catch(() => {});
       }
-      await recordEvalAccounting(opts, issueNumber, cfg.eval_gate.command, lastResult, new Date(), new Date());
+      await recordEvalAccounting(opts, cfg, issueNumber, cfg.eval_gate.command, lastResult, new Date(), new Date());
       break;
     }
 
@@ -673,7 +674,7 @@ export async function advanceEval(
         ),
       ).catch(() => {});
     }
-    await recordEvalAccounting(opts, issueNumber, cfg.eval_gate.command, lastResult, startedAt, endedAt);
+    await recordEvalAccounting(opts, cfg, issueNumber, cfg.eval_gate.command, lastResult, startedAt, endedAt);
 
     if (lastResult.passed) break;
     // Tooling failures (timeout/spawn error) never route to a fix round, in
@@ -883,6 +884,7 @@ function buildEvalComment(opts: {
 
 async function recordEvalAccounting(
   opts: AdvanceEvalOpts,
+  cfg: PipelineConfig,
   issueNumber: number,
   command: string,
   result: EvalRunResult,
@@ -913,6 +915,7 @@ async function recordEvalAccounting(
       usage: { command },
     }),
     opts.runStoreDeps,
+    cfg.observability,
   ).catch(() => {});
 }
 

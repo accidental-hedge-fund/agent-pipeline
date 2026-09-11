@@ -681,6 +681,7 @@ export async function runEligibilityGate(
       judgeResult = await deps.invokeJudge(prompt, opts.worktreeDir, timeoutSec);
     } else {
       const harnessResult = await defaultInvoke(cfg.harnesses.reviewer, opts.worktreeDir, prompt, {
+        pipelineConfig: cfg,
         timeoutSec,
         model: resolveReviewerModelForHarness(
           cfg.harnesses.reviewerModel ?? cfg.models.review,

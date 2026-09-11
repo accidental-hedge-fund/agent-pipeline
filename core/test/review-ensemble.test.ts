@@ -16,7 +16,7 @@ import {
   tryParseUsableReviewVerdict,
 } from "../scripts/review-ensemble.ts";
 import { findingKey } from "../scripts/review-policy.ts";
-import type { HarnessResult } from "../scripts/harness.ts";
+import type { HarnessResult, InvokeOptions } from "../scripts/harness.ts";
 import type { PipelineConfig, ReviewFinding, ReviewVerdict } from "../scripts/types.ts";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
 
@@ -548,6 +548,34 @@ test("invokeReviewEnsemble: sole agent with heading-only plan review fails close
 // ---------------------------------------------------------------------------
 // Orchestration with injected fakes
 // ---------------------------------------------------------------------------
+
+for (const enabled of [false, true]) {
+  test(`review ensemble preserves resolved observability through self-review fallback (enabled=${enabled})`, async () => {
+    const cfg = baseCfg({
+      observability: { enabled, exporter: { type: "file", directory: "/telemetry/reviews" } },
+      review_ensemble: {
+        enabled: true,
+        agents: [{ role: "primary" }, { harness: "claude" }],
+        min_usable_agents: 1,
+        max_agents: 4,
+      },
+    });
+    const calls: Array<{ harness: string; options: InvokeOptions }> = [];
+    const out = await invokeReviewEnsemble(cfg, {
+      worktreeDir: "/wt", prompt: "review", implementer: "grok", kind: "structured", timeoutSec: 30,
+      // The resolved config, not stale/injected invocation options, is authoritative.
+      invokeOpts: { pipelineConfig: baseCfg({ observability: { ...cfg.observability, enabled: !enabled } }) },
+      inv: async (harness, _dir, _prompt, options) => {
+        calls.push({ harness, options: options! });
+        return harness === "codex" ? spawnErr() : okJson(verdict("approve"));
+      },
+    });
+    assert.equal(out.result.success, true);
+    assert.equal(out.selfReview, true);
+    assert.deepEqual(calls.map((call) => call.harness).sort(), ["claude", "codex", "grok"]);
+    for (const call of calls) assert.equal(call.options.pipelineConfig, cfg);
+  });
+}
 
 test("invokeReviewEnsemble: disabled path invokes exactly one reviewer", async () => {
   const calls: string[] = [];

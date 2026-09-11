@@ -36,6 +36,8 @@ import { verifyPlanRevisionOutput } from "../scripts/verify-harness-commits.ts";
 import { validateStageOutput } from "../scripts/stage-output-contract.ts";
 import { realInvokeHarness } from "../scripts/evals/executor.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
+import { DEFAULT_CONFIG } from "../scripts/types.ts";
+import { enqueueAccountingObservation, type ObservabilityDeps } from "../scripts/observability.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harness-test-"));
 
@@ -164,6 +166,38 @@ test("invoke(): accounting records prompt size without raw prompt content", asyn
   assert.equal(event.type, "stage_accounting");
   assert.equal(event.prompt_chars, 16);
   assert.equal(event.prompt_estimated_tokens, 4);
+});
+
+test("invoke(): resolved YAML policy controls both pre-spawn context and completed local export", async () => {
+  const cli = makeScript("observability-fixture", `printf '%s' "\${PIPELINE_INVOCATION_ID:-none}"`);
+  for (const enabled of [false, true]) {
+    const files = new Map<string, object>();
+    const observability = { ...DEFAULT_CONFIG.observability, enabled };
+    const observabilityDeps: ObservabilityDeps = {
+      home: "/fake-home",
+      read: async () => JSON.stringify({ repo: "owner/repo" }),
+      list: async () => [],
+      write: async (p, value) => { files.set(p, value); },
+      remove: async (p) => { files.delete(p); },
+      warn: () => {}, uuid: () => "fixture-invocation",
+    };
+    const runStoreDeps = {
+      appendFile: async () => {},
+      accountingSink: async (dir, record, config) => {
+        assert.equal(config, observability);
+        await enqueueAccountingObservation(dir, record, config, observabilityDeps);
+      },
+    } as RunStoreDeps;
+    const result = await invoke(cli, tmpRoot, "PRIVATE PROMPT", {
+      stream: false, pipelineConfig: { observability }, observabilityDeps,
+      accounting: { runDir: "/repo/.agent-pipeline/runs/run-1", issue: 42, stage: "review-1", runStoreDeps },
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.stdout, enabled ? "fixture-invocation" : "none");
+    assert.equal([...files.keys()].filter((p) => p.includes("/inbox/")).length, enabled ? 2 : 0);
+    assert.equal([...files.keys()].filter((p) => p.includes("/context/")).length, enabled ? 1 : 0);
+    assert.doesNotMatch(JSON.stringify([...files.values()]), /PRIVATE PROMPT/);
+  }
 });
 
 test("invoke(): an unspawnable custom CLI yields a specific named error, not 'Unknown harness'", async () => {

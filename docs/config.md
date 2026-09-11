@@ -574,6 +574,38 @@ Nested fields:
 - **Type:** string | string
 - **Description:** Model alias for the sweep spec-generation step (implementer harness), or "auto".
 
+### `observability`
+
+- **Type:** object
+- **Default:** `{"enabled":false,"traffic_class":"real","execution_purpose":"operational","exporter":{"type":"file","directory":"~/.local/state/agent-pipeline/observability"}}`
+- **Description:** Opt-in, provider-neutral usage observability configured only in pipeline.yml. Independent of papercuts and event_sink; disabled by default. Local export failures never change stage outcomes.
+
+Nested fields:
+
+#### `observability.enabled`
+
+- **Type:** boolean
+- **Description:** When true, export metadata-only stage usage and native-session correlation to the configured local file spool. Default false; no environment override. No prompts, outputs, credentials, or network delivery.
+
+#### `observability.execution_purpose`
+
+- **Type:** enum
+- **Description:** Purpose independent of traffic reality. Defaults to operational; evaluation/test can make genuine paid provider requests.
+
+- **Allowed values:** `operational`, `test`, `evaluation`, `verification`, `unknown`
+
+#### `observability.exporter`
+
+- **Type:** object
+- **Description:** Local exporter configuration. Backend URLs and credentials belong to the independent collector, not pipeline.yml.
+
+#### `observability.traffic_class`
+
+- **Type:** enum
+- **Description:** Traffic evidence: real provider work, mocked synthetic fixtures, or unknown. Defaults to real. Synthetic records never export usage or cost. Real paid tests/evaluations remain real.
+
+- **Allowed values:** `real`, `synthetic`, `unknown`
+
 ### `openspec`
 
 - **Type:** object
