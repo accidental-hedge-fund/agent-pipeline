@@ -8,15 +8,12 @@ lifecycle evidence that must not become implementer tasks.
 
 ### Requirement: The run-scoped clean-openspec fixture SHALL name release 1.40.1
 
-The JSON fixture at
-`core/test/fixtures/frg/frg-1.40.1-e3ab117714d1/clean-openspec.json` SHALL set
-`release_version` to the literal string `1.40.1`. The executable Node unit
-test at `core/test/frg-frg-1.40.1-e3ab117714d1-clean-openspec.test.ts` SHALL
-read only that fixture, parse it, and assert that literal value. The test
-SHALL fail when the fixture's `release_version` value changes. The OpenSpec
-change `frg-1-40-1-e3ab117714d1-clean-openspec` SHALL belong only to issue
-#1593. The product diff SHALL stay inside that fixture path, that test path,
-and this OpenSpec change.
+The fixture SHALL name release `1.40.1`.
+The JSON fixture at `core/test/fixtures/frg/frg-1.40.1-e3ab117714d1/clean-openspec.json` SHALL set `release_version` to the literal string `1.40.1`.
+The executable Node unit test at `core/test/frg-frg-1.40.1-e3ab117714d1-clean-openspec.test.ts` SHALL read only that fixture, parse it, and assert that literal value.
+The test SHALL fail when the fixture's `release_version` value changes.
+The OpenSpec change `frg-1-40-1-e3ab117714d1-clean-openspec` SHALL belong only to issue #1593.
+The product diff SHALL stay inside that fixture path, that test path, and this OpenSpec change.
 
 #### Scenario: Fixture names the exact release
 

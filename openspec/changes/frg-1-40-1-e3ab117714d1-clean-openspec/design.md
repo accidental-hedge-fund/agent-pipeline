@@ -57,6 +57,11 @@ does not modify `factory-reliability-gate` or other living specs. Pre-merge
 archives into
 `openspec/specs/frg-1-40-1-e3ab117714d1-clean-openspec/spec.md` only.
 
+OpenSpec 1.5.0 (`/usr/bin/openspec`, the pipeline PATH) extracts only the
+first non-blank body line after each `### Requirement:` header when it
+checks SHALL/MUST. A wrapped second-line SHALL fails that check even when
+the header also contains SHALL. Keep SHALL on that first body line.
+
 Alternative considered: a delta on `factory-reliability-gate`. Rejected
 because the issue forbids another issue's OpenSpec change and names this
 exact living-spec destination.
