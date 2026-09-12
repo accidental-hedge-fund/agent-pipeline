@@ -387,8 +387,6 @@ export interface ProductionExactCandidateFrgIo {
   readCurrentReviewEvidence(
     input: BeginExactCandidateFrgInput, issueNumber: number, prNumber: number, headSha: string, diffHash: string,
   ): Promise<{ advanceRunId: string; summary: ExactAdvanceSummary; reviewedHeadSha: string; reviewedDiffHash: string } | null>;
-  /** Override the host-local release/FRG exclusion lock. Production omits this. */
-  makeReleaseFrgExclusionLock?(lockDomain: string): ReleaseFrgExclusionLock;
 }
 
 export interface CandidateOrdinaryLoopExecution {
@@ -2641,7 +2639,7 @@ export async function runProductionExactCandidateFrg(
     const existing = selectExactCandidateFrgExistingRecord(records, candidate);
     const epochId = existing ? existing.epoch_id : nextExactCandidateFrgEpochId(records, input.releaseVersion, candidate);
     return runExactCandidateFrg({ ...boundInput, epochId, expectedCandidateSha: candidate }, deps, existing ?? undefined);
-  }, io.makeReleaseFrgExclusionLock);
+  });
 }
 
 export interface DiscoveredExactCandidateFrgPair {
