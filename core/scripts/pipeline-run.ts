@@ -3265,6 +3265,64 @@ export async function runAdvance(
             }
           },
         });
+        const livePrHead = normalizeCandidateSha(prHeadSha);
+        const pushedNorm = normalizeCandidateSha(pushedHeadSha);
+        const sameLinkedPr =
+          prNumber != null && (pushedPrNumber == null || pushedPrNumber === prNumber);
+        if (sameLinkedPr && pushedNorm && livePrHead && pushedNorm !== livePrHead) {
+          const wtAlign = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
+            () => null,
+          );
+          const gitFn: GitRunner = deps.gitInWorktree ?? gitInWorktree;
+          let aligned: string | null = null;
+          if (wtAlign) {
+            await gitFn(
+              wtAlign.path,
+              ["fetch", "--update-head-ok", "origin", livePrHead],
+              { ignoreFailure: true },
+            );
+            const checkout = await gitFn(
+              wtAlign.path,
+              ["checkout", "--force", livePrHead],
+              { ignoreFailure: true },
+            );
+            aligned = normalizeCandidateSha(
+              (await gitFn(wtAlign.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim(),
+            );
+            if (checkout.code !== 0 || aligned !== livePrHead) {
+              aligned = null;
+            }
+          }
+          if (aligned !== livePrHead) {
+            const summary =
+              `tester rebind: cannot checkout linked PR head ${livePrHead}` +
+              (pushedNorm ? ` (worktree was ${pushedNorm})` : "");
+            const blockedOut: Outcome = {
+              advanced: false,
+              status: "blocked",
+              reason: summary,
+              blockerKind: "harness-failure",
+            };
+            await emitBlockedOutcomeEvents(
+              runDir,
+              issueNumber,
+              stage,
+              blockedOut,
+              runStoreDeps,
+            ).catch(() => {});
+            await (deps.setBlocked ?? setBlocked)(
+              cfg,
+              issueNumber,
+              summary,
+              stage,
+              "harness-failure",
+            ).catch(() => {});
+            printOutcome(issueNumber, stage, blockedOut, tlog);
+            return blockedOut;
+          }
+          pushedHeadSha = livePrHead;
+          lastPushedCandidate = { sha: livePrHead, prNumber };
+        }
         const failClosedRebind = async (rebind: Extract<RebindTesterEvidenceResult, { ok: false }>): Promise<Outcome> => {
           tlog(`[pipeline] #${issueNumber}: ${rebind.summary}`);
           const blockedOut: Outcome = {
