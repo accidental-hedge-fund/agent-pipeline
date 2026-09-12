@@ -844,6 +844,7 @@ async function driveDesignGateAdvance(opts: {
   worktreeHeadAfterRebind?: string | null;
   worktreeHeadAfter?: string | null;
   worktreeHeadAfterDispatch?: Array<string | null>;
+  checkoutPrHeadFails?: boolean;
   prHeadAfterDispatch?: Array<string | null>;
   changedPaths?: string[];
   tester?: TesterEvidence | null;
@@ -1011,6 +1012,17 @@ async function driveDesignGateAdvance(opts: {
         };
       }
       if (args[0] === "log" || args[0] === "show") {
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      if (args[0] === "fetch") {
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      if (args[0] === "checkout") {
+        if (opts.checkoutPrHeadFails) {
+          return { stdout: "", stderr: "pathspec did not match", code: 1 };
+        }
+        const sha = args.find((arg) => /^[0-9a-f]{40}$/i.test(arg));
+        if (sha) currentWorktreeHead = sha;
         return { stdout: "", stderr: "", code: 0 };
       }
       return { stdout: "", stderr: "", code: 0 };
@@ -1236,21 +1248,23 @@ test("runAdvance fail-closes later consumer stages on typed rebind failure", asy
   }
 });
 
-test("runAdvance fail-closes when PR head disagrees with the pushed head", async () => {
+test("runAdvance checkouts linked PR head when PR is ahead of worktree at consumer entry", async () => {
   const driven = await driveDesignGateAdvance({
     prNumber: 99,
     prHeadSha: SHA_B,
     worktreeHead: SHA_S,
+    rebind: ownedAwareRebind,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "design-gate" as const,
+      to: "review-1" as const,
+      summary: "design-gate resumed against current PR head",
+    }),
   });
-  assert.equal(driven.rebindCalls.length, 1);
-  assert.equal(driven.rebindCalls[0]?.pushedHeadSha, SHA_S);
+  assert.equal(driven.setBlocked.length, 0);
+  assert.equal(driven.rebindCalls[0]?.pushedHeadSha, SHA_B);
   assert.equal(driven.rebindCalls[0]?.prHeadSha, SHA_B);
-  assert.ok(driven.setBlocked.some((row) => /disagrees with pushed head/.test(row.reason)));
-  assert.equal(
-    (driven.blockerEvents[0]?.diagnostic as { detail?: { evidence_ordering?: { blocker_code?: string } } })
-      ?.detail?.evidence_ordering?.blocker_code,
-    "tester_rebind_pr_head_mismatch",
-  );
+  assert.ok(driven.dispatchCalls >= 1);
 });
 
 test("runAdvance fail-closes when the worktree candidate moves before consumer dispatch (#1562 review 2)", async () => {
@@ -2025,6 +2039,44 @@ test("runAdvance does not leave the consumer stage advanced after post-attempt P
     "tester_rebind_pr_head_mismatch",
   );
   assert.ok(driven.setBlocked.some((row) => /disagrees with pushed head/.test(row.reason)));
+});
+
+test("runAdvance checkouts linked PR head when entering fix-1 with worktree behind same PR", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "fix-1",
+    prNumber: 99,
+    prHeadSha: SHA_B,
+    worktreeHead: SHA_S,
+    tester: boundPassed(),
+    invokeObserver: true,
+    rebind: ownedAwareRebind,
+    dispatch: async () => ({
+      advanced: true as const,
+      from: "fix-1" as const,
+      to: "review-2" as const,
+      summary: "fix-1 resumed against current PR head",
+    }),
+  });
+  assert.equal(driven.setBlocked.length, 0);
+  assert.ok(driven.dispatchCalls >= 1);
+  const first = driven.rebindCalls[0];
+  assert.equal(first?.prNumber, 99);
+  assert.equal(first?.prHeadSha, SHA_B);
+  assert.equal(first?.pushedHeadSha, SHA_B);
+  assert.equal(driven.pipelineStage, "review-2");
+});
+
+test("runAdvance fail-closes when linked PR head cannot be checked out at fix-1", async () => {
+  const driven = await driveDesignGateAdvance({
+    startStage: "fix-1",
+    prNumber: 99,
+    prHeadSha: SHA_B,
+    worktreeHead: SHA_S,
+    checkoutPrHeadFails: true,
+    tester: boundPassed(),
+  });
+  assert.equal(driven.dispatchCalls, 0);
+  assert.ok(driven.setBlocked.some((row) => /cannot checkout linked PR head/.test(row.reason)));
 });
 
 test("runAdvance rebinds a successful fix-1 push instead of treating it as foreign PR drift", async () => {
