@@ -68,10 +68,6 @@ const DOCS = `${PROVENANCE_TEMPLATE}\ndocs {{openspec_change_id}}`;
 const OPENSPEC = `${PROVENANCE_TEMPLATE}\nopenspec {{openspec_change_id}}`;
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
-function passThroughExclusionLock(): ProductionExactCandidateFrgIo["makeReleaseFrgExclusionLock"] {
-  return () => ({ acquire: () => true, release: () => {} });
-}
-
 function engine(): CandidateEngine {
   return {
     engineRoot: ROOT,
@@ -1987,7 +1983,6 @@ test("production record discovery ignores unrelated corruption but fails on rele
     listRecordEpochIds: async () => ["frg-9.9.9-unrelated", passed.epoch_id],
     readFile: async (file: string) => file.endsWith(`${passed.epoch_id}.json`) ? (relevantCorrupt ? "{" : JSON.stringify(passed)) : "{",
     observeOriginMainSha: async () => CANDIDATE, writeRecord: async () => { writes++; }, now: () => new Date(),
-    makeReleaseFrgExclusionLock: passThroughExclusionLock(),
   } as unknown as ProductionExactCandidateFrgIo;
   const input = { repoDir: "/linked", repository: passed.repository, baseBranch: passed.base_branch,
     releaseVersion: passed.release_version, operationalDomain: passed.operational_domain };
@@ -2000,26 +1995,6 @@ test("production record discovery ignores unrelated corruption but fails on rele
   await assert.rejects(() => runProductionExactCandidateFrg(input, io), /JSON/);
 });
 
-test("production wrapper uses the injected exclusion lock, not the host lock", async () => {
-  const events: string[] = [];
-  const io = {
-    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: "owner/repo" }),
-    resolveReleaseStoreRepoDir: async () => "/primary",
-    listRecordEpochIds: async () => { throw new Error("inventory must not run"); },
-    makeReleaseFrgExclusionLock: () => ({
-      acquire: () => { events.push("acquire"); return false; },
-      release: () => { events.push("release"); },
-    }),
-  } as unknown as ProductionExactCandidateFrgIo;
-  await assert.rejects(
-    () => runProductionExactCandidateFrg({
-      repoDir: "/linked", repository: "owner/repo", baseBranch: "main", releaseVersion: "1.40.1",
-    }, io),
-    /already held for agent-pipeline/,
-  );
-  assert.deepEqual(events, ["acquire"], "host lock must not be taken when an injected lock refuses acquire");
-});
-
 test("production wrapper rejects movement from the caller-pinned candidate before record or fixture work", async () => {
   let inventoryCalls = 0;
   const io = {
@@ -2027,7 +2002,6 @@ test("production wrapper rejects movement from the caller-pinned candidate befor
     resolveReleaseStoreRepoDir: async () => "/primary",
     observeOriginMainSha: async () => MOVED,
     listRecordEpochIds: async () => { inventoryCalls++; return []; },
-    makeReleaseFrgExclusionLock: passThroughExclusionLock(),
   } as unknown as ProductionExactCandidateFrgIo;
   await assert.rejects(() => runProductionExactCandidateFrg({
     repoDir: "/linked", repository: "owner/repo", baseBranch: "main",
@@ -2091,7 +2065,6 @@ test("production rejects invalid target-primary bindings before remote mutation"
     validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: "other/repository" }),
     resolveReleaseStoreRepoDir: async () => "/primary",
     listRecordEpochIds: async () => { inventoryCalls++; return []; },
-    makeReleaseFrgExclusionLock: passThroughExclusionLock(),
   } as unknown as ProductionExactCandidateFrgIo;
   const input = { repoDir: "/linked", repository: "owner/repo", baseBranch: "main", releaseVersion: "1.40.1" };
   await assert.rejects(() => runProductionExactCandidateFrg(input, base), /target primary origin other\/repository/);
