@@ -55,6 +55,9 @@ const CANDIDATE = "a".repeat(40);
 const MOVED = "b".repeat(40);
 const ROOT = "/candidate";
 const CANONICAL_LOOP = workListRunId("owner/repo", "claude", ["101", "102"]);
+// runProductionExactCandidateFrg acquires a real /tmp lock for target.domain.
+// Tests must not use the host production domain (agent-pipeline).
+const UNIT_FRG_LOCK_DOMAIN = "exact-candidate-frg-unit";
 const PROVENANCE_TEMPLATE = `<!-- pipeline-frg-instance@1
 pack_id={{pack_id}}
 manifest_version={{manifest_version}}
@@ -1973,7 +1976,7 @@ test("production record discovery ignores unrelated corruption but fails on rele
   record.loop_dispatch_certainty = "known_complete";
   record.slots.forEach((slot, index) => { slot.issue_number = 101 + index; slot.create_certainty = "known_complete"; slot.advance_run_id = `advance-${index + 1}`; });
   const passed = await observeExactCandidateFrgPair(record, deps);
-  passed.operational_domain = "agent-pipeline";
+  passed.operational_domain = UNIT_FRG_LOCK_DOMAIN;
   passed.cleanup = passed.slots.map((slot) => ({ target: `issue:${slot.issue_number}`, status: "debt", detail: "deferred", observed_at: passed.updated_at }));
   passed.cleanup_debt = true;
   let relevantCorrupt = false;
@@ -1998,7 +2001,7 @@ test("production record discovery ignores unrelated corruption but fails on rele
 test("production wrapper rejects movement from the caller-pinned candidate before record or fixture work", async () => {
   let inventoryCalls = 0;
   const io = {
-    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: "owner/repo" }),
+    validateTargetRuntime: async () => ({ domain: UNIT_FRG_LOCK_DOMAIN, repository: "owner/repo" }),
     resolveReleaseStoreRepoDir: async () => "/primary",
     observeOriginMainSha: async () => MOVED,
     listRecordEpochIds: async () => { inventoryCalls++; return []; },
@@ -2062,7 +2065,7 @@ test("default production composition freezes the requested profile for target do
 test("production rejects invalid target-primary bindings before remote mutation", async () => {
   let inventoryCalls = 0;
   const base = {
-    validateTargetRuntime: async () => ({ domain: "agent-pipeline", repository: "other/repository" }),
+    validateTargetRuntime: async () => ({ domain: UNIT_FRG_LOCK_DOMAIN, repository: "other/repository" }),
     resolveReleaseStoreRepoDir: async () => "/primary",
     listRecordEpochIds: async () => { inventoryCalls++; return []; },
   } as unknown as ProductionExactCandidateFrgIo;
@@ -2070,7 +2073,7 @@ test("production rejects invalid target-primary bindings before remote mutation"
   await assert.rejects(() => runProductionExactCandidateFrg(input, base), /target primary origin other\/repository/);
   assert.equal(inventoryCalls, 0);
 
-  base.validateTargetRuntime = async () => ({ domain: "agent-pipeline", repository: "owner/repo" });
+  base.validateTargetRuntime = async () => ({ domain: UNIT_FRG_LOCK_DOMAIN, repository: "owner/repo" });
   base.resolveReleaseStoreRepoDir = async () => "../not-canonical";
   await assert.rejects(() => runProductionExactCandidateFrg(input, base), /normalized absolute path/);
   assert.equal(inventoryCalls, 0);
